@@ -27,6 +27,7 @@ pub struct MySqlSourceConfig {
     /// Resume coordinate; None starts from the server's current position.
     pub start_file: Option<String>,
     pub start_pos: u32,
+    pub tls: pg2osync_tls::TlsSettings,
 }
 
 impl MySqlSourceConfig {
@@ -38,6 +39,7 @@ impl MySqlSourceConfig {
             password: self.password.clone(),
             database: None,
             server_id: self.server_id,
+            tls: self.tls.clone(),
         }
     }
 }

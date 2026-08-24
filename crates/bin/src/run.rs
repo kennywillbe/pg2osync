@@ -218,8 +218,7 @@ async fn run_postgres(
     let polling = cfg.source.mode == "poll";
     let tls = cfg.tls_settings(&source_url)?;
     tracing::info!(target: "pg2osync::run", "source sslmode={}", tls.mode.as_str());
-    let admin = tls
-        .connect(&admin_url)
+    let admin = pg2osync_source::tls::connect(&tls, &admin_url)
         .await
         .context("cannot connect to source PostgreSQL")?;
 
@@ -549,6 +548,7 @@ fn mysql_config(
         tables,
         start_file: None,
         start_pos: 0,
+        tls: cfg.tls_settings(source_url)?,
     })
 }
 

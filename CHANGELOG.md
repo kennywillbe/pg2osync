@@ -8,6 +8,12 @@ pre-1.0, so breaking changes may land in any 0.x release.
 
 ### Added
 
+- TLS for MySQL and MariaDB connections, including the binlog dump, through the
+  same `[source] sslmode` setting.
+- `caching_sha2_password` support, so the MySQL 8 default plugin no longer
+  requires creating a legacy `mysql_native_password` account. Full
+  authentication sends the password inside the TLS session, or encrypted with
+  the server's public key when the connection is plaintext.
 - TLS for every PostgreSQL connection, including the replication stream, via
   `[source] sslmode` and `sslrootcert` with libpq semantics (`disable`,
   `prefer`, `require`, `verify-ca`, `verify-full`). Connections were previously

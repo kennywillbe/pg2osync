@@ -1,0 +1,16 @@
+[package]
+name = "pg2osync-tls"
+version = "0.6.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared TLS configuration for pg2osync sources"
+
+[dependencies]
+anyhow.workspace = true
+rustls = { version = "0.23.43", features = ["ring"] }
+rustls-pemfile = "2.2.0"
+tracing.workspace = true
+url = "2.5.8"
+webpki-roots = "1.0.9"

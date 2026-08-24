@@ -9,6 +9,7 @@ description = "MySQL/MariaDB binlog source for pg2osync"
 
 [dependencies]
 pg2osync-core = { path = "../core" }
+pg2osync-tls = { path = "../tls" }
 tokio.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -20,3 +21,11 @@ futures-util = "0.3.34"
 base64 = "0.23.1"
 crc32fast = "1.5.1"
 url = "2.5.8"
+tokio-rustls = "0.26.4"
+rustls = { version = "0.23.43", features = ["ring"] }
+rsa = "0.9.10"
+# rsa 0.9 is built on digest 0.10 and rand_core 0.6, while the workspace has
+# moved on to sha1/sha2 0.11. These pinned aliases exist only to feed OAEP;
+# rsa 0.10, which would resolve the split, is still a release candidate.
+sha1-oaep = { package = "sha1", version = "0.10" }
+rand-oaep = { package = "rand", version = "0.8" }

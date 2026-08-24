@@ -35,6 +35,7 @@ async fn main() -> Result<()> {
         database: None,
         // high value so it cannot collide with a real replica
         server_id: 4_242_424,
+        tls: pg2osync_tls::TlsSettings::resolve(url.as_str(), None, None)?,
     };
 
     let mut conn = MySqlConnection::connect(&cfg).await?;

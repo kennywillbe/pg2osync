@@ -74,9 +74,8 @@ Stated up front, because finding these out in production is expensive:
 - **Poll mode cannot see deletes.** It has no access to the replication log.
 - **Nested children are one level deep**, re-fetched with a query per changed
   parent — a wide fan-out slows the initial load.
-- **MySQL needs `binlog_row_image = FULL`** and a `mysql_native_password`
-  user; `caching_sha2_password` full-auth is not implemented yet, and the MySQL
-  connection has no TLS (PostgreSQL does).
+- **MySQL needs `binlog_row_image = FULL`.** `TRUNCATE` is not propagated for
+  MySQL sources (it is not a row-level event in the binlog).
 - **MySQL nested children are not supported yet.**
 - Ordering is guaranteed per row, not across tables.
 
@@ -88,7 +87,9 @@ every connection via `[source] sslmode` (libpq semantics, `prefer` by default).
 
 **MySQL source** — MySQL 8.0+ or MariaDB 10.6+ with `log_bin = ON`,
 `binlog_format = ROW`, `binlog_row_image = FULL`, and a user holding `SELECT`,
-`REPLICATION SLAVE` and `REPLICATION CLIENT`.
+`REPLICATION SLAVE` and `REPLICATION CLIENT`. Both `caching_sha2_password` and
+`mysql_native_password` work, and TLS is supported through the same
+`[source] sslmode` setting.
 
 **Target** — OpenSearch 2.x, Elasticsearch 8.x or Meilisearch 1.x.
 

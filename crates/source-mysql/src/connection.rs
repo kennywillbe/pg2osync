@@ -1,22 +1,37 @@
-//! Live connection: handshake, native-password auth, COM_BINLOG_DUMP.
+//! Live connection: TLS negotiation, authentication and COM_BINLOG_DUMP.
 //!
-//! Stage limitation (documented): only `mysql_native_password` is supported.
-//! caching_sha2_password full-auth requires TLS or RSA exchange; create the
-//! replication user with mysql_native_password. The greeting may advertise the
-//! server default plugin — we request native explicitly and follow at most a
-//! handful of AuthSwitchRequest packets.
+//! Supports `mysql_native_password` and `caching_sha2_password`, which is the
+//! default plugin from MySQL 8.0 onward. Full authentication — needed whenever
+//! the server has not cached the account — sends the password over TLS, or
+//! encrypts it with the server's public key when the socket is plaintext, so
+//! the password never crosses the wire in the clear either way.
 
-use crate::packet::{frame_all, native_password_scramble, parse_greeting};
+use crate::auth;
+use crate::packet::{frame_all, parse_greeting};
 use anyhow::{Context as _, Result, bail};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use pg2osync_tls::{SslMode, TlsSettings};
+use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const CLIENT_LONG_PASSWORD: u32 = 0x1;
 const CLIENT_LONG_FLAG: u32 = 0x4;
+const CLIENT_SSL: u32 = 0x800;
 const CLIENT_PROTOCOL_41: u32 = 0x200;
 const CLIENT_TRANSACTIONS: u32 = 0x2000;
 const CLIENT_SECURE_CONNECTION: u32 = 0x8000;
 const CLIENT_PLUGIN_AUTH: u32 = 0x80_000;
+
+const NATIVE_PASSWORD: &str = "mysql_native_password";
+const CACHING_SHA2: &str = "caching_sha2_password";
+
+/// caching_sha2_password full-authentication signals.
+const FAST_AUTH_SUCCESS: u8 = 0x03;
+const FULL_AUTH_REQUIRED: u8 = 0x04;
+const REQUEST_PUBLIC_KEY: u8 = 0x02;
+
+/// utf8mb4, so text-protocol results decode as UTF-8.
+const CHARSET_UTF8MB4: u8 = 45;
 
 #[derive(Debug, Clone)]
 pub struct MySqlConfig {
@@ -26,85 +41,166 @@ pub struct MySqlConfig {
     pub password: String,
     pub database: Option<String>,
     pub server_id: u32,
+    pub tls: TlsSettings,
 }
 
+/// Either a plain socket or a TLS session over one.
+///
+/// The protocol above this point is identical, so the rest of the client is
+/// written against the trait rather than against two nearly identical paths.
+trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
+
 pub struct MySqlConnection {
-    stream: TcpStream,
+    stream: Box<dyn Stream>,
     server_id: u32,
+    encrypted: bool,
 }
 
 impl MySqlConnection {
+    /// Whether this connection negotiated TLS.
+    pub fn is_encrypted(&self) -> bool {
+        self.encrypted
+    }
+
     pub async fn connect(cfg: &MySqlConfig) -> Result<Self> {
-        let mut stream = TcpStream::connect((cfg.host.as_str(), cfg.port))
+        let tcp = TcpStream::connect((cfg.host.as_str(), cfg.port))
             .await
             .context("mysql tcp connect failed")?;
-        stream.set_nodelay(true).ok();
+        tcp.set_nodelay(true).ok();
+        let mut stream: Box<dyn Stream> = Box::new(tcp);
 
         let greeting_payload = read_one(&mut stream).await?;
         let greeting = parse_greeting(&greeting_payload).context("cannot parse mysql greeting")?;
         if greeting.capabilities & CLIENT_PLUGIN_AUTH == 0 {
             bail!("server lacks CLIENT_PLUGIN_AUTH");
         }
-        let scramble = &greeting.auth_plugin_data[..20.min(greeting.auth_plugin_data.len())];
-        let token = native_password_scramble(cfg.password.as_bytes(), scramble);
+        let server_supports_tls = greeting.capabilities & CLIENT_SSL != 0;
 
-        // request mysql_native_password explicitly; the server switches us when
-        // the target user's plugin differs
-        let caps = CLIENT_LONG_PASSWORD
+        let use_tls = match cfg.tls.mode {
+            SslMode::Disable => false,
+            SslMode::Prefer => server_supports_tls,
+            _ if !server_supports_tls => bail!(
+                "sslmode={} was requested but the server does not offer TLS",
+                cfg.tls.mode.as_str()
+            ),
+            _ => true,
+        };
+
+        let mut caps = CLIENT_LONG_PASSWORD
             | CLIENT_LONG_FLAG
             | CLIENT_PROTOCOL_41
             | CLIENT_TRANSACTIONS
             | CLIENT_SECURE_CONNECTION
             | CLIENT_PLUGIN_AUTH;
-        let mut resp = Vec::with_capacity(128);
-        resp.extend_from_slice(&caps.to_le_bytes());
-        resp.extend_from_slice(&0x00FF_FFFFu32.to_le_bytes());
-        resp.push(45);
-        resp.extend_from_slice(&[0u8; 23]);
-        resp.extend_from_slice(cfg.user.as_bytes());
-        resp.push(0);
-        resp.push(token.len() as u8);
-        resp.extend_from_slice(&token);
-        resp.extend_from_slice(b"mysql_native_password");
-        resp.push(0);
+        if use_tls {
+            caps |= CLIENT_SSL;
+        }
 
-        // packet sequences continue across the whole exchange: greeting was 0,
-        // our response is 1, and every later packet keeps counting up
-        let mut seq = 2u8;
-        write_framed_at(&mut stream, 1, &resp).await?;
+        // The greeting is packet 0, so ours is 1. When TLS is used the
+        // SSLRequest takes that slot and the real handshake response becomes 2.
+        let mut seq = 1u8;
+        if use_tls {
+            write_framed_at(&mut stream, seq, &ssl_request(caps)).await?;
+            seq += 1;
+            stream = upgrade_to_tls(stream, cfg).await?;
+        }
 
-        for _ in 0..4 {
-            let payload = read_one(&mut stream).await?;
-            match payload.first() {
-                Some(0x00) | None => {
-                    return Ok(Self {
-                        stream,
-                        server_id: cfg.server_id,
-                    });
-                }
-                Some(0xFF) => return Err(auth_error(&payload)),
+        // Answer with the plugin the server named; it switches us if the
+        // account uses a different one.
+        let nonce = greeting.auth_plugin_data.clone();
+        let plugin = if greeting.auth_plugin_name.is_empty() {
+            NATIVE_PASSWORD.to_string()
+        } else {
+            greeting.auth_plugin_name.clone()
+        };
+        let token = auth_token(&plugin, cfg.password.as_bytes(), &nonce)?;
+        let response = handshake_response(caps, &cfg.user, &token, &plugin);
+        write_framed_at(&mut stream, seq, &response).await?;
+
+        let mut connection = Self {
+            stream,
+            server_id: cfg.server_id,
+            encrypted: use_tls,
+        };
+        connection.finish_authentication(cfg, &nonce).await?;
+        Ok(connection)
+    }
+
+    /// Drive the packets that follow the handshake response until the server
+    /// accepts or rejects the credentials.
+    async fn finish_authentication(
+        &mut self,
+        cfg: &MySqlConfig,
+        initial_nonce: &[u8],
+    ) -> Result<()> {
+        let mut nonce = initial_nonce.to_vec();
+        let mut seq;
+
+        // A handful of round-trips covers switch, fast-auth and full-auth; more
+        // than that means the server and this client disagree about the flow.
+        for _ in 0..8 {
+            let packet = self.read_seq().await?;
+            seq = packet.seq;
+            match packet.payload.first() {
+                Some(0x00) | None => return Ok(()),
+                Some(0xFF) => return Err(auth_error(&packet.payload)),
                 Some(0xFE) => {
-                    // our switch response must use the NEXT sequence after the
-                    // server's request
-                    seq = seq.wrapping_add(1);
-                    let rest = &payload[1..];
-                    let name_end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
-                    let new_plugin = String::from_utf8_lossy(&rest[..name_end]).into_owned();
-                    let new_scramble_raw = &rest[name_end + 1..];
-                    let new_scramble = &new_scramble_raw[..20.min(new_scramble_raw.len())];
-                    if !new_plugin.starts_with("mysql_native_password") {
-                        bail!(
-                            "server switched to '{new_plugin}'; unsupported this stage — \
-                             create the replication user with mysql_native_password"
-                        );
-                    }
-                    let tok = native_password_scramble(cfg.password.as_bytes(), new_scramble);
-                    write_framed(&mut stream, &mut seq, &tok).await?;
+                    let (plugin, new_nonce) = parse_auth_switch(&packet.payload);
+                    nonce = new_nonce;
+                    let token = auth_token(&plugin, cfg.password.as_bytes(), &nonce)?;
+                    self.write_at(seq + 1, &token).await?;
                 }
+                Some(0x01) => match packet.payload.get(1).copied() {
+                    Some(FAST_AUTH_SUCCESS) => continue,
+                    Some(FULL_AUTH_REQUIRED) => {
+                        seq = self.full_authentication(cfg, &nonce, seq).await?;
+                        let _ = seq;
+                    }
+                    // any other AuthMoreData at this point is the public key,
+                    // which only arrives after we asked for it
+                    _ => bail!("unexpected auth data from the server"),
+                },
                 other => bail!("unexpected auth reply {other:?}"),
             }
         }
-        bail!("too many auth switch requests")
+        bail!("authentication did not complete after 8 exchanges")
+    }
+
+    /// caching_sha2_password full authentication.
+    ///
+    /// Over TLS the password goes as cleartext, which is what the server
+    /// expects. On a plaintext socket it is XORed with the nonce and encrypted
+    /// with the server's public key instead.
+    async fn full_authentication(
+        &mut self,
+        cfg: &MySqlConfig,
+        nonce: &[u8],
+        seq: u8,
+    ) -> Result<u8> {
+        if self.encrypted {
+            self.write_at(seq + 1, &auth::cleartext_password(cfg.password.as_bytes()))
+                .await?;
+            return Ok(seq + 1);
+        }
+
+        self.write_at(seq + 1, &[REQUEST_PUBLIC_KEY]).await?;
+        let key_packet = self.read_seq().await?;
+        if key_packet.payload.first() != Some(&0x01) {
+            bail!("server did not return a public key for full authentication");
+        }
+        let encrypted =
+            auth::rsa_encrypted_password(cfg.password.as_bytes(), nonce, &key_packet.payload[1..])?;
+        self.write_at(key_packet.seq + 1, &encrypted).await?;
+        Ok(key_packet.seq + 1)
+    }
+
+    async fn read_seq(&mut self) -> Result<SeqPacket> {
+        read_one_with_seq(&mut self.stream).await
+    }
+
+    async fn write_at(&mut self, seq: u8, payload: &[u8]) -> Result<()> {
+        write_framed_at(&mut self.stream, seq, payload).await
     }
 
     pub async fn send_query(&mut self, sql: &str) -> Result<()> {
@@ -125,7 +221,8 @@ impl MySqlConnection {
     }
 
     async fn write_command(&mut self, payload: &[u8]) -> Result<()> {
-        write_framed(&mut self.stream, &mut 0u8, payload).await
+        // every command starts a new sequence
+        write_framed_at(&mut self.stream, 0, payload).await
     }
 
     /// Read one framed packet of the active phase.
@@ -143,9 +240,22 @@ impl MySqlConnection {
     }
 }
 
+/// One packet with the sequence number the server stamped on it.
+struct SeqPacket {
+    seq: u8,
+    payload: Vec<u8>,
+}
+
 async fn read_one<S>(stream: &mut S) -> Result<Vec<u8>>
 where
-    S: tokio::io::AsyncRead + Unpin,
+    S: AsyncRead + Unpin,
+{
+    Ok(read_one_with_seq(stream).await?.payload)
+}
+
+async fn read_one_with_seq<S>(stream: &mut S) -> Result<SeqPacket>
+where
+    S: AsyncRead + Unpin,
 {
     let mut head = [0u8; 4];
     stream
@@ -158,28 +268,91 @@ where
         .read_exact(&mut payload)
         .await
         .context("connection closed mid-payload")?;
-    Ok(payload)
-}
-
-async fn write_framed<S>(stream: &mut S, seq: &mut u8, payload: &[u8]) -> Result<()>
-where
-    S: tokio::io::AsyncWrite + Unpin,
-{
-    for f in frame_all(*seq, payload) {
-        stream.write_all(&f).await.context("mysql write failed")?;
-        *seq = seq.wrapping_add(1);
-    }
-    stream.flush().await.context("mysql flush failed")
+    Ok(SeqPacket {
+        seq: head[3],
+        payload,
+    })
 }
 
 async fn write_framed_at<S>(stream: &mut S, start_seq: u8, payload: &[u8]) -> Result<()>
 where
-    S: tokio::io::AsyncWrite + Unpin,
+    S: AsyncWrite + Unpin,
 {
     for f in frame_all(start_seq, payload) {
         stream.write_all(&f).await.context("mysql write failed")?;
     }
     stream.flush().await.context("mysql flush failed")
+}
+
+/// The 32-byte prelude that asks the server to start TLS.
+///
+/// It is the head of a normal handshake response and nothing more: everything
+/// that would identify the user is withheld until the session is encrypted.
+fn ssl_request(caps: u32) -> Vec<u8> {
+    let mut p = Vec::with_capacity(32);
+    p.extend_from_slice(&caps.to_le_bytes());
+    p.extend_from_slice(&0x00FF_FFFFu32.to_le_bytes());
+    p.push(CHARSET_UTF8MB4);
+    p.extend_from_slice(&[0u8; 23]);
+    p
+}
+
+fn handshake_response(caps: u32, user: &str, token: &[u8], plugin: &str) -> Vec<u8> {
+    let mut p = Vec::with_capacity(128);
+    p.extend_from_slice(&caps.to_le_bytes());
+    p.extend_from_slice(&0x00FF_FFFFu32.to_le_bytes());
+    p.push(CHARSET_UTF8MB4);
+    p.extend_from_slice(&[0u8; 23]);
+    p.extend_from_slice(user.as_bytes());
+    p.push(0);
+    p.push(token.len() as u8);
+    p.extend_from_slice(token);
+    p.extend_from_slice(plugin.as_bytes());
+    p.push(0);
+    p
+}
+
+fn auth_token(plugin: &str, password: &[u8], nonce: &[u8]) -> Result<Vec<u8>> {
+    let nonce = &nonce[..20.min(nonce.len())];
+    match plugin {
+        NATIVE_PASSWORD => Ok(auth::native_password(password, nonce)),
+        CACHING_SHA2 => Ok(auth::caching_sha2_fast(password, nonce)),
+        other => bail!(
+            "unsupported authentication plugin {other:?}; this client speaks \
+             mysql_native_password and caching_sha2_password"
+        ),
+    }
+}
+
+fn parse_auth_switch(payload: &[u8]) -> (String, Vec<u8>) {
+    let rest = &payload[1..];
+    let name_end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+    let plugin = String::from_utf8_lossy(&rest[..name_end]).into_owned();
+    let nonce_raw = rest.get(name_end + 1..).unwrap_or(&[]);
+    // the trailing NUL is not part of the nonce
+    let nonce = nonce_raw
+        .iter()
+        .copied()
+        .take_while(|&b| b != 0)
+        .collect::<Vec<u8>>();
+    (plugin, nonce)
+}
+
+/// Wrap the socket in a TLS session using the shared source TLS settings.
+async fn upgrade_to_tls(stream: Box<dyn Stream>, cfg: &MySqlConfig) -> Result<Box<dyn Stream>> {
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg.tls.client_config()?));
+    let server_name = rustls::pki_types::ServerName::try_from(cfg.host.clone())
+        .with_context(|| format!("{} is not a valid TLS server name", cfg.host))?;
+    let tls = connector
+        .connect(server_name, stream)
+        .await
+        .with_context(|| {
+            format!(
+                "mysql TLS handshake failed (sslmode={})",
+                cfg.tls.mode.as_str()
+            )
+        })?;
+    Ok(Box::new(tls))
 }
 
 fn auth_error(payload: &[u8]) -> anyhow::Error {
