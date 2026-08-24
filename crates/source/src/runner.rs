@@ -99,9 +99,12 @@ impl WalSource {
         // RELATION messages arrive after every relcache invalidation, so the
         // registry is upserted rather than built once at startup.
         let mut relations: HashMap<u32, crate::pgoutput::Relation> = HashMap::new();
-        // dedicated connection for nested-child + parent-refetch queries
-        let admin_client = match &self.cfg.admin_url {
-            Some(url) => {
+        // Nested children need their own connection for the refetch queries:
+        // the replication connection cannot run them. Without children there
+        // is nothing to query, so no connection is opened.
+        let needs_admin = !self.cfg.children.is_empty() || !self.cfg.child_parents.is_empty();
+        let admin_client = match (&self.cfg.admin_url, needs_admin) {
+            (Some(url), true) => {
                 let (c, conn) = tokio_postgres::connect(url, tokio_postgres::NoTls)
                     .await
                     .context("nested-docs admin connection failed")?;
@@ -110,7 +113,7 @@ impl WalSource {
                 });
                 Some(c)
             }
-            None => None,
+            _ => None,
         };
         tracing::info!(target: "pg2osync::source", "stream loop starting");
 

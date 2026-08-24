@@ -252,6 +252,7 @@ buffer cap, retry policy, checkpoint interval.
 ## Documentation
 
 - [Architecture](docs/architecture.md) — how the pipeline works
+- [Database impact](docs/database-impact.md) — connections, privileges and the load it puts on your source
 - [Configuration](docs/configuration.md) — every option
 - [Deployment](docs/deployment.md) — Docker, Kubernetes, systemd
 - [Operations](docs/operations.md) — metrics, failure modes, recovery
