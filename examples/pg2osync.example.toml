@@ -1,0 +1,27 @@
+# Example pg2osync configuration. Copy to pg2osync.toml and adjust.
+
+[source]
+url_env = "PG2OSYNC_SOURCE_URL"   # postgres://user:pass@host:5432/db
+slot_name = "pg2osync"
+publication = "pg2osync_pub"
+
+[target]
+url = "http://localhost:9200"
+username = "admin"
+password_env = "OS_PASSWORD"
+tls_verify = true
+
+[sync.users]
+table = "public.users"
+index = "users_index"
+# primary_key = "id"              # default: detected from PK constraint
+# exclude_columns = ["password_hash"]
+# replica_identity_full = false
+
+[engine]
+batch_size = 500
+batch_max_bytes = 10485760
+flush_interval_ms = 1000
+txn_buffer_cap_mb = 256
+retry_max = 10
+retry_backoff_ms = 500

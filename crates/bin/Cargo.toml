@@ -1,0 +1,28 @@
+[package]
+name = "pg2osync"
+version = "0.6.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pg2osync"
+path = "src/main.rs"
+
+[dependencies]
+pg2osync-core = { path = "../core" }
+pg2osync-source = { path = "../source" }
+pg2osync-sink = { path = "../sink" }
+pg2osync-engine = { path = "../engine" }
+clap.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
+opensearch.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3.34"
+bytes = "1.12.1"
+url = "2.5.8"

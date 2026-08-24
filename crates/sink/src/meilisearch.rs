@@ -1,0 +1,282 @@
+//! Meilisearch sink — first schema-less target (VISION §2.4).
+//!
+//! Deviations from the OpenSearch contract:
+//! - no mappings: `ensure_ready` creates the index with primaryKey "id"
+//! - writes are async server-side tasks; we wait for completion before acking
+//!   so at-least-once semantics hold
+//! - no arbitrary-document storage exists, so the checkpoint falls back to a
+//!   local JSON file (documented limitation vs ADR #18)
+
+use async_trait::async_trait;
+use pg2osync_core::error::CoreError;
+use pg2osync_core::lsn::Lsn;
+use pg2osync_core::sink::{DocumentOp, Health, IndexSpec, LsnOp, Sink, SinkAck};
+use serde_json::{Value, json};
+
+pub struct MeilisearchSink {
+    http: reqwest::Client,
+    base_url: String,
+    state_dir: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct MeilisearchSinkConfig {
+    pub url: String,
+    pub api_key: Option<String>,
+    /// Directory for the checkpoint file (no in-cluster storage available).
+    pub state_dir: String,
+}
+
+impl MeilisearchSink {
+    pub fn new(cfg: MeilisearchSinkConfig) -> Result<Self, CoreError> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(key) = &cfg.api_key {
+            let v = format!("Bearer {key}")
+                .parse()
+                .map_err(|e| CoreError::Sink(format!("bad key: {e}")))?;
+            headers.insert(reqwest::header::AUTHORIZATION, v);
+        }
+        let http = reqwest::Client::builder()
+            .default_headers(headers)
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .map_err(|e| CoreError::Sink(e.to_string()))?;
+        std::fs::create_dir_all(&cfg.state_dir)
+            .map_err(|e| CoreError::Sink(format!("state dir {}: {e}", cfg.state_dir)))?;
+        Ok(Self {
+            http,
+            base_url: cfg.url.trim_end_matches('/').to_string(),
+            state_dir: cfg.state_dir,
+        })
+    }
+
+    async fn send(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<(u16, Value), CoreError> {
+        let mut req = self
+            .http
+            .request(method, format!("{}{}", self.base_url, path));
+        if let Some(b) = body {
+            req = req.json(&b);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| CoreError::Sink(format!("request failed: {e}")))?;
+        let status = resp.status().as_u16();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| CoreError::Sink(e.to_string()))?;
+        let body = serde_json::from_str(&text).unwrap_or(Value::Null);
+        Ok((status, body))
+    }
+
+    /// Meilisearch operations are async tasks; block (bounded) until success.
+    async fn wait_task(&self, task_uid: u64) -> Result<(), CoreError> {
+        for _ in 0..600 {
+            let (status, body) = self
+                .send(reqwest::Method::GET, &format!("/tasks/{task_uid}"), None)
+                .await?;
+            if status == 200 {
+                match body["status"].as_str() {
+                    Some("succeeded") => return Ok(()),
+                    Some("failed") => {
+                        return Err(CoreError::Sink(format!(
+                            "task {task_uid} failed: {}",
+                            body["error"]
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        Err(CoreError::Sink("task timed out after 30s".into()))
+    }
+
+    fn checkpoint_path(&self) -> String {
+        format!("{}/checkpoint.json", self.state_dir)
+    }
+}
+
+#[async_trait]
+impl Sink for MeilisearchSink {
+    async fn ensure_ready(&self, tables: &[IndexSpec]) -> Result<(), CoreError> {
+        for spec in tables {
+            // "id" as primary key matches our pk_to_id rendering contract
+            let (status, body) = self
+                .send(
+                    reqwest::Method::POST,
+                    "/indexes",
+                    Some(json!({
+                        "uid": spec.name,
+                        "primaryKey": "id"
+                    })),
+                )
+                .await?;
+            if status == 202 {
+                if let Some(uid) = body["taskUid"].as_u64() {
+                    self.wait_task(uid).await?;
+                }
+            } else if status != 200 && status != 201 {
+                // index_already_exists is acceptable
+                let err = body.to_string();
+                if !err.contains("already_exists") && !err.contains("existing") {
+                    return Err(CoreError::Sink(format!(
+                        "create index {}: {status} {err}",
+                        spec.name
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn get_documents(
+        &self,
+        index: &str,
+        ids: &[String],
+    ) -> Result<Vec<Option<Value>>, CoreError> {
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let (status, body) = self
+                .send(
+                    reqwest::Method::GET,
+                    &format!("/indexes/{index}/documents/{id}"),
+                    None,
+                )
+                .await?;
+            out.push(if status == 200 { Some(body) } else { None });
+        }
+        Ok(out)
+    }
+
+    async fn write(&self, batch: Vec<LsnOp>) -> Result<SinkAck, CoreError> {
+        if batch.is_empty() {
+            return Err(CoreError::Sink(
+                "engine must never send empty batches".into(),
+            ));
+        }
+        // group by index: meili endpoints are per-index
+        let mut by_index: HashMap<String, (Vec<Value>, Vec<String>)> = HashMap::new();
+        for op in &batch {
+            let entry = by_index
+                .entry(match &op.op {
+                    DocumentOp::Upsert { index, .. } | DocumentOp::Delete { index, .. } => {
+                        index.clone()
+                    }
+                })
+                .or_insert_with(|| (vec![], vec![]));
+            match &op.op {
+                DocumentOp::Upsert { doc, .. } => entry.0.push(doc.clone()),
+                DocumentOp::Delete { id, .. } => entry.1.push(id.clone()),
+            }
+        }
+        for (index, (docs, del_ids)) in by_index {
+            if !docs.is_empty() {
+                let (status, body) = self
+                    .send(
+                        reqwest::Method::POST,
+                        &format!("/indexes/{index}/documents?primaryKey=id"),
+                        Some(Value::Array(docs)),
+                    )
+                    .await?;
+                if status != 202 {
+                    return Err(CoreError::Sink(format!(
+                        "add documents to {index}: {status}"
+                    )));
+                }
+                if let Some(uid) = body["taskUid"].as_u64() {
+                    self.wait_task(uid).await?;
+                }
+            }
+            if !del_ids.is_empty() {
+                let (status, body) = self
+                    .send(
+                        reqwest::Method::POST,
+                        &format!("/indexes/{index}/documents/delete-batch"),
+                        Some(Value::Array(
+                            del_ids.into_iter().map(Value::String).collect(),
+                        )),
+                    )
+                    .await?;
+                if status != 202 {
+                    return Err(CoreError::Sink(format!(
+                        "delete documents from {index}: {status}"
+                    )));
+                }
+                if let Some(uid) = body["taskUid"].as_u64() {
+                    self.wait_task(uid).await?;
+                }
+            }
+        }
+        Ok(SinkAck {
+            max_lsn: batch.last().expect("nonempty").lsn,
+        })
+    }
+
+    async fn truncate_index(&self, index: &str) -> Result<(), CoreError> {
+        let (status, body) = self
+            .send(
+                reqwest::Method::DELETE,
+                &format!("/indexes/{index}/documents"),
+                None,
+            )
+            .await?;
+        if status != 202 {
+            return Err(CoreError::Sink(format!("truncate {index}: {status}")));
+        }
+        if let Some(uid) = body["taskUid"].as_u64() {
+            self.wait_task(uid).await?;
+        }
+        Ok(())
+    }
+
+    async fn write_checkpoint(
+        &self,
+        slot_name: &str,
+        publication: &str,
+        lsn: Lsn,
+    ) -> Result<(), CoreError> {
+        let doc = json!({
+            "slot_name": slot_name,
+            "publication": publication,
+            "confirmed_lsn": lsn.to_string(),
+            "schema_version": 1
+        });
+        std::fs::write(
+            self.checkpoint_path(),
+            serde_json::to_vec_pretty(&doc).map_err(|e| CoreError::Sink(e.to_string()))?,
+        )
+        .map_err(|e| CoreError::Sink(format!("checkpoint write: {e}")))
+    }
+
+    async fn read_checkpoint(&self) -> Result<Option<Lsn>, CoreError> {
+        match std::fs::read(self.checkpoint_path()) {
+            Ok(bytes) => {
+                let v: Value =
+                    serde_json::from_slice(&bytes).map_err(|e| CoreError::Sink(e.to_string()))?;
+                match v["confirmed_lsn"].as_str() {
+                    Some(s) => Ok(Some(s.parse().map_err(CoreError::from)?)),
+                    None => Ok(None),
+                }
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
+    async fn health(&self) -> Result<Health, CoreError> {
+        let (status, _) = self.send(reqwest::Method::GET, "/health", None).await?;
+        if status == 200 {
+            Ok(Health::Up)
+        } else {
+            Ok(Health::Down(format!("status {status}")))
+        }
+    }
+}
+
+use std::collections::HashMap;
