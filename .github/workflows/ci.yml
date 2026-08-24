@@ -14,7 +14,7 @@ jobs:
     name: fmt + clippy + unit tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -27,7 +27,7 @@ jobs:
     name: minimum supported Rust version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           # keep in sync with rust-version in Cargo.toml
@@ -61,7 +61,7 @@ jobs:
           --health-cmd "curl -s http://localhost:9200/_cluster/health | grep -q green"
           --health-interval 10s --health-timeout 5s --health-retries 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # the service container needs logical replication, which the image's
@@ -103,7 +103,7 @@ jobs:
           --health-cmd "curl -s http://localhost:9200/_cluster/health | grep -q green"
           --health-interval 10s --health-timeout 5s --health-retries 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Create the replication user
@@ -119,7 +119,7 @@ jobs:
     name: container image builds
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
         with:
@@ -132,7 +132,7 @@ jobs:
     name: helm chart lints
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: azure/setup-helm@v4
       - run: helm lint deploy/helm/pg2osync
       - run: helm template pg2osync deploy/helm/pg2osync --set config.sync.users.table=public.users
