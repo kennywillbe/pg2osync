@@ -59,6 +59,102 @@ pub async fn table_info(client: &Client, schema: &str, name: &str) -> Result<Tab
     })
 }
 
+/// What the current role can and cannot do, so `validate` can report a
+/// privilege problem instead of letting `run` fail halfway through bootstrap.
+#[derive(Debug, Clone)]
+pub struct Preflight {
+    pub publication_exists: bool,
+    pub slot_exists: bool,
+    /// `REPLICATION` attribute or superuser: required to create a slot and to
+    /// open a replication connection at all.
+    pub can_replicate: bool,
+    /// `CREATE` on the database: required to create a publication.
+    pub can_create_in_database: bool,
+    /// Tables the role does not own. PostgreSQL requires ownership to publish
+    /// a table, and grants cannot substitute for it.
+    pub tables_not_owned: Vec<String>,
+    /// Tables the role cannot read, which breaks the initial load.
+    pub tables_not_readable: Vec<String>,
+}
+
+impl Preflight {
+    /// Whether `bootstrap` can create what is still missing.
+    pub fn can_bootstrap(&self) -> bool {
+        (self.publication_exists
+            || (self.can_create_in_database && self.tables_not_owned.is_empty()))
+            && (self.slot_exists || self.can_replicate)
+    }
+
+    /// DDL a privileged role can run so the sync role only has to consume.
+    pub fn setup_sql(&self, publication: &str, slot: &str, tables: &[String]) -> Vec<String> {
+        let mut sql = Vec::new();
+        if !self.publication_exists {
+            sql.push(format!(
+                "CREATE PUBLICATION {publication} FOR TABLE {} \
+                 WITH (publish_via_partition_root = true);",
+                tables.join(", ")
+            ));
+        }
+        if !self.slot_exists {
+            sql.push(format!(
+                "SELECT pg_create_logical_replication_slot('{slot}', 'pgoutput');"
+            ));
+        }
+        sql
+    }
+}
+
+/// Inspect the current role's privileges against the configured objects.
+pub async fn preflight(
+    client: &Client,
+    publication: &str,
+    slot_name: &str,
+    qualified_tables: &[String],
+) -> Result<Preflight> {
+    let row = client
+        .query_one(
+            "SELECT (r.rolreplication OR r.rolsuper) AS can_replicate,
+                    has_database_privilege(current_database(), 'CREATE') AS can_create,
+                    EXISTS(SELECT 1 FROM pg_publication WHERE pubname = $1) AS pub_exists,
+                    EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $2) AS slot_exists
+             FROM pg_roles r WHERE r.rolname = current_user",
+            &[&publication, &slot_name],
+        )
+        .await
+        .context("cannot inspect the current role's privileges")?;
+
+    let mut tables_not_owned = Vec::new();
+    let mut tables_not_readable = Vec::new();
+    for table in qualified_tables {
+        // pg_has_role covers membership in the owning role, which is how most
+        // deployments grant ownership in practice
+        let checks = client
+            .query_one(
+                "SELECT pg_has_role(c.relowner, 'USAGE') AS owns,
+                        has_table_privilege(c.oid, 'SELECT') AS reads
+                 FROM pg_class c WHERE c.oid = ($1::text)::regclass",
+                &[&table],
+            )
+            .await
+            .with_context(|| format!("cannot inspect table {table}"))?;
+        if !checks.get::<_, bool>("owns") {
+            tables_not_owned.push(table.clone());
+        }
+        if !checks.get::<_, bool>("reads") {
+            tables_not_readable.push(table.clone());
+        }
+    }
+
+    Ok(Preflight {
+        publication_exists: row.get("pub_exists"),
+        slot_exists: row.get("slot_exists"),
+        can_replicate: row.get("can_replicate"),
+        can_create_in_database: row.get("can_create"),
+        tables_not_owned,
+        tables_not_readable,
+    })
+}
+
 /// Create the publication covering exactly the configured tables if missing;
 /// detect drift when it exists.
 ///
