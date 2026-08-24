@@ -133,7 +133,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
       - run: helm lint deploy/helm/pg2osync
       - run: helm template pg2osync deploy/helm/pg2osync --set config.sync.users.table=public.users
       - run: kubectl kustomize deploy/kubernetes
