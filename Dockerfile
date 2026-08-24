@@ -1,5 +1,5 @@
 # Build a static musl binary so the runtime image needs no libc at all.
-FROM rust:1.90-alpine AS builder
+FROM rust:1.98-alpine AS builder
 RUN apk add --no-cache musl-dev perl make cmake g++
 WORKDIR /build
 
