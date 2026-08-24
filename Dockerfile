@@ -1,5 +1,5 @@
 # Build a static musl binary so the runtime image needs no libc at all.
-FROM rust:1.90-alpine AS builder
+FROM rust:1.98-alpine AS builder
 RUN apk add --no-cache musl-dev perl make cmake g++
 WORKDIR /build
 
@@ -29,7 +29,7 @@ RUN find crates -name '*.rs' -exec touch {} + \
     && cargo build --release --locked -p pg2osync \
     && strip target/release/pg2osync
 
-FROM alpine:3.21
+FROM alpine:3.24
 RUN apk add --no-cache ca-certificates tzdata \
     && adduser -D -u 10001 pg2osync
 COPY LICENSE /usr/share/licenses/pg2osync/LICENSE
