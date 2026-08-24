@@ -41,9 +41,9 @@ export async function searchProducts(query: string): Promise<SearchResult> {
   const res = await fetch(`${BASE_URL}/${DEMO_INDEX}/_search?size=50`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    // unmapped_type keeps sorting from failing outright on a brand-new,
-    // still-empty index that has no mapping for `id` yet (e.g. right after
-    // a TRUNCATE recreates it).
+    // A brand-new index has no mapping until its first document lands, and
+    // sorting on an unmapped field is an error rather than an empty result.
+    // (A TRUNCATE is safe here: it clears documents and leaves the mapping.)
     body: JSON.stringify({ ...body, sort: [{ id: { order: "asc", unmapped_type: "long" } }] }),
   });
 
