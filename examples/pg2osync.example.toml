@@ -6,6 +6,11 @@
 flavor = "postgres"
 # Credentials come from the environment; an inline `url` works but warns.
 url_env = "PG2OSYNC_SOURCE_URL"     # postgres://user:pass@host:5432/db
+# TLS, in libpq's vocabulary: disable | prefer | require | verify-ca | verify-full
+# Defaults to the URL's own sslmode, then to "prefer". Managed providers
+# generally need "require" at minimum; "verify-full" is the safe choice.
+# sslmode = "verify-full"
+# sslrootcert = "/etc/ssl/certs/rds-ca.pem"
 slot_name = "pg2osync"
 publication = "pg2osync_pub"
 # admin_url_env = "PG2OSYNC_ADMIN_URL"   # separate user for catalog queries

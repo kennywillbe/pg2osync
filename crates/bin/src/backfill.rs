@@ -64,18 +64,17 @@ pub async fn columns_of(
 pub async fn run(
     cfg: &AppConfig,
     source_url: &str,
+    tls: &pg2osync_source::tls::TlsSettings,
     admin: &tokio_postgres::Client,
     children: &HashMap<(String, String), Vec<ChildSpec>>,
     tx: Sender<ChangeEvent>,
 ) -> Result<()> {
     // a dedicated connection holds the snapshot so the admin connection stays
     // free for catalog work
-    let (mut reader, reader_bg) = tokio_postgres::connect(source_url, tokio_postgres::NoTls)
+    let mut reader = tls
+        .connect(source_url)
         .await
         .context("backfill connection failed")?;
-    tokio::spawn(async move {
-        let _ = reader_bg.await;
-    });
     let snapshot = reader.transaction().await?;
     snapshot
         .execute(

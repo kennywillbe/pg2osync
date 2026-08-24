@@ -30,6 +30,9 @@ pub struct WalSourceConfig {
     pub start_lsn: Option<Lsn>,
     /// Admin connection string for child-collection queries (nested docs).
     pub admin_url: Option<String>,
+    /// Applies to the replication transport and to the child-query connection
+    /// alike: one source must not be half encrypted.
+    pub tls: crate::tls::TlsSettings,
     /// Child collections keyed by PARENT (schema, table).
     pub children: HashMap<(String, String), Vec<crate::children::ChildSpec>>,
     /// Reverse routing: CHILD (schema, table) -> parent (schema, table).
@@ -91,7 +94,8 @@ impl WalSource {
             .with_port(self.cfg.port)
             .with_start_lsn(pgwire_replication::Lsn(
                 self.cfg.start_lsn.unwrap_or(Lsn(0)).0,
-            )),
+            ))
+            .with_tls(self.cfg.tls.replication_config()),
         )
         .await
         .context("replication connect failed")?;
@@ -104,15 +108,13 @@ impl WalSource {
         // is nothing to query, so no connection is opened.
         let needs_admin = !self.cfg.children.is_empty() || !self.cfg.child_parents.is_empty();
         let admin_client = match (&self.cfg.admin_url, needs_admin) {
-            (Some(url), true) => {
-                let (c, conn) = tokio_postgres::connect(url, tokio_postgres::NoTls)
+            (Some(url), true) => Some(
+                self.cfg
+                    .tls
+                    .connect(url)
                     .await
-                    .context("nested-docs admin connection failed")?;
-                tokio::spawn(async move {
-                    let _ = conn.await;
-                });
-                Some(c)
-            }
+                    .context("nested-docs admin connection failed")?,
+            ),
             _ => None,
         };
         tracing::info!(target: "pg2osync::source", "stream loop starting");

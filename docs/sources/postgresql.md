@@ -35,6 +35,23 @@ pg2osync validate -c pg2osync.toml
 # ✓ table public.users exists
 ```
 
+## TLS
+
+Every connection — catalog, snapshot, nested-child queries and the replication
+stream — honours `[source] sslmode`. It defaults to `prefer`, matching libpq.
+
+```toml
+[source]
+url_env = "PG2OSYNC_SOURCE_URL"
+sslmode = "verify-full"
+sslrootcert = "/etc/ssl/certs/rds-ca.pem"   # omit to use the Mozilla roots
+```
+
+Managed PostgreSQL (RDS with `rds.force_ssl`, Cloud SQL, Supabase, Neon)
+refuses unencrypted connections, so `disable` fails there by design. See the
+mode table in [configuration](../configuration.md) for what each one actually
+verifies.
+
 ## WAL mode (default)
 
 ```toml

@@ -75,14 +75,16 @@ Stated up front, because finding these out in production is expensive:
 - **Nested children are one level deep**, re-fetched with a query per changed
   parent — a wide fan-out slows the initial load.
 - **MySQL needs `binlog_row_image = FULL`** and a `mysql_native_password`
-  user; `caching_sha2_password` full-auth is not implemented yet.
+  user; `caching_sha2_password` full-auth is not implemented yet, and the MySQL
+  connection has no TLS (PostgreSQL does).
 - **MySQL nested children are not supported yet.**
 - Ordering is guaranteed per row, not across tables.
 
 ## Requirements
 
 **PostgreSQL source** — 15 or newer, `wal_level = logical`, a user with
-`REPLICATION`, and a primary key on every synced table.
+`REPLICATION`, and a primary key on every synced table. TLS is supported on
+every connection via `[source] sslmode` (libpq semantics, `prefer` by default).
 
 **MySQL source** — MySQL 8.0+ or MariaDB 10.6+ with `log_bin = ON`,
 `binlog_format = ROW`, `binlog_row_image = FULL`, and a user holding `SELECT`,

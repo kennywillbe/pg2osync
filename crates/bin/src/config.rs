@@ -42,6 +42,13 @@ pub struct SourceConfig {
     pub poll_page_size: i64,
     pub url: Option<String>,
     pub url_env: Option<String>,
+    /// libpq spelling: disable | prefer | require | verify-ca | verify-full.
+    /// Falls back to the URL's own `sslmode`, then to `prefer`.
+    #[serde(default)]
+    pub sslmode: Option<String>,
+    /// PEM bundle of trusted roots for the verifying modes.
+    #[serde(default)]
+    pub sslrootcert: Option<String>,
     /// Nested-child queries use a dedicated connection; defaults to url.
     #[serde(default)]
     pub admin_url_env: Option<String>,
@@ -228,6 +235,10 @@ impl AppConfig {
                 self.source.mode
             );
         }
+        if let Some(sslmode) = &self.source.sslmode {
+            pg2osync_source::tls::SslMode::parse(sslmode)
+                .context("[source] sslmode is not a libpq ssl mode")?;
+        }
         if self.source.flavor == "mysql" && self.source.mode == "poll" {
             anyhow::bail!(
                 "[source] mode = \"poll\" is PostgreSQL-only; MySQL always reads the binlog"
@@ -342,6 +353,17 @@ impl AppConfig {
             target_password,
             warnings,
         })
+    }
+}
+
+impl AppConfig {
+    /// Effective TLS settings for a resolved source URL.
+    pub fn tls_settings(&self, source_url: &str) -> Result<pg2osync_source::tls::TlsSettings> {
+        pg2osync_source::tls::TlsSettings::resolve(
+            source_url,
+            self.source.sslmode.as_deref(),
+            self.source.sslrootcert.as_deref(),
+        )
     }
 }
 

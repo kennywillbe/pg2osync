@@ -31,6 +31,8 @@ startup. Secrets never appear in logs or error messages.
 | `mode` | `"wal"` | `"wal"` (replication log) or `"poll"`. PostgreSQL only |
 | `url_env` | — | Environment variable holding the connection URL |
 | `url` | — | Inline URL; warns as deprecated |
+| `sslmode` | from the URL, else `prefer` | `disable`, `prefer`, `require`, `verify-ca`, `verify-full` |
+| `sslrootcert` | — | PEM bundle of trusted roots for the verifying modes |
 | `admin_url_env` | falls back to the source URL | Separate connection for catalog and nested-child queries |
 | `slot_name` | `"pg2osync"` | PostgreSQL replication slot |
 | `publication` | `"pg2osync_pub"` | PostgreSQL publication |
@@ -52,6 +54,31 @@ works if you encode it.
 `admin_url_env` exists so the replication connection and ordinary queries can
 use different users — the replication role needs `REPLICATION`, the admin role
 needs `SELECT` on the synced tables.
+
+### TLS
+
+`sslmode` follows libpq exactly, and applies to every connection pg2osync opens
+— the replication stream included, so a source can never end up half encrypted.
+
+| Mode | Encrypted | Certificate checked | Hostname checked |
+|---|---|---|---|
+| `disable` | no | — | — |
+| `prefer` *(default)* | if the server offers it | no | no |
+| `require` | yes | no | no |
+| `verify-ca` | yes | yes | no |
+| `verify-full` | yes | yes | yes |
+
+An explicit `sslmode` in the config wins over one in the connection URL, so a
+URL pasted from a provider cannot weaken a deployment that pinned its mode.
+
+`prefer` is the default because libpq uses it and it improves an unconfigured
+deployment without breaking a server that has no certificate. It is not a
+guarantee: a server that does not offer TLS is silently accepted. Anything
+crossing a network you do not control wants `verify-full`.
+
+With `verify-ca` and `verify-full`, `sslrootcert` points at the CA bundle; when
+it is omitted the bundled Mozilla roots are used, which is what public managed
+providers chain to.
 
 ### Poll mode
 

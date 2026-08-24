@@ -27,7 +27,9 @@ async fn main() -> Result<()> {
     let table = args.next().expect("qualified table name required");
 
     let cfg_url = url::Url::parse(&url)?;
+    let tls = pg2osync_source::tls::TlsSettings::resolve(&url, None, None)?;
     let cfg = WalSourceConfig {
+        tls: tls.clone(),
         host: cfg_url.host_str().unwrap_or("localhost").to_string(),
         port: cfg_url.port().unwrap_or(5432),
         user: cfg_url.username().to_string(),
@@ -50,14 +52,13 @@ async fn main() -> Result<()> {
         parent_pk_columns: Default::default(),
     };
 
-    let (admin, conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
+    let admin = tls.connect(&url).await?;
 
     WalSource::new(cfg.clone()).bootstrap(&admin).await?;
     let start_lsn = pg2osync_source::catalog::confirmed_flush_lsn(&admin, &cfg.slot_name).await?;
+    let tls = pg2osync_source::tls::TlsSettings::resolve(&url, None, None)?;
     let cfg = WalSourceConfig {
+        tls: tls.clone(),
         start_lsn,
         durable: None,
         ..cfg
