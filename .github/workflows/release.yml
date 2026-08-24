@@ -52,7 +52,7 @@ jobs:
             -C target/${{ matrix.target }}/release pg2osync
           shasum -a 256 pg2osync-${{ github.ref_name }}-${{ matrix.target }}.tar.gz \
             > pg2osync-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sha256
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: |
             pg2osync-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
