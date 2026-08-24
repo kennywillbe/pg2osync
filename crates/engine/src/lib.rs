@@ -435,14 +435,27 @@ async fn materialize<'a>(
         }
         RowKind::Update {
             pk,
+            previous_pk,
             doc,
             unchanged_toast_columns,
         } => {
             let id = pk_to_id(pk);
+            // A changed key means the row moved to a different document. The
+            // old one still holds the previous version and has to be removed,
+            // or nothing will ever collect it.
+            let moved_from = previous_pk
+                .as_ref()
+                .map(pk_to_id)
+                .filter(|previous| previous != &id);
+
             let mut doc = doc.clone();
             if !unchanged_toast_columns.is_empty() {
+                // Read back from wherever the document actually is: on a move
+                // it is still under the old id, and completing from the new id
+                // would silently write the unchanged columns as null.
+                let stored_id = moved_from.clone().unwrap_or_else(|| id.clone());
                 let prev = sink
-                    .get_documents(index, std::slice::from_ref(&id))
+                    .get_documents(index, std::slice::from_ref(&stored_id))
                     .await?
                     .into_iter()
                     .flatten()
@@ -459,11 +472,25 @@ async fn materialize<'a>(
             }
             projections.apply(table.0, table.1, &mut doc);
             transforms.apply(table.0, table.1, &mut doc);
-            Ok(mk(DocumentOp::Upsert {
+
+            let mut ops = mk(DocumentOp::Upsert {
                 index: index.into(),
                 id,
                 doc,
-            }))
+            });
+            // write first, delete second: a crash between them leaves a
+            // duplicate that the replay repairs, where the reverse order would
+            // leave a gap that nothing repairs
+            if let Some(previous) = moved_from {
+                ops.push(LsnOp {
+                    lsn: PENDING_LSN,
+                    op: DocumentOp::Delete {
+                        index: index.into(),
+                        id: previous,
+                    },
+                });
+            }
+            Ok(ops)
         }
         RowKind::Delete { pk } => Ok(mk(DocumentOp::Delete {
             index: index.into(),
@@ -549,15 +576,29 @@ mod pipeline_tests {
             _index: &str,
             ids: &[String],
         ) -> Result<Vec<Option<Value>>, CoreError> {
-            Ok(vec![None; ids.len()])
+            self.events
+                .lock()
+                .expect("not poisoned")
+                .push(format!("read({})", ids.join(",")));
+            Ok(ids
+                .iter()
+                .map(|id| Some(json!({"id": id, "bio": "stored"})))
+                .collect())
         }
 
         async fn write(&self, batch: Vec<LsnOp>) -> Result<SinkAck, CoreError> {
             let max_lsn = batch.last().expect("engine never sends empty batches").lsn;
+            let rendered: Vec<String> = batch
+                .iter()
+                .map(|op| match &op.op {
+                    DocumentOp::Upsert { id, .. } => format!("upsert:{id}"),
+                    DocumentOp::Delete { id, .. } => format!("delete:{id}"),
+                })
+                .collect();
             self.events
                 .lock()
                 .expect("not poisoned")
-                .push(format!("write({})", batch.len()));
+                .push(format!("write[{}]", rendered.join(" ")));
             Ok(SinkAck { max_lsn })
         }
 
@@ -655,7 +696,7 @@ mod pipeline_tests {
     #[tokio::test]
     async fn transaction_flushes_at_its_commit() {
         let sink = run_script(500, vec![row(1), row(2), commit(0x100)]).await;
-        assert_eq!(sink.events(), vec!["write(2)"]);
+        assert_eq!(sink.events(), vec!["write[upsert:1 upsert:2]"]);
         let ckpt = sink.last_checkpoint().expect("checkpoint persisted");
         assert_eq!(ckpt.token, 0x100);
         assert_eq!(ckpt.position, "0/100", "position is rendered by the source");
@@ -667,7 +708,7 @@ mod pipeline_tests {
         // Without a position marker through the sink channel the checkpoint
         // would stall here, and PostgreSQL would retain WAL forever.
         let sink = run_script(2, vec![row(1), row(2), commit(0x200)]).await;
-        assert_eq!(sink.events(), vec!["write(2)"]);
+        assert_eq!(sink.events(), vec!["write[upsert:1 upsert:2]"]);
         assert_eq!(
             sink.last_checkpoint().map(|c| c.token),
             Some(0x200),
@@ -700,7 +741,7 @@ mod pipeline_tests {
         .await;
         assert_eq!(
             sink.events(),
-            vec!["write(1)", "truncate(users)", "write(1)"],
+            vec!["write[upsert:1]", "truncate(users)", "write[upsert:2]"],
             "a write queued before the truncate must not survive it"
         );
     }
@@ -709,7 +750,7 @@ mod pipeline_tests {
     async fn initial_load_boundaries_never_advance_the_checkpoint() {
         // Lsn(0) marks rows that have no source position of their own
         let sink = run_script(500, vec![row(1), commit(0)]).await;
-        assert_eq!(sink.events(), vec!["write(1)"]);
+        assert_eq!(sink.events(), vec!["write[upsert:1]"]);
         assert!(
             sink.last_checkpoint().is_none(),
             "a positionless batch must never be checkpointed"
@@ -723,10 +764,66 @@ mod pipeline_tests {
         let sink = run_script(2, script).await;
         assert_eq!(
             sink.events(),
-            vec!["write(2)", "write(2)", "write(1)"],
+            vec![
+                "write[upsert:1 upsert:2]",
+                "write[upsert:3 upsert:4]",
+                "write[upsert:5]"
+            ],
             "splitting is expected; every op is idempotent"
         );
         assert_eq!(sink.last_checkpoint().map(|c| c.token), Some(0x600));
+    }
+
+    fn moved(from: i64, to: i64, toast: &[&str]) -> ChangeEvent {
+        ChangeEvent::Row(RowChange {
+            schema: "public".into(),
+            table: "users".into(),
+            kind: RowKind::Update {
+                pk: json!(to),
+                previous_pk: Some(json!(from)),
+                doc: json!({"id": to}),
+                unchanged_toast_columns: toast.iter().map(|c| c.to_string()).collect(),
+            },
+        })
+    }
+
+    #[tokio::test]
+    async fn a_moved_row_is_written_at_its_new_id_and_removed_from_the_old_one() {
+        let sink = run_script(500, vec![moved(1, 2, &[]), commit(0x700)]).await;
+        assert_eq!(
+            sink.events(),
+            vec!["write[upsert:2 delete:1]"],
+            "write first, delete second: a crash between them leaves a duplicate, \
+             not a gap"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_update_that_keeps_its_key_deletes_nothing() {
+        let unchanged = ChangeEvent::Row(RowChange {
+            schema: "public".into(),
+            table: "users".into(),
+            kind: RowKind::Update {
+                pk: json!(7),
+                previous_pk: Some(json!(7)),
+                doc: json!({"id": 7}),
+                unchanged_toast_columns: vec![],
+            },
+        });
+        let sink = run_script(500, vec![unchanged, commit(0x800)]).await;
+        assert_eq!(sink.events(), vec!["write[upsert:7]"]);
+    }
+
+    #[tokio::test]
+    async fn a_moved_row_completes_toast_from_the_document_it_left_behind() {
+        // the stored document is still under the old id; reading the new one
+        // would find nothing and write the unchanged column as null
+        let sink = run_script(500, vec![moved(1, 2, &["bio"]), commit(0x900)]).await;
+        assert_eq!(
+            sink.events(),
+            vec!["read(1)", "write[upsert:2 delete:1]"],
+            "completion must read where the document actually is"
+        );
     }
 
     #[tokio::test]

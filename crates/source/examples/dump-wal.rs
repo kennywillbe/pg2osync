@@ -83,12 +83,17 @@ async fn main() -> Result<()> {
                     ),
                     RowKind::Update {
                         pk,
+                        previous_pk,
                         doc,
                         unchanged_toast_columns,
                     } => println!(
-                        "[{}.{}] UPDATE pk={pk} toast_incomplete={unchanged_toast_columns:?}\n  {}",
+                        "[{}.{}] UPDATE pk={pk}{} toast_incomplete={unchanged_toast_columns:?}\n  {}",
                         r.schema,
                         r.table,
+                        match previous_pk {
+                            Some(previous) if previous != pk => format!(" (moved from {previous})"),
+                            _ => String::new(),
+                        },
                         serde_json::to_string_pretty(doc)?
                     ),
                     RowKind::Delete { pk } => {

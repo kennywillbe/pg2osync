@@ -122,7 +122,17 @@ pg "DELETE FROM users WHERE id=3;" > /dev/null
 sleep 2; refresh
 check "DELETE propagated" "$(os_status e2e_users 3)" "404"
 
-say "5. nested children stay fresh"
+say "5. changing a primary key moves the document"
+pg "UPDATE users SET id = 40 WHERE id = 4;" > /dev/null
+sleep 2; refresh
+check "row lives at its new id" "$(os_field e2e_users 40 name)" "dave-renamed"
+# the old document must not survive: nothing would ever collect it
+check "old document removed" "$(os_status e2e_users 4)" "404"
+pg "DELETE FROM users WHERE id = 40;" > /dev/null
+sleep 2; refresh
+check "deleting the moved row leaves nothing" "$(os_status e2e_users 40)" "404"
+
+say "6. nested children stay fresh"
 pg "INSERT INTO orders (id,customer_id,total) VALUES (13,2,7.50);" > /dev/null
 sleep 2; refresh
 check "child INSERT refreshes parent" "$(os_len e2e_customers 2 orders)" "2"
@@ -130,7 +140,7 @@ pg "DELETE FROM orders WHERE id=13;" > /dev/null
 sleep 2; refresh
 check "child DELETE refreshes parent" "$(os_len e2e_customers 2 orders)" "1"
 
-say "6. TRUNCATE clears the index"
+say "7. TRUNCATE clears the index"
 pg "TRUNCATE users;" > /dev/null
 sleep 3; refresh
 check "index cleared after TRUNCATE" "$(os_count e2e_users)" "0"
@@ -138,7 +148,7 @@ pg "INSERT INTO users (id,name,email) VALUES (7,'grace','grace@test.io');" > /de
 sleep 2; refresh
 check "streaming continues after TRUNCATE" "$(os_count e2e_users)" "1"
 
-say "7. checkpoint and WAL safety"
+say "8. checkpoint and WAL safety"
 checkpoint=$(curl -s "$OS/.pg2osync_meta/_doc/default" | jqf "d['_source']")
 echo "    $checkpoint"
 check "checkpoint source" "$(curl -s "$OS/.pg2osync_meta/_doc/default" | jqf "d['_source']['source']")" "postgres"
@@ -148,7 +158,7 @@ ckpt_lsn=$(curl -s "$OS/.pg2osync_meta/_doc/default" | jqf "d['_source']['positi
 behind=$(pg "SELECT pg_wal_lsn_diff('$ckpt_lsn'::pg_lsn, confirmed_flush_lsn) >= 0 FROM pg_replication_slots WHERE slot_name='pg2osync_e2e';")
 check "slot never acked past the checkpoint" "$behind" "t"
 
-say "8. metrics endpoint"
+say "9. metrics endpoint"
 metrics=$(curl -s http://127.0.0.1:9111/metrics)
 if grep -q "pg2osync_position_confirmed" <<< "$metrics" && grep -q "pg2osync_events_total" <<< "$metrics"; then
   ok "metrics expose position and event counters"
@@ -156,17 +166,17 @@ else
   bad "metrics missing expected series"
 fi
 
-say "9. crash recovery"
+say "10. crash recovery"
 pkill -9 -f "pg2osync run"; sleep 1
 pg "INSERT INTO users (id,name,email) VALUES (8,'eve-during-downtime','eve@test.io');" > /dev/null
 start_sync
 sleep 6; refresh
 check "row written while down is recovered" "$(os_field e2e_users 8 name)" "eve-during-downtime"
 
-say "10. final consistency"
+say "11. final consistency"
 check "row counts match" "$(pg "SELECT count(*) FROM users;")" "$(os_count e2e_users)"
 
-say "11. status and teardown"
+say "12. status and teardown"
 $BIN status -c "$CONFIG" | sed 's/^/    /'
 stop_sync; sleep 1
 $BIN drop-slot -c "$CONFIG" > /dev/null

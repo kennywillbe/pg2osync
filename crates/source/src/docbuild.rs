@@ -153,15 +153,16 @@ pub fn build_row_change(rel: &Relation, incoming: Incoming) -> Result<RowChange,
             Ok(change(RowKind::Insert { pk, doc }))
         }
         Incoming::Update(old, new) => {
-            // prefer the key/old tuple: PK columns themselves may have changed
-            let pk = match &old {
-                Some(prev) => extract_pk(rel, prev).or_else(|_| extract_pk(rel, &new))?,
-                None => extract_pk(rel, &new)?,
-            };
+            // The key must come from the new tuple: it says where the row lives
+            // now. The old key addresses the document the row used to occupy,
+            // which the engine has to remove when the two differ.
+            let pk = extract_pk(rel, &new)?;
+            let previous_pk = old.as_ref().and_then(|prev| extract_pk(rel, prev).ok());
             let old_slices = old.as_ref().map(tuple_slices);
             let (doc, toast) = build_doc(rel, &new, old_slices.as_deref())?;
             Ok(change(RowKind::Update {
                 pk,
+                previous_pk,
                 doc,
                 unchanged_toast_columns: toast,
             }))
@@ -289,11 +290,69 @@ mod tests {
                 pk,
                 doc,
                 unchanged_toast_columns,
+                ..
             } => {
                 assert_eq!(pk, serde_json::json!(42));
                 // completed from old tuple, NOT marked missing
                 assert_eq!(doc["bio"], serde_json::json!("long old bio"));
                 assert!(unchanged_toast_columns.is_empty());
+            }
+            other => panic!("unexpected kind {other:?}"),
+        }
+    }
+
+    #[test]
+    fn changing_the_key_reports_where_the_row_moved_from() {
+        // the key addresses the document, so an update that changes it must
+        // report both ends or the old document is stranded forever
+        let rel = users_relation(pgoutput::ReplicaIdentity::Default);
+        let old = tuple(vec![
+            TupleValue::Text(b"1".to_vec()),
+            TupleValue::Text(b"a@x.io".to_vec()),
+            TupleValue::Null,
+            TupleValue::Text(b"bio".to_vec()),
+        ]);
+        let new = tuple(vec![
+            TupleValue::Text(b"2".to_vec()),
+            TupleValue::Text(b"a@x.io".to_vec()),
+            TupleValue::Null,
+            TupleValue::Text(b"bio".to_vec()),
+        ]);
+        let change = build_row_change(&rel, Incoming::Update(Some(old), new)).unwrap();
+        match change.kind {
+            RowKind::Update {
+                pk, previous_pk, ..
+            } => {
+                assert_eq!(pk, serde_json::json!(2), "the row lives at its new key");
+                assert_eq!(previous_pk, Some(serde_json::json!(1)));
+            }
+            other => panic!("unexpected kind {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_update_that_keeps_its_key_reports_the_same_key_twice() {
+        let rel = users_relation(pgoutput::ReplicaIdentity::Full);
+        let old = tuple(vec![
+            TupleValue::Text(b"42".to_vec()),
+            TupleValue::Text(b"old@x.io".to_vec()),
+            TupleValue::Null,
+            TupleValue::Text(b"bio".to_vec()),
+        ]);
+        let new = tuple(vec![
+            TupleValue::Text(b"42".to_vec()),
+            TupleValue::Text(b"new@x.io".to_vec()),
+            TupleValue::Null,
+            TupleValue::Text(b"bio".to_vec()),
+        ]);
+        let change = build_row_change(&rel, Incoming::Update(Some(old), new)).unwrap();
+        match change.kind {
+            RowKind::Update {
+                pk, previous_pk, ..
+            } => {
+                // REPLICA IDENTITY FULL always sends the old tuple, so equal
+                // keys are the common case and must not read as a move
+                assert_eq!(previous_pk, Some(pk));
             }
             other => panic!("unexpected kind {other:?}"),
         }

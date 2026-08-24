@@ -331,7 +331,7 @@ fn build_change(
                 .after
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("row event carries no after image"))?;
-            (after, row.before.as_ref().unwrap_or(after))
+            (after, after)
         }
     };
 
@@ -345,6 +345,12 @@ fn build_change(
         },
         RowsKind::Update => RowKind::Update {
             pk,
+            // binlog_row_image=FULL is a startup prerequisite, so the before
+            // image is present and carries the key the row is moving away from
+            previous_pk: row
+                .before
+                .as_ref()
+                .and_then(|before| primary_key(&rt.columns, before, &rt.pk_columns).ok()),
             doc: Value::Object(doc),
             // binlog_row_image=FULL is a startup prerequisite, so every
             // column of the new row is present: nothing to complete
@@ -425,10 +431,34 @@ mod tests {
             panic!("expected a row change");
         };
         assert_eq!(change.pk(), &json!(1));
-        let RowKind::Update { doc, .. } = &change.kind else {
+        let RowKind::Update {
+            doc, previous_pk, ..
+        } = &change.kind
+        else {
             panic!("expected an update");
         };
         assert_eq!(doc["total"], json!("9.00"));
+        assert_eq!(previous_pk, &Some(json!(1)), "the key did not move");
+    }
+
+    #[test]
+    fn a_changed_key_reports_where_the_row_moved_from() {
+        let row = binlog::RowsRow {
+            before: Some(vec![Some(json!(1)), Some(json!("5.00"))]),
+            after: Some(vec![Some(json!(2)), Some(json!("5.00"))]),
+        };
+        let ChangeEvent::Row(change) = build_change(&table(), &RowsKind::Update, &row).unwrap()
+        else {
+            panic!("expected a row change");
+        };
+        let RowKind::Update {
+            pk, previous_pk, ..
+        } = &change.kind
+        else {
+            panic!("expected an update");
+        };
+        assert_eq!(pk, &json!(2), "the row lives at its new key");
+        assert_eq!(previous_pk, &Some(json!(1)));
     }
 
     #[test]

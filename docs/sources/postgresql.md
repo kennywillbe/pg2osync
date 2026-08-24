@@ -121,6 +121,10 @@ Limitations:
 
 - **Upsert-only**: deletes are invisible to polling. A soft-delete column plus
   a filter in your queries is the usual workaround.
+- **Primary key changes are invisible too.** Polling only ever sees the row as
+  it is now, never the key it had before, so the document left behind at the old
+  key stays in the index. WAL mode handles this correctly; in poll mode, avoid
+  mutable primary keys.
 - Rows need a reliably bumped, monotonically increasing timestamp column.
 - The latency floor is the poll interval.
 - There is no position to resume from, so every start re-runs the initial load.

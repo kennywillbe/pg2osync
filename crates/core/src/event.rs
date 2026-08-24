@@ -61,6 +61,10 @@ pub enum RowKind {
     /// document before writing; until then `doc` is partial.
     Update {
         pk: Value,
+        /// The key this row had before the update, when the source knows it.
+        /// `None` means unknown, not unchanged — a source that cannot observe
+        /// the old row reports `None` and moves go undetected there.
+        previous_pk: Option<Value>,
         doc: Value,
         unchanged_toast_columns: Vec<String>,
     },

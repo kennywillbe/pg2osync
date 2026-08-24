@@ -104,7 +104,16 @@ my "DELETE FROM shop_users WHERE id=3;"
 sleep 3; refresh
 check "DELETE propagated" "$(os_status e2e_mysql_users 3)" "404"
 
-say "4. checkpoint format"
+say "4. changing a primary key moves the document"
+my "UPDATE shop_users SET id = 40 WHERE id = 4;"
+sleep 3; refresh
+check "row lives at its new id" "$(os_field e2e_mysql_users 40 name)" "dave-renamed"
+check "old document removed" "$(os_status e2e_mysql_users 4)" "404"
+my "DELETE FROM shop_users WHERE id = 40;"
+sleep 3; refresh
+check "deleting the moved row leaves nothing" "$(os_status e2e_mysql_users 40)" "404"
+
+say "5. checkpoint format"
 source_kind=$(curl -s "$OS/.pg2osync_meta/_doc/default" | jqf "d['_source']['source']")
 position=$(curl -s "$OS/.pg2osync_meta/_doc/default" | jqf "d['_source']['position']")
 check "checkpoint source" "$source_kind" "mysql"
@@ -114,7 +123,7 @@ else
   bad "binlog position malformed ($position)"
 fi
 
-say "5. crash recovery resumes from the binlog position"
+say "6. crash recovery resumes from the binlog position"
 pkill -9 -f "pg2osync run"; sleep 1
 my "INSERT INTO shop_users (id,name,email) VALUES (5,'eve-during-downtime','eve@test.io');"
 start_sync
@@ -122,10 +131,10 @@ sleep 6; refresh
 check "row written while down is recovered" "$(os_field e2e_mysql_users 5 name)" "eve-during-downtime"
 check "no full re-snapshot needed" "$(grep -c 'snapshot of' "$LOG")" "0"
 
-say "6. final consistency"
+say "7. final consistency"
 check "row counts match" "$(my 'SELECT count(*) FROM shop_users;')" "$(os_count e2e_mysql_users)"
 
-say "7. status"
+say "8. status"
 $BIN status -c "$CONFIG" | sed 's/^/    /'
 
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
