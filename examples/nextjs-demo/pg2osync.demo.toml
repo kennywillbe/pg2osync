@@ -1,6 +1,12 @@
 # Config for the Next.js demo: syncs public.demo_products -> the
 # demo_products OpenSearch index. Points at the local dev stack from
 # dev/docker-compose.yml.
+#
+# The sync.* extras exist so the app can demonstrate features a plain
+# table-to-index copy cannot show:
+# - internal_note is excluded (never reaches OpenSearch)
+# - supplier_email is redacted (indexed as ***)
+# - demo_reviews is embedded on each product document as `reviews`
 
 [source]
 flavor = "postgres"
@@ -19,3 +25,12 @@ checkpoint_interval_ms = 200
 table = "public.demo_products"
 index = "demo_products"
 primary_key = "id"
+exclude_columns = ["internal_note"]
+
+[sync.demo_products.transform]
+supplier_email = "redact"
+
+[[sync.demo_products.children]]
+table = "public.demo_reviews"
+field = "reviews"
+foreign_key = "product_id"

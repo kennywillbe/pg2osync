@@ -166,17 +166,31 @@ else
   bad "metrics missing expected series"
 fi
 
-say "10. crash recovery"
+say "10. reconnects after the server drops the stream"
+before_pid=$(pgrep -f "pg2osync run" | head -1)
+pg "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE backend_type='walsender';" > /dev/null
+pg "INSERT INTO users (id,name,email) VALUES (9,'written-while-disconnected','w@test.io');" > /dev/null
+sleep 8; refresh
+# the same process must still be running: recovery happens in process, not by
+# a supervisor restarting us
+check "same process recovered" "$(pgrep -f "pg2osync run" | head -1)" "$before_pid"
+check "row written while disconnected arrived" "$(os_field e2e_users 9 name)" "written-while-disconnected"
+metrics=$(curl -s http://127.0.0.1:9111/metrics)
+reconnects=$(awk '$1 == "pg2osync_reconnects_total" {print $2}' <<< "$metrics")
+if [ "${reconnects:-0}" -ge 1 ]; then ok "reconnects_total counted it ($reconnects)"; else bad "reconnects_total still zero"; fi
+check "source reports connected again" "$(awk '$1 == "pg2osync_source_connected" {print $2}' <<< "$metrics")" "1"
+
+say "11. crash recovery"
 pkill -9 -f "pg2osync run"; sleep 1
 pg "INSERT INTO users (id,name,email) VALUES (8,'eve-during-downtime','eve@test.io');" > /dev/null
 start_sync
 sleep 6; refresh
 check "row written while down is recovered" "$(os_field e2e_users 8 name)" "eve-during-downtime"
 
-say "11. final consistency"
+say "12. final consistency"
 check "row counts match" "$(pg "SELECT count(*) FROM users;")" "$(os_count e2e_users)"
 
-say "12. status and teardown"
+say "13. status and teardown"
 $BIN status -c "$CONFIG" | sed 's/^/    /'
 stop_sync; sleep 1
 $BIN drop-slot -c "$CONFIG" > /dev/null

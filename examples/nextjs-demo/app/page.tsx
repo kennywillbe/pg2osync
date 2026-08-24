@@ -1,57 +1,49 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import ProductPanel from "./components/ProductPanel";
+import SearchPanel from "./components/SearchPanel";
+import InspectorModal from "./components/InspectorModal";
+import type { ClientSearchResult, HistoryEntry, Product, Review } from "@/lib/client-types";
 
-type Product = {
-  id: number;
-  name: string;
-  description: string;
-  price: string;
-  tags: string[];
-  updated_at: string;
-};
-
-type Propagation = { landed: boolean; ms: number };
-
-type LastAction = {
-  label: string;
-  propagation: Propagation;
-};
-
-type SearchHit = { id: string; source: Record<string, unknown> };
-
-const emptyForm = { name: "", description: "", price: "", tags: "" };
-
-function parseTags(input: string): string[] {
-  return input
-    .split(",")
-    .map((t) => t.trim())
-    .filter(Boolean);
-}
+const emptySearch: ClientSearchResult = { indexExists: null, total: 0, hits: [] };
 
 export default function Home() {
   const [products, setProducts] = useState<Product[]>([]);
-  const [form, setForm] = useState(emptyForm);
-  const [editingId, setEditingId] = useState<number | null>(null);
-  const [editForm, setEditForm] = useState(emptyForm);
+  const [reviews, setReviews] = useState<Review[]>([]);
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [expandedId, setExpandedId] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
-  const [lastAction, setLastAction] = useState<LastAction | null>(null);
 
   const [query, setQuery] = useState("");
-  const [hits, setHits] = useState<SearchHit[]>([]);
-  const [indexExists, setIndexExists] = useState<boolean | null>(null);
+  const [searchResult, setSearchResult] = useState<ClientSearchResult>(emptySearch);
+  const [autoRefresh, setAutoRefresh] = useState(false);
+
+  const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [inspectingId, setInspectingId] = useState<string | null>(null);
+
+  // The search panel refreshes itself on a timer so a change written on the
+  // left shows up without manual clicks; auto mode is opt-in because polling
+  // every 2s is noise when you are only typing.
+  const queryRef = useRef(query);
+  queryRef.current = query;
 
   const loadProducts = useCallback(async () => {
     const res = await fetch("/api/products");
     const data = await res.json();
     setProducts(data.products ?? []);
+    setReviews(data.reviews ?? []);
+    setSelected((prev) => {
+      const live = new Set((data.products ?? []).map((p: Product) => p.id));
+      const next = new Set([...prev].filter((id) => live.has(id)));
+      return next.size === prev.size ? prev : next;
+    });
   }, []);
 
-  const runSearch = useCallback(async (q: string) => {
-    const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
-    const data = await res.json();
-    setIndexExists(data.indexExists);
-    setHits(data.hits ?? []);
+  const runSearch = useCallback(async (q?: string) => {
+    const term = q ?? queryRef.current;
+    const res = await fetch(`/api/search?q=${encodeURIComponent(term)}`);
+    setSearchResult(await res.json());
   }, []);
 
   useEffect(() => {
@@ -59,88 +51,66 @@ export default function Home() {
     runSearch("");
   }, [loadProducts, runSearch]);
 
-  async function afterWrite(label: string, res: Response) {
-    const data = await res.json();
-    if (data.propagation) {
-      setLastAction({ label, propagation: data.propagation });
-    }
-    await loadProducts();
-    await runSearch(query);
-    return data;
-  }
+  useEffect(() => {
+    if (!autoRefresh) return;
+    const timer = setInterval(() => runSearch(), 2000);
+    return () => clearInterval(timer);
+  }, [autoRefresh, runSearch]);
 
-  async function handleCreate(e: React.FormEvent) {
-    e.preventDefault();
-    setBusy(true);
-    try {
-      const res = await fetch("/api/products", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          name: form.name,
-          description: form.description,
-          price: form.price || "0",
-          tags: parseTags(form.tags),
-        }),
-      });
-      await afterWrite(`Created "${form.name}"`, res);
-      setForm(emptyForm);
-    } finally {
-      setBusy(false);
-    }
-  }
+  // afterWrite is the single funnel for every mutation: record the measured
+  // propagation, then reload both sides. Components hand in the fetch promise
+  // so the timing banner and the reload stay consistent with what ran.
+  const afterWrite = useCallback(
+    async (
+      label: string,
+      request: Promise<Response>,
+      extra?: (data: Record<string, unknown>) => string | undefined,
+    ) => {
+      setBusy(true);
+      try {
+        const res = await request;
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          throw new Error(body.error ?? `HTTP ${res.status}`);
+        }
+        const data = await res.json();
+        if (data.propagation) {
+          setHistory((prev) =>
+            [{ label, propagation: data.propagation, extra: extra?.(data), at: Date.now() }, ...prev].slice(0, 12),
+          );
+        }
+        await loadProducts();
+        await runSearch();
+      } catch (err) {
+        alert(`Request failed: ${err instanceof Error ? err.message : err}`);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [loadProducts, runSearch],
+  );
 
-  function startEdit(p: Product) {
-    setEditingId(p.id);
-    setEditForm({
-      name: p.name,
-      description: p.description,
-      price: p.price,
-      tags: (p.tags ?? []).join(", "),
+  const landedTimes = history.filter((h) => h.propagation.landed).map((h) => h.propagation.ms);
+  const stats = landedTimes.length > 0
+    ? {
+        min: Math.min(...landedTimes),
+        avg: Math.round(landedTimes.reduce((a, b) => a + b, 0) / landedTimes.length),
+        max: Math.max(...landedTimes),
+      }
+    : null;
+  const last = history[0];
+
+  function toggleSelect(id: number) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
     });
   }
 
-  async function handleUpdate(id: number) {
-    setBusy(true);
-    try {
-      const res = await fetch(`/api/products/${id}`, {
-        method: "PUT",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          name: editForm.name,
-          description: editForm.description,
-          price: editForm.price || "0",
-          tags: parseTags(editForm.tags),
-        }),
-      });
-      await afterWrite(`Updated "${editForm.name}"`, res);
-      setEditingId(null);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function handleDelete(p: Product) {
-    setBusy(true);
-    try {
-      const res = await fetch(`/api/products/${p.id}`, { method: "DELETE" });
-      await afterWrite(`Deleted "${p.name}"`, res);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function handleTruncate() {
-    if (!confirm("TRUNCATE demo_products? This removes every row at once, with no per-row DELETE events.")) {
-      return;
-    }
-    setBusy(true);
-    try {
-      const res = await fetch("/api/products/truncate", { method: "POST" });
-      await afterWrite("TRUNCATE demo_products", res);
-    } finally {
-      setBusy(false);
-    }
+  function toggleExpand(id: number) {
+    setExpandedId((prev) => (prev === id ? null : id));
   }
 
   return (
@@ -155,156 +125,58 @@ export default function Home() {
           tailed the PostgreSQL replication log and indexed it. That gap is
           the propagation time shown below.
         </p>
-        {lastAction && (
-          <div className={`propagation ${lastAction.propagation.landed ? "ok" : "timeout"}`}>
-            {lastAction.label}:{" "}
-            {lastAction.propagation.landed ? (
-              <strong>{lastAction.propagation.ms} ms</strong>
+
+        {last && (
+          <div className={`propagation ${last.propagation.landed ? "ok" : "timeout"}`}>
+            {last.label}:{" "}
+            {last.propagation.landed ? (
+              <strong>{last.propagation.ms} ms</strong>
             ) : (
-              <strong>not visible after {lastAction.propagation.ms} ms — is pg2osync running?</strong>
+              <strong>not visible after {last.propagation.ms} ms — is pg2osync running?</strong>
             )}
+            {last.extra ? ` (${last.extra})` : ""}
+          </div>
+        )}
+
+        {stats && (
+          <div className="history">
+            <h3>Propagation history — min {stats.min} · avg {stats.avg} · max {stats.max} ms</h3>
+            <ul>
+              {history.map((h, i) => (
+                <li key={h.at + "-" + i} className={h.propagation.landed ? "ok" : "timeout"} title={`${new Date(h.at).toLocaleTimeString()} — ${h.label}${h.extra ? ` (${h.extra})` : ""}`}>
+                  {h.propagation.landed ? `${h.propagation.ms} ms` : "timeout"} · {h.label}
+                </li>
+              ))}
+            </ul>
           </div>
         )}
       </header>
 
       <div className="columns">
-        <section className="panel">
-          <h2>PostgreSQL — demo_products</h2>
-          <p className="hint">Writes go here. This table is the source of truth.</p>
-
-          <form onSubmit={handleCreate} className="form">
-            <input
-              placeholder="name"
-              value={form.name}
-              onChange={(e) => setForm({ ...form, name: e.target.value })}
-              required
-            />
-            <input
-              placeholder="description"
-              value={form.description}
-              onChange={(e) => setForm({ ...form, description: e.target.value })}
-            />
-            <input
-              placeholder="price"
-              value={form.price}
-              onChange={(e) => setForm({ ...form, price: e.target.value })}
-              inputMode="decimal"
-            />
-            <input
-              placeholder="tags (comma separated)"
-              value={form.tags}
-              onChange={(e) => setForm({ ...form, tags: e.target.value })}
-            />
-            <button type="submit" disabled={busy}>
-              Create
-            </button>
-          </form>
-
-          <button className="danger" onClick={handleTruncate} disabled={busy}>
-            TRUNCATE table
-          </button>
-
-          <ul className="rows">
-            {products.map((p) => (
-              <li key={p.id} className="row">
-                {editingId === p.id ? (
-                  <div className="edit-form">
-                    <input
-                      value={editForm.name}
-                      onChange={(e) => setEditForm({ ...editForm, name: e.target.value })}
-                    />
-                    <input
-                      value={editForm.description}
-                      onChange={(e) => setEditForm({ ...editForm, description: e.target.value })}
-                    />
-                    <input
-                      value={editForm.price}
-                      onChange={(e) => setEditForm({ ...editForm, price: e.target.value })}
-                      inputMode="decimal"
-                    />
-                    <input
-                      value={editForm.tags}
-                      onChange={(e) => setEditForm({ ...editForm, tags: e.target.value })}
-                    />
-                    <div className="row-actions">
-                      <button onClick={() => handleUpdate(p.id)} disabled={busy}>
-                        Save
-                      </button>
-                      <button onClick={() => setEditingId(null)}>Cancel</button>
-                    </div>
-                  </div>
-                ) : (
-                  <>
-                    <div className="row-main">
-                      <span className="id">#{p.id}</span>
-                      <strong>{p.name}</strong>
-                      <span className="price">${p.price}</span>
-                    </div>
-                    <div className="row-detail">
-                      {p.description} — {(p.tags ?? []).join(", ") || "no tags"}
-                    </div>
-                    <div className="row-actions">
-                      <button onClick={() => startEdit(p)}>Edit</button>
-                      <button className="danger" onClick={() => handleDelete(p)} disabled={busy}>
-                        Delete
-                      </button>
-                    </div>
-                  </>
-                )}
-              </li>
-            ))}
-            {products.length === 0 && <li className="empty">No rows yet.</li>}
-          </ul>
-        </section>
-
-        <section className="panel">
-          <h2>OpenSearch — demo_products index</h2>
-          <p className="hint">Reads go here. This is what pg2osync produced.</p>
-
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              runSearch(query);
-            }}
-            className="form"
-          >
-            <input
-              placeholder="search name, description, tags…"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-            />
-            <button type="submit">Search</button>
-            <button type="button" onClick={() => runSearch(query)}>
-              Refresh
-            </button>
-          </form>
-
-          {indexExists === false && (
-            <p className="notice">
-              The <code>demo_products</code> index does not exist yet.
-              pg2osync creates it on first sync — start it with{" "}
-              <code>pg2osync run -c pg2osync.demo.toml</code>.
-            </p>
-          )}
-
-          <ul className="rows">
-            {hits.map((h) => (
-              <li key={h.id} className="row">
-                <div className="row-main">
-                  <span className="id">#{h.id}</span>
-                  <strong>{String(h.source.name ?? "")}</strong>
-                  <span className="price">${String(h.source.price ?? "")}</span>
-                </div>
-                <div className="row-detail">
-                  {String(h.source.description ?? "")} —{" "}
-                  {Array.isArray(h.source.tags) ? h.source.tags.join(", ") : "no tags"}
-                </div>
-              </li>
-            ))}
-            {indexExists && hits.length === 0 && <li className="empty">No documents match.</li>}
-          </ul>
-        </section>
+        <ProductPanel
+          products={products}
+          reviews={reviews}
+          busy={busy}
+          selected={selected}
+          expandedId={expandedId}
+          onToggleSelect={toggleSelect}
+          onToggleExpand={toggleExpand}
+          afterWrite={(label, req, extra) => afterWrite(label, req, extra)}
+        />
+        <SearchPanel
+          result={searchResult}
+          query={query}
+          setQuery={setQuery}
+          onSearch={() => runSearch()}
+          autoRefresh={autoRefresh}
+          setAutoRefresh={setAutoRefresh}
+          onInspect={setInspectingId}
+        />
       </div>
+
+      {inspectingId !== null && (
+        <InspectorModal id={inspectingId} onClose={() => setInspectingId(null)} />
+      )}
     </main>
   );
 }

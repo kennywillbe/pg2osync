@@ -7,6 +7,7 @@ pub mod children;
 pub mod docbuild;
 pub mod pgoutput;
 pub mod poll;
+pub mod reconnect;
 pub mod runner;
 pub mod tls;
 pub mod transport;

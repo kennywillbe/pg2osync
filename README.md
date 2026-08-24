@@ -208,6 +208,11 @@ Every option is documented in
 flushed, sink errors, reconnects, commit-to-indexed latency quantiles, and the
 current/confirmed source position with the lag between them.
 
+**Reconnects** — a dropped connection, a failover or a terminated backend is
+retried in process with backoff, rebuilding from the last checkpoint. After
+`[source] reconnect_max` consecutive failures it exits so a real outage still
+surfaces. Configuration and privilege errors are never retried.
+
 **Crash safety** — restart the process; it resumes from the last checkpoint.
 Delivery is at-least-once with idempotent writes (`_id` is the primary key), so
 replays overwrite rather than duplicate. The acknowledgement sent back to the

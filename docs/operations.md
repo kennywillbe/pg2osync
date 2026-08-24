@@ -11,6 +11,7 @@
 | `pg2osync_batches_flushed` | counter | Requests the target accepted |
 | `pg2osync_sink_errors_total` | counter | Requests that failed permanently |
 | `pg2osync_reconnects_total` | counter | Source reconnect attempts |
+| `pg2osync_source_connected` | gauge | 1 while streaming, 0 while reconnecting |
 | `pg2osync_latency_ms{quantile}` | summary | Source commit to indexed |
 | `pg2osync_position_current` | gauge | Highest source position received |
 | `pg2osync_position_confirmed` | gauge | Highest position durably checkpointed |
@@ -31,6 +32,12 @@ increase(pg2osync_sink_errors_total[5m]) > 0
 
 # the process is gone
 up{job="pg2osync"} == 0
+
+# the source has been disconnected rather than briefly interrupted
+pg2osync_source_connected == 0
+
+# it keeps losing the connection instead of settling
+increase(pg2osync_reconnects_total[15m]) > 5
 ```
 
 Alert on **source disk** too. An unconsumed PostgreSQL replication slot retains
@@ -83,6 +90,28 @@ Targets: `pg2osync::source`, `::engine`, `::sink`, `::checkpoint`, `::backfill`,
 
 A permanent rejection stops the pipeline on purpose: skipping the document would
 be silent data loss, and every batch after it would widen the divergence.
+
+## What retries and what does not
+
+A broken stream — a dropped connection, a failover, a terminated backend — is
+retried in process. The pipeline is rebuilt from the last checkpoint each time,
+with exponential backoff capped at 30 seconds, and the attempt counter resets
+once a connection has lasted longer than that cap. After
+`[source] reconnect_max` consecutive failures (10 by default, roughly five
+minutes) the process exits and hands over.
+
+Configuration and privilege problems are **not** retried: `wal_level`,
+publication drift, a missing table, insufficient privileges and target setup all
+fail at startup and stay fatal. Retrying those is a crash loop wearing a
+costume.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | Clean shutdown — `SIGINT`/`SIGTERM`, or `bootstrap`/`validate` finishing |
+| non-zero | Fatal: bad configuration, insufficient privileges, a permanent document rejection, or reconnection gave up |
+
+A supervisor is still worth having — it just no longer has to catch every
+network blip.
 
 ## Recovery
 

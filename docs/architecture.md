@@ -27,9 +27,15 @@ Owns one replication connection and turns the wire protocol into
 `Transaction(Commit)` boundaries carrying a position token.
 
 Everything protocol-specific stays here. PostgreSQL pgoutput decoding lives in
-`crates/source`, MySQL binlog decoding in `crates/source-mysql`. Any source
-error terminates the task; the pipeline is rebuilt from the last checkpoint,
-because a partially buffered transaction is invalid after a reposition.
+`crates/source`, MySQL binlog decoding in `crates/source-mysql`.
+
+A source error tears the pipeline down and rebuilds it from the last
+checkpoint — new channels, a new engine task, a fresh connection. Rebuilding
+fully is the point rather than the cost: a partially buffered transaction is
+invalid once the stream repositions, and the teardown is what discards it.
+Retries back off exponentially and stop after `[source] reconnect_max`
+consecutive failures, so a real outage still reaches whatever supervises the
+process instead of being hidden by an endless retry loop.
 
 ### Engine task
 
