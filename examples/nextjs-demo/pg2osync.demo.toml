@@ -1,0 +1,21 @@
+# Config for the Next.js demo: syncs public.demo_products -> the
+# demo_products OpenSearch index. Points at the local dev stack from
+# dev/docker-compose.yml.
+
+[source]
+flavor = "postgres"
+url_env = "PG2OSYNC_SOURCE_URL"    # postgres://postgres:postgres@localhost:15432/sourcedb
+slot_name = "pg2osync_demo"
+publication = "pg2osync_demo_pub"
+
+[target]
+flavor = "opensearch"
+url = "http://localhost:9200"
+
+[engine]
+checkpoint_interval_ms = 200
+
+[sync.demo_products]
+table = "public.demo_products"
+index = "demo_products"
+primary_key = "id"
