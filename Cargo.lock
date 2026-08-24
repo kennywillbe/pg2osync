@@ -1393,6 +1393,7 @@ dependencies = [
  "pg2osync-engine",
  "pg2osync-sink",
  "pg2osync-source",
+ "pg2osync-source-mysql",
  "serde",
  "serde_json",
  "tokio",

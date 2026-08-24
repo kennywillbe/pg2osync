@@ -2,7 +2,14 @@
 name = "pg2osync"
 version = "0.6.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Real-time PostgreSQL/MySQL to OpenSearch, Elasticsearch and Meilisearch sync in one binary"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 
 [[bin]]
 name = "pg2osync"
@@ -11,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 pg2osync-core = { path = "../core" }
 pg2osync-source = { path = "../source" }
+pg2osync-source-mysql = { path = "../source-mysql" }
 pg2osync-sink = { path = "../sink" }
 pg2osync-engine = { path = "../engine" }
 clap.workspace = true

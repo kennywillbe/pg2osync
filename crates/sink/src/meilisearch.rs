@@ -1,15 +1,15 @@
-//! Meilisearch sink — first schema-less target (VISION §2.4).
+//! Meilisearch sink: a schema-less target.
 //!
 //! Deviations from the OpenSearch contract:
 //! - no mappings: `ensure_ready` creates the index with primaryKey "id"
 //! - writes are async server-side tasks; we wait for completion before acking
 //!   so at-least-once semantics hold
 //! - no arbitrary-document storage exists, so the checkpoint falls back to a
-//!   local JSON file (documented limitation vs ADR #18)
+//!   local JSON file instead of an in-cluster document (documented limitation)
 
 use async_trait::async_trait;
+use pg2osync_core::checkpoint::Checkpoint;
 use pg2osync_core::error::CoreError;
-use pg2osync_core::lsn::Lsn;
 use pg2osync_core::sink::{DocumentOp, Health, IndexSpec, LsnOp, Sink, SinkAck};
 use serde_json::{Value, json};
 
@@ -236,36 +236,27 @@ impl Sink for MeilisearchSink {
         Ok(())
     }
 
-    async fn write_checkpoint(
-        &self,
-        slot_name: &str,
-        publication: &str,
-        lsn: Lsn,
-    ) -> Result<(), CoreError> {
-        let doc = json!({
-            "slot_name": slot_name,
-            "publication": publication,
-            "confirmed_lsn": lsn.to_string(),
-            "schema_version": 1
-        });
-        std::fs::write(
-            self.checkpoint_path(),
-            serde_json::to_vec_pretty(&doc).map_err(|e| CoreError::Sink(e.to_string()))?,
-        )
-        .map_err(|e| CoreError::Sink(format!("checkpoint write: {e}")))
+    async fn write_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), CoreError> {
+        let path = self.checkpoint_path();
+        let tmp = format!("{path}.tmp");
+        let bytes = serde_json::to_vec_pretty(&crate::checkpoint_doc(checkpoint))
+            .map_err(|e| CoreError::Sink(e.to_string()))?;
+        // write-then-rename: a crash mid-write must not leave a truncated
+        // checkpoint that would silently restart the pipeline from zero
+        std::fs::write(&tmp, bytes)
+            .map_err(|e| CoreError::Sink(format!("checkpoint write: {e}")))?;
+        std::fs::rename(&tmp, &path).map_err(|e| CoreError::Sink(format!("checkpoint rename: {e}")))
     }
 
-    async fn read_checkpoint(&self) -> Result<Option<Lsn>, CoreError> {
+    async fn read_checkpoint(&self) -> Result<Option<Checkpoint>, CoreError> {
         match std::fs::read(self.checkpoint_path()) {
             Ok(bytes) => {
                 let v: Value =
                     serde_json::from_slice(&bytes).map_err(|e| CoreError::Sink(e.to_string()))?;
-                match v["confirmed_lsn"].as_str() {
-                    Some(s) => Ok(Some(s.parse().map_err(CoreError::from)?)),
-                    None => Ok(None),
-                }
+                Ok(crate::checkpoint_from_doc(&v))
             }
-            Err(_) => Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(CoreError::Sink(format!("checkpoint read: {e}"))),
         }
     }
 

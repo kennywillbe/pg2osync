@@ -2,10 +2,11 @@
 //!
 //! Deliberately a thin raw-REST client instead of the `elasticsearch` crate:
 //! we need only ~6 endpoints and avoid pulling a second generated-client HTTP
-//! stack into the binary (VISION §2.3).
+//! stack into the binary.
 
 use async_trait::async_trait;
 use base64::Engine as _;
+use pg2osync_core::checkpoint::Checkpoint;
 use pg2osync_core::error::CoreError;
 use pg2osync_core::lsn::Lsn;
 use pg2osync_core::sink::{DocumentOp, Health, IndexSpec, LsnOp, Sink, SinkAck};
@@ -16,6 +17,7 @@ pub const META_INDEX: &str = ".pg2osync_meta";
 pub struct ElasticsearchSink {
     http: reqwest::Client,
     base_url: String,
+    retry: crate::RetryPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -26,6 +28,7 @@ pub struct ElasticsearchSinkConfig {
     /// ES Cloud / API-key auth: base64 "id:api_key".
     pub api_key: Option<String>,
     pub tls_verify: bool,
+    pub retry: crate::RetryPolicy,
 }
 
 impl ElasticsearchSink {
@@ -58,6 +61,7 @@ impl ElasticsearchSink {
         Ok(Self {
             http,
             base_url: cfg.url.trim_end_matches('/').to_string(),
+            retry: cfg.retry,
         })
     }
 
@@ -119,10 +123,10 @@ impl ElasticsearchSink {
             .body(ndjson)
             .send()
             .await
-            .map_err(|e| CoreError::Sink(format!("bulk request failed: {e}")))?;
+            .map_err(|e| CoreError::SinkTransient(format!("bulk request failed: {e}")))?;
         let status = resp.status().as_u16();
         if status == 429 || status >= 500 {
-            return Err(CoreError::Sink(format!("retryable http status {status}")));
+            return Err(CoreError::SinkTransient(format!("http status {status}")));
         }
         let body: Value = resp
             .json()
@@ -152,7 +156,9 @@ impl ElasticsearchSink {
             }
         }
         if retryable {
-            return Err(CoreError::Sink("retryable item-level 429/5xx".into()));
+            return Err(CoreError::SinkTransient(
+                "item-level 429/5xx in bulk response".into(),
+            ));
         }
         Ok((batch.last().expect("nonempty").lsn, permanent))
     }
@@ -242,8 +248,10 @@ impl Sink for ElasticsearchSink {
                     }
                     return Ok(SinkAck { max_lsn: lsn });
                 }
-                Err(e) if attempt < 10 && is_retryable(&e) => {
-                    let backoff = 500u64 * 2u64.saturating_pow(attempt - 1);
+                Err(e) if attempt < self.retry.max_attempts && is_retryable(&e) => {
+                    let backoff = self.retry.base_backoff_ms * 2u64.saturating_pow(attempt - 1);
+                    tracing::warn!(target: "pg2osync::sink",
+                        "bulk attempt {attempt} failed ({e}); backing off {backoff}ms");
                     tokio::time::sleep(std::time::Duration::from_millis(backoff.min(30_000))).await;
                 }
                 Err(e) => return Err(e),
@@ -252,52 +260,30 @@ impl Sink for ElasticsearchSink {
     }
 
     async fn truncate_index(&self, index: &str) -> Result<(), CoreError> {
+        // an unrefreshed write is invisible to _delete_by_query and would
+        // outlive the TRUNCATE that is supposed to remove it
+        let _ = self
+            .send(reqwest::Method::POST, &format!("/{index}/_refresh"), None)
+            .await;
         let (status, _) = self
             .send(
                 reqwest::Method::POST,
-                &format!("/{index}/_delete_by_query"),
-                Some(
-                    json!({
-                        "query": {"match_all": {}}
-                    })
-                    .to_string(),
-                ),
+                &format!("/{index}/_delete_by_query?refresh=true&conflicts=proceed"),
+                Some(json!({"query": {"match_all": {}}}).to_string()),
             )
             .await?;
         if status != 200 {
             return Err(CoreError::Sink(format!("truncate {index}: {status}")));
         }
-        let _ = self
-            .send(reqwest::Method::POST, &format!("/{index}/_refresh"), None)
-            .await;
         Ok(())
     }
 
-    async fn write_checkpoint(
-        &self,
-        slot_name: &str,
-        publication: &str,
-        lsn: Lsn,
-    ) -> Result<(), CoreError> {
-        let epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+    async fn write_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), CoreError> {
         let (status, _) = self
             .send(
                 reqwest::Method::PUT,
-                &format!("/{META_INDEX}/_doc/default"),
-                Some(
-                    json!({
-                        "slot_name": slot_name,
-                        "publication": publication,
-                        "confirmed_lsn": lsn.to_string(),
-                        "instance_id": std::env::var("PG2OSYNC_INSTANCE_ID").unwrap_or_default(),
-                        "updated_at_epoch": epoch,
-                        "schema_version": 1
-                    })
-                    .to_string(),
-                ),
+                &format!("/{META_INDEX}/_doc/{}", crate::CHECKPOINT_DOC_ID),
+                Some(crate::checkpoint_doc(checkpoint).to_string()),
             )
             .await?;
         if status != 200 && status != 201 {
@@ -306,11 +292,11 @@ impl Sink for ElasticsearchSink {
         Ok(())
     }
 
-    async fn read_checkpoint(&self) -> Result<Option<Lsn>, CoreError> {
+    async fn read_checkpoint(&self) -> Result<Option<Checkpoint>, CoreError> {
         let (status, body) = self
             .send(
                 reqwest::Method::GET,
-                &format!("/{META_INDEX}/_doc/default"),
+                &format!("/{META_INDEX}/_doc/{}", crate::CHECKPOINT_DOC_ID),
                 None,
             )
             .await?;
@@ -320,10 +306,7 @@ impl Sink for ElasticsearchSink {
         if status != 200 {
             return Err(CoreError::Sink(format!("read checkpoint: {status}")));
         }
-        match body["_source"]["confirmed_lsn"].as_str() {
-            Some(s) => Ok(Some(s.parse().map_err(CoreError::from)?)),
-            None => Ok(None),
-        }
+        Ok(crate::checkpoint_from_doc(&body["_source"]))
     }
 
     async fn health(&self) -> Result<Health, CoreError> {
@@ -337,5 +320,5 @@ impl Sink for ElasticsearchSink {
 }
 
 fn is_retryable(e: &CoreError) -> bool {
-    matches!(e, CoreError::Sink(m) if m.contains("retryable") || m.contains("request failed"))
+    matches!(e, CoreError::SinkTransient(_))
 }

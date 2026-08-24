@@ -1,4 +1,4 @@
-# M0 spike environment: PostgreSQL (logical replication enabled) + OpenSearch.
+# Local development stack: PostgreSQL (logical replication enabled) + OpenSearch.
 # Keepable: becomes the basis of examples/docker-compose.yml later.
 
 services:

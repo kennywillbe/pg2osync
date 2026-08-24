@@ -1,0 +1,27 @@
+# Runnable example: pg2osync against your own PostgreSQL and OpenSearch.
+#
+#   cp examples/pg2osync.example.toml deploy/pg2osync.toml   # then edit it
+#   export PG2OSYNC_SOURCE_URL=postgres://user:pass@host:5432/db
+#   docker compose -f deploy/docker-compose.yml up -d
+#
+# For a full local stack including PostgreSQL and OpenSearch, use
+# dev/docker-compose.yml instead.
+
+services:
+  pg2osync:
+    image: ghcr.io/kennywillbe/pg2osync:0.6.0
+    restart: unless-stopped
+    environment:
+      RUST_LOG: pg2osync=info
+      PG2OSYNC_SOURCE_URL: ${PG2OSYNC_SOURCE_URL:?set PG2OSYNC_SOURCE_URL}
+      PG2OSYNC_TARGET_PASSWORD: ${PG2OSYNC_TARGET_PASSWORD:-}
+    volumes:
+      - ./pg2osync.toml:/etc/pg2osync/pg2osync.toml:ro
+    ports:
+      - "9100:9100"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9100/metrics"]
+      interval: 30s
+      timeout: 5s
+      # the initial load may take a while before the endpoint answers
+      start_period: 120s

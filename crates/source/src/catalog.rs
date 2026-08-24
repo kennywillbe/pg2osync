@@ -1,5 +1,5 @@
 //! Catalog inspection and management: wal_level checks, publication/slot
-//! lifecycle, replica-identity and primary-key discovery (ADR #19d).
+//! lifecycle, replica-identity and primary-key discovery.
 
 use anyhow::{Context, Result, bail};
 use pg2osync_core::Lsn;
@@ -63,7 +63,7 @@ pub async fn table_info(client: &Client, schema: &str, name: &str) -> Result<Tab
 /// detect drift when it exists.
 ///
 /// `publish_via_partition_root` makes partitioned tables emit events under the
-/// parent relid so they match config entries (ADR #19b).
+/// parent relid so they match config entries.
 pub async fn ensure_publication(
     client: &Client,
     publication: &str,
@@ -151,11 +151,34 @@ pub async fn ensure_slot(client: &Client, slot_name: &str) -> Result<Option<Stri
 }
 
 pub async fn drop_slot(client: &Client, slot_name: &str) -> Result<()> {
+    let exists = client
+        .query_opt(
+            "SELECT 1 FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot_name],
+        )
+        .await?;
+    if exists.is_none() {
+        tracing::info!(target: "pg2osync::catalog", "slot {slot_name} already absent");
+        return Ok(());
+    }
     client
         .execute("SELECT pg_drop_replication_slot($1)", &[&slot_name])
         .await
         .with_context(|| format!("dropping slot {slot_name} failed"))?;
     tracing::info!(target: "pg2osync::catalog", "dropped replication slot {slot_name}");
+    Ok(())
+}
+
+/// Drop the publication if it exists.
+///
+/// Teardown must be idempotent: a half-finished decommission should be safe to
+/// re-run, so a missing publication is success, not an error.
+pub async fn drop_publication(client: &Client, publication: &str) -> Result<()> {
+    client
+        .execute(&format!("DROP PUBLICATION IF EXISTS {publication}"), &[])
+        .await
+        .with_context(|| format!("dropping publication {publication} failed"))?;
+    tracing::info!(target: "pg2osync::catalog", "dropped publication {publication}");
     Ok(())
 }
 
@@ -167,8 +190,9 @@ pub async fn confirmed_flush_lsn(client: &Client, slot_name: &str) -> Result<Opt
             &[&slot_name],
         )
         .await?;
-    Ok(row.map(|r| {
-        let s: String = r.get(0);
-        s.parse().expect("confirmed_flush_lsn parse")
-    }))
+    // a freshly created slot has a NULL confirmed_flush_lsn until first use
+    match row.and_then(|r| r.get::<_, Option<String>>(0)) {
+        Some(text) => Ok(Some(text.parse()?)),
+        None => Ok(None),
+    }
 }

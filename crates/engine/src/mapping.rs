@@ -16,6 +16,49 @@ impl DurableLsn {
     }
 }
 
+/// Per-table column projection from `[sync.x] columns` / `exclude_columns`.
+///
+/// Applied to every document regardless of source and code path (backfill,
+/// streaming, poll), so an excluded column can never reach a sink.
+#[derive(Debug, Clone, Default)]
+pub struct Projections {
+    map: HashMap<(String, String), Projection>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Projection {
+    /// Keep only these columns, in whatever order the document has them.
+    Include(Vec<String>),
+    /// Keep everything except these columns.
+    Exclude(Vec<String>),
+}
+
+impl Projections {
+    pub fn from_pairs(pairs: impl IntoIterator<Item = ((String, String), Projection)>) -> Self {
+        Self {
+            map: pairs.into_iter().collect(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Drop columns the configuration excludes, in place.
+    pub fn apply(&self, schema: &str, table: &str, doc: &mut serde_json::Value) {
+        let Some(rule) = self.map.get(&(schema.to_string(), table.to_string())) else {
+            return;
+        };
+        let Some(obj) = doc.as_object_mut() else {
+            return;
+        };
+        match rule {
+            Projection::Include(keep) => obj.retain(|k, _| keep.iter().any(|c| c == k)),
+            Projection::Exclude(drop) => obj.retain(|k, _| !drop.iter().any(|c| c == k)),
+        }
+    }
+}
+
 /// Per-table column transformations from `[sync.x.transform]`.
 #[derive(Debug, Clone, Default)]
 pub struct Transforms {
@@ -107,5 +150,82 @@ impl TableMapping {
         self.map
             .get(&(schema.to_string(), table.to_string()))
             .map(String::as_str)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn include_keeps_only_listed_columns() {
+        let p = Projections::from_pairs([(
+            ("public".into(), "users".into()),
+            Projection::Include(vec!["id".into(), "email".into()]),
+        )]);
+        let mut doc = json!({"id": 1, "email": "a@b.c", "secret": "x"});
+        p.apply("public", "users", &mut doc);
+        assert_eq!(doc, json!({"id": 1, "email": "a@b.c"}));
+    }
+
+    #[test]
+    fn exclude_drops_listed_columns_and_ignores_other_tables() {
+        let p = Projections::from_pairs([(
+            ("public".into(), "users".into()),
+            Projection::Exclude(vec!["password_hash".into()]),
+        )]);
+        let mut doc = json!({"id": 1, "password_hash": "$2b$"});
+        p.apply("public", "users", &mut doc);
+        assert_eq!(doc, json!({"id": 1}));
+
+        let mut other = json!({"password_hash": "kept"});
+        p.apply("public", "orders", &mut other);
+        assert_eq!(other, json!({"password_hash": "kept"}));
+    }
+
+    #[test]
+    fn transforms_redact_and_hash_but_leave_nulls() {
+        let rules = HashMap::from([
+            ("email".to_string(), TransformOp::Redact),
+            ("ssn".to_string(), TransformOp::Hash),
+            ("phone".to_string(), TransformOp::Redact),
+        ]);
+        let t = Transforms::from_pairs([(("public".into(), "users".into()), rules)]);
+        let mut doc = json!({"email": "a@b.c", "ssn": "123", "phone": null});
+        t.apply("public", "users", &mut doc);
+        assert_eq!(doc["email"], json!("***"));
+        assert_eq!(
+            doc["ssn"].as_str().map(str::len),
+            Some(16),
+            "hash is truncated to a stable width"
+        );
+        assert!(doc["phone"].is_null(), "null carries no value to mask");
+    }
+
+    #[test]
+    fn hashing_is_deterministic() {
+        let rules = HashMap::from([("v".to_string(), TransformOp::Hash)]);
+        let t = Transforms::from_pairs([(("s".into(), "t".into()), rules)]);
+        let mut a = json!({"v": "same"});
+        let mut b = json!({"v": "same"});
+        t.apply("s", "t", &mut a);
+        t.apply("s", "t", &mut b);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn durable_lsn_reports_none_until_set() {
+        let d = DurableLsn::default();
+        assert!(d.load().is_none());
+        d.store(pg2osync_core::Lsn(42));
+        assert_eq!(d.load(), Some(pg2osync_core::Lsn(42)));
+    }
+
+    #[test]
+    fn unmapped_tables_have_no_index() {
+        let m = TableMapping::from_pairs([(("public".into(), "users".into()), "users_v1".into())]);
+        assert_eq!(m.index_for("public", "users"), "users_v1");
+        assert_eq!(m.opt_index_for("public", "orders"), None);
     }
 }

@@ -1,4 +1,4 @@
-//! The multi-task pipeline (ADR #17):
+//! The multi-task pipeline:
 //!
 //! source task ──events──► engine task ──batches──► sink task
 //!                              │                     │
@@ -12,6 +12,7 @@ pub mod mapping;
 pub mod metrics;
 
 use crate::mapping::TableMapping;
+use pg2osync_core::checkpoint::{Checkpoint, StreamId};
 use pg2osync_core::error::CoreError;
 use pg2osync_core::event::{ChangeEvent, RowKind, TransactionBoundary};
 use pg2osync_core::lsn::Lsn;
@@ -26,9 +27,13 @@ use tokio::sync::{mpsc, watch};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EngineConfig {
+    /// Rows per sink request.
     pub batch_size: usize,
+    /// Approximate byte ceiling per sink request; whichever limit is reached
+    /// first splits the batch.
     pub batch_max_bytes: usize,
-    pub flush_interval_ms: u64,
+    /// Warning threshold for a single open transaction. Exceeding it means the
+    /// transaction is split, so the sink briefly holds a partial transaction.
     pub txn_buffer_cap_mb: usize,
     pub retry_max: u32,
     pub retry_backoff_ms: u64,
@@ -40,7 +45,6 @@ impl Default for EngineConfig {
         Self {
             batch_size: 500,
             batch_max_bytes: 10 * 1024 * 1024,
-            flush_interval_ms: 1000,
             txn_buffer_cap_mb: 256,
             retry_max: 10,
             retry_backoff_ms: 500,
@@ -88,10 +92,27 @@ impl DurableLsn {
     }
 }
 
+/// Work handed to the sink task, in the order the source produced it.
+///
+/// TRUNCATE travels through the same channel as writes: executing it directly
+/// would let writes still queued ahead of it land afterwards and resurrect
+/// documents the source has already dropped.
+enum SinkCommand {
+    Write(Vec<LsnOp>),
+    Truncate(String),
+}
+
+/// Renders an engine position token into the source's own textual form.
+///
+/// Injected by the binary so the engine can persist a resumable checkpoint
+/// without knowing whether the token is a WAL LSN or a binlog offset.
+pub type PositionRenderer = Arc<dyn Fn(u64) -> String + Send + Sync>;
+
 /// Runtime handles shared by all pipeline tasks.
 pub struct PipelineCtx {
     pub sink: Arc<dyn Sink>,
     pub mapping: TableMapping,
+    pub projections: crate::mapping::Projections,
     pub transforms: crate::mapping::Transforms,
     pub cfg: EngineConfig,
     /// Updated by the sink task after every successful flush.
@@ -106,12 +127,12 @@ pub struct PipelineCtx {
 pub async fn run(
     mut events: mpsc::Receiver<ChangeEvent>,
     ctx: Arc<PipelineCtx>,
-    slot_name: String,
-    publication: String,
+    stream: StreamId,
+    render_position: PositionRenderer,
     durable: crate::mapping::DurableLsn,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), CoreError> {
-    let (batch_tx, batch_rx) = mpsc::channel::<Vec<LsnOp>>(64);
+    let (batch_tx, batch_rx) = mpsc::channel::<SinkCommand>(64);
     let (ckpt_done_tx, ckpt_done_rx) = watch::channel::<Option<Lsn>>(None);
 
     let sink_task = tokio::spawn(sink_loop(
@@ -125,8 +146,9 @@ pub async fn run(
     // checkpoint loop: persist acked LSN periodically; only after a successful
     // persist does `durable` advance, which is what gates source acknowledgment
     let ckpt_sink = ctx.sink.clone();
-    let ckpt_slot = slot_name.clone();
-    let ckpt_pub = publication;
+    let ckpt_stream = stream;
+    let ckpt_render = render_position;
+    let ckpt_metrics = ctx.metrics.clone();
     let ckpt_interval = ctx.cfg.checkpoint_interval_ms.max(100);
     let ckpt_task = tokio::spawn(async move {
         let mut last_persisted: Option<Lsn> = None;
@@ -139,15 +161,21 @@ pub async fn run(
                 break;
             }
             let new_lsn = *ckpt_done_rx.borrow_and_update();
-            if last_persisted == new_lsn || new_lsn.is_none() {
+            if last_persisted == new_lsn {
                 continue;
             }
-            match ckpt_sink
-                .write_checkpoint(&ckpt_slot, &ckpt_pub, new_lsn.expect("checked"))
-                .await
-            {
+            let Some(lsn) = new_lsn else { continue };
+            let checkpoint = Checkpoint {
+                stream: ckpt_stream.clone(),
+                token: lsn.0,
+                position: ckpt_render(lsn.0),
+            };
+            match ckpt_sink.write_checkpoint(&checkpoint).await {
                 Ok(()) => {
-                    durable.store(new_lsn.expect("checked"));
+                    // `durable` gates what the source may acknowledge, so it
+                    // must advance only after the checkpoint is persisted
+                    durable.store(lsn);
+                    ckpt_metrics.set_confirmed_position(lsn.0);
                     last_persisted = new_lsn;
                 }
                 Err(e) => {
@@ -158,6 +186,9 @@ pub async fn run(
     });
 
     let mut txn_buffer: Vec<LsnOp> = Vec::new();
+    let mut txn_bytes: usize = 0;
+    let txn_cap_bytes = ctx.cfg.txn_buffer_cap_mb.saturating_mul(1024 * 1024);
+    let mut cap_warned = false;
 
     let result = loop {
         let ev = tokio::select! {
@@ -193,12 +224,16 @@ pub async fn run(
                 // backfill boundaries carry Lsn(0): their rows have no WAL
                 // position, so they must NEVER advance ack/checkpoint state
                 let backfill_boundary = lsn.0 == 0;
+                if !backfill_boundary {
+                    ctx.metrics.set_current_position(lsn.0);
+                }
                 if !txn_buffer.is_empty() {
+                    txn_bytes = 0;
                     if !backfill_boundary && let Some(last) = txn_buffer.last_mut() {
                         last.lsn = lsn;
                     }
                     if batch_tx
-                        .send(std::mem::take(&mut txn_buffer))
+                        .send(SinkCommand::Write(std::mem::take(&mut txn_buffer)))
                         .await
                         .is_err()
                     {
@@ -217,6 +252,7 @@ pub async fn run(
                     index,
                     (&row.schema, &row.table),
                     &row.kind,
+                    &ctx.projections,
                     &ctx.transforms,
                     ctx.sink.as_ref(),
                 )
@@ -225,25 +261,46 @@ pub async fn run(
                     Ok(ops) => ops,
                     Err(e) => break Err(e),
                 };
+                txn_bytes += ops.iter().map(op_size).sum::<usize>();
                 txn_buffer.extend(ops);
-                if txn_buffer.len() >= ctx.cfg.batch_size {
+                if txn_bytes > txn_cap_bytes && !cap_warned {
+                    cap_warned = true;
+                    tracing::warn!(target: "pg2osync::engine",
+                        "open transaction exceeds txn_buffer_cap_mb ({} MB); it will be \
+                         split across sink requests",
+                        ctx.cfg.txn_buffer_cap_mb);
+                }
+                if txn_buffer.len() >= ctx.cfg.batch_size || txn_bytes >= ctx.cfg.batch_max_bytes {
                     // oversized transaction split: safe because every op is
                     // idempotent and the commit LSN lands on the final piece
                     if batch_tx
-                        .send(std::mem::take(&mut txn_buffer))
+                        .send(SinkCommand::Write(std::mem::take(&mut txn_buffer)))
                         .await
                         .is_err()
                     {
                         break Err(CoreError::Other("batch channel closed".into()));
                     }
+                    txn_bytes = 0;
                 }
             }
             ChangeEvent::TableTruncated { schema, table } => {
-                if let Some(index) = ctx.mapping.opt_index_for(&schema, &table) {
-                    if let Err(e) = ctx.sink.truncate_index(index).await {
-                        break Err(e);
-                    }
-                    tracing::info!(target: "pg2osync::engine", "index {index} cleared after TRUNCATE");
+                ctx.metrics.incr_event("truncate");
+                let Some(index) = ctx.mapping.opt_index_for(&schema, &table) else {
+                    continue;
+                };
+                let index = index.to_string();
+                // rows buffered before the TRUNCATE belong before it
+                if !txn_buffer.is_empty()
+                    && batch_tx
+                        .send(SinkCommand::Write(std::mem::take(&mut txn_buffer)))
+                        .await
+                        .is_err()
+                {
+                    break Err(CoreError::Other("batch channel closed".into()));
+                }
+                txn_bytes = 0;
+                if batch_tx.send(SinkCommand::Truncate(index)).await.is_err() {
+                    break Err(CoreError::Other("batch channel closed".into()));
                 }
             }
         }
@@ -257,33 +314,47 @@ pub async fn run(
 
 #[allow(clippy::too_many_arguments)]
 async fn sink_loop(
-    mut batches: mpsc::Receiver<Vec<LsnOp>>,
+    mut commands: mpsc::Receiver<SinkCommand>,
     sink: Arc<dyn Sink>,
     ack_tx: watch::Sender<Option<Lsn>>,
     ckpt_done_tx: watch::Sender<Option<Lsn>>,
     metrics: Arc<crate::metrics::Metrics>,
 ) {
-    while let Some(batch) = batches.recv().await {
-        match sink.write(batch).await {
-            Ok(ack) => {
+    while let Some(command) = commands.recv().await {
+        let result = match command {
+            SinkCommand::Write(batch) => sink.write(batch).await.map(Some),
+            SinkCommand::Truncate(index) => match sink.truncate_index(&index).await {
+                Ok(()) => {
+                    tracing::info!(target: "pg2osync::sink",
+                        "index {index} cleared after TRUNCATE");
+                    Ok(None)
+                }
+                Err(e) => Err(e),
+            },
+        };
+        match result {
+            Ok(Some(ack)) => {
                 metrics.batches_flushed.fetch_add(1, Ordering::Relaxed);
-                // zero-LSN acks come from backfill batches; acknowledging them
-                // would corrupt the WAL position chain
+                // zero-position acks come from initial-load batches;
+                // acknowledging them would corrupt the source position chain
                 if ack.max_lsn.0 > 0 {
                     ack_tx.send_replace(Some(ack.max_lsn));
                     ckpt_done_tx.send_replace(Some(ack.max_lsn));
                 }
             }
+            Ok(None) => {}
             Err(CoreError::DocumentRejected {
                 index,
                 doc_id,
                 reason,
             }) => {
+                metrics.sink_errors_total.fetch_add(1, Ordering::Relaxed);
                 tracing::error!(target: "pg2osync::sink",
                     "halting pipeline: permanent rejection {reason} for {index}/{doc_id}");
                 return;
             }
             Err(e) => {
+                metrics.sink_errors_total.fetch_add(1, Ordering::Relaxed);
                 tracing::error!(target: "pg2osync::sink", "sink failed permanently: {e}");
                 return;
             }
@@ -291,12 +362,44 @@ async fn sink_loop(
     }
 }
 
+/// Rough serialized size of one operation, used only to cap batch size.
+///
+/// Re-serializing the document to measure it exactly would double the work for
+/// no benefit: the limit exists to keep requests under the sink's own ceiling.
+fn op_size(op: &LsnOp) -> usize {
+    const OVERHEAD: usize = 64;
+    match &op.op {
+        DocumentOp::Upsert { index, id, doc } => {
+            index.len() + id.len() + estimate_json(doc) + OVERHEAD
+        }
+        DocumentOp::Delete { index, id } => index.len() + id.len() + OVERHEAD,
+    }
+}
+
+fn estimate_json(value: &Value) -> usize {
+    match value {
+        Value::Null => 4,
+        Value::Bool(_) => 5,
+        Value::Number(_) => 8,
+        Value::String(s) => s.len() + 2,
+        Value::Array(items) => 2 + items.iter().map(estimate_json).sum::<usize>(),
+        Value::Object(map) => {
+            2 + map
+                .iter()
+                .map(|(k, v)| k.len() + 4 + estimate_json(v))
+                .sum::<usize>()
+        }
+    }
+}
+
 /// Convert one row change into document operations, completing unchanged-TOAST
-/// columns from the previously indexed document when needed (ADR #19a).
+/// columns from the previously indexed document when needed.
+#[allow(clippy::too_many_arguments)]
 async fn materialize<'a>(
     index: &'a str,
     table: (&'a str, &'a str),
     kind: &RowKind,
+    projections: &crate::mapping::Projections,
     transforms: &crate::mapping::Transforms,
     sink: &dyn Sink,
 ) -> Result<Vec<LsnOp>, CoreError> {
@@ -312,6 +415,7 @@ async fn materialize<'a>(
     match kind {
         RowKind::Insert { pk, doc } => {
             let mut doc = doc.clone();
+            projections.apply(table.0, table.1, &mut doc);
             transforms.apply(table.0, table.1, &mut doc);
             Ok(mk(DocumentOp::Upsert {
                 index: index.into(),
@@ -343,6 +447,8 @@ async fn materialize<'a>(
                     }
                 }
             }
+            projections.apply(table.0, table.1, &mut doc);
+            transforms.apply(table.0, table.1, &mut doc);
             Ok(mk(DocumentOp::Upsert {
                 index: index.into(),
                 id,
@@ -353,5 +459,41 @@ async fn materialize<'a>(
             index: index.into(),
             id: pk_to_id(pk),
         })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn scalar_keys_render_as_plain_ids() {
+        assert_eq!(pk_to_id(&json!(42)), "42");
+        assert_eq!(pk_to_id(&json!("u-1")), "u-1");
+        assert_eq!(pk_to_id(&json!(true)), "true");
+        assert_eq!(pk_to_id(&Value::Null), "__null__");
+    }
+
+    #[test]
+    fn composite_keys_are_order_independent() {
+        let a = pk_to_id(&json!({"tenant": "acme", "id": 7}));
+        let b = pk_to_id(&json!({"id": 7, "tenant": "acme"}));
+        assert_eq!(a, b, "the same row must always yield the same id");
+        assert_eq!(a, "id=7,tenant=acme");
+    }
+
+    #[test]
+    fn string_key_parts_are_not_quoted() {
+        // a quoted part would change the id of every existing document
+        assert_eq!(pk_to_id(&json!({"a": "x", "b": "y"})), "a=x,b=y");
+    }
+
+    #[test]
+    fn defaults_are_production_sane() {
+        let cfg = EngineConfig::default();
+        assert!(cfg.batch_size > 0);
+        assert!(cfg.checkpoint_interval_ms > 0);
+        assert!(cfg.retry_max > 0);
     }
 }

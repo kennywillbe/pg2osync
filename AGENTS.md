@@ -1,136 +1,64 @@
-# AGENTS.md — Guide for AI Agents and Human Contributors
+# AGENTS.md — Guide for contributors and AI agents
 
-This document defines the rules every AI agent (Claude, Copilot, Cursor, etc.)
-and human contributor MUST follow when working on this repository. Read it fully
-before making any change.
+Read this before changing anything in this repository. It is the short version
+of [CONTRIBUTING.md](CONTRIBUTING.md) plus the rules that are easy to break by
+accident.
 
-## Project Overview
+## What this project is
 
-**pg2osync** is a single-binary, zero-dependency (no Logstash, no Kafka, no
-Redis) tool that keeps an OpenSearch index in sync with PostgreSQL tables in
-real time using logical replication (WAL). Written in Rust.
+pg2osync keeps a search index in sync with a relational database in real time:
+PostgreSQL (logical replication) or MySQL/MariaDB (binlog) into OpenSearch,
+Elasticsearch or Meilisearch. One static binary, one TOML file, no Kafka, no
+Logstash, no Redis.
 
-- Full product vision (multi-source/multi-sink end state): [VISION.md](VISION.md)
-- Full plan, milestones, and decision record: see [PLAN.md](PLAN.md)
-- Current status: **planning phase — no production code exists yet**
+- How the pipeline works: [docs/architecture.md](docs/architecture.md)
+- Every config option: [docs/configuration.md](docs/configuration.md)
+- Why things are built the way they are: [docs/decisions.md](docs/decisions.md)
 
-## Current Phase Rules
+## Architecture invariants
 
-While the project is in the planning/design phase:
+Breaking one of these is a bug even if the tests pass:
 
-1. Do NOT write implementation code unless explicitly asked.
-2. Do NOT run `cargo init`, `cargo add`, or scaffold a project skeleton unless
-   explicitly asked.
-3. Design work happens in PLAN.md first; code follows only after the relevant
-   milestone's design is agreed upon.
-4. All documentation, comments, commit messages, PR descriptions, and issue
-   discussions are written in **English**.
+- `core` depends on no other workspace crate. `ChangeEvent` and the `Sink`
+  trait are the only things crossing module boundaries.
+- The engine is source-agnostic. Nothing PostgreSQL- or MySQL-specific belongs
+  in `crates/engine`; source positions reach it as an opaque `u64` token.
+- Protocol decoding stays inside its source crate — pgoutput in
+  `crates/source`, binlog in `crates/source-mysql`. No CDC framework.
+- New targets implement `Sink`. The engine never matches on a sink kind.
+- Delivery is at-least-once with idempotent writes (`_id` = primary key).
+- A partial transaction must never be visible as a complete one.
+- A source position is acknowledged only after the data is durably written and
+  checkpointed. Acknowledging early loses data on crash-restart.
+- Checkpoint state lives in the target (a hidden index, or a state file for
+  Meilisearch), never in the source database.
 
-## Architecture (high level)
+If a change contradicts [docs/decisions.md](docs/decisions.md), update that
+document in the same change and say why.
 
-```
-PostgreSQL (logical replication / pgoutput)
-        │
-        ▼
-   Source reader ──► Engine (batching, dedup, backpressure) ──► Sink trait ──► OpenSearch
-        ▲                                                            │
-        └──────────────── LSN ack / checkpoint ◄──── State store ◄───┘
-```
+## Code rules
 
-Key architectural invariants (see PLAN.md §9 for full rationale):
+- Comments explain **why**, never what. No commented-out code, no changelog
+  comments, no bare `TODO` without an issue reference.
+- SOLID and YAGNI: build what the change needs. A trait with one implementation
+  and no second caller in sight is not an improvement.
+- Errors: `thiserror` in libraries, `anyhow` only in `crates/bin`.
+- No `unwrap()`/`expect()` outside tests unless a comment proves the invariant.
+- Async everywhere with tokio; never block the runtime.
+- Secrets never appear in logs, errors, or fixtures.
+- English for all code, comments, commits and documentation.
 
-- The replication **transport** is the `pgwire-replication` crate (transport-only:
-  raw `XLogData` frames), accessed through our own transport trait. All
-  replication **logic** (pgoutput decoding, slot/publication management,
-  transaction buffering) is implemented in-house. Never introduce a CDC
-  *framework*; never let pgoutput decoding leak outside the source module.
-- The Engine consumes sinks through a `Sink` **trait**, never through a concrete
-  OpenSearch type. OpenSearch is one implementation of that trait.
-- The Engine is **source-agnostic**: it knows only `core::ChangeEvent`. The fact
-  that the source is PostgreSQL lives entirely inside the `source` crate.
-- Delivery is at-least-once; correctness relies on idempotent writes
-  (`_id` = primary key).
-- A partial transaction must never reach a sink: events buffer until COMMIT.
-- Checkpoint state lives inside OpenSearch (hidden `_pg2osync_meta` index).
+## Definition of done
 
-## Comment Policy (strict)
-
-Comments must answer **why**, never **what**.
-
-FORBIDDEN — "what" comments (the code already says this):
-
-```rust
-// Set the retry count to 3
-let retries = 3;
-
-// Loop over all users
-for user in &users {
+```sh
+cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+./dev/e2e-test.sh          # when the pipeline changed
 ```
 
-ALLOWED — "why" comments (context the code cannot express):
+Every bug fix ships with a regression test that fails without the fix. For
+protocol decoders, that means a byte-level test vector.
 
-```rust
-// 3 retries because a single OS node restart can take ~2s to accept connections again
-let retries = 3;
-
-// Skip system catalogs: pgoutput emits RELATION messages for them during slot creation
-for rel in relations.iter().filter(|r| !r.is_system_catalog()) {
-```
-
-Additional comment rules:
-
-- No commented-out code. Delete it; git remembers.
-- No changelog-style comments ("added X on date Y"). Git history is the log.
-- No placeholder comments like `// TODO` without an issue reference
-  (`// TODO(#42): ...`). Prefer opening an issue over leaving TODOs.
-- Doc comments (`///`) describe contracts, invariants, error conditions — not
-  implementations.
-
-## Engineering Principles (strict)
-
-### SOLID
-
-- **Single Responsibility:** each module/type has exactly one reason to change.
-  The pgoutput parser must not know about batching; the batcher must not know
-  about HTTP.
-- **Open/Closed:** new targets (Elasticsearch, etc.) are added by implementing
-  `Sink`, never by editing engine logic with `match sink_kind { ... }`.
-- **Liskov Substitution:** any `Sink` implementation must be substitutable;
-  behavior contracts (at-least-once, ack semantics) are defined on the trait.
-- **Interface Segregation:** small, purposeful traits. Don't force mock sinks to
-  implement admin APIs they don't need.
-- **Dependency Inversion:** high-level modules (engine) depend on traits;
-  low-level details (opensearch-rs, tokio-postgres) live behind them.
-
-### YAGNI
-
-- Build what the current milestone requires. Nothing else.
-- No config options "for the future", no feature flags without a consumer,
-  no abstraction layers with a single planned implementation *unless* the trait
-  boundary is already justified by the architecture (e.g., `Sink`).
-- When in doubt between flexible and simple: choose simple, note the extension
-  point in PLAN.md instead of building it.
-
-## Code Conventions
-
-- Rust stable, edition 2024+; MSRV per PLAN.md §9.
-- `cargo fmt` and `cargo clippy -- -D warnings` must pass before every commit.
-- Errors: `thiserror` for library-level typed errors, `anyhow` only in `main.rs`.
-- No `unwrap()`/`expect()` outside tests and truly-impossible invariants (and
-  invariants require a why-comment proving it).
-- Async: tokio everywhere; do not block the runtime.
-- Secrets never appear in logs, errors, or test fixtures.
-
-## Testing Expectations
-
-- Unit tests live next to the code they test.
-- Integration tests use `testcontainers` and are gated behind an
-  `integration-tests` feature flag.
-- Every bug fix comes with a regression test that fails without the fix.
-
-## Workflow
-
-1. Read the relevant section of PLAN.md before starting any task.
-2. New architectural decisions get appended to the Decision Record (PLAN.md §9)
-   — code that contradicts a recorded decision is a bug.
-3. Milestones are the unit of delivery; keep main branch shippable.
+Commits: short imperative subject, reasoning in the body when the diff does not
+show it. One logical change per commit.

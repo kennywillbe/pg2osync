@@ -1,0 +1,30 @@
+name: Feature request
+description: Propose a capability or a supported source/target
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        pg2osync is deliberately narrow: one-way replication from a relational
+        database into a search engine. Requests that turn it into a streaming
+        platform or an ETL language are unlikely to be accepted — see
+        docs/decisions.md.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that you cannot do today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behaviour
+      description: What should pg2osync do? Configuration sketches help.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you tried instead
+      description: Workarounds, other tools, and why they fall short.

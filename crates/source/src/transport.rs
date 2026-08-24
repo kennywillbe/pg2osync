@@ -1,6 +1,6 @@
 //! Adapter layer between the `pgwire-replication` transport and core types.
 //!
-//! The transport is swappable by design (ADR #5): nothing outside this module
+//! The transport is swappable by design: nothing outside this module
 //! may name pgwire-replication types.
 
 use crate::pgoutput;

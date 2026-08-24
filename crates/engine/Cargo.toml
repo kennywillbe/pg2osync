@@ -2,7 +2,10 @@
 name = "pg2osync-engine"
 version = "0.6.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Batching, checkpointing and transform engine for pg2osync"
 
 [dependencies]
 serde.workspace = true

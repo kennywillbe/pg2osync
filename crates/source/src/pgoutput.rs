@@ -471,7 +471,7 @@ mod tests {
 
         let update = {
             // new tuple: col0 unchanged-toast, col1 "grace" — exercises the
-            // TOAST marker path that drives ADR #19a completion logic later.
+            // TOAST marker path that drives the engine's completion logic.
             let mut m = vec![b'U'];
             m.extend_from_slice(&16384u32.to_be_bytes());
             m.push(b'K');

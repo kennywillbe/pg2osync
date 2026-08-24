@@ -1,27 +1,66 @@
-# Example pg2osync configuration. Copy to pg2osync.toml and adjust.
+# pg2osync example configuration. Copy to pg2osync.toml and adjust.
+# Every option is documented in docs/configuration.md.
 
 [source]
-url_env = "PG2OSYNC_SOURCE_URL"   # postgres://user:pass@host:5432/db
+# "postgres" (default) or "mysql" (also covers MariaDB)
+flavor = "postgres"
+# Credentials come from the environment; an inline `url` works but warns.
+url_env = "PG2OSYNC_SOURCE_URL"     # postgres://user:pass@host:5432/db
 slot_name = "pg2osync"
 publication = "pg2osync_pub"
+# admin_url_env = "PG2OSYNC_ADMIN_URL"   # separate user for catalog queries
+
+# MySQL only:
+# server_id = 424242                     # unique across the server's replicas
+
+# Polling fallback for managed PostgreSQL without logical replication.
+# Deletes cannot be detected in this mode.
+# mode = "poll"
+# poll_column = "updated_at"
+# poll_interval_secs = 30
 
 [target]
+# "opensearch" (default), "elasticsearch" or "meilisearch"
+flavor = "opensearch"
 url = "http://localhost:9200"
 username = "admin"
-password_env = "OS_PASSWORD"
+password_env = "PG2OSYNC_TARGET_PASSWORD"
 tls_verify = true
-
-[sync.users]
-table = "public.users"
-index = "users_index"
-# primary_key = "id"              # default: detected from PK constraint
-# exclude_columns = ["password_hash"]
-# replica_identity_full = false
+# api_key_env = "ES_API_KEY"             # Elasticsearch API key / Meilisearch key
+# serverless = true                      # Amazon OpenSearch Serverless
+# state_dir = "./.pg2osync-state"        # Meilisearch checkpoint directory
 
 [engine]
 batch_size = 500
 batch_max_bytes = 10485760
-flush_interval_ms = 1000
 txn_buffer_cap_mb = 256
 retry_max = 10
 retry_backoff_ms = 500
+checkpoint_interval_ms = 500
+
+[metrics]
+enabled = true
+# use 0.0.0.0:9100 inside a container so probes can reach it
+bind = "127.0.0.1:9100"
+
+[sync.users]
+table = "public.users"               # database.table for MySQL
+index = "users"
+# primary_key = "id"                 # default: detected from the primary key
+# columns = ["id", "name", "email"]  # or exclude_columns, not both
+exclude_columns = ["password_hash"]
+
+[sync.users.transform]
+email = "redact"                     # "redact" -> "***", "hash" -> SHA-256 prefix
+
+# Nested children: embed a one-to-many relation as a JSON array (one level).
+# Child tables should have REPLICA IDENTITY FULL so deletes can find the parent.
+# [sync.customers]
+# table = "public.customers"
+# index = "customers"
+# primary_key = "id"
+#
+# [[sync.customers.children]]
+# table = "public.orders"
+# field = "orders"
+# foreign_key = "customer_id"

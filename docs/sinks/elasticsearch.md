@@ -15,9 +15,12 @@ password_env = "ES_PASSWORD"
 
 Identical contract to the [OpenSearch sink](opensearch.md):
 
-- `_bulk` writes keyed by primary key (at-least-once + idempotent).
-- Checkpoints in a hidden `.pg2osync_meta` index.
-- TRUNCATE mapped to index operations.
+- `_bulk` writes keyed by primary key (at-least-once and idempotent).
+- The checkpoint is one document in a hidden `.pg2osync_meta` index, in the same
+  format the OpenSearch sink writes.
+- TRUNCATE runs as `_delete_by_query?refresh=true&conflicts=proceed`, after an
+  explicit refresh so unrefreshed writes cannot outlive it.
+- Retries follow `[engine] retry_max` and `retry_backoff_ms`.
 
 Differences from OpenSearch are limited to REST dialect details (error
 response shapes, refresh semantics) that the sink abstracts away — config and
@@ -25,8 +28,13 @@ operational behavior are the same.
 
 ## Version targeting
 
-Developed against Elasticsearch 8.x. If you run 7.x and hit mapping or bulk
-incompatibilities, open an issue — the fix is usually small.
+Verified end to end against Elasticsearch 8.15 with security disabled. The sink
+speaks raw REST (`_bulk`, `_mget`, `_delete_by_query`, `_refresh`, `_doc`)
+rather than using the official client, which keeps a second HTTP stack out of
+the binary.
+
+7.x is untested. If you hit a bulk or mapping incompatibility there, open an
+issue — the fix is usually small.
 
 ## Security notes
 

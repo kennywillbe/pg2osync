@@ -2,7 +2,10 @@
 name = "pg2osync-source-mysql"
 version = "0.6.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "MySQL/MariaDB binlog source for pg2osync"
 
 [dependencies]
 pg2osync-core = { path = "../core" }

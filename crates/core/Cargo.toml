@@ -2,7 +2,10 @@
 name = "pg2osync-core"
 version = "0.6.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Shared types and trait boundaries for pg2osync"
 
 [dependencies]
 async-trait.workspace = true

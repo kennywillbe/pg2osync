@@ -1,6 +1,6 @@
 //! Config loading and validation.
 //!
-//! Secrets are env-first (ADR #8): `*_env` keys are resolved at load time;
+//! Secrets are env-first: `*_env` keys are resolved at load time;
 //! plain-text secrets in the file are accepted but warn deprecated.
 
 use anyhow::{Context, Result};
@@ -14,16 +14,12 @@ pub struct AppConfig {
     pub source: SourceConfig,
     pub target: TargetConfig,
     pub sync: BTreeMap<String, TableSync>,
-    // consumed by the engine wiring in M4
-    #[allow(dead_code)]
     #[serde(default)]
     pub engine: pg2osync_engine::EngineConfig,
     #[serde(default)]
     pub metrics: MetricsConfig,
 }
 
-// slot_name/publication are consumed by M2 slot/publication management.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceConfig {
@@ -36,11 +32,14 @@ pub struct SourceConfig {
     /// MySQL/MariaDB only: unique server_id for binlog dump
     #[serde(default = "default_server_id")]
     pub server_id: u32,
-    /// poll mode: timestamp column name per table
+    /// poll mode: default timestamp column, overridable per table
     #[serde(default = "default_poll_column")]
     pub poll_column: String,
     #[serde(default = "default_poll_interval")]
     pub poll_interval_secs: u64,
+    /// poll mode: rows fetched per table per cycle
+    #[serde(default = "default_poll_page_size")]
+    pub poll_page_size: i64,
     pub url: Option<String>,
     pub url_env: Option<String>,
     /// Nested-child queries use a dedicated connection; defaults to url.
@@ -62,6 +61,10 @@ fn default_poll_column() -> String {
 
 fn default_poll_interval() -> u64 {
     30
+}
+
+fn default_poll_page_size() -> i64 {
+    5000
 }
 
 fn default_flavor() -> String {
@@ -93,7 +96,7 @@ pub struct TargetConfig {
     pub api_key_env: Option<String>,
     #[serde(default = "default_true")]
     pub tls_verify: bool,
-    /// Amazon OpenSearch Serverless profile (VISION §2.2): skips operations
+    /// Amazon OpenSearch Serverless profile: skips operations
     /// Serverless rejects (refresh, settings changes) and expects IAM-signed
     /// access via an authorization token env (proxy or SigV4 gateway).
     #[serde(default)]
@@ -115,8 +118,6 @@ fn default_true() -> bool {
     true
 }
 
-// fields consumed by the metrics server task
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MetricsConfig {
@@ -140,8 +141,6 @@ impl Default for MetricsConfig {
     }
 }
 
-// primary_key/replica_identity_full/columns feed doc building in M2/M4.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TableSync {
@@ -153,8 +152,9 @@ pub struct TableSync {
     pub columns: Option<Vec<String>>,
     #[serde(default)]
     pub exclude_columns: Vec<String>,
+    /// poll mode: overrides `[source] poll_column` for this table
     #[serde(default)]
-    pub replica_identity_full: bool,
+    pub poll_column: Option<String>,
     /// Column transformations, e.g. email = "hash" | "redact"
     #[serde(default)]
     pub transform: std::collections::HashMap<String, String>,
@@ -175,16 +175,18 @@ pub struct ChildJoin {
     pub foreign_key: String,
 }
 
-// transform map is consumed by the engine via PipelineCtx
-
 impl TableSync {
     pub fn index_name(&self, key: &str) -> String {
         self.index.clone().unwrap_or_else(|| key.to_string())
     }
 }
 
+#[derive(Debug)]
 pub struct ResolvedSecrets {
     pub source_url: String,
+    /// Separate connection for catalog and nested-child queries; defaults to
+    /// `source_url`. A dedicated admin user keeps replication privileges apart.
+    pub admin_url: String,
     pub target_password: Option<String>,
     pub warnings: Vec<String>,
 }
@@ -204,6 +206,33 @@ impl AppConfig {
     pub fn validate(&self) -> Result<()> {
         use std::collections::HashSet;
 
+        const SOURCE_FLAVORS: [&str; 3] = ["postgres", "postgresql", "mysql"];
+        const TARGET_FLAVORS: [&str; 3] = ["opensearch", "elasticsearch", "meilisearch"];
+        const SOURCE_MODES: [&str; 2] = ["wal", "poll"];
+
+        if !SOURCE_FLAVORS.contains(&self.source.flavor.as_str()) {
+            anyhow::bail!(
+                "[source] flavor {:?} is not one of {SOURCE_FLAVORS:?}",
+                self.source.flavor
+            );
+        }
+        if !TARGET_FLAVORS.contains(&self.target.flavor.as_str()) {
+            anyhow::bail!(
+                "[target] flavor {:?} is not one of {TARGET_FLAVORS:?}",
+                self.target.flavor
+            );
+        }
+        if !SOURCE_MODES.contains(&self.source.mode.as_str()) {
+            anyhow::bail!(
+                "[source] mode {:?} is not one of {SOURCE_MODES:?}",
+                self.source.mode
+            );
+        }
+        if self.source.flavor == "mysql" && self.source.mode == "poll" {
+            anyhow::bail!(
+                "[source] mode = \"poll\" is PostgreSQL-only; MySQL always reads the binlog"
+            );
+        }
         let mut seen_indexes: HashSet<String> = HashSet::new();
         if self.sync.is_empty() {
             anyhow::bail!("no [sync.*] sections: nothing to synchronize");
@@ -226,7 +255,7 @@ impl AppConfig {
                 anyhow::bail!("[sync.{key}] index {index:?} may only contain lowercase [a-z0-9_-]");
             }
             // OpenSearch rejects names starting with '_'; dot-prefix is reserved
-            // for system indices (verified in M0 Spike C).
+            // for system indices.
             if index.starts_with('_') || index.starts_with('.') {
                 anyhow::bail!("[sync.{key}] index {index:?} must not start with '_' or '.'");
             }
@@ -241,12 +270,34 @@ impl AppConfig {
             if tbl.columns.as_ref().is_some_and(|c| c.is_empty()) {
                 anyhow::bail!("[sync.{key}] columns must not be empty");
             }
+            for (col, op) in &tbl.transform {
+                if op != "hash" && op != "redact" {
+                    anyhow::bail!(
+                        "[sync.{key}.transform] {col} = {op:?} must be \"hash\" or \"redact\""
+                    );
+                }
+            }
+            // an excluded column silently dropped from the key would produce
+            // colliding document ids
+            if let Some(pk) = &tbl.primary_key
+                && tbl.exclude_columns.contains(pk)
+            {
+                anyhow::bail!("[sync.{key}] primary_key {pk:?} cannot be in exclude_columns");
+            }
+            for child in &tbl.children {
+                if !is_qualified_table(&child.table) {
+                    anyhow::bail!(
+                        "[sync.{key}] child table {:?} must be schema-qualified",
+                        child.table
+                    );
+                }
+            }
         }
         Ok(())
     }
 
     /// Resolve env-var indirections; returns deprecation warnings for any
-    /// plain-text secret found in the file (ADR #8).
+    /// plain-text secret found in the file.
     pub fn resolve_secrets(&self) -> Result<ResolvedSecrets> {
         let mut warnings = Vec::new();
 
@@ -278,8 +329,16 @@ impl AppConfig {
             (None, None) => None,
         };
 
+        let admin_url = match &self.source.admin_url_env {
+            Some(env_key) => std::env::var(env_key).map_err(|_| {
+                anyhow::anyhow!("source.admin_url_env={env_key:?} is set but variable is missing")
+            })?,
+            None => source_url.clone(),
+        };
+
         Ok(ResolvedSecrets {
             source_url,
+            admin_url,
             target_password,
             warnings,
         })
@@ -289,4 +348,100 @@ impl AppConfig {
 fn is_qualified_table(name: &str) -> bool {
     let parts: Vec<&str> = name.split('.').collect();
     parts.len() == 2 && parts.iter().all(|p| !p.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(toml_str: &str) -> Result<AppConfig> {
+        let cfg: AppConfig = toml::from_str(toml_str)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    const MINIMAL: &str = r#"
+[source]
+url = "postgres://u:p@localhost/db"
+[target]
+url = "http://localhost:9200"
+[sync.users]
+table = "public.users"
+"#;
+
+    #[test]
+    fn minimal_config_defaults_to_postgres_and_opensearch() {
+        let cfg = parse(MINIMAL).expect("valid");
+        assert_eq!(cfg.source.flavor, "postgres");
+        assert_eq!(cfg.target.flavor, "opensearch");
+        assert_eq!(cfg.sync["users"].index_name("users"), "users");
+        assert!(cfg.metrics.enabled, "metrics must default to on");
+    }
+
+    #[test]
+    fn unknown_flavors_and_modes_are_rejected() {
+        assert!(parse(&MINIMAL.replace("[source]", "[source]\nflavor = \"mongodb\"")).is_err());
+        assert!(parse(&MINIMAL.replace("[target]", "[target]\nflavor = \"solr\"")).is_err());
+        assert!(parse(&MINIMAL.replace("[source]", "[source]\nmode = \"trigger\"")).is_err());
+        assert!(
+            parse(&MINIMAL.replace("[source]", "[source]\nflavor = \"mysql\"\nmode = \"poll\""))
+                .is_err(),
+            "poll mode is PostgreSQL-only"
+        );
+    }
+
+    #[test]
+    fn index_names_and_duplicates_are_validated() {
+        assert!(parse(&MINIMAL.replace("table = \"public.users\"", "table = \"users\"")).is_err());
+        assert!(parse(&format!("{MINIMAL}index = \"_bad\"\n")).is_err());
+        assert!(parse(&format!("{MINIMAL}index = \"Users\"\n")).is_err());
+        let duplicate = format!(
+            "{MINIMAL}index = \"same\"\n[sync.other]\ntable = \"public.other\"\nindex = \"same\"\n"
+        );
+        assert!(parse(&duplicate).is_err(), "two tables in one index");
+    }
+
+    #[test]
+    fn transforms_and_projections_are_checked() {
+        assert!(
+            parse(&format!(
+                "{MINIMAL}[sync.users.transform]\nemail = \"encrypt\"\n"
+            ))
+            .is_err(),
+            "unknown transform op"
+        );
+        assert!(
+            parse(&format!(
+                "{MINIMAL}columns = [\"id\"]\nexclude_columns = [\"x\"]\n"
+            ))
+            .is_err(),
+            "columns and exclude_columns are mutually exclusive"
+        );
+        assert!(
+            parse(&format!(
+                "{MINIMAL}primary_key = \"id\"\nexclude_columns = [\"id\"]\n"
+            ))
+            .is_err(),
+            "the key column cannot be excluded"
+        );
+    }
+
+    #[test]
+    fn plaintext_secrets_warn_but_resolve() {
+        let cfg = parse(MINIMAL).expect("valid");
+        let secrets = cfg.resolve_secrets().expect("resolved");
+        assert_eq!(secrets.source_url, "postgres://u:p@localhost/db");
+        assert_eq!(secrets.warnings.len(), 1, "plain-text url must warn");
+    }
+
+    #[test]
+    fn missing_env_var_is_a_clear_error() {
+        let cfg = parse(&MINIMAL.replace(
+            "url = \"postgres://u:p@localhost/db\"",
+            "url_env = \"PG2OSYNC_TEST_MISSING_VAR\"",
+        ))
+        .expect("valid");
+        let err = cfg.resolve_secrets().expect_err("must fail");
+        assert!(err.to_string().contains("PG2OSYNC_TEST_MISSING_VAR"));
+    }
 }

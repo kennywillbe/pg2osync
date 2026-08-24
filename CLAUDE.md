@@ -1,28 +1,19 @@
 # CLAUDE.md
 
-Read and follow [AGENTS.md](AGENTS.md) — it is the canonical guide for all
-agents working on this repository. This file only highlights the rules Claude
-must never violate.
+[AGENTS.md](AGENTS.md) is the canonical guide for this repository — read it
+first. The rules below are the ones that must never be violated.
 
-## Critical rules (from AGENTS.md)
-
-1. **Planning phase:** no implementation code, no `cargo init`/scaffolding
-   unless explicitly requested. Design work happens in PLAN.md first.
-2. **Language:** everything (docs, comments, commits, PRs) in English.
-3. **Comments:** explain *why*, never *what*. No commented-out code, no
-   changelog comments, no bare TODOs (use issue references).
-4. **SOLID + YAGNI, strictly:** new targets extend via traits; build only what
-   the current milestone needs.
-5. **Architecture invariants** (PLAN.md §9): replication transport via
-   `pgwire-replication` behind our own trait, pgoutput decoding in-house (no CDC
-   framework), Engine → `Sink` trait → OpenSearch impl, engine is source-agnostic
-   (knows only `core::ChangeEvent`), at-least-once delivery with idempotent
-   writes, no partial transactions to sinks, checkpoint state inside OpenSearch.
-6. Contradicting a recorded decision is a bug: update the Decision Record first,
-   then the code.
-
-## Quick orientation
-
-- Project plan, milestones, decisions: [PLAN.md](PLAN.md)
-- Current status: planning phase — see PLAN.md §9 "Open decisions" for what
-  must be settled before any code is written.
+1. **Architecture invariants** (AGENTS.md): source-agnostic engine, decoding
+   inside its source crate, sinks behind the `Sink` trait, at-least-once with
+   idempotent writes, no partial transactions, no acknowledgement before the
+   checkpoint is durable, checkpoint state in the target.
+2. **Comments explain why, never what.** No commented-out code, no changelog
+   comments, no bare `TODO`s.
+3. **SOLID + YAGNI:** extend through existing traits; build only what the
+   current change requires.
+4. **English** for code, comments, commits and documentation.
+5. Contradicting [docs/decisions.md](docs/decisions.md) is a bug: update the
+   decision record first, then the code.
+6. Before calling a change done: `cargo fmt --all`,
+   `cargo clippy --workspace --all-targets -- -D warnings`,
+   `cargo test --workspace`, and `./dev/e2e-test.sh` when the pipeline changed.

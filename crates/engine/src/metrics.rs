@@ -15,8 +15,10 @@ pub struct Metrics {
     pub reconnects_total: AtomicU64,
     /// end-to-end latency samples in ms (commit -> indexed), capped ring
     pub latencies_ms: Mutex<Vec<u64>>,
-    pub lsn_current: Mutex<Option<u64>>,
-    pub lsn_confirmed: Mutex<Option<u64>>,
+    /// Highest position token seen from the source (WAL LSN / binlog offset).
+    pub position_current: AtomicU64,
+    /// Highest position token whose checkpoint is durably persisted.
+    pub position_confirmed: AtomicU64,
 }
 
 pub type SharedMetrics = Arc<Metrics>;
@@ -29,6 +31,14 @@ impl Metrics {
             .entry(kind.to_string())
             .or_insert_with(|| AtomicU64::new(0))
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn set_current_position(&self, token: u64) {
+        self.position_current.store(token, Ordering::Relaxed);
+    }
+
+    pub fn set_confirmed_position(&self, token: u64) {
+        self.position_confirmed.store(token, Ordering::Relaxed);
     }
 
     pub fn record_latency(&self, ms: u64) {
@@ -57,8 +67,12 @@ impl Metrics {
                 )
             })
             .collect();
-        out.push_str(&events.join("\n"));
-        out.push('\n');
+        if !events.is_empty() {
+            out.push_str("# HELP pg2osync_events_total Change events received from the source\n");
+            out.push_str("# TYPE pg2osync_events_total counter\n");
+            out.push_str(&events.join("\n"));
+            out.push('\n');
+        }
         push(
             &mut out,
             "pg2osync_batches_flushed",
@@ -85,29 +99,42 @@ impl Metrics {
             let mut sorted = lat.clone();
             sorted.sort_unstable();
             let q = |p: usize| sorted[(p * (sorted.len() - 1)) / 100];
-            push(
-                &mut out,
-                "pg2osync_latency_ms",
-                "End-to-end sync latency (commit->indexed)",
-                "summary",
-                format!(
-                    "{{quantile=\"0.5\"}} {} {{quantile=\"0.9\"}} {} {{quantile=\"0.99\"}} {}",
-                    q(50),
-                    q(90),
-                    q(99)
-                ),
-            );
+            // one line per quantile: a summary with several quantiles on a
+            // single line is not valid exposition format
+            out.push_str("# HELP pg2osync_latency_ms End-to-end sync latency (commit->indexed)\n");
+            out.push_str("# TYPE pg2osync_latency_ms summary\n");
+            for p in [50usize, 90, 99] {
+                out.push_str(&format!(
+                    "pg2osync_latency_ms{{quantile=\"0.{p}\"}} {}\n",
+                    q(p)
+                ));
+            }
+            out.push_str(&format!("pg2osync_latency_ms_count {}\n", sorted.len()));
         }
         drop(lat);
-        if let Some(l) = self.lsn_confirmed.lock().unwrap().as_ref() {
-            push(
-                &mut out,
-                "pg2osync_lsn_confirmed",
-                "Highest durably indexed LSN",
-                "gauge",
-                l.to_string(),
-            );
-        }
+        let current = self.position_current.load(Ordering::Relaxed);
+        let confirmed = self.position_confirmed.load(Ordering::Relaxed);
+        push(
+            &mut out,
+            "pg2osync_position_current",
+            "Highest source position token received (WAL LSN or binlog offset)",
+            "gauge",
+            current.to_string(),
+        );
+        push(
+            &mut out,
+            "pg2osync_position_confirmed",
+            "Highest source position token durably checkpointed",
+            "gauge",
+            confirmed.to_string(),
+        );
+        push(
+            &mut out,
+            "pg2osync_position_lag",
+            "Position tokens received but not yet checkpointed",
+            "gauge",
+            current.saturating_sub(confirmed).to_string(),
+        );
         out
     }
 }

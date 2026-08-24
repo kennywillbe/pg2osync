@@ -2,7 +2,10 @@
 name = "pg2osync-sink"
 version = "0.6.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "OpenSearch, Elasticsearch and Meilisearch sinks for pg2osync"
 
 [dependencies]
 pg2osync-core = { path = "../core" }
