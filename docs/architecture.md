@@ -86,6 +86,10 @@ which is what a restart parses to resume.
 - **Ordering** is guaranteed per row. Across tables there is none, as with any
   CDC system without global serialization.
 - **TRUNCATE** clears the target index, ordered against pending writes.
+- **A changed primary key is a move**: the document is written at its new
+  identity and the old one is deleted, in that order. A crash between the two
+  leaves a duplicate that the replay repairs, where the reverse order would
+  leave a document nothing ever collects.
 
 ## Crash safety
 
