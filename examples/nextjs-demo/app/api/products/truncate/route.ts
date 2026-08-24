@@ -9,7 +9,9 @@ import { measurePropagation } from "@/lib/propagation";
 // TRUNCATE event itself and clears the target index to match.
 export async function POST() {
   const before = await countProducts();
-  await pool.query("TRUNCATE TABLE demo_products RESTART IDENTITY");
+  // demo_references references demo_products, so PostgreSQL refuses to
+  // truncate the parent alone; both go in one statement, one WAL record.
+  await pool.query("TRUNCATE TABLE demo_products, demo_reviews RESTART IDENTITY");
 
   const propagation = await measurePropagation(async () => {
     const count = await countProducts();

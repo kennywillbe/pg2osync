@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { pool } from "@/lib/db";
+import { listProducts, listReviews, pool } from "@/lib/db";
 import { getProductDoc, refreshIndex } from "@/lib/opensearch";
 import { measurePropagation } from "@/lib/propagation";
 
@@ -8,10 +8,8 @@ import { measurePropagation } from "@/lib/propagation";
 // it never issues that write itself.
 
 export async function GET() {
-  const { rows } = await pool.query(
-    "SELECT id, name, description, price, tags, updated_at FROM demo_products ORDER BY id",
-  );
-  return NextResponse.json({ products: rows });
+  const [products, reviews] = await Promise.all([listProducts(), listReviews()]);
+  return NextResponse.json({ products, reviews });
 }
 
 export async function POST(req: NextRequest) {
@@ -23,12 +21,16 @@ export async function POST(req: NextRequest) {
   const description = String(body.description ?? "");
   const price = Number(body.price ?? 0);
   const tags = Array.isArray(body.tags) ? body.tags : [];
+  // Fields the sync config deliberately keeps out of or transforms inside
+  // OpenSearch; the document inspector is what makes that visible.
+  const internalNote = String(body.internalNote ?? "");
+  const supplierEmail = String(body.supplierEmail ?? "");
 
   const { rows } = await pool.query(
-    `INSERT INTO demo_products (name, description, price, tags)
-     VALUES ($1, $2, $3, $4::jsonb)
+    `INSERT INTO demo_products (name, description, price, tags, internal_note, supplier_email)
+     VALUES ($1, $2, $3, $4::jsonb, $5, $6)
      RETURNING id, name, description, price, tags, updated_at`,
-    [name, description, price, JSON.stringify(tags)],
+    [name, description, price, JSON.stringify(tags), internalNote, supplierEmail],
   );
   const product = rows[0];
 

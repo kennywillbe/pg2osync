@@ -7,7 +7,11 @@ export const DEMO_INDEX = process.env.DEMO_OS_INDEX ?? "demo_products";
 export type SearchResult = {
   indexExists: boolean;
   total: number;
-  hits: Array<{ id: string; source: Record<string, unknown> }>;
+  hits: Array<{
+    id: string;
+    source: Record<string, unknown>;
+    highlight?: Record<string, string[]>;
+  }>;
 };
 
 async function indexExists(index: string): Promise<boolean> {
@@ -35,6 +39,11 @@ export async function searchProducts(query: string): Promise<SearchResult> {
             fuzziness: "AUTO",
           },
         },
+        // Highlights show *why* a hit matched, which makes the fuzziness
+        // visible: searching "keybaord" still lights up "keyboard".
+        highlight: {
+          fields: { name: {}, description: {}, tags: {} },
+        },
       }
     : { query: { match_all: {} } };
 
@@ -55,9 +64,10 @@ export async function searchProducts(query: string): Promise<SearchResult> {
   return {
     indexExists: true,
     total: json.hits?.total?.value ?? 0,
-    hits: (json.hits?.hits ?? []).map((h: { _id: string; _source: Record<string, unknown> }) => ({
+    hits: (json.hits?.hits ?? []).map((h: { _id: string; _source: Record<string, unknown>; highlight?: Record<string, string[]> }) => ({
       id: h._id,
       source: h._source,
+      highlight: h.highlight,
     })),
   };
 }

@@ -13,6 +13,10 @@ url_env = "PG2OSYNC_SOURCE_URL"     # postgres://user:pass@host:5432/db
 # sslrootcert = "/etc/ssl/certs/rds-ca.pem"
 slot_name = "pg2osync"
 publication = "pg2osync_pub"
+# A broken stream is retried in process with backoff; after this many
+# consecutive failures the process exits and the supervisor takes over.
+# reconnect_max = 10
+# reconnect_backoff_ms = 1000
 # admin_url_env = "PG2OSYNC_ADMIN_URL"   # separate user for catalog queries
 
 # MySQL only:

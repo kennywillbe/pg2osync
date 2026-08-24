@@ -52,6 +52,12 @@ pub struct SourceConfig {
     /// Nested-child queries use a dedicated connection; defaults to url.
     #[serde(default)]
     pub admin_url_env: Option<String>,
+    /// Consecutive stream failures tolerated before the process gives up and
+    /// hands over to whatever supervises it. Zero exits on the first failure.
+    #[serde(default = "default_reconnect_max")]
+    pub reconnect_max: u32,
+    #[serde(default = "default_reconnect_backoff")]
+    pub reconnect_backoff_ms: u64,
     #[serde(default = "default_slot_name")]
     pub slot_name: String,
     #[serde(default = "default_publication")]
@@ -80,6 +86,14 @@ fn default_flavor() -> String {
 
 fn default_server_id() -> u32 {
     424242
+}
+
+fn default_reconnect_max() -> u32 {
+    10
+}
+
+fn default_reconnect_backoff() -> u64 {
+    1000
 }
 
 fn default_slot_name() -> String {
@@ -364,6 +378,15 @@ impl AppConfig {
             self.source.sslmode.as_deref(),
             self.source.sslrootcert.as_deref(),
         )
+    }
+}
+
+impl SourceConfig {
+    pub fn reconnect_policy(&self) -> pg2osync_source::reconnect::ReconnectPolicy {
+        pg2osync_source::reconnect::ReconnectPolicy {
+            max_attempts: self.reconnect_max,
+            base_backoff_ms: self.reconnect_backoff_ms.max(1),
+        }
     }
 }
 

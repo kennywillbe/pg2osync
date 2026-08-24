@@ -13,6 +13,9 @@ pub struct Metrics {
     pub batches_flushed: AtomicU64,
     pub sink_errors_total: AtomicU64,
     pub reconnects_total: AtomicU64,
+    /// 1 while the source is streaming, 0 while it is being retried. The
+    /// counter says how often it broke; this says whether it is broken now.
+    pub source_connected: AtomicU64,
     /// end-to-end latency samples in ms (commit -> indexed), capped ring
     pub latencies_ms: Mutex<Vec<u64>>,
     /// Highest position token seen from the source (WAL LSN / binlog offset).
@@ -31,6 +34,11 @@ impl Metrics {
             .entry(kind.to_string())
             .or_insert_with(|| AtomicU64::new(0))
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn set_source_connected(&self, connected: bool) {
+        self.source_connected
+            .store(u64::from(connected), Ordering::Relaxed);
     }
 
     pub fn set_current_position(&self, token: u64) {
@@ -93,6 +101,13 @@ impl Metrics {
             "Source reconnect attempts",
             "counter",
             self.reconnects_total.load(Ordering::Relaxed).to_string(),
+        );
+        push(
+            &mut out,
+            "pg2osync_source_connected",
+            "1 while the source is streaming, 0 while reconnecting",
+            "gauge",
+            self.source_connected.load(Ordering::Relaxed).to_string(),
         );
         let lat = self.latencies_ms.lock().unwrap();
         if !lat.is_empty() {

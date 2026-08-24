@@ -11,9 +11,12 @@ use pg2osync_core::sink::{IndexSpec, Sink};
 use pg2osync_engine::mapping::{
     DurableLsn, Projection, Projections, TableMapping, TransformOp, Transforms,
 };
+use pg2osync_engine::metrics::SharedMetrics;
 use pg2osync_engine::{PipelineCtx, PositionRenderer};
+use pg2osync_source::reconnect::ReconnectPolicy;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tokio::sync::{mpsc, watch};
 
 use crate::backfill::split_qualified;
@@ -167,14 +170,24 @@ fn transforms(cfg: &AppConfig) -> Result<Transforms> {
     Ok(Transforms::from_pairs(pairs))
 }
 
-/// Build the engine context and start the metrics endpoint.
-fn pipeline_ctx(cfg: &AppConfig, sink: Arc<dyn Sink>) -> Result<Arc<PipelineCtx>> {
+/// Metrics outlive any one attempt: they are created once and the endpoint is
+/// served once, so a reconnect does not reset every counter or re-bind the port.
+fn start_metrics(cfg: &AppConfig) -> SharedMetrics {
     let metrics = Arc::new(pg2osync_engine::metrics::Metrics::default());
     if cfg.metrics.enabled {
         let bind = cfg.metrics.bind.clone();
         let m = metrics.clone();
         tokio::spawn(async move { pg2osync_engine::metrics::serve(&bind, m).await });
     }
+    metrics
+}
+
+/// Build the engine context for one attempt.
+fn pipeline_ctx(
+    cfg: &AppConfig,
+    sink: Arc<dyn Sink>,
+    metrics: SharedMetrics,
+) -> Result<Arc<PipelineCtx>> {
     let (ack_tx, _ack_rx) = watch::channel(None);
     Ok(Arc::new(PipelineCtx {
         sink,
@@ -185,6 +198,72 @@ fn pipeline_ctx(cfg: &AppConfig, sink: Arc<dyn Sink>) -> Result<Arc<PipelineCtx>
         ack_tx,
         metrics,
     }))
+}
+
+/// How one streaming attempt ended.
+enum AttemptEnd {
+    /// The shutdown signal fired; nothing to retry.
+    Shutdown,
+    /// The stream stopped on its own. Streaming for `streamed_for` first is
+    /// what separates a healthy connection that dropped from a crash loop.
+    Ended { streamed_for: std::time::Duration },
+}
+
+/// Run attempts until one shuts down cleanly or the policy gives up.
+///
+/// Every attempt rebuilds the channels and the engine task from scratch. That
+/// is deliberate rather than wasteful: a partially buffered transaction is
+/// invalid once the stream repositions, and tearing the pipeline down is what
+/// discards it.
+async fn stream_with_reconnect<A, F>(
+    policy: ReconnectPolicy,
+    metrics: SharedMetrics,
+    shutdown: &watch::Receiver<bool>,
+    mut attempt: A,
+) -> Result<()>
+where
+    A: FnMut() -> F,
+    F: std::future::Future<Output = Result<AttemptEnd>>,
+{
+    let mut failures = 0u32;
+    loop {
+        metrics.set_source_connected(true);
+        let outcome = attempt().await;
+        metrics.set_source_connected(false);
+
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+
+        let (error, streamed_for) = match outcome {
+            Ok(AttemptEnd::Shutdown) => return Ok(()),
+            // the source returning without an error, while nobody asked it to
+            // stop, still means the stream is gone
+            Ok(AttemptEnd::Ended { streamed_for }) => (
+                anyhow::anyhow!("the source closed the stream"),
+                streamed_for,
+            ),
+            Err(e) => (e, std::time::Duration::ZERO),
+        };
+
+        if policy.attempt_recovered(streamed_for) {
+            failures = 0;
+        }
+        if !policy.should_retry(failures) {
+            return Err(error.context(format!(
+                "giving up after {} consecutive source failures",
+                failures + 1
+            )));
+        }
+
+        let delay = policy.delay_for(failures);
+        failures += 1;
+        metrics.reconnects_total.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(target: "pg2osync::run",
+            "source stream failed ({error:#}); reconnecting in {:.1}s (attempt {failures})",
+            delay.as_secs_f64());
+        tokio::time::sleep(delay).await;
+    }
 }
 
 /// A stored checkpoint is only usable when it belongs to this exact stream.
@@ -267,6 +346,57 @@ async fn run_postgres(
         publication: cfg.source.publication.clone(),
     };
     let render: PositionRenderer = Arc::new(|token| Lsn(token).to_string());
+    let metrics = start_metrics(&cfg);
+
+    stream_with_reconnect(
+        cfg.source.reconnect_policy(),
+        metrics.clone(),
+        &shutdown_rx,
+        || {
+            attempt_postgres(
+                &cfg,
+                &source_url,
+                &admin_url,
+                &admin,
+                &tls,
+                &children,
+                &src_cfg,
+                sink.clone(),
+                metrics.clone(),
+                stream_id.clone(),
+                render.clone(),
+                durable.clone(),
+                shutdown_rx.clone(),
+                polling,
+            )
+        },
+    )
+    .await
+}
+
+/// One PostgreSQL streaming attempt: decide where to resume, build the
+/// pipeline, load if needed, stream until it stops.
+///
+/// The checkpoint is read here rather than once at startup, so a reconnect
+/// resumes from wherever the last attempt actually got to.
+#[allow(clippy::too_many_arguments)]
+async fn attempt_postgres(
+    cfg: &AppConfig,
+    source_url: &str,
+    admin_url: &str,
+    admin: &tokio_postgres::Client,
+    tls: &pg2osync_source::tls::TlsSettings,
+    children: &HashMap<(String, String), Vec<pg2osync_source::children::ChildSpec>>,
+    src_cfg: &pg2osync_source::runner::WalSourceConfig,
+    sink: Arc<dyn Sink>,
+    metrics: SharedMetrics,
+    stream_id: StreamId,
+    render: PositionRenderer,
+    durable: DurableLsn,
+    shutdown_rx: watch::Receiver<bool>,
+    polling: bool,
+) -> Result<AttemptEnd> {
+    use pg2osync_source::runner::WalSource;
 
     // Poll mode has no source position to resume from, so a leftover WAL
     // checkpoint would skip rows changed while the process was down.
@@ -278,7 +408,7 @@ async fn run_postgres(
     let mut resume_from = stored.map(|c| Lsn(c.token));
     if !polling {
         let slot_lsn =
-            pg2osync_source::catalog::confirmed_flush_lsn(&admin, &cfg.source.slot_name).await?;
+            pg2osync_source::catalog::confirmed_flush_lsn(admin, &cfg.source.slot_name).await?;
         // A checkpoint behind the slot's replay position is unusable: streaming
         // resumes at the slot position, so the gap between them would be lost.
         if let (Some(cp), Some(slot)) = (resume_from, slot_lsn)
@@ -298,7 +428,7 @@ async fn run_postgres(
     }
 
     let (events_tx, events_rx) = mpsc::channel::<ChangeEvent>(EVENT_CHANNEL_DEPTH);
-    let ctx = pipeline_ctx(&cfg, sink)?;
+    let ctx = pipeline_ctx(cfg, sink, metrics)?;
     let engine = spawn_engine(
         events_rx,
         ctx,
@@ -309,22 +439,31 @@ async fn run_postgres(
     );
 
     if resume_from.is_none() {
-        crate::backfill::run(&cfg, &admin_url, &tls, &admin, &children, events_tx.clone()).await?;
+        crate::backfill::run(cfg, admin_url, tls, admin, children, events_tx.clone()).await?;
     }
 
+    let started = std::time::Instant::now();
     let result = if polling {
         let mut poll =
-            pg2osync_source::poll::PollSource::new(poll_config(&cfg, &source_url, tls.clone())?);
-        poll.stream(events_tx, shutdown_rx).await
+            pg2osync_source::poll::PollSource::new(poll_config(cfg, source_url, tls.clone())?);
+        poll.stream(events_tx, shutdown_rx.clone()).await
     } else {
-        let mut source = WalSource::new(src_cfg);
-        source.stream(events_tx, shutdown_rx).await
+        let mut source = WalSource::new(src_cfg.clone());
+        source.stream(events_tx, shutdown_rx.clone()).await
     };
+    // dropping the sender above is what lets the engine drain and exit
     let _ = engine.await;
-    result
+    result?;
+
+    Ok(if *shutdown_rx.borrow() {
+        AttemptEnd::Shutdown
+    } else {
+        AttemptEnd::Ended {
+            streamed_for: started.elapsed(),
+        }
+    })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn wal_config(
     cfg: &AppConfig,
     source_url: &str,
@@ -454,7 +593,6 @@ async fn run_mysql(
     durable: DurableLsn,
     mode: Mode,
 ) -> Result<()> {
-    use pg2osync_source_mysql::catalog as mysql_catalog;
     use pg2osync_source_mysql::runner::MySqlSource;
 
     if cfg.sync.values().any(|t| !t.children.is_empty()) {
@@ -476,6 +614,47 @@ async fn run_mysql(
         stream: cfg.source.server_id.to_string(),
         publication: String::new(),
     };
+    let metrics = start_metrics(&cfg);
+
+    stream_with_reconnect(
+        cfg.source.reconnect_policy(),
+        metrics.clone(),
+        &shutdown_rx,
+        || {
+            attempt_mysql(
+                &cfg,
+                &source_url,
+                sink.clone(),
+                metrics.clone(),
+                stream_id.clone(),
+                durable.clone(),
+                shutdown_rx.clone(),
+            )
+        },
+    )
+    .await
+}
+
+/// One MySQL streaming attempt.
+///
+/// Each attempt opens its own administrative connection: whatever broke the
+/// binlog stream — a restart, a failover, a killed thread — usually took that
+/// connection with it.
+async fn attempt_mysql(
+    cfg: &AppConfig,
+    source_url: &str,
+    sink: Arc<dyn Sink>,
+    metrics: SharedMetrics,
+    stream_id: StreamId,
+    durable: DurableLsn,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<AttemptEnd> {
+    use pg2osync_source_mysql::catalog as mysql_catalog;
+    use pg2osync_source_mysql::runner::MySqlSource;
+
+    let source = MySqlSource::new(mysql_config(cfg, source_url)?);
+    let mut admin = source.admin_connection().await?;
+
     let stored = usable_checkpoint(sink.read_checkpoint().await?, &stream_id);
     let resume = stored.and_then(|c| mysql_catalog::parse_position(&c.position));
     let (file_prefix, _) = match &resume {
@@ -493,7 +672,7 @@ async fn run_mysql(
     };
 
     let (events_tx, events_rx) = mpsc::channel::<ChangeEvent>(EVENT_CHANNEL_DEPTH);
-    let ctx = pipeline_ctx(&cfg, sink)?;
+    let ctx = pipeline_ctx(cfg, sink, metrics)?;
     let engine = spawn_engine(
         events_rx,
         ctx,
@@ -503,7 +682,7 @@ async fn run_mysql(
         shutdown_rx.clone(),
     );
 
-    let mut src_cfg = mysql_config(&cfg, &source_url)?;
+    let mut src_cfg = mysql_config(cfg, source_url)?;
     match resume {
         Some((file, pos)) => {
             tracing::info!(target: "pg2osync::run", "resuming binlog from {file}@{pos}");
@@ -520,10 +699,19 @@ async fn run_mysql(
         }
     }
 
+    let started = std::time::Instant::now();
     let mut streaming = MySqlSource::new(src_cfg);
-    let result = streaming.stream(events_tx, shutdown_rx).await;
+    let result = streaming.stream(events_tx, shutdown_rx.clone()).await;
     let _ = engine.await;
-    result
+    result?;
+
+    Ok(if *shutdown_rx.borrow() {
+        AttemptEnd::Shutdown
+    } else {
+        AttemptEnd::Ended {
+            streamed_for: started.elapsed(),
+        }
+    })
 }
 
 fn mysql_config(

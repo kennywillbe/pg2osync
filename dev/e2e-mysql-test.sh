@@ -123,7 +123,26 @@ else
   bad "binlog position malformed ($position)"
 fi
 
-say "6. crash recovery resumes from the binlog position"
+say "6. reconnects after the server kills the dump thread"
+before_pid=$(pgrep -f "pg2osync run" | head -1)
+# information_schema.PROCESSLIST rather than performance_schema.threads:
+# MariaDB ships with performance_schema disabled, so the latter finds nothing
+# and the kill silently becomes a no-op
+dump_id=$(my "SELECT ID FROM information_schema.PROCESSLIST WHERE COMMAND LIKE 'Binlog Dump%' LIMIT 1;")
+if [ -z "$dump_id" ]; then
+  bad "no Binlog Dump connection found to kill"
+else
+  my "KILL ${dump_id};" || true
+fi
+my "INSERT INTO shop_users (id,name,email) VALUES (9,'written-while-disconnected','w@test.io');"
+sleep 8; refresh
+check "same process recovered" "$(pgrep -f "pg2osync run" | head -1)" "$before_pid"
+check "row written while disconnected arrived" "$(os_field e2e_mysql_users 9 name)" "written-while-disconnected"
+metrics=$(curl -s http://127.0.0.1:9112/metrics)
+reconnects=$(awk '$1 == "pg2osync_reconnects_total" {print $2}' <<< "$metrics")
+if [ "${reconnects:-0}" -ge 1 ]; then ok "reconnects_total counted it ($reconnects)"; else bad "reconnects_total still zero"; fi
+
+say "7. crash recovery resumes from the binlog position"
 pkill -9 -f "pg2osync run"; sleep 1
 my "INSERT INTO shop_users (id,name,email) VALUES (5,'eve-during-downtime','eve@test.io');"
 start_sync
@@ -131,10 +150,10 @@ sleep 6; refresh
 check "row written while down is recovered" "$(os_field e2e_mysql_users 5 name)" "eve-during-downtime"
 check "no full re-snapshot needed" "$(grep -c 'snapshot of' "$LOG")" "0"
 
-say "7. final consistency"
+say "8. final consistency"
 check "row counts match" "$(my 'SELECT count(*) FROM shop_users;')" "$(os_count e2e_mysql_users)"
 
-say "8. status"
+say "9. status"
 $BIN status -c "$CONFIG" | sed 's/^/    /'
 
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"

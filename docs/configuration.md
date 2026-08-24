@@ -34,6 +34,8 @@ startup. Secrets never appear in logs or error messages.
 | `sslmode` | from the URL, else `prefer` | `disable`, `prefer`, `require`, `verify-ca`, `verify-full` |
 | `sslrootcert` | — | PEM bundle of trusted roots for the verifying modes |
 | `admin_url_env` | falls back to the source URL | Separate connection for catalog and nested-child queries |
+| `reconnect_max` | `10` | Consecutive stream failures tolerated before exiting; `0` exits on the first |
+| `reconnect_backoff_ms` | `1000` | Initial reconnect delay, doubled per failure, capped at 30 s |
 | `slot_name` | `"pg2osync"` | PostgreSQL replication slot |
 | `publication` | `"pg2osync_pub"` | PostgreSQL publication |
 | `server_id` | `424242` | MySQL: replica id, unique across the server's replicas |
