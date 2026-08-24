@@ -121,6 +121,7 @@ async fn validate_postgres(cfg: &config::AppConfig, source_url: &str) -> Result<
         pg2osync_source::catalog::check_wal_level(&client).await?;
         println!("✓ wal_level = logical");
     }
+    let mut tables: Vec<String> = Vec::new();
     for table in cfg.sync.values() {
         let exists = client
             .query_opt(
@@ -132,8 +133,76 @@ async fn validate_postgres(cfg: &config::AppConfig, source_url: &str) -> Result<
             bail!("table {} does not exist", table.table);
         }
         println!("✓ table {} exists", table.table);
+        tables.push(table.table.clone());
+        for child in &table.children {
+            tables.push(child.table.clone());
+        }
+    }
+
+    if cfg.source.mode == "wal" {
+        report_privileges(&client, cfg, &tables).await?;
     }
     Ok(())
+}
+
+/// Report whether this role can actually run the pipeline.
+///
+/// Reading tables is not enough: PostgreSQL requires table *ownership* to
+/// publish a table and the `REPLICATION` attribute to create a slot. Finding
+/// that out during `run` wastes a maintenance window, so it is checked here.
+async fn report_privileges(
+    client: &tokio_postgres::Client,
+    cfg: &config::AppConfig,
+    tables: &[String],
+) -> Result<()> {
+    let pre = pg2osync_source::catalog::preflight(
+        client,
+        &cfg.source.publication,
+        &cfg.source.slot_name,
+        tables,
+    )
+    .await?;
+
+    if !pre.tables_not_readable.is_empty() {
+        bail!(
+            "no SELECT privilege on {:?}; the initial load cannot read them",
+            pre.tables_not_readable
+        );
+    }
+    if pre.publication_exists {
+        println!("✓ publication {} exists", cfg.source.publication);
+    }
+    if pre.slot_exists {
+        println!("✓ replication slot {} exists", cfg.source.slot_name);
+    }
+    if pre.can_bootstrap() {
+        if !pre.publication_exists || !pre.slot_exists {
+            println!("✓ privileges sufficient to create the missing objects");
+        }
+        return Ok(());
+    }
+
+    println!("\n✗ this role cannot create what is missing:");
+    if !pre.publication_exists {
+        if !pre.can_create_in_database {
+            println!("  - CREATE on the database is required to create a publication");
+        }
+        if !pre.tables_not_owned.is_empty() {
+            println!(
+                "  - publishing a table requires owning it; not owned: {:?}",
+                pre.tables_not_owned
+            );
+        }
+    }
+    if !pre.slot_exists && !pre.can_replicate {
+        println!("  - the REPLICATION attribute is required to create a slot");
+    }
+    println!("\nAsk a privileged role to run this once, then re-run validate:\n");
+    for statement in pre.setup_sql(&cfg.source.publication, &cfg.source.slot_name, tables) {
+        println!("  {statement}");
+    }
+    println!();
+    bail!("insufficient privileges to bootstrap; see the statements above")
 }
 
 async fn validate_mysql(cfg: &config::AppConfig, source_url: &str) -> Result<()> {

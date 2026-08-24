@@ -14,8 +14,17 @@ for real-time change capture with a consistent-snapshot backfill.
 
 ```sql
 CREATE USER sync_user WITH REPLICATION PASSWORD '...';
+GRANT CONNECT ON DATABASE appdb TO sync_user;
+GRANT USAGE ON SCHEMA public TO sync_user;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO sync_user;
 ```
+
+Creating the publication additionally requires `CREATE` on the database and
+**ownership of every published table** — a PostgreSQL restriction that a grant
+cannot work around. If the tables belong to someone else, have a privileged role
+create the publication and slot once; `pg2osync validate` prints the exact
+statements. See [database impact](../database-impact.md) for the full privilege
+matrix and what the tool costs the server.
 
 Verify readiness:
 
