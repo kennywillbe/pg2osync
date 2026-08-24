@@ -31,6 +31,7 @@ pub struct PollSourceConfig {
     pub url: String,
     pub tables: Vec<PollTable>,
     pub interval_secs: u64,
+    pub tls: crate::tls::TlsSettings,
     /// Rows fetched per table per cycle; bounds memory and query time.
     pub page_size: i64,
 }
@@ -55,10 +56,7 @@ impl PollSource {
         tx: tokio::sync::mpsc::Sender<ChangeEvent>,
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<()> {
-        let (client, conn) = tokio_postgres::connect(&self.cfg.url, tokio_postgres::NoTls).await?;
-        tokio::spawn(async move {
-            let _ = conn.await;
-        });
+        let client = self.cfg.tls.connect(&self.cfg.url).await?;
 
         let mut watermarks: HashMap<String, String> = HashMap::new();
         for t in &self.cfg.tables {

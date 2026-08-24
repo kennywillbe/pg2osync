@@ -8,5 +8,6 @@ pub mod docbuild;
 pub mod pgoutput;
 pub mod poll;
 pub mod runner;
+pub mod tls;
 pub mod transport;
 pub mod typemap;

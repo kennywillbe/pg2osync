@@ -114,8 +114,11 @@ async fn validate(path: &Path) -> Result<()> {
 }
 
 async fn validate_postgres(cfg: &config::AppConfig, source_url: &str) -> Result<()> {
-    let client = connect_pg(source_url).await?;
-    println!("✓ connected to PostgreSQL");
+    let client = connect_pg(cfg, source_url).await?;
+    println!(
+        "✓ connected to PostgreSQL (sslmode={})",
+        cfg.tls_settings(source_url)?.mode.as_str()
+    );
 
     if cfg.source.mode == "wal" {
         pg2osync_source::catalog::check_wal_level(&client).await?;
@@ -248,7 +251,7 @@ async fn status(path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let client = connect_pg(&secrets.source_url).await?;
+    let client = connect_pg(&cfg, &secrets.source_url).await?;
     match client
         .query_opt(
             "SELECT active, confirmed_flush_lsn::text, \
@@ -276,21 +279,16 @@ async fn drop_slot(path: &Path) -> Result<()> {
         bail!("drop-slot is PostgreSQL-only; MySQL keeps no server-side state for us");
     }
     let secrets = cfg.resolve_secrets()?;
-    let client = connect_pg(&secrets.source_url).await?;
+    let client = connect_pg(&cfg, &secrets.source_url).await?;
     pg2osync_source::catalog::drop_slot(&client, &cfg.source.slot_name).await?;
     pg2osync_source::catalog::drop_publication(&client, &cfg.source.publication).await
 }
 
-async fn connect_pg(source_url: &str) -> Result<tokio_postgres::Client> {
-    let (client, conn) = tokio_postgres::connect(source_url, tokio_postgres::NoTls)
+async fn connect_pg(cfg: &config::AppConfig, source_url: &str) -> Result<tokio_postgres::Client> {
+    cfg.tls_settings(source_url)?
+        .connect(source_url)
         .await
-        .context("cannot connect to source PostgreSQL")?;
-    tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            tracing::debug!(target: "pg2osync", "source connection closed: {e}");
-        }
-    });
-    Ok(client)
+        .context("cannot connect to source PostgreSQL")
 }
 
 fn mysql_source(

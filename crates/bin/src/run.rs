@@ -216,12 +216,12 @@ async fn run_postgres(
     use pg2osync_source::runner::{WalSource, WalSourceConfig};
 
     let polling = cfg.source.mode == "poll";
-    let (admin, admin_conn) = tokio_postgres::connect(&admin_url, tokio_postgres::NoTls)
+    let tls = cfg.tls_settings(&source_url)?;
+    tracing::info!(target: "pg2osync::run", "source sslmode={}", tls.mode.as_str());
+    let admin = tls
+        .connect(&admin_url)
         .await
         .context("cannot connect to source PostgreSQL")?;
-    tokio::spawn(async move {
-        let _ = admin_conn.await;
-    });
 
     let children = child_specs(&cfg)?;
     let mut tables: Vec<String> = cfg.sync.values().map(|t| t.table.clone()).collect();
@@ -234,8 +234,15 @@ async fn run_postgres(
         }
     }
 
-    let src_cfg: WalSourceConfig =
-        wal_config(&cfg, &source_url, &admin_url, &tables, &children, &durable)?;
+    let src_cfg: WalSourceConfig = wal_config(
+        &cfg,
+        &source_url,
+        &admin_url,
+        &tables,
+        &children,
+        &durable,
+        &tls,
+    )?;
     let source = WalSource::new(src_cfg.clone());
 
     if !polling {
@@ -303,11 +310,12 @@ async fn run_postgres(
     );
 
     if resume_from.is_none() {
-        crate::backfill::run(&cfg, &admin_url, &admin, &children, events_tx.clone()).await?;
+        crate::backfill::run(&cfg, &admin_url, &tls, &admin, &children, events_tx.clone()).await?;
     }
 
     let result = if polling {
-        let mut poll = pg2osync_source::poll::PollSource::new(poll_config(&cfg, &source_url));
+        let mut poll =
+            pg2osync_source::poll::PollSource::new(poll_config(&cfg, &source_url, tls.clone())?);
         poll.stream(events_tx, shutdown_rx).await
     } else {
         let mut source = WalSource::new(src_cfg);
@@ -317,6 +325,7 @@ async fn run_postgres(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn wal_config(
     cfg: &AppConfig,
     source_url: &str,
@@ -324,6 +333,7 @@ fn wal_config(
     tables: &[String],
     children: &HashMap<(String, String), Vec<pg2osync_source::children::ChildSpec>>,
     durable: &DurableLsn,
+    tls: &pg2osync_source::tls::TlsSettings,
 ) -> Result<pg2osync_source::runner::WalSourceConfig> {
     let url = url::Url::parse(source_url).context("source url is not a valid URL")?;
     let mut child_parents = HashMap::new();
@@ -357,14 +367,19 @@ fn wal_config(
         // loses data on crash-restart.
         durable: Some(durable.0.clone()),
         admin_url: Some(admin_url.to_string()),
+        tls: tls.clone(),
         children: children.clone(),
         child_parents,
         parent_pk_columns,
     })
 }
 
-fn poll_config(cfg: &AppConfig, source_url: &str) -> pg2osync_source::poll::PollSourceConfig {
-    pg2osync_source::poll::PollSourceConfig {
+fn poll_config(
+    cfg: &AppConfig,
+    source_url: &str,
+    tls: pg2osync_source::tls::TlsSettings,
+) -> Result<pg2osync_source::poll::PollSourceConfig> {
+    Ok(pg2osync_source::poll::PollSourceConfig {
         url: source_url.to_string(),
         tables: cfg
             .sync
@@ -380,7 +395,8 @@ fn poll_config(cfg: &AppConfig, source_url: &str) -> pg2osync_source::poll::Poll
             .collect(),
         interval_secs: cfg.source.poll_interval_secs,
         page_size: cfg.source.poll_page_size,
-    }
+        tls,
+    })
 }
 
 fn child_specs(

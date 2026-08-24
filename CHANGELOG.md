@@ -8,6 +8,13 @@ pre-1.0, so breaking changes may land in any 0.x release.
 
 ### Added
 
+- TLS for every PostgreSQL connection, including the replication stream, via
+  `[source] sslmode` and `sslrootcert` with libpq semantics (`disable`,
+  `prefer`, `require`, `verify-ca`, `verify-full`). Connections were previously
+  always unencrypted, which made managed instances that require TLS unusable.
+  **The default is now `prefer` rather than plaintext**: a server offering TLS
+  gets an encrypted connection without any configuration change.
+
 - MySQL/MariaDB source wired into the CLI end to end: prerequisite checks,
   consistent-snapshot initial load, binlog streaming with real column names
   and primary keys, and resumable binlog checkpoints. Verified against

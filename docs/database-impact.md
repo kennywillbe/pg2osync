@@ -24,6 +24,10 @@ each per instance.
 MySQL is the same shape: one connection for `COM_BINLOG_DUMP` and one for
 `information_schema` lookups.
 
+All PostgreSQL connections share one TLS configuration (`[source] sslmode`), so
+a source cannot end up with an encrypted query connection and a plaintext
+replication stream.
+
 ## Privileges
 
 Two different things are needed, and they are usually held by different roles.
