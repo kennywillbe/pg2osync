@@ -23,12 +23,21 @@ pre-1.0, so breaking changes may land in any 0.x release.
   updates.
 - `batch_max_bytes` and `txn_buffer_cap_mb` are honoured; `retry_max` and
   `retry_backoff_ms` now configure the sinks' retry behaviour.
-- Kubernetes manifests, a published container image and deployment docs.
+- Helm chart, plain Kubernetes manifests, a container image and deployment docs.
+- `dev/benchmark.sh`: reproducible initial-load, latency and large-transaction
+  measurements; the README numbers come from it.
 - Prometheus gauges `pg2osync_position_current`, `pg2osync_position_confirmed`
   and `pg2osync_position_lag`.
 
 ### Fixed
 
+- **Checkpoints could stall indefinitely:** a commit whose rows had already
+  been handed to the sink — an empty transaction, or one whose row count was an
+  exact multiple of `batch_size` — advanced the in-memory position but was never
+  persisted. PostgreSQL then retained WAL until the next differently-shaped
+  transaction, and a restart replayed everything since the last persisted
+  position. Positions now travel through the sink queue, so they are recorded in
+  order and after the writes they follow.
 - **Data loss on crash-restart:** the acknowledgement sent to PostgreSQL was
   not clamped to the durable checkpoint, so the server could recycle WAL for
   rows that were not indexed yet.
@@ -53,8 +62,9 @@ pre-1.0, so breaking changes may land in any 0.x release.
 - `drop-slot` also drops the publication and is idempotent.
 - Retryable sink failures are classified by error type instead of by matching
   strings in messages.
-- The Prometheus latency summary is valid exposition format, and sink errors
-  are actually counted.
+- The Prometheus latency summary is valid exposition format, its quantile labels
+  are `0.5`/`0.9`/`0.99` rather than `0.50`/`0.90`, and sink errors are actually
+  counted.
 - A never-used replication slot with a NULL `confirmed_flush_lsn` no longer
   panics on startup.
 

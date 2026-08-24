@@ -16,7 +16,7 @@ use pg2osync_core::checkpoint::{Checkpoint, StreamId};
 use pg2osync_core::error::CoreError;
 use pg2osync_core::event::{ChangeEvent, RowKind, TransactionBoundary};
 use pg2osync_core::lsn::Lsn;
-use pg2osync_core::sink::{DocumentOp, LsnOp, Sink};
+use pg2osync_core::sink::{DocumentOp, LsnOp, Sink, SinkAck};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
@@ -100,6 +100,11 @@ impl DurableLsn {
 enum SinkCommand {
     Write(Vec<LsnOp>),
     Truncate(String),
+    /// A commit whose rows were already handed over — an empty transaction, or
+    /// one whose row count was an exact multiple of the batch size. The
+    /// position still has to be acknowledged, and it travels through this
+    /// channel so it lands *after* the writes it belongs behind.
+    Position(Lsn),
 }
 
 /// Renders an engine position token into the source's own textual form.
@@ -239,9 +244,10 @@ pub async fn run(
                     {
                         break Err(CoreError::Other("batch channel closed".into()));
                     }
-                } else if !backfill_boundary {
-                    // empty transaction still advances the safe position
-                    ctx.ack_tx.send_replace(Some(lsn));
+                } else if !backfill_boundary
+                    && batch_tx.send(SinkCommand::Position(lsn)).await.is_err()
+                {
+                    break Err(CoreError::Other("batch channel closed".into()));
                 }
             }
             ChangeEvent::Row(row) => {
@@ -321,8 +327,10 @@ async fn sink_loop(
     metrics: Arc<crate::metrics::Metrics>,
 ) {
     while let Some(command) = commands.recv().await {
+        let wrote = matches!(command, SinkCommand::Write(_));
         let result = match command {
             SinkCommand::Write(batch) => sink.write(batch).await.map(Some),
+            SinkCommand::Position(lsn) => Ok(Some(SinkAck { max_lsn: lsn })),
             SinkCommand::Truncate(index) => match sink.truncate_index(&index).await {
                 Ok(()) => {
                     tracing::info!(target: "pg2osync::sink",
@@ -334,7 +342,9 @@ async fn sink_loop(
         };
         match result {
             Ok(Some(ack)) => {
-                metrics.batches_flushed.fetch_add(1, Ordering::Relaxed);
+                if wrote {
+                    metrics.batches_flushed.fetch_add(1, Ordering::Relaxed);
+                }
                 // zero-position acks come from initial-load batches;
                 // acknowledging them would corrupt the source position chain
                 if ack.max_lsn.0 > 0 {
@@ -495,5 +505,240 @@ mod tests {
         assert!(cfg.batch_size > 0);
         assert!(cfg.checkpoint_interval_ms > 0);
         assert!(cfg.retry_max > 0);
+    }
+}
+
+#[cfg(test)]
+mod pipeline_tests {
+    use super::*;
+    use pg2osync_core::checkpoint::{SOURCE_POSTGRES, StreamId};
+    use pg2osync_core::event::{RowChange, RowKind};
+    use pg2osync_core::sink::{Health, IndexSpec};
+    use serde_json::json;
+    use std::sync::Mutex;
+
+    /// Records what the pipeline asks of a sink, so ordering and checkpoint
+    /// behaviour can be asserted without a live cluster.
+    #[derive(Default)]
+    struct RecordingSink {
+        events: Mutex<Vec<String>>,
+        checkpoints: Mutex<Vec<Checkpoint>>,
+    }
+
+    impl RecordingSink {
+        fn events(&self) -> Vec<String> {
+            self.events.lock().expect("not poisoned").clone()
+        }
+        fn last_checkpoint(&self) -> Option<Checkpoint> {
+            self.checkpoints
+                .lock()
+                .expect("not poisoned")
+                .last()
+                .cloned()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Sink for RecordingSink {
+        async fn ensure_ready(&self, _tables: &[IndexSpec]) -> Result<(), CoreError> {
+            Ok(())
+        }
+
+        async fn get_documents(
+            &self,
+            _index: &str,
+            ids: &[String],
+        ) -> Result<Vec<Option<Value>>, CoreError> {
+            Ok(vec![None; ids.len()])
+        }
+
+        async fn write(&self, batch: Vec<LsnOp>) -> Result<SinkAck, CoreError> {
+            let max_lsn = batch.last().expect("engine never sends empty batches").lsn;
+            self.events
+                .lock()
+                .expect("not poisoned")
+                .push(format!("write({})", batch.len()));
+            Ok(SinkAck { max_lsn })
+        }
+
+        async fn truncate_index(&self, index: &str) -> Result<(), CoreError> {
+            self.events
+                .lock()
+                .expect("not poisoned")
+                .push(format!("truncate({index})"));
+            Ok(())
+        }
+
+        async fn write_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), CoreError> {
+            self.checkpoints
+                .lock()
+                .expect("not poisoned")
+                .push(checkpoint.clone());
+            Ok(())
+        }
+
+        async fn read_checkpoint(&self) -> Result<Option<Checkpoint>, CoreError> {
+            Ok(self.last_checkpoint())
+        }
+
+        async fn health(&self) -> Result<Health, CoreError> {
+            Ok(Health::Up)
+        }
+    }
+
+    fn row(id: i64) -> ChangeEvent {
+        ChangeEvent::Row(RowChange {
+            schema: "public".into(),
+            table: "users".into(),
+            kind: RowKind::Insert {
+                pk: json!(id),
+                doc: json!({"id": id}),
+            },
+        })
+    }
+
+    fn commit(lsn: u64) -> ChangeEvent {
+        ChangeEvent::Transaction(TransactionBoundary::Commit {
+            lsn: Lsn(lsn),
+            commit_ts_micros: 0,
+        })
+    }
+
+    /// Drives the engine over a fixed event script and returns the sink.
+    async fn run_script(batch_size: usize, script: Vec<ChangeEvent>) -> Arc<RecordingSink> {
+        let sink = Arc::new(RecordingSink::default());
+        let (events_tx, events_rx) = mpsc::channel(1024);
+        let (ack_tx, _ack_rx) = watch::channel(None);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let ctx = Arc::new(PipelineCtx {
+            sink: sink.clone(),
+            mapping: TableMapping::from_pairs([(
+                ("public".to_string(), "users".to_string()),
+                "users".to_string(),
+            )]),
+            projections: crate::mapping::Projections::default(),
+            transforms: crate::mapping::Transforms::default(),
+            cfg: EngineConfig {
+                batch_size,
+                // a short interval keeps the test fast; the loop only persists
+                // when the acknowledged position actually moved
+                checkpoint_interval_ms: 100,
+                ..EngineConfig::default()
+            },
+            ack_tx,
+            metrics: Arc::new(crate::metrics::Metrics::default()),
+        });
+        let stream = StreamId {
+            source: SOURCE_POSTGRES.into(),
+            stream: "slot".into(),
+            publication: "pub".into(),
+        };
+        let render: PositionRenderer = Arc::new(|token| Lsn(token).to_string());
+        let engine = tokio::spawn(run(
+            events_rx,
+            ctx,
+            stream,
+            render,
+            crate::mapping::DurableLsn::default(),
+            shutdown_rx,
+        ));
+        for event in script {
+            events_tx.send(event).await.expect("engine alive");
+        }
+        // let the checkpoint loop observe the final acknowledged position
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        drop(events_tx);
+        engine.await.expect("task joined").expect("engine ran");
+        sink
+    }
+
+    #[tokio::test]
+    async fn transaction_flushes_at_its_commit() {
+        let sink = run_script(500, vec![row(1), row(2), commit(0x100)]).await;
+        assert_eq!(sink.events(), vec!["write(2)"]);
+        let ckpt = sink.last_checkpoint().expect("checkpoint persisted");
+        assert_eq!(ckpt.token, 0x100);
+        assert_eq!(ckpt.position, "0/100", "position is rendered by the source");
+    }
+
+    #[tokio::test]
+    async fn commit_with_an_exhausted_buffer_still_checkpoints() {
+        // batch_size 2 with exactly 2 rows leaves the buffer empty at COMMIT.
+        // Without a position marker through the sink channel the checkpoint
+        // would stall here, and PostgreSQL would retain WAL forever.
+        let sink = run_script(2, vec![row(1), row(2), commit(0x200)]).await;
+        assert_eq!(sink.events(), vec!["write(2)"]);
+        assert_eq!(
+            sink.last_checkpoint().map(|c| c.token),
+            Some(0x200),
+            "the commit position must be checkpointed even with nothing buffered"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_transaction_advances_the_position() {
+        let sink = run_script(500, vec![commit(0x300)]).await;
+        assert!(sink.events().is_empty(), "nothing to write");
+        assert_eq!(sink.last_checkpoint().map(|c| c.token), Some(0x300));
+    }
+
+    #[tokio::test]
+    async fn truncate_lands_after_the_writes_it_follows() {
+        let sink = run_script(
+            500,
+            vec![
+                row(1),
+                commit(0x400),
+                ChangeEvent::TableTruncated {
+                    schema: "public".into(),
+                    table: "users".into(),
+                },
+                row(2),
+                commit(0x500),
+            ],
+        )
+        .await;
+        assert_eq!(
+            sink.events(),
+            vec!["write(1)", "truncate(users)", "write(1)"],
+            "a write queued before the truncate must not survive it"
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_load_boundaries_never_advance_the_checkpoint() {
+        // Lsn(0) marks rows that have no source position of their own
+        let sink = run_script(500, vec![row(1), commit(0)]).await;
+        assert_eq!(sink.events(), vec!["write(1)"]);
+        assert!(
+            sink.last_checkpoint().is_none(),
+            "a positionless batch must never be checkpointed"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_transaction_is_split_but_keeps_its_commit_position() {
+        let mut script: Vec<ChangeEvent> = (1..=5).map(row).collect();
+        script.push(commit(0x600));
+        let sink = run_script(2, script).await;
+        assert_eq!(
+            sink.events(),
+            vec!["write(2)", "write(2)", "write(1)"],
+            "splitting is expected; every op is idempotent"
+        );
+        assert_eq!(sink.last_checkpoint().map(|c| c.token), Some(0x600));
+    }
+
+    #[tokio::test]
+    async fn unmapped_tables_are_ignored_for_truncate() {
+        let sink = run_script(
+            500,
+            vec![ChangeEvent::TableTruncated {
+                schema: "public".into(),
+                table: "not_synced".into(),
+            }],
+        )
+        .await;
+        assert!(sink.events().is_empty());
     }
 }

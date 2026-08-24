@@ -103,9 +103,11 @@ impl Metrics {
             // single line is not valid exposition format
             out.push_str("# HELP pg2osync_latency_ms End-to-end sync latency (commit->indexed)\n");
             out.push_str("# TYPE pg2osync_latency_ms summary\n");
-            for p in [50usize, 90, 99] {
+            // literal labels: "0.{p}" would render p50 as the unconventional
+            // quantile label 0.50, which scrapers and dashboards do not expect
+            for (label, p) in [("0.5", 50usize), ("0.9", 90), ("0.99", 99)] {
                 out.push_str(&format!(
-                    "pg2osync_latency_ms{{quantile=\"0.{p}\"}} {}\n",
+                    "pg2osync_latency_ms{{quantile=\"{label}\"}} {}\n",
                     q(p)
                 ));
             }

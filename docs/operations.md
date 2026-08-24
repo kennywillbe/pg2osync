@@ -133,9 +133,10 @@ checkpoint and re-run the initial load, which is safe but expensive.
 
 ## Capacity notes
 
-- Memory is bounded by the channel depths and `batch_max_bytes`; expect tens of
-  MB steady-state.
+- Memory is bounded by the channel depths and `batch_max_bytes`; measured at
+  ~90 MB resident while loading 200K docs, and lower at steady state.
 - One instance is single-threaded in effect — the source, engine and sink tasks
   pipeline but do not shard. Scale by splitting tables across instances.
 - The initial load's cost is dominated by the target's indexing throughput, not
-  by pg2osync.
+  by pg2osync. `dev/benchmark.sh` reproduces the numbers in the README against a
+  local stack.

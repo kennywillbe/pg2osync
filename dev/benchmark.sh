@@ -1,136 +1,151 @@
-#!/bin/bash
-# pg2osync benchmark: fresh lift from zero, measure backfill + live latency + DB impact.
-set -e
+#!/usr/bin/env bash
+# Reproducible benchmark: initial load throughput, live latency and the cost of
+# one large transaction.
+#
+# Prerequisites:
+#   docker compose -f dev/docker-compose.yml up -d
+#   cargo build --release
+#
+# Usage: [ROWS=200000] [SAMPLES=200] ./dev/benchmark.sh
+set -euo pipefail
+
 cd "$(dirname "$0")/.."
+BIN=./target/release/pg2osync
+OS=${OS_URL:-http://localhost:9200}
+PG_CONTAINER=${PG_CONTAINER:-dev-postgres-1}
+ROWS=${ROWS:-200000}
+SAMPLES=${SAMPLES:-200}
+BIG_TXN=${BIG_TXN:-50000}
+CONFIG=$(mktemp /tmp/pg2osync-bench-XXXX.toml)
+LOG=/tmp/pg2osync-bench.log
+export PG2OSYNC_SOURCE_URL="postgres://postgres:postgres@localhost:15432/sourcedb"
 
-PSQL="docker exec -i dev-postgres-1 psql -U postgres -d sourcedb"
-OS="http://localhost:9200"
-CFG=/tmp/bench.toml
+pg()      { docker exec "$PG_CONTAINER" psql -U postgres -d sourcedb -qtAc "$1"; }
+refresh() { curl -s -XPOST "$OS/bench_docs/_refresh" > /dev/null; }
+count()   { curl -s "$OS/bench_docs/_count" | python3 -c "import sys,json;print(json.load(sys.stdin).get('count',0))"; }
+# exact series match: a substring match would also pick up the HELP/TYPE lines
+metric()  { curl -s http://127.0.0.1:9113/metrics | awk -v k="$1" '$1 == k {print $2}'; }
+now()     { python3 -c "import time;print(time.time())"; }
 
-echo "=== 0. reset state ==="
-pkill -f "pg2osync run" 2>/dev/null || true; sleep 1
-$PSQL -q << 'SQL'
-DROP PUBLICATION IF EXISTS pg2osync_pub;
-SELECT pg_drop_replication_slot('pg2osync') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='pg2osync');
-SQL
-curl -s -XDELETE "$OS/users_index,bench_a_index,users_index_v2,bench_users_index,bench_products_index,bench_events_index,bench_wide_index,.pg2osync_meta" > /dev/null || true
+stop_sync() { pkill -f "pg2osync run" 2> /dev/null || true; }
+cleanup()   { stop_sync; rm -f "$CONFIG"; }
+trap cleanup EXIT
 
-cat > $CFG << 'EOF'
+cat > "$CONFIG" <<'TOML'
 [source]
 url_env = "PG2OSYNC_SOURCE_URL"
-slot_name = "pg2osync"
-publication = "pg2osync_pub"
+slot_name = "pg2osync_bench"
+publication = "pg2osync_bench_pub"
 
 [target]
 url = "http://localhost:9200"
 
-[sync.users]
-table = "public.users"
-index = "users_index"
+[metrics]
+bind = "127.0.0.1:9113"
 
-[sync.bench_a]
-table = "public.bench_a"
-index = "bench_a_index"
+[sync.bench_docs]
+table = "public.bench_docs"
+index = "bench_docs"
+TOML
 
-[sync.bench_users]
-table = "public.bench_users"
-index = "bench_users_index"
+echo "== 0. prepare $ROWS rows =="
+stop_sync
+pg "DROP PUBLICATION IF EXISTS pg2osync_bench_pub;" > /dev/null
+pg "SELECT pg_drop_replication_slot('pg2osync_bench') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='pg2osync_bench');" > /dev/null
+pg "DROP TABLE IF EXISTS bench_docs;" > /dev/null
+pg "CREATE TABLE bench_docs (
+      id bigint PRIMARY KEY,
+      name text NOT NULL,
+      email text,
+      city text,
+      score numeric(10,2),
+      payload jsonb,
+      created_at timestamptz NOT NULL DEFAULT now());" > /dev/null
+pg "INSERT INTO bench_docs (id,name,email,city,score,payload)
+    SELECT g, 'user_' || g, 'u' || g || '@example.com',
+           (ARRAY['istanbul','berlin','lisbon','osaka'])[1 + g % 4],
+           (g % 10000)::numeric / 100,
+           jsonb_build_object('tier', g % 5, 'tags', ARRAY['a','b'])
+    FROM generate_series(1, $ROWS) g;" > /dev/null
+curl -s -XDELETE "$OS/bench_docs,.pg2osync_meta" > /dev/null
+echo "   $(pg 'SELECT count(*) FROM bench_docs;') rows ready"
 
-[sync.bench_products]
-table = "public.bench_products"
-index = "bench_products_index"
-
-[sync.bench_events]
-table = "public.bench_events"
-index = "bench_events_index"
-
-[sync.bench_wide]
-table = "public.bench_wide"
-index = "bench_wide_index"
-EOF
-
-os_count() {
-  local total=0
-  for idx in users_index bench_a_index bench_users_index bench_products_index bench_events_index bench_wide_index; do
-    c=$(curl -s "$OS/$idx/_count" | python3 -c "import json,sys
-try: print(json.load(sys.stdin).get('count',0))
-except: print(0)")
-    total=$((total + c))
-  done
-  echo $total
-}
-
-db_stats() {
-  $PSQL -tAc "SELECT xact_commit, wal_bytes FROM pg_stat_database, LATERAL (SELECT pg_wal_lsn_diff(pg_current_wal_lsn(),'0/0')::bigint) w(wal_bytes) WHERE datname='sourcedb'"
-}
-
-echo "=== 1. start binary (release) ==="
-export PG2OSYNC_SOURCE_URL="postgres://postgres:postgres@localhost:15432/sourcedb"
-START=$(date +%s)
-RUST_LOG=info ./target/release/pg2osync run -c $CFG &> /tmp/bench.log &
-BIN_PID=$!
-
-TARGET_DOCS=$(($($PSQL -tAc "SELECT sum(cnt) FROM (SELECT count(*) cnt FROM users UNION ALL SELECT count(*) FROM bench_a UNION ALL SELECT count(*) FROM bench_users UNION ALL SELECT count(*) FROM bench_products UNION ALL SELECT count(*) FROM bench_events UNION ALL SELECT count(*) FROM bench_wide) s") | tr -d ' '))
-echo "target docs: $TARGET_DOCS"
-
-echo "=== 2. wait for backfill ==="
-PREV=0; STABLE=0
-while true; do
-  NOW=$(date +%s); ELAPSED=$((NOW-START))
-  C=$(os_count)
-  echo "t=${ELAPSED}s indexed=$C/$TARGET_DOCS"
-  if [ "$C" -ge "$TARGET_DOCS" ]; then break; fi
-  if [ "$C" == "$PREV" ]; then STABLE=$((STABLE+1)); else STABLE=0; fi
-  if [ $STABLE -ge 5 ] && [ $ELAPSED -gt 30 ]; then echo "STALL detected"; break; fi
-  PREV=$C
-  sleep 3
+echo "== 1. initial load =="
+start=$(now)
+nohup $BIN run -c "$CONFIG" &> "$LOG" < /dev/null & disown
+while :; do
+  refresh
+  indexed=$(count)
+  [ "$indexed" -ge "$ROWS" ] && break
+  sleep 1
 done
-BACKFILL_END=$(date +%s)
-BACKFILL_SECS=$((BACKFILL_END-START))
-echo "backfill complete in ${BACKFILL_SECS}s -> $(( TARGET_DOCS / (BACKFILL_SECS>0?BACKFILL_SECS:1) )) docs/sec"
+elapsed=$(python3 -c "print($(now) - $start)")
+python3 -c "print(f'   {$ROWS} docs in {$elapsed:.1f}s -> {$ROWS/$elapsed:,.0f} docs/s (process start to last doc searchable)')"
 
-echo "=== 3. db impact snapshot after backfill ==="
-$PSQL -tAc "SELECT slot_name, confirmed_flush_lsn, pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn) AS lag_bytes FROM pg_replication_slots WHERE slot_name='pg2osync'"
+echo "== 2. live latency, $SAMPLES single-row commits =="
+python3 - "$SAMPLES" "$OS" <<'PY'
+import json, subprocess, sys, time, urllib.request
+samples, os_url = int(sys.argv[1]), sys.argv[2]
+psql = ["docker", "exec", "-i", "dev-postgres-1", "psql", "-U", "postgres", "-d", "sourcedb", "-qtA"]
+searchable = []
+for i in range(samples):
+    doc_id = 90_000_000 + i
+    t0 = time.time()
+    subprocess.run(psql, input=(
+        f"INSERT INTO bench_docs (id,name,email,city,score) "
+        f"VALUES ({doc_id},'lat_{i}','l{i}@x.io','istanbul',1.00);"
+    ).encode(), capture_output=True, check=True)
+    while True:
+        # a refresh per poll: without it the wait would just measure the
+        # index's 1s refresh interval instead of the pipeline
+        urllib.request.urlopen(urllib.request.Request(
+            f"{os_url}/bench_docs/_refresh", method="POST"))
+        try:
+            with urllib.request.urlopen(f"{os_url}/bench_docs/_doc/{doc_id}") as r:
+                if json.load(r).get("found"):
+                    break
+        except urllib.error.HTTPError:
+            pass
+    searchable.append((time.time() - t0) * 1000)
 
-echo "=== 4. live DML latency test ==="
-# 200 inserts measured individually end-to-end (commit -> visible in OS)
-LATENCIES=()
-for i in $(seq 1 200); do
-  ID=$((500000+i))
-  T0=$(python3 -c 'import time; print(time.time())')
-  $PSQL -q -c "INSERT INTO bench_users (id,name,email,city,country,age,score,active,created_at,tags) VALUES ($ID,'lat_$i','l$i@x.io','x','y',30,'1.0',true,now(),'{}')"
-  # poll until visible
-  while true; do
-    FOUND=$(curl -s "$OS/bench_users_index/_doc/$ID" | python3 -c "import json,sys
-print(1 if json.load(sys.stdin).get('found') else 0)")
-    [ "$FOUND" == "1" ] && break
-    sleep 0.05
-  done
-  T1=$(python3 -c 'import time; print(time.time())')
-  LATENCIES+=("$(python3 -c "print(round(($T1-$T0)*1000))")")
+searchable.sort()
+n = len(searchable)
+q = lambda p: searchable[min(n - 1, int(n * p / 100))]
+# includes the psql client round-trip and a forced refresh, so it is an upper
+# bound on what a reader observes, not a measure of the pipeline alone
+print(f"   commit to searchable ms (incl. client + refresh): "
+      f"p50={q(50):.0f} p90={q(90):.0f} p99={q(99):.0f}")
+PY
+echo -n "   pipeline commit-to-indexed ms (from /metrics): "
+for q in 0.5 0.9 0.99; do
+  printf "p%s=%s " "$(python3 -c "print(int(float('$q')*100))")" "$(metric "pg2osync_latency_ms{quantile=\"$q\"}")"
 done
-python3 -c "
-lat = sorted(int(x) for x in ['$LATENCIES'.replace('\n','')][0].split(',')) if False else sorted(int(x) for x in '''${LATENCIES[@]}'''.split())
-n=len(lat)
-print(f'live insert latency ms: min={lat[0]} p50={lat[n//2]} p90={lat[int(n*0.9)]} p99={lat[int(n*0.99)]} max={lat[-1]} mean={sum(lat)/n:.0f}')
-"
+echo
 
-echo "=== 5. update/delete propagation ==="
-UPD_START=$(date +%s)
-$PSQL -q -c "UPDATE bench_users SET city='UPDATED' WHERE id <= 1000"
-sleep 3
-UPD_COUNT=$(curl -s "$OS/bench_users_index/_search" -H 'Content-Type: application/json' -d '{"query":{"term":{"city":"UPDATED"}}}' | python3 -c "import json,sys; print(json.load(sys.stdin)['hits']['total']['value'])")
-UPD_END=$(date +%s)
-echo "updated docs propagated: $UPD_COUNT/1000 in ~$((UPD_END-UPD_START))s"
+echo "== 3. one transaction of $BIG_TXN rows =="
+before=$(count)
+start=$(now)
+pg "INSERT INTO bench_docs (id,name,email,city,score)
+    SELECT 100000000 + g, 'bulk_' || g, 'b' || g || '@x.io', 'berlin', 2.50
+    FROM generate_series(1, $BIG_TXN) g;" > /dev/null
+while :; do
+  refresh
+  [ "$(count)" -ge $((before + BIG_TXN)) ] && break
+  sleep 0.2
+done
+python3 -c "print(f'   {$BIG_TXN} rows propagated in {$(now) - $start:.1f}s')"
 
-DEL_START=$(date +%s)
-$PSQL -q -c "DELETE FROM bench_users WHERE id > 400000 AND id <= 401000"
-SQL
-sleep 3
-echo "=== 6. final consistency check ==="
-PG_TOTAL=$($PSQL -tAc "SELECT sum(cnt) FROM (SELECT count(*) cnt FROM users UNION ALL SELECT count(*) FROM bench_a UNION ALL SELECT count(*) FROM bench_users UNION ALL SELECT count(*) FROM bench_products UNION ALL SELECT count(*) FROM bench_events UNION ALL SELECT count(*) FROM bench_wide) s" | tr -d ' ')
-OS_TOTAL=$(os_count)
-echo "pg_rows=$PG_TOTAL os_docs=$OS_TOTAL delta=$((PG_TOTAL-OS_TOTAL))"
+echo "== 4. steady state =="
+echo "   events: $(metric 'pg2osync_events_total{type="row"}')"
+echo "   batches: $(metric pg2osync_batches_flushed)"
+# sampled after a checkpoint interval: between an ack and the next checkpoint
+# write there is always a gap, and reading it immediately measures that gap
+sleep 2
+echo "   position lag: $(metric pg2osync_position_lag) (current=$(metric pg2osync_position_current) confirmed=$(metric pg2osync_position_confirmed))"
+echo "   rss: $(ps -o rss= -p "$(pgrep -f 'pg2osync run' | head -1)" | awk '{printf "%.0f MB", $1/1024}')"
+echo "   pg rows=$(pg 'SELECT count(*) FROM bench_docs;') os docs=$(count)"
 
-kill $BIN_PID 2>/dev/null || true
-echo "=== benchmark complete ==="
+stop_sync
+pg "SELECT pg_drop_replication_slot('pg2osync_bench') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='pg2osync_bench');" > /dev/null
+pg "DROP PUBLICATION IF EXISTS pg2osync_bench_pub;" > /dev/null
+echo "== done =="
