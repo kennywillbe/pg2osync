@@ -1,7 +1,7 @@
 //! Tuple → document construction.
 //!
 //! Turns decoded pgoutput tuples into `core::RowChange` values: JSON docs,
-//! primary-key extraction and unchanged-TOAST surfacing/completion (ADR #19a).
+//! primary-key extraction and unchanged-TOAST surfacing/completion.
 
 use crate::pgoutput::{Relation, ReplicaIdentity, Tuple, TupleValue};
 use crate::typemap;
@@ -173,7 +173,7 @@ pub fn build_row_change(rel: &Relation, incoming: Incoming) -> Result<RowChange,
     }
 }
 
-/// Startup guard mirroring ADR #19d: tables with REPLICA IDENTITY NOTHING will
+/// Startup guard: tables with REPLICA IDENTITY NOTHING will
 /// fail at delete time unless fixed now.
 pub fn check_delete_capability(rel: &Relation) -> Result<(), BuildError> {
     if rel.replica_identity == ReplicaIdentity::None {
@@ -190,7 +190,7 @@ pub fn column_index(rel: &Relation, name: &str) -> Option<usize> {
     rel.columns.iter().position(|c| c.name == name)
 }
 
-/// Typed JSON value of one tuple column (raw wire bytes -> JSON per ADR #19c).
+/// Typed JSON value of one tuple column (raw wire bytes to JSON).
 pub fn convert_column_at(rel: &Relation, idx: usize, tuple: &Tuple) -> Result<Value, BuildError> {
     let col = &rel.columns[idx];
     let raw = match tuple.get(idx) {

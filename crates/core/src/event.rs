@@ -57,7 +57,7 @@ pub enum RowKind {
     },
     /// `unchanged_toast_columns` lists columns whose values PG omitted because
     /// they are large, externally stored and unchanged since the last write
-    /// (ADR #19a). The engine must complete them from the previously indexed
+    /// The engine must complete them from the previously indexed
     /// document before writing; until then `doc` is partial.
     Update {
         pk: Value,

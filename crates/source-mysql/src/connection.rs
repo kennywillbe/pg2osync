@@ -30,6 +30,7 @@ pub struct MySqlConfig {
 
 pub struct MySqlConnection {
     stream: TcpStream,
+    server_id: u32,
 }
 
 impl MySqlConnection {
@@ -75,7 +76,12 @@ impl MySqlConnection {
         for _ in 0..4 {
             let payload = read_one(&mut stream).await?;
             match payload.first() {
-                Some(0x00) | None => return Ok(Self { stream }),
+                Some(0x00) | None => {
+                    return Ok(Self {
+                        stream,
+                        server_id: cfg.server_id,
+                    });
+                }
                 Some(0xFF) => return Err(auth_error(&payload)),
                 Some(0xFE) => {
                     // our switch response must use the NEXT sequence after the
@@ -112,17 +118,10 @@ impl MySqlConnection {
         let mut p = vec![0x12];
         p.extend_from_slice(&pos.to_le_bytes());
         p.extend_from_slice(&0u16.to_le_bytes()); // flags: BINLOG_DUMP_NON_BLOCK=0
-        p.extend_from_slice(&self.server_id().to_le_bytes());
+        p.extend_from_slice(&self.server_id.to_le_bytes());
         p.extend_from_slice(filename.as_bytes());
         p.push(0);
         self.write_command(&p).await
-    }
-
-    fn server_id(&self) -> u32 {
-        std::env::var("PG2OSYNC_MYSQL_SERVER_ID")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(424243)
     }
 
     async fn write_command(&mut self, payload: &[u8]) -> Result<()> {
@@ -190,40 +189,120 @@ fn auth_error(payload: &[u8]) -> anyhow::Error {
 }
 
 impl MySqlConnection {
-    /// Read a text-protocol resultset first-row's values as strings.
-    /// Used for SHOW MASTER STATUS and similar single-row queries.
-    pub async fn query_text_row(&mut self, sql: &str) -> Result<Vec<Option<String>>> {
+    /// Run a query and return every row of the text-protocol resultset.
+    ///
+    /// Values arrive as strings (text protocol); NULL becomes `None`.
+    pub async fn query_text_rows(&mut self, sql: &str) -> Result<Vec<Vec<Option<String>>>> {
         self.send_query(sql).await?;
-        // column count packet
-        let cc = read_one(&mut self.stream).await?;
-        if cc.first() == Some(&0xFF) {
-            anyhow::bail!("query error: {}", String::from_utf8_lossy(&cc[9..]));
+        let head = read_one(&mut self.stream).await?;
+        match head.first() {
+            Some(0xFF) => bail!("query failed: {}", error_message(&head)),
+            // OK packet: a statement with no resultset
+            Some(0x00) => return Ok(vec![]),
+            None => return Ok(vec![]),
+            _ => {}
         }
-        let ncols = cc.first().copied().unwrap_or(0) as usize;
-        // skip column definition packets
+        let ncols = head.first().copied().unwrap_or(0) as usize;
+        // column definitions, then the EOF that closes them
         for _ in 0..=ncols {
             let _ = read_one(&mut self.stream).await?;
         }
-        // row packet: lenenc-prefixed string values; NULL = 0xFB byte
-        let row = read_one(&mut self.stream).await?;
-        let mut vals = Vec::with_capacity(ncols);
-        let mut pos = 0usize;
-        for _ in 0..ncols {
-            if pos >= row.len() || row[pos] == 0xFB {
+        let mut rows = Vec::new();
+        loop {
+            let pkt = read_one(&mut self.stream).await?;
+            match pkt.first() {
+                Some(0xFF) => bail!("query failed mid-resultset: {}", error_message(&pkt)),
+                // EOF packet: 0xFE with a short payload. A longer packet
+                // starting with 0xFE is a row whose first value is 8-byte
+                // length-encoded, which cannot happen for our metadata queries.
+                Some(0xFE) if pkt.len() < 9 => break,
+                None => break,
+                _ => rows.push(parse_text_row(&pkt, ncols)?),
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Convenience wrapper for single-row queries such as `SHOW MASTER STATUS`.
+    pub async fn query_text_row(&mut self, sql: &str) -> Result<Vec<Option<String>>> {
+        Ok(self
+            .query_text_rows(sql)
+            .await?
+            .into_iter()
+            .next()
+            .unwrap_or_default())
+    }
+
+    /// Read one global variable, e.g. `binlog_format`.
+    pub async fn global_var(&mut self, name: &str) -> Result<Option<String>> {
+        let row = self
+            .query_text_row(&format!("SELECT @@GLOBAL.{name}"))
+            .await?;
+        Ok(row.into_iter().next().flatten())
+    }
+}
+
+/// Decode one text-protocol row: length-encoded strings, 0xFB marking NULL.
+fn parse_text_row(pkt: &[u8], ncols: usize) -> Result<Vec<Option<String>>> {
+    let mut vals = Vec::with_capacity(ncols);
+    let mut pos = 0usize;
+    for _ in 0..ncols {
+        let Some(&first) = pkt.get(pos) else { break };
+        pos += 1;
+        let len = match first {
+            0xFB => {
                 vals.push(None);
-                pos += 1;
                 continue;
             }
-            let len = row[pos] as usize;
-            pos += 1;
-            if pos + len > row.len() {
-                anyhow::bail!("row data truncated");
+            0xFC => {
+                let b = pkt.get(pos..pos + 2).context("row truncated")?;
+                pos += 2;
+                u16::from_le_bytes([b[0], b[1]]) as usize
             }
-            vals.push(Some(
-                String::from_utf8_lossy(&row[pos..pos + len]).into_owned(),
-            ));
-            pos += len;
-        }
-        Ok(vals)
+            0xFD => {
+                let b = pkt.get(pos..pos + 3).context("row truncated")?;
+                pos += 3;
+                b[0] as usize | (b[1] as usize) << 8 | (b[2] as usize) << 16
+            }
+            0xFE => {
+                let b = pkt.get(pos..pos + 8).context("row truncated")?;
+                pos += 8;
+                u64::from_le_bytes(b.try_into().expect("8 bytes")) as usize
+            }
+            other => other as usize,
+        };
+        let raw = pkt.get(pos..pos + len).context("row value truncated")?;
+        pos += len;
+        vals.push(Some(String::from_utf8_lossy(raw).into_owned()));
+    }
+    Ok(vals)
+}
+
+fn error_message(payload: &[u8]) -> String {
+    String::from_utf8_lossy(payload.get(9..).unwrap_or(&[])).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_row_handles_null_and_long_values() {
+        let mut pkt = vec![3];
+        pkt.extend_from_slice(b"row");
+        pkt.push(0xFB);
+        pkt.push(0xFC);
+        pkt.extend_from_slice(&300u16.to_le_bytes());
+        pkt.extend(std::iter::repeat_n(b'x', 300));
+        let row = parse_text_row(&pkt, 3).expect("parse");
+        assert_eq!(row[0].as_deref(), Some("row"));
+        assert_eq!(row[1], None);
+        assert_eq!(row[2].as_deref().map(str::len), Some(300));
+    }
+
+    #[test]
+    fn truncated_row_is_an_error_not_a_panic() {
+        let pkt = vec![10, b'a'];
+        assert!(parse_text_row(&pkt, 1).is_err());
     }
 }

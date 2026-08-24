@@ -1,0 +1,17 @@
+apiVersion: v2
+name: pg2osync
+description: Real-time PostgreSQL/MySQL to OpenSearch, Elasticsearch and Meilisearch sync
+type: application
+version: 0.6.0
+appVersion: "0.6.0"
+home: https://github.com/kennywillbe/pg2osync
+sources:
+  - https://github.com/kennywillbe/pg2osync
+keywords:
+  - cdc
+  - postgresql
+  - mysql
+  - opensearch
+  - elasticsearch
+maintainers:
+  - name: pg2osync contributors

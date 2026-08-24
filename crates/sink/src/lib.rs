@@ -8,16 +8,73 @@ use opensearch::auth::Credentials;
 use opensearch::http::response::Response;
 use opensearch::http::transport::{SingleNodeConnectionPool, TransportBuilder};
 use opensearch::{BulkOperation, BulkParts, GetParts, IndexParts, OpenSearch};
+use pg2osync_core::checkpoint::Checkpoint;
 use pg2osync_core::error::CoreError;
 use pg2osync_core::lsn::Lsn;
 use pg2osync_core::sink::{Health, IndexSpec, LsnOp, Sink, SinkAck};
 use serde_json::{Value, json};
 
 pub const META_INDEX: &str = ".pg2osync_meta";
+/// Single checkpoint document per pipeline; per-document atomicity is what
+/// makes the write crash-safe without any compare-and-swap.
+pub const CHECKPOINT_DOC_ID: &str = "default";
+/// Bumped when the document layout changes; v1 stored only `confirmed_lsn`.
+pub const CHECKPOINT_SCHEMA_VERSION: u32 = 2;
+
+/// Serialize a checkpoint into its stored document form.
+pub fn checkpoint_doc(ckpt: &Checkpoint) -> Value {
+    json!({
+        "source": ckpt.stream.source,
+        "stream": ckpt.stream.stream,
+        "slot_name": ckpt.stream.stream,
+        "publication": ckpt.stream.publication,
+        "position": ckpt.position,
+        "token": ckpt.token,
+        "instance_id": std::env::var("PG2OSYNC_INSTANCE_ID").unwrap_or_default(),
+        "updated_at_epoch": chrono_now(),
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
+    })
+}
+
+/// Parse a stored checkpoint document.
+///
+/// Accepts the v1 layout (`confirmed_lsn`, no `source`) so an existing
+/// deployment resumes instead of re-running a full backfill after an upgrade.
+pub fn checkpoint_from_doc(src: &Value) -> Option<Checkpoint> {
+    use pg2osync_core::checkpoint::{SOURCE_POSTGRES, StreamId};
+
+    let stream = StreamId {
+        source: src["source"]
+            .as_str()
+            .unwrap_or(SOURCE_POSTGRES)
+            .to_string(),
+        stream: src["slot_name"]
+            .as_str()
+            .or(src["stream"].as_str())
+            .unwrap_or_default()
+            .to_string(),
+        publication: src["publication"].as_str().unwrap_or_default().to_string(),
+    };
+    let position = src["position"]
+        .as_str()
+        .or(src["confirmed_lsn"].as_str())?
+        .to_string();
+    let token = match src["token"].as_u64() {
+        Some(t) => t,
+        // v1 documents carry only the textual LSN
+        None => position.parse::<Lsn>().ok()?.0,
+    };
+    Some(Checkpoint {
+        stream,
+        token,
+        position,
+    })
+}
 
 pub struct OpenSearchSink {
     client: OpenSearch,
     serverless: bool,
+    retry: RetryPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -29,9 +86,10 @@ pub struct OpenSearchSinkConfig {
     pub username: Option<String>,
     pub password: Option<String>,
     pub tls_verify: bool,
+    pub retry: RetryPolicy,
 }
 
-/// Retry policy for transient failures (ADR plan §4 [engine]).
+/// Retry policy for transient failures; tunable via `[engine]` config.
 #[derive(Debug, Clone)]
 pub struct RetryPolicy {
     pub max_attempts: u32,
@@ -63,10 +121,11 @@ impl OpenSearchSink {
         Ok(Self {
             client: OpenSearch::new(transport),
             serverless: cfg.serverless,
+            retry: cfg.retry,
         })
     }
 
-    /// Create the hidden checkpoint index if missing (ADR #18).
+    /// Create the hidden checkpoint index if missing.
     pub async fn ensure_meta_index(&self) -> Result<(), CoreError> {
         let exists = self
             .client
@@ -91,59 +150,6 @@ impl OpenSearchSink {
             .await
             .map_err(http_err)?;
         check_status(resp, "create meta index").await
-    }
-
-    /// Persist the checkpoint document (single-doc atomicity per ADR #18).
-    pub async fn write_checkpoint(
-        &self,
-        slot_name: &str,
-        publication: &str,
-        lsn: Lsn,
-    ) -> Result<(), CoreError> {
-        let resp = self
-            .client
-            .index(IndexParts::IndexId(META_INDEX, "default"))
-            .body(json!({
-                "slot_name": slot_name,
-                "publication": publication,
-                "confirmed_lsn": lsn.to_string(),
-                "instance_id": std::env::var("PG2OSYNC_INSTANCE_ID").unwrap_or_default(),
-                "updated_at_epoch": chrono_now(),
-                "schema_version": 1
-            }))
-            .send()
-            .await
-            .map_err(http_err)?;
-        check_status(resp, "write checkpoint").await
-    }
-
-    /// Read last confirmed LSN; None when no checkpoint exists yet.
-    pub async fn read_checkpoint(&self) -> Result<Option<Lsn>, CoreError> {
-        let resp = self
-            .client
-            .get(GetParts::IndexId(META_INDEX, "default"))
-            .send()
-            .await
-            .map_err(http_err)?;
-        if resp.status_code().as_u16() == 404 {
-            return Ok(None);
-        }
-        check_status(resp, "read checkpoint").await?;
-        // re-issue as get to fetch body: simplest is a second request
-        let resp = self
-            .client
-            .get(GetParts::IndexId(META_INDEX, "default"))
-            .send()
-            .await
-            .map_err(http_err)?;
-        let body: Value = resp
-            .json()
-            .await
-            .map_err(|e| CoreError::Sink(e.to_string()))?;
-        match body["_source"]["confirmed_lsn"].as_str() {
-            Some(s) => Ok(Some(s.parse().map_err(CoreError::from)?)),
-            None => Ok(None),
-        }
     }
 
     async fn bulk_once(
@@ -175,11 +181,11 @@ impl OpenSearchSink {
             .body(ops)
             .send()
             .await
-            .map_err(|e| CoreError::Sink(format!("bulk request failed: {e}")))?;
+            .map_err(|e| CoreError::SinkTransient(format!("bulk request failed: {e}")))?;
 
         let status = resp.status_code().as_u16();
-        if status == 429 || status == 503 || status >= 500 {
-            return Err(CoreError::Sink(format!("retryable http status {status}")));
+        if status == 429 || status >= 500 {
+            return Err(CoreError::SinkTransient(format!("http status {status}")));
         }
         let body: Value = resp
             .json()
@@ -209,7 +215,9 @@ impl OpenSearchSink {
             }
         }
         if retryable_http {
-            return Err(CoreError::Sink("retryable item-level 429/5xx".into()));
+            return Err(CoreError::SinkTransient(
+                "item-level 429/5xx in bulk response".into(),
+            ));
         }
         let max_lsn = batch.last().expect("nonempty checked").lsn;
         Ok((max_lsn, permanent))
@@ -237,7 +245,7 @@ impl OpenSearchSink {
 }
 
 fn is_retryable(e: &CoreError) -> bool {
-    matches!(e, CoreError::Sink(msg) if msg.contains("retryable") || msg.contains("request failed"))
+    matches!(e, CoreError::SinkTransient(_))
 }
 
 fn http_err(e: opensearch::Error) -> CoreError {
@@ -328,13 +336,13 @@ impl Sink for OpenSearchSink {
                 "engine must never send empty batches".into(),
             ));
         }
-        let retry = RetryPolicy::default();
-        let (max_lsn, permanent) = self.bulk_with_retry(&batch, &retry).await?;
+        let (max_lsn, permanent) = self.bulk_with_retry(&batch, &self.retry).await?;
         for (id, index, reason) in &permanent {
             tracing::error!(target: "pg2osync::sink", "PERMANENT rejection id={id} {index}: {reason}");
         }
         if !permanent.is_empty() {
-            // correctness-first failure policy (M4): halt pipeline on permanent errors
+            // correctness-first failure policy: a document the sink will never
+            // accept must stop the pipeline instead of being skipped silently
             return Err(CoreError::DocumentRejected {
                 index: permanent[0].1.clone(),
                 doc_id: permanent[0].0.clone(),
@@ -345,61 +353,47 @@ impl Sink for OpenSearchSink {
     }
 
     async fn truncate_index(&self, index: &str) -> Result<(), CoreError> {
+        // delete_by_query only removes documents a search can see, so writes
+        // still sitting in the translog would survive the TRUNCATE and
+        // resurrect rows the source has already dropped
+        if !self.serverless {
+            let resp = self
+                .client
+                .indices()
+                .refresh(opensearch::indices::IndicesRefreshParts::Index(&[index]))
+                .send()
+                .await
+                .map_err(http_err)?;
+            check_status(resp, "pre-truncate refresh").await?;
+        }
         let resp = self
             .client
             .delete_by_query(opensearch::DeleteByQueryParts::Index(&[index]))
+            .refresh(true)
+            .conflicts(opensearch::params::Conflicts::Proceed)
             .body(json!({"query": {"match_all": {}}}))
             .send()
             .await
             .map_err(http_err)?;
-        check_status(resp, &format!("truncate index {index}")).await?;
-        if self.serverless {
-            return Ok(()); // Serverless manages visibility itself
-        }
-        // refresh so subsequent reads see an empty index immediately
-        let resp = self
-            .client
-            .indices()
-            .refresh(opensearch::indices::IndicesRefreshParts::Index(&[index]))
-            .send()
-            .await
-            .map_err(http_err)?;
-        check_status(resp, "post-truncate refresh").await
+        check_status(resp, &format!("truncate index {index}")).await
     }
 
-    async fn write_checkpoint(
-        &self,
-        slot_name: &str,
-        publication: &str,
-        lsn: Lsn,
-    ) -> Result<(), CoreError> {
+    async fn write_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), CoreError> {
         self.ensure_meta_index().await?;
-        let instance_id = std::env::var("PG2OSYNC_INSTANCE_ID").unwrap_or_default();
-        let epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
         let resp = self
             .client
-            .index(IndexParts::IndexId(META_INDEX, "default"))
-            .body(json!({
-                "slot_name": slot_name,
-                "publication": publication,
-                "confirmed_lsn": lsn.to_string(),
-                "instance_id": instance_id,
-                "updated_at_epoch": epoch,
-                "schema_version": 1
-            }))
+            .index(IndexParts::IndexId(META_INDEX, CHECKPOINT_DOC_ID))
+            .body(checkpoint_doc(checkpoint))
             .send()
             .await
             .map_err(http_err)?;
         check_status(resp, "write checkpoint").await
     }
 
-    async fn read_checkpoint(&self) -> Result<Option<Lsn>, CoreError> {
+    async fn read_checkpoint(&self) -> Result<Option<Checkpoint>, CoreError> {
         let resp = self
             .client
-            .get(GetParts::IndexId(META_INDEX, "default"))
+            .get(GetParts::IndexId(META_INDEX, CHECKPOINT_DOC_ID))
             .send()
             .await
             .map_err(http_err)?;
@@ -417,10 +411,7 @@ impl Sink for OpenSearchSink {
             .json()
             .await
             .map_err(|e| CoreError::Sink(e.to_string()))?;
-        match body["_source"]["confirmed_lsn"].as_str() {
-            Some(s) => Ok(Some(s.parse().map_err(CoreError::from)?)),
-            None => Ok(None),
-        }
+        Ok(checkpoint_from_doc(&body["_source"]))
     }
 
     async fn health(&self) -> Result<Health, CoreError> {
@@ -435,5 +426,76 @@ impl Sink for OpenSearchSink {
         } else {
             Ok(Health::Down(format!("status {}", resp.status_code())))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pg2osync_core::checkpoint::{SOURCE_MYSQL, SOURCE_POSTGRES, StreamId};
+
+    fn checkpoint() -> Checkpoint {
+        Checkpoint {
+            stream: StreamId {
+                source: SOURCE_POSTGRES.into(),
+                stream: "pg2osync".into(),
+                publication: "pg2osync_pub".into(),
+            },
+            token: 0x1B4_F2A8,
+            position: "0/1B4F2A8".into(),
+        }
+    }
+
+    #[test]
+    fn checkpoint_documents_round_trip() {
+        let doc = checkpoint_doc(&checkpoint());
+        assert_eq!(checkpoint_from_doc(&doc), Some(checkpoint()));
+    }
+
+    #[test]
+    fn mysql_positions_round_trip_unchanged() {
+        let mysql = Checkpoint {
+            stream: StreamId {
+                source: SOURCE_MYSQL.into(),
+                stream: "424242".into(),
+                publication: String::new(),
+            },
+            token: (4u64 << 32) | 1234,
+            position: "binlog.000004:1234".into(),
+        };
+        let doc = checkpoint_doc(&mysql);
+        assert_eq!(checkpoint_from_doc(&doc), Some(mysql));
+    }
+
+    #[test]
+    fn v1_documents_still_resume() {
+        // pre-0.7 deployments stored only the textual LSN; refusing to read
+        // them would force a full re-index on upgrade
+        let legacy = json!({
+            "slot_name": "pg2osync",
+            "publication": "pg2osync_pub",
+            "confirmed_lsn": "0/1B4F2A8",
+            "schema_version": 1
+        });
+        let parsed = checkpoint_from_doc(&legacy).expect("v1 document must parse");
+        assert_eq!(parsed.stream.source, SOURCE_POSTGRES);
+        assert_eq!(parsed.token, 0x1B4_F2A8);
+    }
+
+    #[test]
+    fn documents_without_a_position_are_ignored() {
+        assert_eq!(checkpoint_from_doc(&json!({})), None);
+        assert_eq!(checkpoint_from_doc(&Value::Null), None);
+    }
+
+    #[test]
+    fn only_transient_errors_are_retried() {
+        assert!(is_retryable(&CoreError::SinkTransient("429".into())));
+        assert!(!is_retryable(&CoreError::Sink("bad mapping".into())));
+        assert!(!is_retryable(&CoreError::DocumentRejected {
+            index: "i".into(),
+            doc_id: "1".into(),
+            reason: "mapper_parsing_exception".into(),
+        }));
     }
 }

@@ -1,4 +1,9 @@
 target
 spike
 dev
+docs
+deploy
 .git
+.github
+*.md
+!LICENSE

@@ -11,6 +11,12 @@ pub enum CoreError {
     #[error("sink error: {0}")]
     Sink(String),
 
+    /// A sink failure that is expected to succeed on a later attempt
+    /// (HTTP 429/5xx, connection resets). Classifying at construction time
+    /// keeps retry decisions out of string matching.
+    #[error("transient sink error: {0}")]
+    SinkTransient(String),
+
     #[error("sink rejected document {doc_id} on index {index}: {reason}")]
     DocumentRejected {
         index: String,

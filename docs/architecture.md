@@ -1,90 +1,146 @@
 # Architecture
 
-## Overview
+## The pipeline
 
 ```
-PostgreSQL (logical replication / pgoutput)
-        │
-        ▼
-   Source task ────► Engine task ────► Sink task ────► OpenSearch
-   pgoutput decode    txn buffering     _bulk API
-   → ChangeEvents     coalescing        checkpoint write
-        ▲                 │                  │
-        └──── LSN ack / checkpoint ◄────────┘
+  source task            engine task              sink task
+┌──────────────┐  mpsc  ┌──────────────┐  mpsc  ┌──────────────┐
+│ decode WAL / │ 10k    │ buffer until │ 64     │ bulk write   │
+│ binlog into  ├───────►│ COMMIT, then ├───────►│ + truncate,  │
+│ ChangeEvents │  ▲     │ batch + map  │        │ in order     │
+└──────────────┘  │     └──────┬───────┘        └──────┬───────┘
+       ▲          │            │                       │
+       │      backpressure     ▼                       ▼
+       │                 checkpoint task ◄──── acknowledged position
+       └──────── durable position (clamps what may be acked)
 ```
 
-Three async tasks connected by bounded channels:
+Three tokio tasks joined by **bounded** channels. The bounds are the entire
+backpressure mechanism: a slow sink fills the batch channel, which blocks the
+engine, which fills the event channel, which stops the source from reading —
+so the database retains its log instead of the process growing without limit.
 
-1. **Source** holds one replication connection, decodes pgoutput into
-   `ChangeEvent`s and forwards them with their LSN.
-2. **Engine** buffers events until it sees the transaction's COMMIT, then
-   releases the whole transaction at once — a partial transaction is never
-   indexed. It coalesces multiple updates to the same row within a batch,
-   groups rows into `_bulk`-sized batches, applies column transforms, and
-   embeds nested children for insert/update documents.
-3. **Sink** writes batches to OpenSearch/Elasticsearch via `_bulk` and
-   persists the checkpoint (highest durably-flushed LSN) into a hidden
-   `.pg2osync_meta` index. The confirmed LSN is fed back to the source so
-   PostgreSQL knows which WAL can be recycled.
+### Source task
+
+Owns one replication connection and turns the wire protocol into
+`core::ChangeEvent` values: `Row` (insert/update/delete), `TableTruncated`, and
+`Transaction(Commit)` boundaries carrying a position token.
+
+Everything protocol-specific stays here. PostgreSQL pgoutput decoding lives in
+`crates/source`, MySQL binlog decoding in `crates/source-mysql`. Any source
+error terminates the task; the pipeline is rebuilt from the last checkpoint,
+because a partially buffered transaction is invalid after a reposition.
+
+### Engine task
+
+Source-agnostic by construction — it knows `ChangeEvent`, the `Sink` trait, and
+nothing else. It:
+
+1. buffers rows until their `Commit` arrives, so a partial transaction is never
+   handed to a sink;
+2. splits a transaction that exceeds `batch_size` or `batch_max_bytes` across
+   requests (safe because every write is idempotent, and the commit position
+   lands on the final piece);
+3. applies column projection and transforms;
+4. completes unchanged-TOAST columns by reading the previously indexed
+   document;
+5. maps `(schema, table)` to a target index.
+
+### Sink task
+
+Executes writes and truncates **in the order the engine produced them**. Both
+travel through the same channel: running a truncate directly would let writes
+still queued ahead of it land afterwards and resurrect rows the source has
+already dropped.
+
+### Checkpoint task
+
+Every `checkpoint_interval_ms` it persists the highest acknowledged position.
+Only after that write succeeds does the *durable position* advance — and that
+value is what the source is allowed to acknowledge upstream.
+
+## Positions
+
+The engine treats a source position as an opaque, monotonically increasing
+`u64` token:
+
+| Source | Token | Stored text |
+|---|---|---|
+| PostgreSQL | WAL LSN as `u64` | `0/1B4F2A8` |
+| MySQL/MariaDB | `(binlog file index << 32) \| offset` | `binlog.000004:1234` |
+
+Packing the file index into the high bits makes a rotation compare greater than
+any offset in the previous file, so ordering holds across rotations. The binary
+supplies a closure that renders the token into the source's own textual form,
+which is what a restart parses to resume.
 
 ## Delivery semantics
 
-- **At-least-once**: a crash between sink write and checkpoint means the last
-  batch is replayed on restart. Correctness relies on idempotent writes:
-  every document's `_id` is the row's primary key, so replays overwrite to
-  the same value.
-- **Ordering**: per-row ordering is preserved because coalescing keeps only
-  the newest image; across tables there is no ordering guarantee (same as
-  every CDC system without global serialization).
-- **Truncate**: mapped to an index-level delete-by-query / index drop in the
-  sink.
+- **At-least-once.** A crash between a sink write and the checkpoint replays the
+  last batch on restart. Correctness rests on idempotent writes: a document's
+  `_id` is its row's primary key, so a replay overwrites to the same value.
+- **Never acknowledge early.** The position reported to the source is clamped to
+  the durable checkpoint. Acknowledging further would let the database recycle
+  history for rows that are not indexed yet — the classic way CDC pipelines
+  lose data on crash-restart.
+- **Ordering** is guaranteed per row. Across tables there is none, as with any
+  CDC system without global serialization.
+- **TRUNCATE** clears the target index, ordered against pending writes.
 
 ## Crash safety
 
-- Checkpoints are written every `checkpoint_interval_ms` (default 500 ms).
-- On startup, if the stored checkpoint predates the slot's restart LSN
-  (WAL was recycled or the slot was recreated), pg2osync refuses to stream a
-  gap and falls back to a full backfill — idempotent writes make this safe.
-- `kill -9` at any point loses nothing: either the batch was flushed and
-  checkpointed, or it will be replayed.
+On startup pg2osync reads the checkpoint and refuses to use one that does not
+belong to this stream — a different source kind, slot or `server_id` means a
+full initial load instead of resuming into the wrong position space.
 
-The e2e suite (`dev/e2e-test.sh`) verifies this by killing the process with
-SIGKILL, writing a row during downtime, restarting, and asserting zero data
-loss.
+For PostgreSQL it additionally compares the checkpoint with the slot's
+`confirmed_flush_lsn`. A checkpoint *behind* the slot is unusable: streaming
+would resume at the slot's position and the gap between them would be lost, so
+the initial load runs again.
 
-## Backfill
+`dev/e2e-test.sh` verifies this by `SIGKILL`ing the process, writing rows during
+the downtime, restarting, and asserting nothing is missing.
 
-On first run (no usable checkpoint), the source:
+## Initial load
 
-1. Creates publication + replication slot (`CREATE PUBLICATION ... FOR TABLE
-   ..., CREATE REPLICATION SLOT ... LOGICAL pgoutput`).
-2. Opens a second connection and reads a consistent snapshot
-   (`pg_export_snapshot`) taken at the slot's consistent point.
-3. Streams the table contents via `COPY (SELECT ...) TO STDOUT (BINARY)`.
-4. Switches to WAL streaming; because the snapshot matches the slot's LSN,
-   no row is missed or double-applied.
+**PostgreSQL:** the slot is created first, then a second connection opens a
+`REPEATABLE READ READ ONLY` transaction and reads each table with
+`COPY (SELECT …) TO STDOUT (FORMAT text)`. Because the snapshot is taken after
+the slot exists, the overlap between snapshot and stream can only produce
+duplicates, never a gap — and duplicates are harmless. Synthetic commit
+boundaries every few thousand rows keep the engine flushing during large loads.
 
-## Source abstraction
+**MySQL:** `START TRANSACTION WITH CONSISTENT SNAPSHOT`, then the binlog
+coordinate is read *inside* that transaction and every table is selected. InnoDB
+establishes the read view at the start of the transaction, so streaming from
+that coordinate can only re-deliver rows.
 
-The engine consumes only `core::ChangeEvent`. Sources are swappable behind
-this boundary:
+Rows produced by an initial load carry position token `0`, which flushes batches
+without ever advancing the checkpoint — they have no position of their own.
 
-- **PostgreSQL** (`crates/source`): transport via the `pgwire-replication`
-  crate (raw frames only); all pgoutput decoding, type mapping and relation
-  catalog handling lives in-house.
-- **MySQL/MariaDB** (`crates/source-mysql`, preview): own wire-protocol
-  implementation — handshake, native/caching-sha2 auth, binlog dump — plus an
-  in-house binlog event decoder. See [sources/mysql.md](sources/mysql.md).
+## Row fidelity
 
-Sinks implement the small `Sink` trait (`ensure_ready`, `write`,
-`truncate_index`, `write_checkpoint`, `read_checkpoint`). Adding a new target
-never touches engine code.
+- **Unchanged TOAST** (PostgreSQL): an UPDATE omits large unchanged columns. If
+  the table has `REPLICA IDENTITY FULL` the old tuple supplies the value;
+  otherwise the previously indexed document is read back through
+  `Sink::get_documents`.
+- **Types.** `numeric` and `decimal` become JSON strings, because a float
+  round-trip loses precision. `bytea`, MySQL blobs and geometry become base64.
+  `json`/`jsonb` are parsed into real JSON. Unknown types fall back to strings.
+- **Partitioned tables** (PostgreSQL): publications are created with
+  `publish_via_partition_root = true`, so events arrive under the parent
+  relation and match the configuration.
+- **MySQL row images** require `binlog_row_image = FULL`. The null bitmap is
+  indexed by position among *present* columns, which is what makes partial
+  images decode correctly at all.
 
-## Design principles
+## Extension points
 
-- **No CDC framework**: protocol logic is in-house, dependencies are limited
-  to transport primitives.
-- **Secrets env-first**: config files reference environment variables
-  (`url_env`, `password_env`); plain-text secrets warn as deprecated.
-- **YAGNI**: six metrics don't justify a prometheus dependency; the exposition
-  endpoint is hand-rolled. Every abstraction must pay for itself.
+Adding a target means implementing `Sink` (`ensure_ready`, `get_documents`,
+`write`, `truncate_index`, `write_checkpoint`, `read_checkpoint`, `health`). No
+engine code changes, and the engine never matches on a sink kind.
+
+Adding a source means producing `ChangeEvent`s with position tokens. The engine
+cannot tell the difference.
+
+Rationale for these boundaries is in [decisions.md](decisions.md).

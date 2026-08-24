@@ -14,12 +14,17 @@ url = "http://localhost:9200"
 
 - Writes batches via `_bulk` with `index`/`delete` operations; document `_id`
   is the row's primary key → idempotent replay-safe writes.
-- Checkpoints live in a hidden **`.pg2osync_meta`** index (one doc per
-  slot/publication pair). Don't delete it while syncing; deleting it triggers
-  a safe full backfill on next start.
-- TRUNCATE is applied as an index operation on the target.
-- Partial updates: unmodified TOASTed columns are omitted from update docs;
-  combined with partial `_doc` merges this keeps large fields intact.
+- The checkpoint is one document in a hidden **`.pg2osync_meta`** index.
+  Deleting it forces a full initial load on the next start, which is safe but
+  expensive.
+- TRUNCATE runs as `_delete_by_query` with a refresh first, so a write that has
+  not been refreshed yet cannot survive the truncate.
+- Unmodified TOASTed columns are completed before the write — from the old
+  tuple under `REPLICA IDENTITY FULL`, otherwise by reading the current
+  document back — so a document is never written with a hole in it.
+- Transient failures (429, 5xx, connection resets) are retried with exponential
+  backoff per `[engine] retry_max` and `retry_backoff_ms`. A permanent
+  rejection stops the pipeline instead of skipping the document.
 
 ## Amazon OpenSearch Serverless
 
@@ -48,6 +53,16 @@ ambiguous.
 
 - `pg2osync validate` checks reachability and version before you commit to a
   run.
-- Watch `pg2osync_sink_errors_total` and `pg2osync_batches_flushed` on
-  `/metrics`; sustained errors with stalled `lsn_confirmed` mean the sink is
-  unhappy (disk full, mapping conflicts, auth expiry).
+- Watch `pg2osync_sink_errors_total` and `pg2osync_position_confirmed` on
+  `/metrics`. Errors with a stalled confirmed position mean the target is
+  unhappy: disk full, a mapping conflict, or expired credentials.
+
+## Mappings
+
+Indices are created with dynamic mapping if they do not exist. For anything
+beyond the defaults — analyzers, `keyword` subfields, explicit date formats —
+create the index (or an index template) yourself before running; pg2osync only
+creates what is missing and never modifies an existing mapping.
+
+A document that conflicts with an existing mapping is a permanent rejection and
+stops the pipeline, by design.

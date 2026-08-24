@@ -1,0 +1,85 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pg2osync
+  namespace: pg2osync
+  labels:
+    app.kubernetes.io/name: pg2osync
+spec:
+  # Exactly one replica: two processes on the same replication slot fight over
+  # the position and undo each other's progress. Scale by splitting tables
+  # across Deployments with their own slot_name instead.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pg2osync
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pg2osync
+      annotations:
+        # rolls the pod whenever the config changes
+        checksum/config: "replace-with-configmap-hash"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: pg2osync
+          image: ghcr.io/kennywillbe/pg2osync:0.6.0
+          args: ["run", "-c", "/etc/pg2osync/pg2osync.toml"]
+          env:
+            - name: RUST_LOG
+              value: pg2osync=info
+            # distinguishes instances in the checkpoint document
+            - name: PG2OSYNC_INSTANCE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          envFrom:
+            - secretRef:
+                name: pg2osync-credentials
+          ports:
+            - name: metrics
+              containerPort: 9100
+          startupProbe:
+            # the initial load of a large table can take minutes; a liveness
+            # probe alone would kill the pod before it ever streams
+            httpGet:
+              path: /metrics
+              port: metrics
+            periodSeconds: 10
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/pg2osync
+              readOnly: true
+      # SIGTERM stops the stream between messages; the checkpoint is already
+      # durable, so a short grace period is enough
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - name: config
+          configMap:
+            name: pg2osync-config

@@ -1,0 +1,117 @@
+image:
+  repository: ghcr.io/kennywillbe/pg2osync
+  # defaults to the chart's appVersion
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# The pipeline configuration, rendered into a ConfigMap as pg2osync.toml.
+# Credentials belong in `secrets` or `existingSecret`, never here.
+config:
+  source:
+    url_env: PG2OSYNC_SOURCE_URL
+    slot_name: pg2osync
+    publication: pg2osync_pub
+  target:
+    url: http://opensearch:9200
+    # username: pg2osync
+    # password_env: PG2OSYNC_TARGET_PASSWORD
+  metrics:
+    # not 127.0.0.1: kubelet probes and Prometheus reach the pod from outside
+    bind: 0.0.0.0:9100
+  # One entry per table. Left empty on purpose: Helm merges maps, so a default
+  # table here would survive your override and sync something you never asked
+  # for.
+  sync: {}
+  #  users:
+  #    table: public.users        # database.table for MySQL
+  #    index: users
+  #    exclude_columns: ["password_hash"]
+  #    transform:
+  #      email: redact
+
+# Raw TOML appended to the rendered config. Use it for constructs the values
+# tree cannot express, such as repeated [[sync.x.children]] blocks.
+extraConfig: ""
+
+# Rendered into a Secret and exposed as environment variables. Prefer
+# existingSecret in production so credentials never enter values.yaml.
+secrets: {}
+#  PG2OSYNC_SOURCE_URL: postgres://user:pass@postgres:5432/appdb
+#  PG2OSYNC_TARGET_PASSWORD: changeme
+
+# Name of a Secret that already holds the same keys (External Secrets, Vault,
+# SOPS). Takes precedence over `secrets`.
+existingSecret: ""
+
+env:
+  RUST_LOG: pg2osync=info
+extraEnv: []
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+service:
+  # headless: nothing needs to load-balance a single instance
+  type: ClusterIP
+  clusterIP: None
+  port: 9100
+  annotations: {}
+
+metrics:
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    labels: {}
+
+# The initial load of a large table happens before the endpoint answers, so the
+# startup probe must outlast it; liveness alone would restart the pod forever.
+probes:
+  startup:
+    enabled: true
+    periodSeconds: 10
+    failureThreshold: 60
+  liveness:
+    enabled: true
+    periodSeconds: 30
+    failureThreshold: 3
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# Meilisearch keeps its checkpoint on disk; give it a volume that survives
+# restarts. Other targets store the checkpoint in the search cluster.
+persistence:
+  enabled: false
+  size: 1Gi
+  storageClass: ""
+  mountPath: /var/lib/pg2osync
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}
+podLabels: {}
+terminationGracePeriodSeconds: 30

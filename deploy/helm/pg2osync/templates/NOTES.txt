@@ -1,0 +1,25 @@
+pg2osync {{ .Chart.AppVersion }} is installed as {{ include "pg2osync.fullname" . }}.
+
+Follow the pipeline:
+
+  kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "pg2osync.fullname" . }} -f
+
+Check how far behind it is:
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "pg2osync.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+  curl -s localhost:{{ .Values.service.port }}/metrics | grep pg2osync_position
+
+{{- if and (not .Values.secrets) (not .Values.existingSecret) }}
+
+WARNING: no credentials were provided. Set `secrets` or `existingSecret`,
+otherwise the process cannot resolve source.url_env and will exit.
+{{- end }}
+{{- if not .Values.config.sync }}
+
+WARNING: config.sync is empty, so there is nothing to synchronize and the
+process will exit. Add at least one table.
+{{- end }}
+{{- if and (eq .Values.config.target.url "http://opensearch:9200") }}
+
+NOTE: target.url is still the chart default (http://opensearch:9200).
+{{- end }}

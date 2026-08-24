@@ -55,8 +55,8 @@ the sync user can't run DDL and a DBA provisions the objects instead.
 ALTER TABLE users REPLICA IDENTITY FULL;
 ```
 
-or per-table in config: `replica_identity_full = true` (documents intent;
-validate warns if the table doesn't match).
+pg2osync reads the actual setting from `pg_class.relreplident` and warns at
+startup when a table cannot support what your configuration asks of it.
 
 ### Column selection
 
@@ -69,9 +69,14 @@ exclude_columns = ["password_hash", "internal_notes"]
 # columns = ["id", "name", "email"]
 ```
 
-TOASTed columns (very large values) that were not modified in an UPDATE are
-omitted from the document update — OpenSearch merges partial `_doc` updates,
-so unmodified fields stay intact.
+Projection applies to the initial load and to live streaming alike, so an
+excluded column never reaches the target.
+
+TOASTed columns (very large values) that an UPDATE did not modify arrive as
+markers rather than values. pg2osync completes them from the old tuple when the
+table has `REPLICA IDENTITY FULL`, and otherwise reads the previously indexed
+document back from the target — so the document is never written with a hole in
+it.
 
 ## Poll mode (fallback)
 
@@ -88,11 +93,25 @@ poll_interval_secs = 30
 
 Limitations:
 
-- **Upsert-only**: deletes are not visible to polling. Soft-delete pattern
-  (`deleted_at IS NULL` filtering) is the workaround.
-- Rows must have a reliably-bumped monotonically increasing timestamp column.
-- Latency floor is the poll interval.
-- Checkpoint is stored in the target like in WAL mode.
+- **Upsert-only**: deletes are invisible to polling. A soft-delete column plus
+  a filter in your queries is the usual workaround.
+- Rows need a reliably bumped, monotonically increasing timestamp column.
+- The latency floor is the poll interval.
+- There is no position to resume from, so every start re-runs the initial load.
+  WAL checkpoints left by a previous `mode = "wal"` run are ignored on purpose:
+  using one would skip rows that changed while the process was down.
+- `poll_page_size` (default 5000) bounds how many rows one cycle reads per
+  table; a large backlog drains over several cycles.
+
+## Truncates and deletes
+
+`TRUNCATE` on a synced table clears the target index. It is ordered against
+writes still queued for the target, so a row written just before the truncate
+cannot survive it.
+
+`DELETE` needs the row's key, which the default replica identity provides. A
+table with `REPLICA IDENTITY NOTHING` cannot replicate updates or deletes at
+all; pg2osync fails with the exact `ALTER TABLE` to run.
 
 ## Slot hygiene
 

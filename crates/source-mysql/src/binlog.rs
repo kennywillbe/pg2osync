@@ -1,4 +1,4 @@
-//! MySQL binlog event parsing (stage 0.7).
+//! MySQL binlog event parsing.
 //!
 //! Scope: ROW-format streams from MySQL 8.0 defaults — FORMAT_DESCRIPTION,
 //! ROTATE, TABLE_MAP, WRITE/UPDATE/DELETE_ROWS (v1+v2), XID, QUERY.
@@ -92,6 +92,9 @@ impl<'a> R<'a> {
 pub struct EventHeader {
     pub timestamp: u32,
     pub event_type: u8,
+    pub event_size: u32,
+    /// Offset of the *next* event in the current binlog file: this is what a
+    /// resume position must be, not the offset of this event.
     pub log_pos: u32,
 }
 
@@ -118,7 +121,10 @@ pub fn parse_header(ev: &[u8]) -> Option<EventHeader> {
     Some(EventHeader {
         timestamp: u32::from_le_bytes(ev[0..4].try_into().unwrap()),
         event_type: ev[4],
-        log_pos: u32::from_le_bytes(ev[9..13].try_into().unwrap()),
+        // header layout: timestamp(4) type(1) server_id(4) event_size(4)
+        //                log_pos(4) flags(2)
+        event_size: u32::from_le_bytes(ev[9..13].try_into().unwrap()),
+        log_pos: u32::from_le_bytes(ev[13..17].try_into().unwrap()),
     })
 }
 
@@ -137,7 +143,6 @@ pub fn parse_fde(body_after_header: &[u8]) -> (usize, usize) {
         .get(body_after_header.len() - 5)
         .unwrap_or(&1);
     let checksum_len = if alg == 1 { 4 } else { 0 };
-    eprintln!("DBG-FDE hlen={header_len} alg={alg} -> csum={checksum_len}");
     (header_len.max(19), checksum_len)
 }
 
@@ -335,16 +340,7 @@ pub fn parse_table_map(payload: &[u8]) -> Result<(u64, TableMeta, OptionalMeta),
 
 // ---- ROWS -------------------------------------------------------------------
 
-/// Stream state carried across events.
-#[derive(Debug, Default)]
-pub struct BinlogState {
-    pub current_file: String,
-    pub checksum_len: usize,
-    pub tables: std::collections::HashMap<u64, TableMeta>,
-}
-
 pub fn rows_kind_for_type(ty: u8) -> Option<RowsKind> {
-    eprintln!("DBG-KIND ty={ty}");
     match ty {
         T_WRITE_ROWS_V1 | T_WRITE_ROWS_V2 | T_MARIA_WRITE_ROWS_V2 => Some(RowsKind::Write),
         T_UPDATE_ROWS_V1 | T_UPDATE_ROWS_V2 | T_MARIA_UPDATE_ROWS_V2 => Some(RowsKind::Update),
@@ -393,10 +389,6 @@ pub fn parse_rows(
 
     let body = strip_checksum(payload, checksum_len);
     let mut r = R::new(body);
-    {
-        let hx: String = body.iter().map(|b| format!("{b:02x}")).collect();
-        eprintln!("ROWSHEX {}B {}", body.len(), hx);
-    }
     let table_id = r.u48()?;
     let _flags = r.u16v()?;
     // MySQL v2 row events carry a 2-byte extra-data length + payload;
@@ -418,7 +410,9 @@ pub fn parse_rows(
 
     let mut rows = Vec::new();
     loop {
-        if r.rest_len() < bmp_len {
+        // the rows section ends exactly at the event boundary; anything else
+        // would decode padding into a phantom all-NULL row
+        if r.rest_len() == 0 {
             break;
         }
         // trailing padding/CRC bytes can look like an extra row start; per the
@@ -456,51 +450,34 @@ fn decode_image(
     ncols: usize,
     present_bmp: &[u8],
 ) -> Result<Vec<Option<Value>>, DecodeError> {
-    eprintln!("DBG-IMG enter pos={} nb={}", r.pos, ncols.div_ceil(8));
-    let nb = ncols.div_ceil(8);
-    let null_bmp = r.take(nb)?.to_vec();
-    let is_null = |i: usize| null_bmp.get(i / 8).copied().unwrap_or(0) >> (i % 8) & 1 == 1;
+    // The null bitmap covers only the columns present in this image, indexed
+    // by their position among the present ones — not by column ordinal. With
+    // binlog_row_image=FULL the two coincide; with a partial image they do not,
+    // and using the ordinal would shift every value after the first gap.
+    let present_count = (0..ncols).filter(|&i| bmp_bit(present_bmp, i)).count();
+    let null_bmp = r.take(present_count.div_ceil(8))?.to_vec();
+    let is_null = |nth: usize| null_bmp.get(nth / 8).copied().unwrap_or(0) >> (nth % 8) & 1 == 1;
 
     let mut out = Vec::with_capacity(ncols);
+    let mut nth = 0usize;
     for (i, cm) in meta.columns.iter().enumerate() {
-        let before = r.pos;
         if !bmp_bit(present_bmp, i) {
             out.push(None);
             continue;
         }
-        if is_null(i) {
+        if is_null(nth) {
             out.push(Some(Value::Null));
-            eprintln!("DBG-C col{i} ty={:#04x} NULL", cm.type_code);
-            continue;
+        } else {
+            out.push(Some(decode_value_inner(
+                r,
+                cm.type_code,
+                &cm.meta,
+                cm.unsigned,
+            )?));
         }
-        let v = decode_value(r, cm.type_code, &cm.meta, cm.unsigned)?;
-        eprintln!(
-            "DBG-C col{i} ty={:#04x} meta={:?} took {}B -> {}",
-            cm.type_code,
-            cm.meta,
-            r.pos - before,
-            v
-        );
-        out.push(Some(v));
+        nth += 1;
     }
     Ok(out)
-}
-
-fn decode_value(r: &mut R, ty: u8, meta: &[u8], unsigned: bool) -> Result<Value, DecodeError> {
-    let start = r.pos;
-    let out = decode_value_inner(r, ty, meta, unsigned);
-    match &out {
-        Ok(v) => eprintln!(
-            "DBG-V ty={ty} meta={meta:?} took {}B -> {}",
-            r.pos - start,
-            v
-        ),
-        Err(e) => eprintln!(
-            "DBG-V ty={ty} meta={meta:?} ERR {e} after {}B",
-            r.pos - start
-        ),
-    }
-    out
 }
 
 fn decode_value_inner(
@@ -807,7 +784,9 @@ fn decode_decimal(r: &mut R, precision: usize, scale: usize) -> Result<Value, De
             width = frac_last
         ));
     }
-    let frac_digits = frac_digits.trim_end_matches('0').to_string();
+    // keep the column's declared scale: trimming would make the streamed
+    // value differ from the same row read during the initial load
+    frac_digits.truncate(scale);
 
     let sign = if positive || (int_digits.is_empty() && frac_digits.is_empty()) {
         ""
@@ -867,11 +846,25 @@ mod tests {
     #[test]
     fn header_parses() {
         let mut ev = vec![0u8; 19];
-        ev[0..4].copy_from_slice(&1700000000u32.to_le_bytes());
+        ev[0..4].copy_from_slice(&1_700_000_000u32.to_le_bytes());
         ev[4] = T_QUERY;
+        ev[5..9].copy_from_slice(&7u32.to_le_bytes()); // server id
+        ev[9..13].copy_from_slice(&31u32.to_le_bytes()); // event size
+        ev[13..17].copy_from_slice(&4305u32.to_le_bytes()); // next event position
         let h = parse_header(&ev).unwrap();
-        assert_eq!(h.event_type, 2);
-        assert_eq!(h.log_pos, 0);
+        assert_eq!(h.event_type, T_QUERY);
+        assert_eq!(h.event_size, 31);
+        // reading the size as the position would checkpoint mid-event and the
+        // server would reject the resume with "bogus data in log event"
+        assert_eq!(h.log_pos, 4305);
+    }
+
+    #[test]
+    fn decimals_keep_their_declared_scale() {
+        // decimal(12,2) value 8.50 must not collapse to "8.5": the initial
+        // load reads the same row as "8.50" via the text protocol
+        let v = decode_decimal(&mut R::new(&[0x80, 0x00, 0x00, 0x00, 0x08, 0x32]), 12, 2).unwrap();
+        assert_eq!(v, Value::String("8.50".into()));
     }
 
     #[test]

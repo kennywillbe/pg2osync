@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg2osync-metrics
+  namespace: pg2osync
+  labels:
+    app.kubernetes.io/name: pg2osync
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: pg2osync
+  ports:
+    - name: metrics
+      port: 9100
+      targetPort: metrics

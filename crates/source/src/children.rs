@@ -1,4 +1,4 @@
-//! Nested child-collection support (v0.3).
+//! Nested child-collection support.
 //!
 //! Children are resolved at the SOURCE side via SQL so the engine stays
 //! source-agnostic: parent documents simply arrive with extra array fields.

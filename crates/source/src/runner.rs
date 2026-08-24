@@ -1,6 +1,6 @@
 //! Live WAL streaming into a `ChangeEvent` channel.
 //!
-//! Failure policy (ADR #17): any source error terminates this task; the engine
+//! Failure policy: any source error terminates this task; the engine
 //! tears down and rebuilds the whole pipeline from the last checkpoint. This
 //! task never reconnects on its own.
 
@@ -151,6 +151,23 @@ impl WalSource {
                     match msg {
                         crate::pgoutput::Message::Relation(rel) => {
                             relations.insert(rel.rel_id, rel.clone());
+                        }
+                        crate::pgoutput::Message::Truncate(tr) => {
+                            // one event per relation: the engine clears each
+                            // mapped index independently
+                            for rel_id in &tr.rel_ids {
+                                let Some(rel) = relations.get(rel_id) else {
+                                    return Err(anyhow::anyhow!(
+                                        "TRUNCATE for unknown relation oid {rel_id}"
+                                    ));
+                                };
+                                tx.send(ChangeEvent::TableTruncated {
+                                    schema: rel.schema.clone(),
+                                    table: rel.name.clone(),
+                                })
+                                .await
+                                .context("change channel closed")?;
+                            }
                         }
                         msg @ (crate::pgoutput::Message::Insert(_)
                         | crate::pgoutput::Message::Update(_)

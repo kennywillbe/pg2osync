@@ -21,14 +21,22 @@ Operational consequences:
 
 - **The checkpoint is tied to one machine.** Don't run two pg2osync instances
   against the same Meilisearch target with a shared state dir.
-- Back up or persist `state_dir` alongside the process (volume mount in
-  Docker). Losing it triggers a safe full re-sync (upsert semantics make this
-  idempotent).
+- Persist `state_dir` (a volume mount in Docker, `persistence.enabled` in the
+  Helm chart). Losing it triggers a full re-sync, which is safe but expensive.
+- The file is written to a temporary name and renamed into place, so a crash
+  mid-write cannot leave a truncated checkpoint that silently restarts the
+  pipeline from zero.
 - Deletes still propagate — pg2osync issues explicit delete calls; nothing
   depends on tombstones inside Meilisearch.
 
 ## Behavior
 
 - Documents are upserted with the primary key as Meilisearch's document id.
-- Batches wait for task completion (`wait_task`) so checkpoints only advance
-  after durable acceptance.
+- Writes are asynchronous server-side tasks; the sink waits for each task to
+  complete before acknowledging, so the checkpoint only advances after durable
+  acceptance.
+- TRUNCATE deletes all documents of the index and waits for that task too.
+- Meilisearch has no mappings; searchable and filterable attributes are yours to
+  configure on the index.
+
+Verified end to end against Meilisearch 1.11.

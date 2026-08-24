@@ -1,218 +1,98 @@
-//! The main mode: bootstrap, consistent backfill, live streaming.
+//! Pipeline orchestration: bootstrap, initial load, live streaming.
+//!
+//! Everything source-specific stays behind `SourceKind`; the engine and sink
+//! wiring below is identical for every source.
 
-use anyhow::{Context as _, Result};
-use pg2osync_core::event::{ChangeEvent, RowKind, TransactionBoundary};
+use anyhow::{Context as _, Result, bail};
+use pg2osync_core::checkpoint::{Checkpoint, SOURCE_MYSQL, SOURCE_POSTGRES, StreamId};
+use pg2osync_core::event::ChangeEvent;
 use pg2osync_core::lsn::Lsn;
-use pg2osync_core::sink::Sink;
+use pg2osync_core::sink::{IndexSpec, Sink};
+use pg2osync_engine::mapping::{
+    DurableLsn, Projection, Projections, TableMapping, TransformOp, Transforms,
+};
+use pg2osync_engine::{PipelineCtx, PositionRenderer};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 
+use crate::backfill::split_qualified;
 use crate::config::AppConfig;
 
-/// Column metadata needed to rebuild documents outside the WAL stream.
-#[derive(Clone)]
-struct ColMeta {
-    name: String,
-    type_oid: u32,
-    is_pk: bool,
+/// How far the CLI takes the pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Create source-side objects and target indices, then exit.
+    Bootstrap,
+    /// Initial load plus continuous streaming.
+    Run,
 }
 
-async fn columns_of(
-    client: &tokio_postgres::Client,
-    qualified_table: &str,
-) -> Result<Vec<ColMeta>> {
-    let rows = client
-        .query(
-            r#"
-            SELECT a.attname AS name,
-                   a.atttypid::int4 AS oid,
-                   EXISTS(
-                       SELECT 1 FROM pg_index i
-                       WHERE i.indrelid = a.attrelid
-                         AND i.indisprimary
-                         AND a.attnum = ANY(i.indkey)
-                   ) AS is_pk
-            FROM pg_attribute a
-            WHERE a.attrelid = ($1::text)::regclass
-              AND a.attnum > 0
-              AND NOT a.attisdropped
-            ORDER BY a.attnum
-            "#,
-            &[&qualified_table],
-        )
-        .await?;
-    Ok(rows
-        .into_iter()
-        .map(|r| ColMeta {
-            name: r.get("name"),
-            // atttypid arrives via text cast above
-            type_oid: r.get::<_, i32>(1) as u32,
-            is_pk: r.get("is_pk"),
-        })
-        .collect())
-}
-
-/// COPY-style unescape for PostgreSQL TEXT format field values.
-fn unescape_copy(field: &str) -> Option<Vec<u8>> {
-    if field == "\\N" {
-        return None;
-    }
-    let mut out = Vec::with_capacity(field.len());
-    let mut chars = field.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.extend_from_slice(c.to_string().as_bytes());
-            continue;
-        }
-        match chars.next() {
-            Some('t') => out.push(b'\t'),
-            Some('n') => out.push(b'\n'),
-            Some('r') => out.push(b'\r'),
-            Some('\\') => out.push(b'\\'),
-            Some(other) => {
-                out.extend_from_slice(other.to_string().as_bytes());
-            }
-            None => {}
-        }
-    }
-    Some(out)
-}
+/// Channel depth between source and engine. Bounded channels are the whole
+/// backpressure mechanism: a slow sink must stall the source, not buffer.
+const EVENT_CHANNEL_DEPTH: usize = 10_000;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_pipeline(
     cfg: AppConfig,
     source_url: String,
+    admin_url: String,
     target_password: Option<String>,
     shutdown_rx: watch::Receiver<bool>,
-    durable: pg2osync_engine::mapping::DurableLsn,
+    durable: DurableLsn,
+    mode: Mode,
 ) -> Result<()> {
-    let engine_shutdown = shutdown_rx.clone();
-    use pg2osync_source::runner::{WalSource, WalSourceConfig};
+    let sink = build_sink(&cfg, target_password)?;
+    let index_specs: Vec<IndexSpec> = cfg
+        .sync
+        .iter()
+        .map(|(k, t)| IndexSpec {
+            name: t.index_name(k),
+        })
+        .collect();
 
-    // --- connections & bootstrap -------------------------------------------------
-    let (admin, admin_conn) = tokio_postgres::connect(&source_url, tokio_postgres::NoTls)
-        .await
-        .context("cannot connect to source")?;
-    tokio::spawn(async move {
-        let _ = admin_conn.await;
-    });
-
-    let mut children_map: HashMap<(String, String), Vec<pg2osync_source::children::ChildSpec>> =
-        HashMap::new();
-    let mut child_parents_map: HashMap<(String, String), (String, String)> = HashMap::new();
-    let mut parent_pk_columns: HashMap<(String, String), String> = HashMap::new();
-    for tbl in cfg.sync.values() {
-        let mut parts = tbl.table.splitn(2, '.');
-        let (ps, pt) = (
-            parts.next().unwrap_or_default().to_string(),
-            parts.next().unwrap_or_default().to_string(),
-        );
-        if !tbl.primary_key.as_ref().is_some_and(|k| !k.is_empty()) {
-            // pk detection happens later via catalog; placeholder "id" keeps
-            // refetch queries working for the common case
+    match cfg.source.flavor.as_str() {
+        "mysql" => {
+            run_mysql(
+                cfg,
+                source_url,
+                sink,
+                index_specs,
+                shutdown_rx,
+                durable,
+                mode,
+            )
+            .await
         }
-        parent_pk_columns.insert(
-            (ps.clone(), pt.clone()),
-            tbl.primary_key.clone().unwrap_or_else(|| "id".into()),
-        );
-        for cj in &tbl.children {
-            let spec = pg2osync_source::children::ChildSpec::new(
-                &cj.table,
-                &cj.field,
-                &cj.foreign_key,
-                &tbl.primary_key.clone().unwrap_or_else(|| "id".into()),
-            )?;
-            let cparts: Vec<&str> = cj.table.splitn(2, '.').collect();
-            child_parents_map.insert(
-                (cparts[0].to_string(), cparts[1].to_string()),
-                (ps.clone(), pt.clone()),
-            );
-            children_map
-                .entry((ps.clone(), pt.clone()))
-                .or_default()
-                .push(spec);
+        "postgres" | "postgresql" => {
+            run_postgres(
+                cfg,
+                source_url,
+                admin_url,
+                sink,
+                index_specs,
+                shutdown_rx,
+                durable,
+                mode,
+            )
+            .await
         }
+        other => bail!("unsupported source.flavor {other:?}; expected \"postgres\" or \"mysql\""),
     }
+}
 
-    let tables: Vec<String> = cfg.sync.values().map(|t| t.table.clone()).collect();
-    // child tables join the publication or their changes never reach us
-    let mut tables = tables;
-    for tbl in cfg.sync.values() {
-        for cj in &tbl.children {
-            if !tables.contains(&cj.table) {
-                tables.push(cj.table.clone());
-            }
-        }
-    }
-    let url = url::Url::parse(&source_url)?;
-    let src_cfg = WalSourceConfig {
-        host: url.host_str().unwrap_or("localhost").into(),
-        port: url.port().unwrap_or(5432),
-        user: url.username().into(),
-        password: url.password().unwrap_or_default().into(),
-        database: url.path().trim_start_matches('/').to_string(),
-        slot_name: cfg.source.slot_name.clone(),
-        publication: cfg.source.publication.clone(),
-        tables: tables.clone(),
-        start_lsn: None,
-        durable: None,
-        admin_url: Some(source_url.clone()),
-        children: children_map.clone(),
-        child_parents: child_parents_map.clone(),
-        parent_pk_columns,
-    };
-    let source = WalSource::new(src_cfg.clone());
-    source.bootstrap(&admin).await?;
-    // MySQL source bootstrap happens inside stream(); PG-specific checks here
-    // deletes on CHILD tables carry no FK under the default replica identity;
-    // warn upfront — runtime still errors precisely if a delete loses its way
-    for tbl in cfg.sync.values() {
-        for cj in &tbl.children {
-            let mut cp = cj.table.splitn(2, '.');
-            let cs = cp.next().unwrap_or("public");
-            let ct = cp.next().unwrap_or_default();
-            let ci = pg2osync_source::catalog::table_info(&admin, cs, ct)
-                .await
-                .with_context(|| format!("cannot inspect child table {}", cj.table))?;
-            if ci.relreplident != 'f' {
-                tracing::warn!(target: "pg2osync::run",
-                    "child table {} has REPLICA IDENTITY '{}': child DELETE refresh will fail.                      Recommended: ALTER TABLE {} REPLICA IDENTITY FULL",
-                    cj.table, ci.relreplident, cj.table);
-            }
-        }
-    }
+// ---------------------------------------------------------------- shared wiring
 
-    // --- sink & mapping ----------------------------------------------------------
-    let transform_pairs = cfg.sync.values().filter_map(|tbl| {
-        let mut parts = tbl.table.splitn(2, '.');
-        let schema = parts.next()?.to_string();
-        let table = parts.next()?.to_string();
-        if tbl.transform.is_empty() {
-            return None;
-        }
-        let rules: HashMap<String, pg2osync_engine::mapping::TransformOp> = tbl
-            .transform
-            .iter()
-            .filter_map(|(c, op)| TransformOp::parse(op).map(|o| (c.clone(), o)))
-            .collect();
-        Some(((schema, table), rules))
-    });
-    let transforms = pg2osync_engine::mapping::Transforms::from_pairs(transform_pairs);
-    use pg2osync_engine::mapping::TransformOp;
-    let mapping_pairs = cfg.sync.iter().map(|(key, tbl)| {
-        let mut parts = tbl.table.splitn(2, '.');
-        let schema = parts.next().unwrap_or_default().to_string();
-        let table = parts.next().unwrap_or_default().to_string();
-        ((schema, table), tbl.index_name(key))
-    });
-    let mapping = pg2osync_engine::mapping::TableMapping::from_pairs(mapping_pairs);
-
+pub fn build_sink(cfg: &AppConfig, target_password: Option<String>) -> Result<Arc<dyn Sink>> {
     let api_key = cfg
         .target
         .api_key_env
         .as_ref()
         .and_then(|k| std::env::var(k).ok());
+    let retry = pg2osync_sink::RetryPolicy {
+        max_attempts: cfg.engine.retry_max.max(1),
+        base_backoff_ms: cfg.engine.retry_backoff_ms.max(1),
+    };
     let sink: Arc<dyn Sink> = match cfg.target.flavor.as_str() {
         "elasticsearch" => Arc::new(pg2osync_sink::elasticsearch::ElasticsearchSink::new(
             pg2osync_sink::elasticsearch::ElasticsearchSinkConfig {
@@ -221,6 +101,7 @@ pub async fn run_pipeline(
                 password: target_password,
                 api_key,
                 tls_verify: cfg.target.tls_verify,
+                retry,
             },
         )?),
         "meilisearch" => Arc::new(pg2osync_sink::meilisearch::MeilisearchSink::new(
@@ -230,243 +111,495 @@ pub async fn run_pipeline(
                 state_dir: cfg.target.state_dir.clone(),
             },
         )?),
-        _ => Arc::new(pg2osync_sink::OpenSearchSink::new(
+        "opensearch" => Arc::new(pg2osync_sink::OpenSearchSink::new(
             pg2osync_sink::OpenSearchSinkConfig {
                 url: cfg.target.url.clone(),
                 username: cfg.target.username.clone(),
                 password: target_password,
                 tls_verify: cfg.target.tls_verify,
                 serverless: cfg.target.serverless,
+                retry,
             },
         )?),
+        other => bail!(
+            "unsupported target.flavor {other:?}; expected \"opensearch\", \
+             \"elasticsearch\" or \"meilisearch\""
+        ),
     };
-    let index_specs: Vec<pg2osync_core::sink::IndexSpec> = cfg
-        .sync
-        .iter()
-        .map(|(k, t)| pg2osync_core::sink::IndexSpec {
-            name: t.index_name(k),
-        })
-        .collect();
-    sink.ensure_ready(&index_specs).await?;
+    Ok(sink)
+}
 
-    let start_lsn =
-        pg2osync_source::catalog::confirmed_flush_lsn(&admin, &cfg.source.slot_name).await?;
-    let mut resume_from = sink.read_checkpoint().await?;
-    // A checkpoint older than the slot's replay position is unusable: streaming
-    // starts at the slot position, so anything between them would be lost.
-    // The safe response is a full backfill (at-least-once makes it harmless).
-    if let (Some(cp), Some(conf)) = (resume_from, start_lsn)
-        && cp < conf
-    {
-        tracing::warn!(target: "pg2osync::run",
-                "checkpoint {cp} predates slot position {conf}; forcing full backfill to avoid gaps");
-        resume_from = None;
-    }
-    match &resume_from {
-        Some(lsn) => {
-            tracing::info!(target: "pg2osync::run", "checkpoint found at {lsn}; skipping backfill")
+fn table_mapping(cfg: &AppConfig) -> TableMapping {
+    TableMapping::from_pairs(cfg.sync.iter().map(|(key, tbl)| {
+        let (schema, table) = split_qualified(&tbl.table);
+        ((schema.to_string(), table.to_string()), tbl.index_name(key))
+    }))
+}
+
+fn projections(cfg: &AppConfig) -> Projections {
+    Projections::from_pairs(cfg.sync.values().filter_map(|tbl| {
+        let (schema, table) = split_qualified(&tbl.table);
+        let rule = match (&tbl.columns, tbl.exclude_columns.is_empty()) {
+            (Some(cols), _) => Projection::Include(cols.clone()),
+            (None, false) => Projection::Exclude(tbl.exclude_columns.clone()),
+            (None, true) => return None,
+        };
+        Some(((schema.to_string(), table.to_string()), rule))
+    }))
+}
+
+fn transforms(cfg: &AppConfig) -> Result<Transforms> {
+    let mut pairs = Vec::new();
+    for (key, tbl) in &cfg.sync {
+        if tbl.transform.is_empty() {
+            continue;
         }
-        None => {
-            tracing::info!(target: "pg2osync::run", "no usable checkpoint; running full backfill")
+        let (schema, table) = split_qualified(&tbl.table);
+        let mut rules = HashMap::new();
+        for (col, op) in &tbl.transform {
+            let parsed = TransformOp::parse(op).with_context(|| {
+                format!("[sync.{key}.transform] {col} = {op:?} is not \"hash\" or \"redact\"")
+            })?;
+            rules.insert(col.clone(), parsed);
         }
+        pairs.push(((schema.to_string(), table.to_string()), rules));
     }
+    Ok(Transforms::from_pairs(pairs))
+}
 
-    // --- pipeline channels -------------------------------------------------------
-    let (events_tx, events_rx) = mpsc::channel::<ChangeEvent>(10_000);
-    let (ack_tx, _ack_rx) = watch::channel(None);
-
+/// Build the engine context and start the metrics endpoint.
+fn pipeline_ctx(cfg: &AppConfig, sink: Arc<dyn Sink>) -> Result<Arc<PipelineCtx>> {
     let metrics = Arc::new(pg2osync_engine::metrics::Metrics::default());
     if cfg.metrics.enabled {
         let bind = cfg.metrics.bind.clone();
         let m = metrics.clone();
         tokio::spawn(async move { pg2osync_engine::metrics::serve(&bind, m).await });
     }
-    let ctx = Arc::new(pg2osync_engine::PipelineCtx {
-        sink: sink.clone(),
-        mapping,
-        transforms,
+    let (ack_tx, _ack_rx) = watch::channel(None);
+    Ok(Arc::new(PipelineCtx {
+        sink,
+        mapping: table_mapping(cfg),
+        projections: projections(cfg),
+        transforms: transforms(cfg)?,
         cfg: cfg.engine.clone(),
         ack_tx,
         metrics,
+    }))
+}
+
+/// A stored checkpoint is only usable when it belongs to this exact stream.
+fn usable_checkpoint(stored: Option<Checkpoint>, expected: &StreamId) -> Option<Checkpoint> {
+    let stored = stored?;
+    if stored.stream.source != expected.source || stored.stream.stream != expected.stream {
+        tracing::warn!(target: "pg2osync::run",
+            "checkpoint belongs to {}/{} but this run is {}/{}; ignoring it and \
+             running a full initial load",
+            stored.stream.source, stored.stream.stream, expected.source, expected.stream);
+        return None;
+    }
+    Some(stored)
+}
+
+// ------------------------------------------------------------------- PostgreSQL
+
+#[allow(clippy::too_many_arguments)]
+async fn run_postgres(
+    cfg: AppConfig,
+    source_url: String,
+    admin_url: String,
+    sink: Arc<dyn Sink>,
+    index_specs: Vec<IndexSpec>,
+    shutdown_rx: watch::Receiver<bool>,
+    durable: DurableLsn,
+    mode: Mode,
+) -> Result<()> {
+    use pg2osync_source::runner::{WalSource, WalSourceConfig};
+
+    let polling = cfg.source.mode == "poll";
+    let (admin, admin_conn) = tokio_postgres::connect(&admin_url, tokio_postgres::NoTls)
+        .await
+        .context("cannot connect to source PostgreSQL")?;
+    tokio::spawn(async move {
+        let _ = admin_conn.await;
     });
 
-    let engine_handle = {
-        let slot = cfg.source.slot_name.clone();
-        let pub_name = cfg.source.publication.clone();
-        tokio::spawn(async move {
-            pg2osync_engine::run(events_rx, ctx, slot, pub_name, durable, engine_shutdown).await
-        })
-    };
-
-    // --- backfill ------------------------------------------------------------------
-    if resume_from.is_none() {
-        // Snapshot AFTER slot creation: overlap becomes harmless duplicates,
-        // gaps are impossible under at-least-once semantics (Spike B).
-        // A dedicated connection holds the repeatable-read snapshot so the
-        // admin connection stays free for catalog work.
-        let (mut reader_conn, reader_conn_bg) =
-            tokio_postgres::connect(&source_url, tokio_postgres::NoTls).await?;
-        tokio::spawn(async move {
-            let _ = reader_conn_bg.await;
-        });
-        let tx = reader_conn.transaction().await?;
-        tx.execute(
-            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
-            &[],
-        )
-        .await?;
-        let bf_tx = events_tx.clone();
-
-        for tbl in cfg.sync.values() {
-            let cols = columns_of(&admin, &tbl.table).await?;
-            let select_cols: Vec<String> = cols
-                .iter()
-                .map(|c| format!("{}::text", pg_quote_ident(&c.name)))
-                .collect();
-            let sql = format!(
-                "COPY (SELECT {} FROM {}) TO STDOUT (FORMAT text)",
-                select_cols.join(", "),
-                tbl.table
-            );
-            let col_meta = cols.clone();
-
-            let started = std::time::Instant::now();
-            let mut count: u64 = 0;
-            let copy_stream = tx.copy_out(&sql).await?;
-            use futures::StreamExt;
-            let mut lines = String::new();
-            let mut stream = std::pin::pin!(copy_stream);
-            while let Some(chunk) = stream.next().await {
-                let chunk: bytes::Bytes = chunk.context("copy stream failed")?;
-                lines.push_str(&String::from_utf8_lossy(&chunk));
-                while let Some(pos) = lines.find('\n') {
-                    let line: String = lines.drain(..pos + 1).collect();
-                    let line = line.trim_end_matches('\n');
-                    if line.is_empty() {
-                        continue;
-                    }
-                    count += 1;
-                    let fields: Vec<Option<Vec<u8>>> = split_copy_line(line)
-                        .iter()
-                        .map(|f| unescape_copy(f))
-                        .collect();
-                    let change = build_backfill_change(&tbl.table, &col_meta, &fields)?;
-                    if bf_tx.send(change).await.is_err() {
-                        anyhow::bail!("engine closed during backfill");
-                    }
-                    if count.is_multiple_of(5000) {
-                        // synthetic commit boundaries give the engine periodic
-                        // flush points during very large backfills
-                        let _ = bf_tx
-                            .send(ChangeEvent::Transaction(TransactionBoundary::Commit {
-                                lsn: Lsn(0),
-                                commit_ts_micros: 0,
-                            }))
-                            .await;
-                    }
-                }
+    let children = child_specs(&cfg)?;
+    let mut tables: Vec<String> = cfg.sync.values().map(|t| t.table.clone()).collect();
+    // child tables must join the publication or their changes never reach us
+    for tbl in cfg.sync.values() {
+        for child in &tbl.children {
+            if !tables.contains(&child.table) {
+                tables.push(child.table.clone());
             }
-            // final boundary marks the whole backfill as one logical txn
-            let _ = bf_tx
-                .send(ChangeEvent::Transaction(TransactionBoundary::Commit {
-                    lsn: Lsn(0),
-                    commit_ts_micros: 0,
-                }))
-                .await;
-            let secs = started.elapsed().as_secs_f64();
-            tracing::info!(target: "pg2osync::run",
-                "backfilled {} in {:.1}s (~{:.0} rows/s)", tbl.table, secs, count as f64 / secs);
         }
-        drop(tx); // release snapshot
     }
 
-    // --- streaming -----------------------------------------------------------------
-    let result = if cfg.source.mode == "poll" {
-        if resume_from.is_none() {
-            tracing::info!(target: "pg2osync::run", "poll mode: backfill complete");
+    let src_cfg: WalSourceConfig =
+        wal_config(&cfg, &source_url, &admin_url, &tables, &children, &durable)?;
+    let source = WalSource::new(src_cfg.clone());
+
+    if !polling {
+        source.bootstrap(&admin).await?;
+        warn_on_child_replica_identity(&cfg, &admin).await?;
+    }
+    sink.ensure_ready(&index_specs).await?;
+
+    if mode == Mode::Bootstrap {
+        println!("✓ source objects and target indices are ready");
+        if !polling {
+            println!(
+                "  publication: {}\n  slot: {}",
+                cfg.source.publication, cfg.source.slot_name
+            );
         }
-        let tables = cfg
-            .sync
-            .values()
-            .map(|t| (t.table.clone(), cfg.source.poll_column.clone()))
-            .collect();
-        let mut poll =
-            pg2osync_source::poll::PollSource::new(pg2osync_source::poll::PollSourceConfig {
-                url: source_url.clone(),
-                tables,
-                interval_secs: cfg.source.poll_interval_secs,
-            });
+        return Ok(());
+    }
+
+    let stream_id = StreamId {
+        source: SOURCE_POSTGRES.into(),
+        stream: cfg.source.slot_name.clone(),
+        publication: cfg.source.publication.clone(),
+    };
+    let render: PositionRenderer = Arc::new(|token| Lsn(token).to_string());
+
+    // Poll mode has no source position to resume from, so a leftover WAL
+    // checkpoint would skip rows changed while the process was down.
+    let stored = if polling {
+        None
+    } else {
+        usable_checkpoint(sink.read_checkpoint().await?, &stream_id)
+    };
+    let mut resume_from = stored.map(|c| Lsn(c.token));
+    if !polling {
+        let slot_lsn =
+            pg2osync_source::catalog::confirmed_flush_lsn(&admin, &cfg.source.slot_name).await?;
+        // A checkpoint behind the slot's replay position is unusable: streaming
+        // resumes at the slot position, so the gap between them would be lost.
+        if let (Some(cp), Some(slot)) = (resume_from, slot_lsn)
+            && cp < slot
+        {
+            tracing::warn!(target: "pg2osync::run",
+                "checkpoint {cp} predates slot position {slot}; running a full \
+                 initial load to avoid a gap");
+            resume_from = None;
+        }
+    }
+    match &resume_from {
+        Some(lsn) => {
+            tracing::info!(target: "pg2osync::run", "resuming from checkpoint {lsn}")
+        }
+        None => tracing::info!(target: "pg2osync::run", "no usable checkpoint; initial load"),
+    }
+
+    let (events_tx, events_rx) = mpsc::channel::<ChangeEvent>(EVENT_CHANNEL_DEPTH);
+    let ctx = pipeline_ctx(&cfg, sink)?;
+    let engine = spawn_engine(
+        events_rx,
+        ctx,
+        stream_id,
+        render,
+        durable,
+        shutdown_rx.clone(),
+    );
+
+    if resume_from.is_none() {
+        crate::backfill::run(&cfg, &admin_url, &admin, &children, events_tx.clone()).await?;
+    }
+
+    let result = if polling {
+        let mut poll = pg2osync_source::poll::PollSource::new(poll_config(&cfg, &source_url));
         poll.stream(events_tx, shutdown_rx).await
     } else {
         let mut source = WalSource::new(src_cfg);
         source.stream(events_tx, shutdown_rx).await
     };
-
-    let _ = engine_handle.await;
+    let _ = engine.await;
     result
 }
 
-fn pg_quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
-
-fn split_copy_line(line: &str) -> Vec<String> {
-    // tabs separate fields; escaped tabs inside values were encoded as \t
-    let mut fields = vec![];
-    let mut cur = String::new();
-
-    let mut esc = false;
-    for c in line.chars() {
-        if esc {
-            cur.push('\\');
-            cur.push(c);
-            esc = false;
-            continue;
-        }
-        match c {
-            '\\' => esc = true,
-            '\t' => fields.push(std::mem::take(&mut cur)),
-            other => cur.push(other),
+fn wal_config(
+    cfg: &AppConfig,
+    source_url: &str,
+    admin_url: &str,
+    tables: &[String],
+    children: &HashMap<(String, String), Vec<pg2osync_source::children::ChildSpec>>,
+    durable: &DurableLsn,
+) -> Result<pg2osync_source::runner::WalSourceConfig> {
+    let url = url::Url::parse(source_url).context("source url is not a valid URL")?;
+    let mut child_parents = HashMap::new();
+    let mut parent_pk_columns = HashMap::new();
+    for tbl in cfg.sync.values() {
+        let (ps, pt) = split_qualified(&tbl.table);
+        parent_pk_columns.insert(
+            (ps.to_string(), pt.to_string()),
+            tbl.primary_key.clone().unwrap_or_else(|| "id".into()),
+        );
+        for child in &tbl.children {
+            let (cs, ct) = split_qualified(&child.table);
+            child_parents.insert(
+                (cs.to_string(), ct.to_string()),
+                (ps.to_string(), pt.to_string()),
+            );
         }
     }
-    fields.push(cur);
-    fields
+    Ok(pg2osync_source::runner::WalSourceConfig {
+        host: url.host_str().unwrap_or("localhost").into(),
+        port: url.port().unwrap_or(5432),
+        user: url.username().into(),
+        password: url.password().unwrap_or_default().into(),
+        database: url.path().trim_start_matches('/').to_string(),
+        slot_name: cfg.source.slot_name.clone(),
+        publication: cfg.source.publication.clone(),
+        tables: tables.to_vec(),
+        start_lsn: None,
+        // Feedback to PostgreSQL is clamped to this: acknowledging beyond the
+        // durable checkpoint lets PG recycle WAL we have not indexed yet, which
+        // loses data on crash-restart.
+        durable: Some(durable.0.clone()),
+        admin_url: Some(admin_url.to_string()),
+        children: children.clone(),
+        child_parents,
+        parent_pk_columns,
+    })
 }
 
-fn build_backfill_change(
-    qualified_table: &str,
-    cols: &[ColMeta],
-    fields: &[Option<Vec<u8>>],
-) -> Result<ChangeEvent> {
-    let (schema, table) = qualified_table
-        .split_once('.')
-        .unwrap_or(("public", qualified_table));
-    let mut doc = serde_json::Map::new();
-    let mut pk_map = serde_json::Map::new();
-    let mut scalar_pk: Option<serde_json::Value> = None;
-    for (i, meta) in cols.iter().enumerate() {
-        let v = pg2osync_source::typemap::convert(
-            meta.type_oid,
-            fields.get(i).and_then(|f| f.as_deref()),
-        )
-        .map_err(|e| anyhow::anyhow!("column {}: {e}", meta.name))?;
-        if meta.is_pk {
-            scalar_pk.get_or_insert(v.clone());
-            pk_map.insert(meta.name.clone(), v.clone());
-        }
-        doc.insert(meta.name.clone(), v);
+fn poll_config(cfg: &AppConfig, source_url: &str) -> pg2osync_source::poll::PollSourceConfig {
+    pg2osync_source::poll::PollSourceConfig {
+        url: source_url.to_string(),
+        tables: cfg
+            .sync
+            .values()
+            .map(|t| pg2osync_source::poll::PollTable {
+                qualified: t.table.clone(),
+                poll_column: t
+                    .poll_column
+                    .clone()
+                    .unwrap_or_else(|| cfg.source.poll_column.clone()),
+                pk_columns: vec![t.primary_key.clone().unwrap_or_else(|| "id".into())],
+            })
+            .collect(),
+        interval_secs: cfg.source.poll_interval_secs,
+        page_size: cfg.source.poll_page_size,
     }
-    let pk: serde_json::Value = if pk_map.len() == 1 {
-        scalar_pk.expect("single pk inserted")
-    } else {
-        serde_json::Value::Object(pk_map)
+}
+
+fn child_specs(
+    cfg: &AppConfig,
+) -> Result<HashMap<(String, String), Vec<pg2osync_source::children::ChildSpec>>> {
+    let mut map: HashMap<_, Vec<_>> = HashMap::new();
+    for tbl in cfg.sync.values() {
+        let (schema, table) = split_qualified(&tbl.table);
+        for child in &tbl.children {
+            let spec = pg2osync_source::children::ChildSpec::new(
+                &child.table,
+                &child.field,
+                &child.foreign_key,
+                &tbl.primary_key.clone().unwrap_or_else(|| "id".into()),
+            )?;
+            map.entry((schema.to_string(), table.to_string()))
+                .or_default()
+                .push(spec);
+        }
+    }
+    Ok(map)
+}
+
+/// Deletes on a child table carry no foreign key under the default replica
+/// identity, so the parent cannot be located. Warn before it happens.
+async fn warn_on_child_replica_identity(
+    cfg: &AppConfig,
+    admin: &tokio_postgres::Client,
+) -> Result<()> {
+    for tbl in cfg.sync.values() {
+        for child in &tbl.children {
+            let (schema, table) = split_qualified(&child.table);
+            let info = pg2osync_source::catalog::table_info(admin, schema, table)
+                .await
+                .with_context(|| format!("cannot inspect child table {}", child.table))?;
+            if info.relreplident != 'f' {
+                tracing::warn!(target: "pg2osync::run",
+                    "child table {} has REPLICA IDENTITY '{}': DELETEs on it cannot \
+                     refresh the parent document. Run: ALTER TABLE {} REPLICA IDENTITY FULL",
+                    child.table, info.relreplident, child.table);
+            }
+        }
+    }
+    Ok(())
+}
+
+// ------------------------------------------------------------------------ MySQL
+
+#[allow(clippy::too_many_arguments)]
+async fn run_mysql(
+    cfg: AppConfig,
+    source_url: String,
+    sink: Arc<dyn Sink>,
+    index_specs: Vec<IndexSpec>,
+    shutdown_rx: watch::Receiver<bool>,
+    durable: DurableLsn,
+    mode: Mode,
+) -> Result<()> {
+    use pg2osync_source_mysql::catalog as mysql_catalog;
+    use pg2osync_source_mysql::runner::MySqlSource;
+
+    if cfg.sync.values().any(|t| !t.children.is_empty()) {
+        bail!("nested children are not supported for the MySQL source yet");
+    }
+    let src_cfg = mysql_config(&cfg, &source_url)?;
+    let source = MySqlSource::new(src_cfg);
+    let mut admin = source.admin_connection().await?;
+    source.bootstrap(&mut admin).await?;
+    sink.ensure_ready(&index_specs).await?;
+
+    if mode == Mode::Bootstrap {
+        println!("✓ MySQL prerequisites met and target indices are ready");
+        return Ok(());
+    }
+
+    let stream_id = StreamId {
+        source: SOURCE_MYSQL.into(),
+        stream: cfg.source.server_id.to_string(),
+        publication: String::new(),
     };
-    Ok(ChangeEvent::Row(pg2osync_core::event::RowChange {
-        schema: schema.to_string(),
-        table: table.to_string(),
-        kind: RowKind::Insert {
-            pk,
-            doc: serde_json::Value::Object(doc),
-        },
-    }))
+    let stored = usable_checkpoint(sink.read_checkpoint().await?, &stream_id);
+    let resume = stored.and_then(|c| mysql_catalog::parse_position(&c.position));
+    let (file_prefix, _) = match &resume {
+        Some((file, _)) => {
+            mysql_catalog::split_binlog_file(file).unwrap_or_else(|| ("binlog".to_string(), 0))
+        }
+        None => {
+            let (file, _) = mysql_catalog::master_position(&mut admin).await?;
+            mysql_catalog::split_binlog_file(&file).unwrap_or_else(|| ("binlog".to_string(), 0))
+        }
+    };
+    let render: PositionRenderer = {
+        let prefix = file_prefix.clone();
+        Arc::new(move |token| mysql_catalog::position_text(&prefix, token))
+    };
+
+    let (events_tx, events_rx) = mpsc::channel::<ChangeEvent>(EVENT_CHANNEL_DEPTH);
+    let ctx = pipeline_ctx(&cfg, sink)?;
+    let engine = spawn_engine(
+        events_rx,
+        ctx,
+        stream_id,
+        render,
+        durable,
+        shutdown_rx.clone(),
+    );
+
+    let mut src_cfg = mysql_config(&cfg, &source_url)?;
+    match resume {
+        Some((file, pos)) => {
+            tracing::info!(target: "pg2osync::run", "resuming binlog from {file}@{pos}");
+            src_cfg.start_file = Some(file);
+            src_cfg.start_pos = pos;
+        }
+        None => {
+            tracing::info!(target: "pg2osync::run", "no usable checkpoint; initial load");
+            let start = source.snapshot(&mut admin, &events_tx).await?;
+            tracing::info!(target: "pg2osync::run",
+                "snapshot complete; streaming from {}@{}", start.file, start.pos);
+            src_cfg.start_file = Some(start.file);
+            src_cfg.start_pos = start.pos;
+        }
+    }
+
+    let mut streaming = MySqlSource::new(src_cfg);
+    let result = streaming.stream(events_tx, shutdown_rx).await;
+    let _ = engine.await;
+    result
+}
+
+fn mysql_config(
+    cfg: &AppConfig,
+    source_url: &str,
+) -> Result<pg2osync_source_mysql::runner::MySqlSourceConfig> {
+    let url = url::Url::parse(source_url).context("source url is not a valid URL")?;
+    let tables = cfg
+        .sync
+        .values()
+        .map(|t| {
+            let (schema, table) = split_qualified(&t.table);
+            (schema.to_string(), table.to_string())
+        })
+        .collect();
+    Ok(pg2osync_source_mysql::runner::MySqlSourceConfig {
+        host: url.host_str().unwrap_or("localhost").into(),
+        port: url.port().unwrap_or(3306),
+        user: percent_decode(url.username()),
+        password: percent_decode(url.password().unwrap_or_default()),
+        server_id: cfg.source.server_id,
+        tables,
+        start_file: None,
+        start_pos: 0,
+    })
+}
+
+/// URL-encoded credentials are common in connection strings; MySQL auth needs
+/// the decoded bytes.
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+            if let Ok(b) = u8::from_str_radix(hex, 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn spawn_engine(
+    events_rx: mpsc::Receiver<ChangeEvent>,
+    ctx: Arc<PipelineCtx>,
+    stream_id: StreamId,
+    render: PositionRenderer,
+    durable: DurableLsn,
+    shutdown: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<Result<(), pg2osync_core::CoreError>> {
+    tokio::spawn(async move {
+        pg2osync_engine::run(events_rx, ctx, stream_id, render, durable, shutdown).await
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credentials_are_percent_decoded() {
+        assert_eq!(percent_decode("p%40ss%3Aword"), "p@ss:word");
+        assert_eq!(percent_decode("plain"), "plain");
+        assert_eq!(percent_decode("trailing%"), "trailing%");
+    }
+
+    #[test]
+    fn checkpoints_from_another_stream_are_rejected() {
+        let expected = StreamId {
+            source: SOURCE_POSTGRES.into(),
+            stream: "slot_a".into(),
+            publication: "pub".into(),
+        };
+        let stored = Checkpoint {
+            stream: StreamId {
+                source: SOURCE_POSTGRES.into(),
+                stream: "slot_b".into(),
+                publication: "pub".into(),
+            },
+            token: 42,
+            position: "0/2A".into(),
+        };
+        assert!(usable_checkpoint(Some(stored.clone()), &expected).is_none());
+        let mut same = stored;
+        same.stream.stream = "slot_a".into();
+        assert!(usable_checkpoint(Some(same), &expected).is_some());
+    }
 }

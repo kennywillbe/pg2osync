@@ -5,6 +5,7 @@
 //! - at-least-once delivery of every `LsnOp` accepted into `write`
 //! - acks only for operations that are durably visible to search
 
+use crate::checkpoint::Checkpoint;
 use crate::error::CoreError;
 use crate::lsn::Lsn;
 use serde_json::Value;
@@ -67,16 +68,11 @@ pub trait Sink: Send + Sync {
     /// Clear all documents of an index after a source-side TRUNCATE.
     async fn truncate_index(&self, index: &str) -> Result<(), CoreError>;
 
-    /// Persist the pipeline checkpoint (source position) durably.
-    async fn write_checkpoint(
-        &self,
-        slot_name: &str,
-        publication: &str,
-        lsn: Lsn,
-    ) -> Result<(), CoreError>;
+    /// Persist the pipeline checkpoint durably.
+    async fn write_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), CoreError>;
 
     /// Read the last persisted checkpoint; None before the first persist.
-    async fn read_checkpoint(&self) -> Result<Option<Lsn>, CoreError>;
+    async fn read_checkpoint(&self) -> Result<Option<Checkpoint>, CoreError>;
 
     /// Cheap health probe for /status and reconnect logic.
     async fn health(&self) -> Result<Health, CoreError>;

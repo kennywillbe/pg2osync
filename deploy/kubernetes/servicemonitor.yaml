@@ -1,0 +1,16 @@
+# Requires the Prometheus Operator CRDs. Skip this file if you scrape via
+# annotations or a static config instead.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: pg2osync
+  namespace: pg2osync
+  labels:
+    app.kubernetes.io/name: pg2osync
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pg2osync
+  endpoints:
+    - port: metrics
+      interval: 30s

@@ -11,8 +11,13 @@ members = [
 
 [workspace.package]
 edition = "2024"
+rust-version = "1.90"
 license = "Apache-2.0"
-repository = "https://github.com/emresimsek/pg2osync"
+repository = "https://github.com/kennywillbe/pg2osync"
+homepage = "https://github.com/kennywillbe/pg2osync"
+authors = ["pg2osync contributors"]
+keywords = ["cdc", "postgresql", "mysql", "opensearch", "elasticsearch"]
+categories = ["database", "command-line-utilities"]
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }

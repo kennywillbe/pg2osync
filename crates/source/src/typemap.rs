@@ -1,4 +1,4 @@
-//! PG text-format values → JSON, per ADR #19c.
+//! PG text-format values to JSON.
 //!
 //! pgoutput (protocol v1) transmits every column value as the type's text
 //! representation. Conversion rules that are binding:

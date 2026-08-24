@@ -1,10 +1,12 @@
 # pg2osync
 
-**PostgreSQL → OpenSearch in one binary. No Logstash. No Kafka. No Redis.**
+**Keep your search index in sync with your database, in real time, from one
+binary.** No Logstash, no Kafka, no Redis, no JVM.
 
-pg2osync keeps search indices in sync with your database in real time using
-logical replication (WAL). A single static Rust binary, one TOML config file,
-zero external services.
+pg2osync reads changes straight from the database's replication stream —
+PostgreSQL's WAL or MySQL's binlog — and writes them to OpenSearch,
+Elasticsearch or Meilisearch within milliseconds. Inserts, updates, deletes and
+truncates included. One static Rust binary, one TOML file.
 
 ```toml
 [source]
@@ -15,57 +17,108 @@ url = "http://localhost:9200"
 
 [sync.users]
 table = "public.users"
-index = "users_index"
+index = "users"
 ```
 
 ```sh
 export PG2OSYNC_SOURCE_URL="postgres://user:pass@db-host/mydb"
-pg2osync validate -c pg2osync.toml   # check connections & prerequisites
-pg2osync run -c pg2osync.toml        # consistent backfill + live streaming
+pg2osync validate -c pg2osync.toml   # check connections and prerequisites
+pg2osync run -c pg2osync.toml        # consistent initial load, then streaming
 ```
 
-Every insert, update, delete and truncate on `public.users` is indexed into
-`users_index` within milliseconds — deletes included.
+That's the whole setup. `run` loads the table once from a consistent snapshot,
+then streams every subsequent change until you stop it — resuming exactly where
+it left off if the process dies.
 
-## Feature matrix
+## Why this instead of the usual stack
 
-| | Status | Notes |
-|---|---|---|
-| **PostgreSQL → OpenSearch** (WAL) | ✅ production-ready | Live-verified end-to-end |
-| PostgreSQL → Elasticsearch | ✅ | Same engine, REST sink |
-| PostgreSQL → Meilisearch | ✅ | File-based checkpointing |
-| PostgreSQL → OS Serverless | ✅ | Serverless-safe profile |
-| PostgreSQL polling fallback | ✅ | Upsert-only, for managed DBs without replication |
-| Nested child collections | ✅ | One level: parent doc embeds child arrays |
-| Column transforms (`hash`, `redact`) | ✅ | Applied before indexing |
-| Crash recovery, zero data loss | ✅ | kill -9 safe, verified by e2e suite |
-| Prometheus metrics | ✅ | Built-in `/metrics` endpoint |
-| **MySQL / MariaDB source** | 🔶 preview | Binlog transport + row decoder live-verified against MySQL 8.0 **and** MariaDB 11.8; CLI integration in progress — see [docs/sources/mysql.md](docs/sources/mysql.md) |
-
-## Why not X?
-
-| | pg2osync | Debezium + Kafka | Logstash JDBC input |
+|  | pg2osync | Debezium + Kafka | Logstash JDBC input |
 |---|---|---|---|
-| Moving parts | **1 binary** | Kafka cluster + Connect + connectors | 1 process, but… |
-| Real-time deletes | ✅ WAL-based | ✅ | ❌ polling can't see them |
-| Initial load | ✅ consistent snapshot | ✅ | manual orchestration |
-| Setup effort | 1 TOML file | topics, registry, connectors | pipeline config + caveats |
+| Moving parts | **1 binary** | Kafka + Connect + connectors | 1 process |
+| Real-time deletes | ✅ from the replication log | ✅ | ❌ polling cannot see them |
+| Initial load | ✅ consistent snapshot, automatic | ✅ | manual orchestration |
+| Setup | 1 TOML file | topics, registry, connector configs | pipeline config plus caveats |
+| Memory footprint | tens of MB | GBs of JVM | hundreds of MB |
 
-## Documentation
+The trade-off is deliberate: pg2osync is a single-purpose pipeline, not a
+streaming platform. There is no fan-out to multiple consumers, no message
+replay, and no transformation language — if you need those, you want Kafka.
 
-- [Architecture](docs/architecture.md) — how the pipeline works
-- [Configuration reference](docs/configuration.md) — every option explained
-- **Sources:** [PostgreSQL](docs/sources/postgresql.md) · [MySQL/MariaDB](docs/sources/mysql.md)
-- **Sinks:** [OpenSearch](docs/sinks/opensearch.md) · [Elasticsearch](docs/sinks/elasticsearch.md) · [Meilisearch](docs/sinks/meilisearch.md)
+## Features
 
-## Quick start
+| | Status |
+|---|---|
+| **PostgreSQL → OpenSearch** (logical replication) | ✅ verified end to end |
+| PostgreSQL → Elasticsearch 8.x | ✅ verified end to end |
+| PostgreSQL → Meilisearch 1.x | ✅ verified end to end (file-based checkpoint) |
+| PostgreSQL → Amazon OpenSearch Serverless | ✅ serverless-safe profile |
+| **MySQL 8.0 / MariaDB 10.6+ → any of the above** | ✅ verified end to end |
+| Consistent initial load, then live streaming | ✅ |
+| Crash recovery with no data loss (`kill -9` safe) | ✅ verified by the e2e suite |
+| Nested child collections (one level) | ✅ parent document embeds child arrays |
+| Column projection (`columns` / `exclude_columns`) | ✅ |
+| Column transforms (`hash`, `redact`) | ✅ |
+| TRUNCATE propagation | ✅ |
+| Polling fallback for managed databases without replication | ✅ upsert-only |
+| Prometheus metrics | ✅ built-in endpoint |
+
+### Known limitations
+
+Stated up front, because finding these out in production is expensive:
+
+- **One instance per replication slot.** Two processes on the same slot fight
+  over its position. Scale by splitting tables across instances.
+- **No schema migration.** DDL drift is detected and reported, never applied.
+  Adding a column is fine (it appears in new documents); renaming or dropping
+  one needs a re-index.
+- **Poll mode cannot see deletes.** It has no access to the replication log.
+- **Nested children are one level deep**, re-fetched with a query per changed
+  parent — a wide fan-out slows the initial load.
+- **MySQL needs `binlog_row_image = FULL`** and a `mysql_native_password`
+  user; `caching_sha2_password` full-auth is not implemented yet.
+- **MySQL nested children are not supported yet.**
+- Ordering is guaranteed per row, not across tables.
+
+## Requirements
+
+**PostgreSQL source** — 15 or newer, `wal_level = logical`, a user with
+`REPLICATION`, and a primary key on every synced table.
+
+**MySQL source** — MySQL 8.0+ or MariaDB 10.6+ with `log_bin = ON`,
+`binlog_format = ROW`, `binlog_row_image = FULL`, and a user holding `SELECT`,
+`REPLICATION SLAVE` and `REPLICATION CLIENT`.
+
+**Target** — OpenSearch 2.x, Elasticsearch 8.x or Meilisearch 1.x.
+
+`pg2osync validate` checks all of this and tells you exactly what to fix.
+
+## Install
 
 ```sh
-# 1. Local test environment (PG on :15432 with wal_level=logical, OS on :9200)
-docker compose -f dev/docker-compose.yml up -d
+# from source
+cargo install --path crates/bin
 
-# 2. Configure — see examples/pg2osync.example.toml for all options
-cat > pg2osync.toml << 'EOF'
+# container
+docker run --rm \
+  -e PG2OSYNC_SOURCE_URL="postgres://user:pass@db:5432/appdb" \
+  -v "$PWD/pg2osync.toml:/etc/pg2osync/pg2osync.toml:ro" \
+  -p 9100:9100 \
+  ghcr.io/kennywillbe/pg2osync:0.6.0
+```
+
+Kubernetes manifests are in [deploy/kubernetes](deploy/kubernetes)
+(`kubectl apply -k deploy/kubernetes`); see
+[docs/deployment.md](docs/deployment.md) for probes, scaling and systemd.
+
+## Try it locally
+
+```sh
+# PostgreSQL on :15432 with logical replication, OpenSearch on :9200
+docker compose -f dev/docker-compose.yml up -d
+docker exec -i dev-postgres-1 psql -U postgres -d sourcedb < dev/seed.sql
+
+cargo build --release
+cat > pg2osync.toml <<'TOML'
 [source]
 url_env = "PG2OSYNC_SOURCE_URL"
 
@@ -74,100 +127,149 @@ url = "http://localhost:9200"
 
 [sync.users]
 table = "public.users"
-index = "users_index"
-EOF
+index = "users"
+TOML
 
-# 3. Run
 export PG2OSYNC_SOURCE_URL="postgres://postgres:postgres@localhost:15432/sourcedb"
-pg2osync validate -c pg2osync.toml
-pg2osync run -c pg2osync.toml
+./target/release/pg2osync validate -c pg2osync.toml
+./target/release/pg2osync run -c pg2osync.toml
 ```
 
-A nested-documents example with column transforms:
+In another shell, watch a change land:
+
+```sh
+docker exec dev-postgres-1 psql -U postgres -d sourcedb \
+  -c "UPDATE users SET name = 'renamed' WHERE id = 1;"
+curl -s localhost:9200/users/_doc/1 | jq .
+```
+
+## A fuller configuration
 
 ```toml
+[source]
+url_env = "PG2OSYNC_SOURCE_URL"
+slot_name = "pg2osync"
+publication = "pg2osync_pub"
+
+[target]
+url = "https://opensearch.internal:9200"
+username = "pg2osync"
+password_env = "PG2OSYNC_TARGET_PASSWORD"
+
+[metrics]
+bind = "127.0.0.1:9100"
+
 [sync.customers]
 table = "public.customers"
-index = "customers_index"
-exclude_columns = ["password_hash"]
+index = "customers"
+exclude_columns = ["password_hash"]     # never leaves the database
 
 [sync.customers.transform]
-email = "redact"   # or "hash"
+email = "redact"                        # or "hash"
 
 [[sync.customers.children]]
 table = "public.orders"
-field = "orders"          # embedded as a JSON array on each customer doc
+field = "orders"                        # embedded as a JSON array
 foreign_key = "customer_id"
 ```
 
+MySQL is the same file with two lines changed:
+
+```toml
+[source]
+flavor = "mysql"
+url_env = "PG2OSYNC_SOURCE_URL"         # mysql://user:pass@host:3306/db
+server_id = 424242                      # unique among the server's replicas
+
+[sync.users]
+table = "appdb.users"                    # database.table for MySQL
+index = "users"
+```
+
+Every option is documented in
+[docs/configuration.md](docs/configuration.md).
+
 ## Commands
 
-| Command | Purpose |
+| Command | What it does |
 |---|---|
-| `run -c <cfg>` | Backfill + continuous streaming (main mode) |
-| `validate -c <cfg>` | Config syntax, connectivity, `wal_level` checks |
-| `status -c <cfg>` | Checkpoint vs. replication slot position |
-| `bootstrap -c <cfg>` | Create publication + slot only (no streaming) |
-| `drop-slot -c <cfg>` | Clean teardown of slot and publication |
+| `run -c <cfg>` | Initial load plus continuous streaming (main mode) |
+| `validate -c <cfg>` | Config, connectivity and server prerequisites |
+| `bootstrap -c <cfg>` | Create the slot, publication and target indices, then exit |
+| `status -c <cfg>` | Checkpoint position versus the source's current position |
+| `drop-slot -c <cfg>` | Drop the slot and publication when decommissioning |
 
-## Operations
+## Operating it
 
-- **Metrics**: `GET http://127.0.0.1:9100/metrics` (configurable) — event
-  counters per type, batches flushed, sink errors, reconnects, commit→indexed
-  latency histogram, current/confirmed LSN.
-- **Checkpoints**: written every 500 ms into a hidden `.pg2osync_meta` index
-  (OpenSearch/Elasticsearch) or a local state directory (Meilisearch).
-- **Crash safety**: restart the process; it resumes from the last checkpoint.
-  Delivery is at-least-once with idempotent writes (`_id` = primary key), so
-  replays are harmless. See the crash-recovery step in `dev/e2e-test.sh`.
-- **Monitoring slot lag**: `pg2osync status` shows checkpoint vs. slot
-  position; large gaps mean WAL is accumulating on the database.
+**Metrics** — `GET http://127.0.0.1:9100/metrics`: events by type, batches
+flushed, sink errors, reconnects, commit-to-indexed latency quantiles, and the
+current/confirmed source position with the lag between them.
+
+**Crash safety** — restart the process; it resumes from the last checkpoint.
+Delivery is at-least-once with idempotent writes (`_id` is the primary key), so
+replays overwrite rather than duplicate. The acknowledgement sent back to the
+source is clamped to the durable checkpoint, so the database never recycles
+history for rows that are not indexed yet.
+
+**Watch the slot** — `pg2osync status` shows the checkpoint against the
+source's position. A growing gap means WAL or binlogs are accumulating on the
+database. If you stop syncing for good, run `drop-slot`; an abandoned slot will
+fill the source's disk.
+
+More in [docs/operations.md](docs/operations.md).
 
 ## Performance
 
-Measured with the release binary against dockerized PostgreSQL 17 +
-OpenSearch 2.19 on a laptop:
+Release binary against dockerized PostgreSQL 17 and OpenSearch 2.19 on a
+laptop — treat as an order of magnitude, not a benchmark:
 
 | Metric | Value |
 |---|---|
-| Backfill throughput | ~21,000 docs/s sustained (210K docs in 10 s) |
-| Live sync latency p50 | **4 ms** |
-| Single-row commit → indexed | ~70 ms end-to-end incl. PG round-trip |
-| 50K-row single transaction | propagated in ~2 s |
+| Initial load throughput | ~21,000 docs/s (210K docs in 10 s) |
+| Live latency, p50 | ~4 ms commit to indexed |
+| Single-row commit to indexed | ~70 ms including round-trips |
+| 50K-row transaction | propagated in ~2 s |
 
-Tuning knobs live under `[engine]` — batch size, max bytes, flush interval,
-transaction buffer cap, retry policy. Defaults are sane; see
-[configuration.md](docs/configuration.md).
+Tuning knobs live under `[engine]`: batch size, byte ceiling, transaction
+buffer cap, retry policy, checkpoint interval.
 
-## Requirements
+## Documentation
 
-- PostgreSQL 15+ with `wal_level = logical` and a user with `REPLICATION`
-  privilege
-- OpenSearch 2.x / Elasticsearch 8.x / Meilisearch 1.x
-- Linux/macOS static binary; official Docker image available (`Dockerfile`
-  in repo root)
+- [Architecture](docs/architecture.md) — how the pipeline works
+- [Configuration](docs/configuration.md) — every option
+- [Deployment](docs/deployment.md) — Docker, Kubernetes, systemd
+- [Operations](docs/operations.md) — metrics, failure modes, recovery
+- [Design decisions](docs/decisions.md) — why it is built this way
+- Sources: [PostgreSQL](docs/sources/postgresql.md) · [MySQL/MariaDB](docs/sources/mysql.md)
+- Sinks: [OpenSearch](docs/sinks/opensearch.md) · [Elasticsearch](docs/sinks/elasticsearch.md) · [Meilisearch](docs/sinks/meilisearch.md)
 
 ## Development
 
 ```sh
+cargo build
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+
 cargo build --release
-cargo test --workspace                                  # unit tests
-cargo clippy --workspace --all-targets -- -D warnings   # lint gate
-./dev/e2e-test.sh                                       # full e2e against live containers
+./dev/e2e-test.sh          # PostgreSQL -> OpenSearch, full pipeline
+./dev/e2e-mysql-test.sh    # MySQL/MariaDB source
 ```
 
-The workspace layout:
+Workspace layout:
 
 ```
 crates/
-├── core/          ChangeEvent model, LSN type, Sink trait, error taxonomy
-├── source/        PostgreSQL transport, pgoutput decoder, catalog, poll mode
-├── source-mysql/  MySQL binlog transport + decoder (preview)
-├── engine/        batching, transaction buffering, transforms, metrics
+├── core/          ChangeEvent model, Sink trait, checkpoint types, errors
+├── source/        PostgreSQL: pgoutput decoder, catalog, poll fallback
+├── source-mysql/  MySQL/MariaDB: wire protocol, binlog decoder, catalog
+├── engine/        transaction buffering, batching, projections, metrics
 ├── sink/          OpenSearch / Elasticsearch / Meilisearch writers
-└── bin/           CLI: run, validate, status, bootstrap, drop-slot
+└── bin/           CLI and pipeline wiring
 ```
+
+[CONTRIBUTING.md](CONTRIBUTING.md) covers the architecture rules a change has
+to respect.
 
 ## License
 
-Licensed under [Apache-2.0](LICENSE-APACHE).
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).

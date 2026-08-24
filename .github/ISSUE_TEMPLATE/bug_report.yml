@@ -1,0 +1,70 @@
+name: Bug report
+description: Something behaves incorrectly, or data went missing
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Data loss and data corruption reports get priority. If secrets appear
+        in your logs or config, redact them before pasting.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what you got instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: The smallest sequence of steps or SQL that shows the problem.
+      placeholder: |
+        1. Config as below
+        2. INSERT INTO … / UPDATE … / TRUNCATE …
+        3. The document in the index shows …
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: pg2osync version
+      placeholder: "0.6.0, or a commit SHA"
+    validations:
+      required: true
+  - type: input
+    id: source
+    attributes:
+      label: Source
+      placeholder: "PostgreSQL 17.2, or MySQL 8.0.46 / MariaDB 11.8"
+    validations:
+      required: true
+  - type: input
+    id: target
+    attributes:
+      label: Target
+      placeholder: "OpenSearch 2.19, Elasticsearch 8.15, Meilisearch 1.11"
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration
+      description: Your TOML, with credentials removed.
+      render: toml
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Output with `RUST_LOG=pg2osync=debug`, credentials removed.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: "`pg2osync validate` passes, or its error is the bug I am reporting"
+        - label: I removed all credentials from everything I pasted
+          required: true

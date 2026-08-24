@@ -1,23 +1,43 @@
 # Configuration reference
 
+One TOML file describes the whole pipeline. Unknown keys are rejected at load
+time, so a typo fails immediately instead of silently doing nothing.
+
 Full example: [examples/pg2osync.example.toml](../examples/pg2osync.example.toml).
-Unknown keys are rejected at load time (`deny_unknown_fields`), so typos fail
-fast instead of silently misconfiguring.
+
+Everything structural is checked by `pg2osync validate`, which also connects to
+both ends and verifies server prerequisites.
+
+## Secrets
+
+Credentials belong in environment variables. Every secret has an `*_env` form:
+
+```toml
+[source]
+url_env = "PG2OSYNC_SOURCE_URL"      # preferred
+
+[target]
+password_env = "PG2OSYNC_TARGET_PASSWORD"
+```
+
+Plain `url` and `password` keys still work but log a deprecation warning on
+startup. Secrets never appear in logs or error messages.
 
 ## `[source]`
 
 | Option | Default | Description |
 |---|---|---|
-| `flavor` | `"postgres"` | `"postgres"` or `"mysql"` |
-| `mode` | `"wal"` | `"wal"` (logical replication) or `"poll"`. Ignored for MySQL. |
-| `url_env` | — | Environment variable holding the connection URL (**recommended**) |
-| `url` | — | Plain-text URL; works but warns as deprecated for secrets hygiene |
-| `admin_url_env` | falls back to `url` | Dedicated connection for child-collection queries |
-| `slot_name` | `"pg2osync"` | PostgreSQL replication slot name |
-| `publication` | `"pg2osync_pub"` | PostgreSQL publication name |
-| `server_id` | `424242` | MySQL only: unique replica server id |
-| `poll_column` | `"updated_at"` | Poll mode: timestamp column |
-| `poll_interval_secs` | `30` | Poll mode: interval |
+| `flavor` | `"postgres"` | `"postgres"` or `"mysql"` (also covers MariaDB) |
+| `mode` | `"wal"` | `"wal"` (replication log) or `"poll"`. PostgreSQL only |
+| `url_env` | — | Environment variable holding the connection URL |
+| `url` | — | Inline URL; warns as deprecated |
+| `admin_url_env` | falls back to the source URL | Separate connection for catalog and nested-child queries |
+| `slot_name` | `"pg2osync"` | PostgreSQL replication slot |
+| `publication` | `"pg2osync_pub"` | PostgreSQL publication |
+| `server_id` | `424242` | MySQL: replica id, unique across the server's replicas |
+| `poll_column` | `"updated_at"` | Poll mode: default timestamp column |
+| `poll_interval_secs` | `30` | Poll mode: seconds between cycles |
+| `poll_page_size` | `5000` | Poll mode: rows per table per cycle |
 
 URL formats:
 
@@ -26,75 +46,187 @@ postgres://user:pass@host:5432/dbname
 mysql://user:pass@host:3306/dbname
 ```
 
+Percent-encoded credentials are decoded, so a password containing `@` or `:`
+works if you encode it.
+
+`admin_url_env` exists so the replication connection and ordinary queries can
+use different users — the replication role needs `REPLICATION`, the admin role
+needs `SELECT` on the synced tables.
+
+### Poll mode
+
+For managed PostgreSQL instances where logical replication cannot be enabled.
+It re-reads rows whose timestamp column advanced since the last cycle.
+
+- **Deletes are invisible.** There is no log to read them from.
+- Requires a monotonically increasing timestamp column per table.
+- Each start re-runs the initial load: there is no position to resume from, and
+  re-indexing is harmless under idempotent writes. Existing WAL checkpoints are
+  ignored in this mode so a gap can never be skipped.
+
 ## `[target]`
 
 | Option | Default | Description |
 |---|---|---|
-| `flavor` | `"opensearch"` | `"opensearch"`, `"elasticsearch"`, `"meilisearch"` |
+| `flavor` | `"opensearch"` | `"opensearch"`, `"elasticsearch"` or `"meilisearch"` |
 | `url` | *(required)* | Base URL, e.g. `http://localhost:9200` |
-| `username` | — | Basic auth username |
-| `password_env` | — | Env var with the password (**recommended** over `password`) |
-| `api_key_env` | — | Elasticsearch API key |
-| `tls_verify` | `true` | Set `false` only for self-signed dev certs |
-| `serverless` | `false` | Amazon OpenSearch Serverless profile |
-| `state_dir` | `./.pg2osync-state` | Meilisearch checkpoint directory |
+| `username` | — | Basic-auth user |
+| `password` / `password_env` | — | Basic-auth password |
+| `api_key_env` | — | Elasticsearch API key, or Meilisearch master key |
+| `tls_verify` | `true` | Only disable for self-signed development certificates |
+| `serverless` | `false` | Amazon OpenSearch Serverless profile: skips the refresh and settings calls it rejects |
+| `state_dir` | `./.pg2osync-state` | Meilisearch only: directory for the checkpoint file |
+
+Meilisearch has no place to store an arbitrary document, so its checkpoint is a
+local file. Give that directory persistent storage, or a restart re-runs the
+initial load.
 
 ## `[sync.<key>]`
 
-One section per table. `<key>` is the default index name if `index` is omitted.
+One section per table. `<key>` is the index name when `index` is omitted.
 
 | Option | Description |
 |---|---|
-| `table` | Schema-qualified name, e.g. `"public.users"` (**required**) |
-| `index` | Target index/collection name; must be lowercase `[a-z0-9_-]` |
-| `primary_key` | Override PK detection (rarely needed) |
-| `columns` | Whitelist of columns to index |
-| `exclude_columns` | Blacklist; mutually exclusive with `columns` |
-| `replica_identity_full` | Documents intent that the table uses `REPLICA IDENTITY FULL` |
-| `transform` | Map of column → `"hash"` \| `"redact"` |
+| `table` | **Required.** `schema.table` for PostgreSQL, `database.table` for MySQL |
+| `index` | Target index or collection; lowercase `[a-z0-9_-]`, not starting with `_` or `.` |
+| `primary_key` | Overrides key detection; also the join column for nested children |
+| `columns` | Only these columns are indexed |
+| `exclude_columns` | All columns except these; mutually exclusive with `columns` |
+| `transform` | Map of column to `"hash"` or `"redact"` |
+| `poll_column` | Poll mode: overrides `[source] poll_column` for this table |
+| `children` | Nested child collections, see below |
+
+Projection and transforms apply to every path — initial load, live streaming and
+poll mode — so an excluded column never reaches the target. The primary key is
+read before projection, so excluding a key column is rejected at load time
+(it would collide document ids).
+
+`hash` replaces the value with a truncated SHA-256 digest, stable across runs so
+it can still be grouped on. `redact` replaces it with `***`. Null values are
+left alone in both cases.
+
+Two tables may not map to the same index: document identity would be ambiguous.
 
 ### Nested children
 
-Embed one-to-many children as JSON arrays on the parent document (one level):
+Embed a one-to-many relation as a JSON array on the parent document:
 
 ```toml
+[sync.customers]
+table = "public.customers"
+index = "customers"
+primary_key = "id"
+
 [[sync.customers.children]]
 table = "public.orders"      # child table
-field = "orders"             # array field on the parent doc
-foreign_key = "customer_id"  # FK column on the CHILD table
+field = "orders"             # array field on the parent document
+foreign_key = "customer_id"  # column on the CHILD referencing the parent key
 ```
 
-Children are re-fetched and re-embedded whenever the parent row changes.
-Child changes alone do not currently trigger parent re-indexing.
+- One level deep only.
+- Children are fetched during the initial load and re-fetched whenever the
+  parent or any of its children changes, so the array is never stale.
+- Child tables are added to the publication automatically.
+- A change to a child costs one query for the parent plus one per child
+  collection. A wide fan-out slows the initial load noticeably.
+- **Give child tables `REPLICA IDENTITY FULL`**
+  (`ALTER TABLE public.orders REPLICA IDENTITY FULL`). Without it a DELETE
+  carries no foreign key, so the parent cannot be located; pg2osync warns at
+  startup and fails on such a delete rather than silently going stale.
+- Not supported for the MySQL source yet.
 
 ## `[engine]`
 
-Sane defaults; tune only under measurable load.
+Defaults are production-sane; tune only against measurements.
 
 | Option | Default | Description |
 |---|---|---|
-| `batch_size` | `500` | Max rows per `_bulk` request |
-| `batch_max_bytes` | 10 MB | Max bytes per batch |
-| `flush_interval_ms` | `1000` | Flush even when batch isn't full |
-| `txn_buffer_cap_mb` | `256` | Cap for buffering an open transaction |
-| `retry_max` | `10` | Retries per failed batch (exponential backoff) |
-| `retry_backoff_ms` | `500` | Initial backoff |
-| `checkpoint_interval_ms` | `500` | Checkpoint write frequency |
+| `batch_size` | `500` | Rows per sink request |
+| `batch_max_bytes` | `10485760` | Approximate byte ceiling per request; whichever limit hits first splits the batch |
+| `txn_buffer_cap_mb` | `256` | Warning threshold for one open transaction |
+| `retry_max` | `10` | Attempts per request before the pipeline stops |
+| `retry_backoff_ms` | `500` | Initial backoff, doubled per attempt, capped at 30 s |
+| `checkpoint_interval_ms` | `500` | How often the position is persisted |
+
+`checkpoint_interval_ms` is the ceiling on replayed work after a crash: a lower
+value means less replay and more writes to the target.
+
+A transaction larger than `txn_buffer_cap_mb` is split across requests, which
+means the target briefly holds part of it. Everything is idempotent, so the end
+state is correct, but a reader can observe the transaction half-applied.
+
+Transient failures (HTTP 429, 5xx, connection resets) are retried with
+exponential backoff. A permanent rejection — a mapping conflict, for example —
+stops the pipeline instead of skipping the document, because skipping is silent
+data loss.
 
 ## `[metrics]`
 
 | Option | Default | Description |
 |---|---|---|
-| `enabled` | `true` | Serve Prometheus text exposition |
-| `bind` | `127.0.0.1:9100` | Listen address |
-
-Exposed metrics:
+| `enabled` | `true` | Serve the Prometheus endpoint |
+| `bind` | `127.0.0.1:9100` | Listen address; use `0.0.0.0:9100` in a container |
 
 ```
-pg2osync_events_total{type="insert|update|delete|truncate"}
+pg2osync_events_total{type="row|truncate"}
 pg2osync_batches_flushed
 pg2osync_sink_errors_total
 pg2osync_reconnects_total
-pg2osync_latency_ms{quantile="0.5|0.9|0.99"}   # commit → indexed
-pg2osync_lsn_confirmed                          # highest durably indexed LSN
+pg2osync_latency_ms{quantile="0.5|0.9|0.99"}   # source commit to indexed
+pg2osync_latency_ms_count
+pg2osync_position_current                       # highest position received
+pg2osync_position_confirmed                     # highest position checkpointed
+pg2osync_position_lag                           # difference between the two
+```
+
+## Environment variables
+
+| Variable | Purpose |
+|---|---|
+| `RUST_LOG` | Log filter, e.g. `pg2osync=debug` |
+| `PG2OSYNC_INSTANCE_ID` | Recorded in the checkpoint document; identifies the writer |
+| whatever `*_env` names | The credentials themselves |
+
+## Complete example
+
+```toml
+[source]
+flavor = "postgres"
+url_env = "PG2OSYNC_SOURCE_URL"
+slot_name = "pg2osync"
+publication = "pg2osync_pub"
+
+[target]
+flavor = "opensearch"
+url = "https://opensearch.internal:9200"
+username = "pg2osync"
+password_env = "PG2OSYNC_TARGET_PASSWORD"
+tls_verify = true
+
+[engine]
+batch_size = 500
+batch_max_bytes = 10485760
+checkpoint_interval_ms = 500
+
+[metrics]
+enabled = true
+bind = "127.0.0.1:9100"
+
+[sync.users]
+table = "public.users"
+index = "users"
+exclude_columns = ["password_hash"]
+
+[sync.users.transform]
+email = "redact"
+
+[sync.customers]
+table = "public.customers"
+index = "customers"
+primary_key = "id"
+
+[[sync.customers.children]]
+table = "public.orders"
+field = "orders"
+foreign_key = "customer_id"
 ```
