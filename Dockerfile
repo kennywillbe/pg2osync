@@ -29,7 +29,7 @@ RUN find crates -name '*.rs' -exec touch {} + \
     && cargo build --release --locked -p pg2osync \
     && strip target/release/pg2osync
 
-FROM alpine:3.21
+FROM alpine:3.24
 RUN apk add --no-cache ca-certificates tzdata \
     && adduser -D -u 10001 pg2osync
 COPY LICENSE /usr/share/licenses/pg2osync/LICENSE
