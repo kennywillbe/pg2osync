@@ -220,15 +220,31 @@ More in [docs/operations.md](docs/operations.md).
 
 ## Performance
 
-Release binary against dockerized PostgreSQL 17 and OpenSearch 2.19 on a
-laptop — treat as an order of magnitude, not a benchmark:
+Measured with `dev/benchmark.sh` on an Apple M2 laptop (8 cores, 16 GB) against
+dockerized PostgreSQL 17.11 and OpenSearch 2.19 — a single-node dev stack, so
+read this as an order of magnitude, not a capacity plan:
 
 | Metric | Value |
 |---|---|
-| Initial load throughput | ~21,000 docs/s (210K docs in 10 s) |
-| Live latency, p50 | ~4 ms commit to indexed |
-| Single-row commit to indexed | ~70 ms including round-trips |
-| 50K-row transaction | propagated in ~2 s |
+| Initial load | 200K docs in ~5.8 s (**~35,000 docs/s**) |
+| Pipeline latency, commit to indexed | **p50 1 ms**, p99 2 ms |
+| Commit to searchable, single row | ~80 ms including the client round-trip and a forced index refresh |
+| One 50K-row transaction | propagated in ~1.4 s |
+| Resident memory under load | ~90 MB |
+
+The two latency rows measure different things on purpose. "Commit to indexed" is
+what pg2osync controls, taken from its own `pg2osync_latency_ms`. "Commit to
+searchable" adds your client's round-trip and the target's refresh interval,
+which is what a reader actually waits for — and is dominated by the search
+engine, not by this tool.
+
+Reproduce it yourself:
+
+```sh
+docker compose -f dev/docker-compose.yml up -d
+cargo build --release
+ROWS=200000 ./dev/benchmark.sh
+```
 
 Tuning knobs live under `[engine]`: batch size, byte ceiling, transaction
 buffer cap, retry policy, checkpoint interval.
