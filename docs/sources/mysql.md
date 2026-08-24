@@ -25,11 +25,51 @@ settings in `my.cnf` as well — `SET GLOBAL` does not survive a restart.
 `pg2osync validate` checks all three settings, the connection and every
 configured table before you run anything.
 
-**`mysql_native_password` is required.** The `caching_sha2_password` full-auth
-exchange needs TLS or an RSA key exchange, which is not implemented yet. The
-server's default plugin does not matter, only the sync user's.
-
 Every synced table needs a **primary key**; it becomes the document `_id`.
+
+## TLS
+
+Every MySQL connection honours `[source] sslmode`, using the same five levels
+as the PostgreSQL source. MySQL's own vocabulary maps onto them directly:
+
+| pg2osync | MySQL |
+|---|---|
+| `disable` | `DISABLED` |
+| `prefer` *(default)* | `PREFERRED` |
+| `require` | `REQUIRED` |
+| `verify-ca` | `VERIFY_CA` |
+| `verify-full` | `VERIFY_IDENTITY` |
+
+```toml
+[source]
+flavor = "mysql"
+url_env = "PG2OSYNC_SOURCE_URL"
+sslmode = "verify-ca"
+sslrootcert = "/etc/mysql/ca.pem"
+```
+
+MySQL's auto-generated certificates are issued to
+`MySQL_Server_<version>_Auto_Generated_Server_Certificate`, not to your
+hostname, so `verify-full` rejects them by design. Use `verify-ca` with the
+server's own `ca.pem`, or install certificates issued for the real hostname.
+
+### Authentication
+
+`caching_sha2_password` (the MySQL 8 default) and `mysql_native_password` are
+both supported.
+
+The first authentication of an account needs *full* authentication, because the
+server has nothing cached yet. pg2osync handles both routes:
+
+- **On a TLS connection** the password is sent as cleartext inside the
+  encrypted session, which is what the server expects.
+- **On a plaintext connection** it asks for the server's public key, XORs the
+  password with the nonce and encrypts it, so the password is never recoverable
+  from the wire even without TLS.
+
+Later connections take the fast path while the account remains in the server's
+cache. `FLUSH PRIVILEGES` empties that cache and forces full authentication
+again — which is exactly how the full-auth paths above were tested.
 
 ## Configuration
 
@@ -127,8 +167,8 @@ field names.
 | Limitation | Detail | Workaround |
 |---|---|---|
 | Nested children | Not implemented for MySQL | Use PostgreSQL, or denormalize in a view |
+| `TRUNCATE` | Not propagated (it is a `QUERY` event, not a row event) | Clear the index yourself |
 | `JSON` while streaming | MySQL's binary JSON format is not parsed; a hex placeholder is stored | Store JSON as `TEXT`, or re-run the initial load |
-| `caching_sha2_password` | Full auth needs TLS/RSA | Create the sync user with `mysql_native_password` |
 | GTID positions | Checkpoints use file and offset, not GTID sets | Fine for a single server; failover to a replica needs a fresh initial load |
 | Timezone edge cases | `DATETIME` values decode naive | Prefer `TIMESTAMP`, or verify your setup |
 

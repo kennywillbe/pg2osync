@@ -56,7 +56,7 @@ impl PollSource {
         tx: tokio::sync::mpsc::Sender<ChangeEvent>,
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<()> {
-        let client = self.cfg.tls.connect(&self.cfg.url).await?;
+        let client = crate::tls::connect(&self.cfg.tls, &self.cfg.url).await?;
 
         let mut watermarks: HashMap<String, String> = HashMap::new();
         for t in &self.cfg.tables {

@@ -285,8 +285,7 @@ async fn drop_slot(path: &Path) -> Result<()> {
 }
 
 async fn connect_pg(cfg: &config::AppConfig, source_url: &str) -> Result<tokio_postgres::Client> {
-    cfg.tls_settings(source_url)?
-        .connect(source_url)
+    pg2osync_source::tls::connect(&cfg.tls_settings(source_url)?, source_url)
         .await
         .context("cannot connect to source PostgreSQL")
 }
@@ -313,6 +312,7 @@ fn mysql_source(
                 .collect(),
             start_file: None,
             start_pos: 0,
+            tls: cfg.tls_settings(source_url)?,
         },
     ))
 }

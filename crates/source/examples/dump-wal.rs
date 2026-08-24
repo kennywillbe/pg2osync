@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
         parent_pk_columns: Default::default(),
     };
 
-    let admin = tls.connect(&url).await?;
+    let admin = pg2osync_source::tls::connect(&tls, &url).await?;
 
     WalSource::new(cfg.clone()).bootstrap(&admin).await?;
     let start_lsn = pg2osync_source::catalog::confirmed_flush_lsn(&admin, &cfg.slot_name).await?;

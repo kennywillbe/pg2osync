@@ -58,7 +58,8 @@ needs `SELECT` on the synced tables.
 ### TLS
 
 `sslmode` follows libpq exactly, and applies to every connection pg2osync opens
-— the replication stream included, so a source can never end up half encrypted.
+— the replication stream and the MySQL binlog dump included, so a source can
+never end up half encrypted.
 
 | Mode | Encrypted | Certificate checked | Hostname checked |
 |---|---|---|---|

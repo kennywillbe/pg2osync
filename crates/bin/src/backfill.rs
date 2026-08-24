@@ -71,8 +71,7 @@ pub async fn run(
 ) -> Result<()> {
     // a dedicated connection holds the snapshot so the admin connection stays
     // free for catalog work
-    let mut reader = tls
-        .connect(source_url)
+    let mut reader = pg2osync_source::tls::connect(tls, source_url)
         .await
         .context("backfill connection failed")?;
     let snapshot = reader.transaction().await?;

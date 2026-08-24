@@ -95,7 +95,7 @@ impl WalSource {
             .with_start_lsn(pgwire_replication::Lsn(
                 self.cfg.start_lsn.unwrap_or(Lsn(0)).0,
             ))
-            .with_tls(self.cfg.tls.replication_config()),
+            .with_tls(crate::tls::replication_config(&self.cfg.tls)),
         )
         .await
         .context("replication connect failed")?;
@@ -109,9 +109,7 @@ impl WalSource {
         let needs_admin = !self.cfg.children.is_empty() || !self.cfg.child_parents.is_empty();
         let admin_client = match (&self.cfg.admin_url, needs_admin) {
             (Some(url), true) => Some(
-                self.cfg
-                    .tls
-                    .connect(url)
+                crate::tls::connect(&self.cfg.tls, url)
                     .await
                     .context("nested-docs admin connection failed")?,
             ),
