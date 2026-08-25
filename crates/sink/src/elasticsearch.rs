@@ -9,7 +9,7 @@ use base64::Engine as _;
 use pg2osync_core::checkpoint::Checkpoint;
 use pg2osync_core::error::CoreError;
 use pg2osync_core::lsn::Lsn;
-use pg2osync_core::sink::{DocumentOp, Health, IndexSpec, LsnOp, Sink, SinkAck};
+use pg2osync_core::sink::{BulkLoadSettings, DocumentOp, Health, IndexSpec, LsnOp, Sink, SinkAck};
 use serde_json::{Value, json};
 
 pub const META_INDEX: &str = ".pg2osync_meta";
@@ -32,6 +32,20 @@ pub struct ElasticsearchSinkConfig {
 }
 
 impl ElasticsearchSink {
+    async fn put_settings(&self, index: &str, body: serde_json::Value) -> Result<(), CoreError> {
+        let (status, body) = self
+            .send(
+                reqwest::Method::PUT,
+                &format!("/{index}/_settings"),
+                Some(body.to_string()),
+            )
+            .await?;
+        if status != 200 {
+            return Err(CoreError::Sink(format!("settings for {index}: {status} {body}")));
+        }
+        Ok(())
+    }
+
     pub fn new(cfg: ElasticsearchSinkConfig) -> Result<Self, CoreError> {
         let mut headers = reqwest::header::HeaderMap::new();
         match (&cfg.api_key, &cfg.username, &cfg.password) {
@@ -307,6 +321,60 @@ impl Sink for ElasticsearchSink {
             .await?;
         if status != 200 {
             return Err(CoreError::Sink(format!("refresh: {status}")));
+        }
+        Ok(())
+    }
+
+    async fn begin_bulk_load(&self, indices: &[String]) -> Result<BulkLoadSettings, CoreError> {
+        if indices.is_empty() {
+            return Ok(BulkLoadSettings::default());
+        }
+        let (_, body) = self
+            .send(
+                reqwest::Method::GET,
+                &format!("/{}/_settings", indices.join(",")),
+                None,
+            )
+            .await?;
+        let mut saved = Vec::new();
+        for index in indices {
+            let settings = &body[index]["settings"]["index"];
+            // "-1" means an earlier load never got to put it back; restoring
+            // that value would make the damage permanent
+            let refresh = settings["refresh_interval"]
+                .as_str()
+                .map(str::to_string)
+                .filter(|v| v != "-1");
+            let replicas = settings["number_of_replicas"].as_str().map(str::to_string);
+            saved.push((index.clone(), refresh, replicas));
+        }
+        for (index, _, _) in &saved {
+            self.put_settings(
+                index,
+                json!({"index": {"refresh_interval": "-1", "number_of_replicas": 0}}),
+            )
+            .await?;
+        }
+        tracing::info!(target: "pg2osync::sink",
+            "refresh and replicas suspended on {} index(es) for the initial load",
+            saved.len());
+        Ok(BulkLoadSettings(saved))
+    }
+
+    async fn end_bulk_load(&self, saved: &BulkLoadSettings) -> Result<(), CoreError> {
+        for (index, refresh, replicas) in &saved.0 {
+            self.put_settings(
+                index,
+                json!({"index": {
+                    "refresh_interval": refresh,
+                    "number_of_replicas": replicas
+                }}),
+            )
+            .await?;
+        }
+        if !saved.0.is_empty() {
+            tracing::info!(target: "pg2osync::sink",
+                "refresh and replicas restored on {} index(es)", saved.0.len());
         }
         Ok(())
     }

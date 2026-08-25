@@ -156,6 +156,30 @@ that coordinate can only re-deliver rows.
 Rows produced by an initial load carry position token `0`, which flushes batches
 without ever advancing the checkpoint — they have no position of their own.
 
+### Target-side cost
+
+One read of the table, and the rest of the cost on the target: 15M rows at the
+default `batch_size` of 500 is one `COPY` and roughly 30,000 bulk requests.
+
+For the duration of the load `refresh_interval` is set to `-1` and
+`number_of_replicas` to `0`, and both are put back afterwards — the standard
+bulk-load recipe. Nothing searches an index that is still being filled, so
+refreshing it every second and writing replicas is work nobody is waiting for.
+Two honest caveats:
+
+- **It is not always worth anything.** Measured on a single-node development
+  cluster loading 200k narrow rows, it made no measurable difference: with one
+  node the replicas are unassigned and a two-second load spans two refreshes.
+  The work it removes only bills on a cluster that really has replicas and a
+  load that runs for minutes.
+- **An interrupted load leaves refresh suspended**, and the symptom is nasty:
+  writes are accepted, the pipeline looks healthy, and searches return nothing.
+  A later load treats `-1` as "no saved value" rather than restoring it, and
+  startup warns about any configured index still in that state.
+
+Serverless targets skip both, since they manage refresh and replication
+themselves and reject the call.
+
 ## Row fidelity
 
 - **Unchanged TOAST** (PostgreSQL): an UPDATE omits large unchanged columns. If
