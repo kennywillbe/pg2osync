@@ -38,7 +38,6 @@ export async function POST(req: NextRequest) {
   const propagation = await measureBulkPropagation(ids, (_id, doc) =>
     doc !== null && rows.some((r) => r.name === doc.name),
   );
-  await refreshIndex();
 
   return NextResponse.json({
     count,
@@ -85,7 +84,6 @@ export async function PUT(req: NextRequest) {
     // flush may take several batches; give it more room than a single write.
     { timeoutMs: 60_000 },
   );
-  await refreshIndex();
 
   return NextResponse.json({ updated: expected.size, percent, propagation });
 }
@@ -112,7 +110,6 @@ export async function DELETE(req: NextRequest) {
   await pool.query("DELETE FROM demo_products WHERE id = ANY($1::int[])", [ids]);
 
   const propagation = await measureBulkPropagation(ids, (_id, doc) => doc === null);
-  await refreshIndex();
 
   return NextResponse.json({ deleted: ids.length, propagation });
 }

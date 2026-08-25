@@ -97,6 +97,33 @@ which is what a restart parses to resume.
   leaves a duplicate that the replay repairs, where the reverse order would
   leave a document nothing ever collects.
 
+## Read-your-writes
+
+The pipeline is asynchronous, so a caller that just committed cannot assume its
+change is searchable. `GET /synced` closes that gap on request: it waits until
+the acknowledged position passes the source's position and, with
+`refresh=true`, until the target has made the writes searchable.
+
+Waiting on the *acknowledged* position rather than the checkpoint is deliberate.
+The checkpoint exists for crash recovery and is written on an interval; the
+acknowledgement is the moment the target accepted the write, which is what the
+caller actually cares about.
+
+Two source-specific details make this work at all:
+
+- **PostgreSQL skips transactions that touch no published table.** The position
+  a caller reads from `pg_current_wal_lsn()` therefore includes activity the
+  pipeline will never see, and on a quiet database the gap never closes. When
+  the endpoint finds itself behind, it emits a logical decoding message
+  (`pg_logical_emit_message`) — a marker the stream does carry, written without
+  touching any table and without needing DDL privileges.
+- **MySQL's binlog is server-wide**, so the position a caller reads is reached
+  by the commit's own `XID` event. A heartbeat period is requested on the dump
+  connection as a fallback for a genuinely idle server.
+
+Measured on the dev stack: 20 writes each followed immediately by a search, zero
+misses, `/synced` returning in 5 ms at the median. MySQL and MariaDB the same.
+
 ## Crash safety
 
 On startup pg2osync reads the checkpoint and refuses to use one that does not

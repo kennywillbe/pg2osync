@@ -278,6 +278,23 @@ impl Sink for ElasticsearchSink {
         Ok(())
     }
 
+    async fn refresh(&self, indices: &[String]) -> Result<(), CoreError> {
+        if indices.is_empty() {
+            return Ok(());
+        }
+        let (status, _) = self
+            .send(
+                reqwest::Method::POST,
+                &format!("/{}/_refresh", indices.join(",")),
+                None,
+            )
+            .await?;
+        if status != 200 {
+            return Err(CoreError::Sink(format!("refresh: {status}")));
+        }
+        Ok(())
+    }
+
     async fn write_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), CoreError> {
         let (status, _) = self
             .send(

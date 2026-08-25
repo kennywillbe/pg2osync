@@ -51,6 +51,10 @@ url = "http://localhost:9200"
 [metrics]
 bind = "127.0.0.1:9111"
 
+[api]
+enabled = true
+bind = "127.0.0.1:9131"
+
 [sync.users]
 table = "public.users"
 index = "e2e_users"
@@ -191,17 +195,32 @@ reconnects=$(awk '$1 == "pg2osync_reconnects_total" {print $2}' <<< "$metrics")
 if [ "${reconnects:-0}" -ge 1 ]; then ok "reconnects_total counted it ($reconnects)"; else bad "reconnects_total still zero"; fi
 check "source reports connected again" "$(awk '$1 == "pg2osync_source_connected" {print $2}' <<< "$metrics")" "1"
 
-say "11. crash recovery"
+say "11. read-your-writes"
+pg "INSERT INTO users (id,name,email) VALUES (11,'ryw','r@test.io');" > /dev/null
+# no position, no sleep, no retry: the endpoint returns only once the write is
+# searchable, so a single query afterwards must find it
+synced=$(curl -s "http://127.0.0.1:9131/synced?refresh=true&timeout=8000")
+found=$(curl -s "$OS/e2e_users/_search" -H 'Content-Type: application/json' \
+  -d '{"query":{"term":{"id":11}}}' | jqf "d['hits']['total']['value']")
+check "the row is searchable the moment /synced returns" "$found" "1"
+check "and it says so" "$(jqf "d['synced']" <<< "$synced")" "True"
+waited=$(jqf "d['waited_ms']" <<< "$synced")
+ok "waited ${waited}ms"
+# a position nothing will ever reach must time out rather than hang
+code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:9131/synced?position=FFFF%2FFFFFFFFF&timeout=300")
+check "an unreachable position times out" "$code" "408"
+
+say "12. crash recovery"
 pkill -9 -f "pg2osync run"; sleep 1
 pg "INSERT INTO users (id,name,email) VALUES (8,'eve-during-downtime','eve@test.io');" > /dev/null
 start_sync
 sleep 6; refresh
 check "row written while down is recovered" "$(os_field e2e_users 8 name)" "eve-during-downtime"
 
-say "12. final consistency"
+say "13. final consistency"
 check "row counts match" "$(pg "SELECT count(*) FROM users;")" "$(os_count e2e_users)"
 
-say "13. status and teardown"
+say "14. status and teardown"
 $BIN status -c "$CONFIG" | sed 's/^/    /'
 stop_sync; sleep 1
 $BIN drop-slot -c "$CONFIG" > /dev/null

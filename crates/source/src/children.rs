@@ -62,25 +62,35 @@ impl ChildSpec {
     }
 }
 
-/// Bind a key in the column's own type so the query can use an index.
+/// Build the lookup predicate and its parameter.
 ///
-/// Casting either side to text — which this did before — makes the index
-/// unusable and turns every lookup into a sequential scan: measured at 165s
-/// against 50k parents where the typed form took 74ms. Anything that is not a
-/// plain scalar falls back to the text form, which is correct if slow.
+/// Casting the column to text makes an index unusable and turns every lookup
+/// into a sequential scan: measured at 165s against 50k parents where the typed
+/// comparison took 74ms. Integer keys therefore compare numerically; everything
+/// else keeps the text form, which is correct for any column type at that cost.
 fn key_predicate(
     quoted_column: &str,
     key: &Value,
 ) -> (String, Box<dyn tokio_postgres::types::ToSql + Sync + Send>) {
     match key {
+        // ::bigint rather than a bare parameter: the column may be int2, int4,
+        // int8 or numeric, and tokio-postgres refuses to send an i64 for an
+        // int4 parameter. PostgreSQL's integer operator family compares across
+        // those widths, so the index on the column is still used.
         Value::Number(n) if n.is_i64() => (
-            format!("{quoted_column} = $1"),
+            format!("{quoted_column} = $1::bigint"),
             Box::new(n.as_i64().expect("checked")),
         ),
-        Value::String(s) => (format!("{quoted_column} = $1"), Box::new(s.clone())),
+        // Text keys cannot take the same shortcut: a text parameter has no
+        // operator against a uuid column, and the column's type is not known
+        // here. Comparing as text is correct for every type, at the cost of
+        // the index — resolving the column type would lift that.
         other => (
             format!("{quoted_column}::text = $1"),
-            Box::new(other.to_string()),
+            Box::new(match other {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            }),
         ),
     }
 }
@@ -140,15 +150,19 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn integer_keys_compare_in_their_own_type() {
+    fn integer_keys_do_not_pin_a_width() {
+        // an int4 column cannot take an i64 parameter, and the column's width
+        // is not known here; ::bigint compares across all integer widths and
+        // still uses the index
         let (predicate, _) = key_predicate("\"customer_id\"", &json!(42));
-        assert_eq!(predicate, "\"customer_id\" = $1");
+        assert!(predicate.ends_with("$1::bigint"), "{predicate}");
     }
 
     #[test]
-    fn string_keys_compare_in_their_own_type() {
+    fn text_keys_stay_on_the_portable_comparison() {
+        // a text parameter has no operator against uuid, so correctness wins
         let (predicate, _) = key_predicate("\"tenant\"", &json!("acme"));
-        assert_eq!(predicate, "\"tenant\" = $1");
+        assert_eq!(predicate, "\"tenant\"::text = $1");
     }
 
     #[test]

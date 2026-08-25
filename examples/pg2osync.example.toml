@@ -47,6 +47,13 @@ retry_max = 10
 retry_backoff_ms = 500
 checkpoint_interval_ms = 500
 
+# Read-your-writes: GET /synced blocks until your own commit is searchable.
+# Off by default because it is a surface applications call.
+# [api]
+# enabled = true
+# bind = "127.0.0.1:9101"
+# token_env = "PG2OSYNC_API_TOKEN"
+
 [metrics]
 enabled = true
 # use 0.0.0.0:9100 inside a container so probes can reach it

@@ -236,6 +236,12 @@ impl Sink for MeilisearchSink {
         Ok(())
     }
 
+    async fn refresh(&self, _indices: &[String]) -> Result<(), CoreError> {
+        // writes are server-side tasks and the sink already waits for them to
+        // complete, so an accepted write is searchable by then
+        Ok(())
+    }
+
     async fn write_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), CoreError> {
         let path = self.checkpoint_path();
         let tmp = format!("{path}.tmp");

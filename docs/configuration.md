@@ -195,6 +195,47 @@ exponential backoff. A permanent rejection — a mapping conflict, for example �
 stops the pipeline instead of skipping the document, because skipping is silent
 data loss.
 
+## `[api]`
+
+The read-your-writes endpoint. Off by default: it is a surface applications
+call, not an operational one.
+
+| Option | Default | Description |
+|---|---|---|
+| `enabled` | `false` | Serve the endpoint |
+| `bind` | `127.0.0.1:9101` | Listen address |
+| `token_env` | — | Env var holding a bearer token required on every request |
+
+### `GET /synced`
+
+Blocks until everything committed before the request is written to the target,
+then answers. A query made after it returns is guaranteed to see those writes.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `position` | read from the source | Where to wait for; omit and pg2osync reads it itself |
+| `timeout` | `5000` | Milliseconds to wait, capped at 30 s |
+| `refresh` | `false` | Also make the writes searchable, not merely stored |
+
+```
+GET /synced?refresh=true&timeout=2000
+200 {"synced":true,"requested":"0/1B4F2A8","confirmed":"0/1B4F2B0","waited_ms":5}
+408 {"synced":false,…}   still behind when the timeout elapsed
+400 the position could not be parsed
+```
+
+Leave `position` out unless you have a reason not to. Reading it requires
+`REPLICATION CLIENT` on MySQL — a privilege an application account should not
+hold — and pg2osync already has a connection that does.
+
+`refresh=true` is what separates *stored* from *searchable*: OpenSearch and
+Elasticsearch only expose a write to search after a refresh, on their own
+interval. Without it the document is retrievable by id but a search may not
+find it yet.
+
+The wait costs nothing on the write path. A background job that does not care
+never calls this and pays nothing.
+
 ## `[metrics]`
 
 | Option | Default | Description |

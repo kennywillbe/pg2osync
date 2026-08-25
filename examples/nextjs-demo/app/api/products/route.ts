@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { listProducts, listReviews, pool } from "@/lib/db";
-import { getProductDoc, refreshIndex } from "@/lib/opensearch";
-import { measurePropagation } from "@/lib/propagation";
+import { getProductDoc } from "@/lib/opensearch";
+import { waitUntilSearchable } from "@/lib/propagation";
 
 // Every route in this file talks to PostgreSQL only. The propagation timing
 // below reads OpenSearch purely to observe when pg2osync's write shows up —
@@ -34,11 +34,7 @@ export async function POST(req: NextRequest) {
   );
   const product = rows[0];
 
-  const propagation = await measurePropagation(async () => {
-    const doc = await getProductDoc(product.id);
-    return doc !== null && doc.name === product.name;
-  });
-  await refreshIndex();
+  const propagation = await waitUntilSearchable();
 
   return NextResponse.json({ product, propagation });
 }

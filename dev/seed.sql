@@ -26,9 +26,11 @@ CREATE TABLE IF NOT EXISTS orders (
     total       numeric(12, 2) NOT NULL
 );
 
+-- integer rather than bigint on purpose: a child key narrower than i64 is the
+-- common case and once broke the typed comparison
 CREATE TABLE IF NOT EXISTS tickets (
     id          bigint PRIMARY KEY,
-    customer_id bigint NOT NULL REFERENCES customers(id),
+    customer_id integer NOT NULL REFERENCES customers(id),
     subject     text NOT NULL
 );
 

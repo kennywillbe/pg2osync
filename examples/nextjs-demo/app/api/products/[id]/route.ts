@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { pool } from "@/lib/db";
-import { getProductDoc, refreshIndex } from "@/lib/opensearch";
-import { measurePropagation } from "@/lib/propagation";
+import { getProductDoc } from "@/lib/opensearch";
+import { waitUntilSearchable } from "@/lib/propagation";
 
 export async function PUT(
   req: NextRequest,
@@ -29,11 +29,7 @@ export async function PUT(
   }
   const product = rows[0];
 
-  const propagation = await measurePropagation(async () => {
-    const doc = await getProductDoc(product.id);
-    return doc !== null && doc.name === product.name && doc.description === product.description;
-  });
-  await refreshIndex();
+  const propagation = await waitUntilSearchable();
 
   return NextResponse.json({ product, propagation });
 }
@@ -48,11 +44,7 @@ export async function DELETE(
     return NextResponse.json({ error: "not found" }, { status: 404 });
   }
 
-  const propagation = await measurePropagation(async () => {
-    const doc = await getProductDoc(id);
-    return doc === null;
-  });
-  await refreshIndex();
+  const propagation = await waitUntilSearchable();
 
   return NextResponse.json({ ok: true, propagation });
 }

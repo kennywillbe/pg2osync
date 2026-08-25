@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { pool } from "@/lib/db";
-import { getProductDoc, refreshIndex } from "@/lib/opensearch";
-import { measurePropagation } from "@/lib/propagation";
+import { getProductDoc } from "@/lib/opensearch";
+import { waitUntilSearchable } from "@/lib/propagation";
 
 // One transaction that inserts, updates and deletes at once. pg2osync buffers
 // the whole transaction before flushing, so OpenSearch must never show the
@@ -31,9 +31,7 @@ export async function POST() {
      RETURNING id`,
   );
   const sentinelId = sentinel.rows[0].id as number;
-  const sentinelLanded = await measurePropagation(async () =>
-    (await getProductDoc(sentinelId))?.name === "tx sentinel",
-  );
+  const sentinelLanded = await waitUntilSearchable();
 
   await pool.query("BEGIN");
   try {
@@ -50,19 +48,7 @@ export async function POST() {
     const atomId = inserted.rows[0].id as number;
     await pool.query("COMMIT");
 
-    const propagation = await measurePropagation(async () => {
-      const [atomDoc, renamedDoc, victimDoc] = await Promise.all([
-        getProductDoc(atomId),
-        getProductDoc(updatedId),
-        getProductDoc(victimId),
-      ]);
-      return (
-        atomDoc !== null &&
-        renamedDoc?.name === "tx new name" &&
-        victimDoc === null
-      );
-    });
-    await refreshIndex();
+    const propagation = await waitUntilSearchable();
 
     return NextResponse.json({
       insertedId: atomId,

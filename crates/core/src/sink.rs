@@ -68,6 +68,13 @@ pub trait Sink: Send + Sync {
     /// Clear all documents of an index after a source-side TRUNCATE.
     async fn truncate_index(&self, index: &str) -> Result<(), CoreError>;
 
+    /// Make everything written so far visible to search.
+    ///
+    /// A write that the sink has accepted is not necessarily searchable yet;
+    /// engines that refresh on an interval need to be asked. Implementations
+    /// where acceptance already implies visibility do nothing here.
+    async fn refresh(&self, indices: &[String]) -> Result<(), CoreError>;
+
     /// Persist the pipeline checkpoint durably.
     async fn write_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), CoreError>;
 

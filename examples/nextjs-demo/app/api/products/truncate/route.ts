@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { pool } from "@/lib/db";
 import { countProducts, refreshIndex } from "@/lib/opensearch";
-import { measurePropagation } from "@/lib/propagation";
+import { waitUntilSearchable } from "@/lib/propagation";
 
 // TRUNCATE is the path worth calling out separately: it never appears as a
 // row-level DELETE in the WAL, so a naive CDC pipeline built only around
@@ -13,11 +13,7 @@ export async function POST() {
   // truncate the parent alone; both go in one statement, one WAL record.
   await pool.query("TRUNCATE TABLE demo_products, demo_reviews RESTART IDENTITY");
 
-  const propagation = await measurePropagation(async () => {
-    const count = await countProducts();
-    return count === 0 || count === null; // null: index doesn't exist, so nothing to see either
-  });
-  await refreshIndex();
+  const propagation = await waitUntilSearchable();
 
   return NextResponse.json({ ok: true, before, propagation });
 }

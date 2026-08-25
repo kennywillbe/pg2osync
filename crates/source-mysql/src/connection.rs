@@ -230,6 +230,19 @@ impl MySqlConnection {
         read_one(&mut self.stream).await
     }
 
+    /// Ask the server for heartbeats while the binlog is quiet.
+    ///
+    /// Without them the position only moves when something is written, so a
+    /// caller waiting for its own commit on an idle server would wait for the
+    /// next unrelated write. Must run before COM_BINLOG_DUMP.
+    pub async fn set_heartbeat_period(&mut self, period: std::time::Duration) -> Result<()> {
+        let nanos = period.as_nanos().min(u64::MAX as u128) as u64;
+        self.send_query(&format!("SET @master_heartbeat_period = {nanos}"))
+            .await?;
+        let _ = read_one(&mut self.stream).await?;
+        Ok(())
+    }
+
     /// Required before COM_BINLOG_DUMP when the source logs CRC32 checksums:
     /// tells the server we can consume them. Must run on the same connection.
     pub async fn negotiate_checksum(&mut self) -> Result<()> {
