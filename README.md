@@ -60,7 +60,9 @@ replay, and no transformation language — if you need those, you want Kafka.
 | Column projection (`columns` / `exclude_columns`) | ✅ |
 | Column transforms (`hash`, `redact`) | ✅ |
 | TRUNCATE propagation | ✅ PostgreSQL and MySQL/MariaDB |
-| Polling fallback for managed databases without replication | ✅ upsert-only |
+| Polling fallback for managed databases without replication | ✅ upserts, plus deletes via `soft_delete` |
+| Index mappings you define (`mapping_file`) | ✅ applied at creation, compared at startup |
+| Reconcile an index against its table (`reconcile`) | ✅ names or removes documents whose row is gone |
 | **Read-your-writes** (`/synced`) | ✅ wait for your own commit to be searchable |
 | Prometheus metrics | ✅ built-in endpoint |
 
