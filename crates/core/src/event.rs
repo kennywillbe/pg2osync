@@ -14,8 +14,8 @@ use serde_json::Value;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionBoundary {
     /// `lsn` is the position this transaction will commit at, which pgoutput
-    /// reports up front. Known before any of its rows arrive, which is what
-    /// lets every document it produces carry a version.
+    /// reports up front. It marks the transaction open: while one is, nothing
+    /// may flush a batch, or a concurrent producer's boundary would split it.
     Begin { lsn: Lsn },
     /// `lsn` is the commit LSN; it is the highest position that may be
     /// acknowledged to the source once this transaction's rows are durable.
@@ -30,6 +30,12 @@ pub struct RowChange {
     pub schema: String,
     pub table: String,
     pub kind: RowKind,
+    /// The source position at which this change became visible, carried on the
+    /// row rather than inferred from the surrounding boundaries: two producers
+    /// may feed the engine at once, so ambient state would attribute one's
+    /// position to the other's rows. Deliberately not the checkpoint token —
+    /// the target versions documents by it, nothing acknowledges it.
+    pub version: Option<u64>,
 }
 
 impl RowChange {
@@ -79,8 +85,10 @@ pub enum ChangeEvent {
     Transaction(TransactionBoundary),
     Row(RowChange),
     /// TRUNCATE on a source table; target index content must be cleared.
+    /// `version` is the position it happened at, as for a row.
     TableTruncated {
         schema: String,
         table: String,
+        version: Option<u64>,
     },
 }

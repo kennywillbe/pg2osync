@@ -140,6 +140,9 @@ pub fn build_row_change(rel: &Relation, incoming: Incoming) -> Result<RowChange,
         schema: rel.schema.clone(),
         table: rel.name.clone(),
         kind,
+        // the decoder sees one message; the position belongs to the
+        // transaction around it, which only the caller tracks
+        version: None,
     };
     // without a replica identity there is no key to address the row on
     // update/delete; inserts are unaffected
