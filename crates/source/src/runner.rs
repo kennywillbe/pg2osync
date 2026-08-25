@@ -138,8 +138,18 @@ impl WalSource {
             };
             tracing::trace!(target: "pg2osync::source", "raw event");
             match ev {
-                ReplicationEvent::Begin { .. } => {
+                ReplicationEvent::Begin { final_lsn, .. } => {
                     in_transaction = true;
+                    // pgoutput reports the commit position before the rows, so
+                    // every document this transaction produces can be versioned
+                    // by the position it becomes visible at
+                    tx.send(ChangeEvent::Transaction(
+                        pg2osync_core::event::TransactionBoundary::Begin {
+                            lsn: to_core_lsn(final_lsn),
+                        },
+                    ))
+                    .await
+                    .context("change channel closed")?;
                 }
                 ReplicationEvent::Commit {
                     end_lsn,

@@ -23,10 +23,20 @@ pub enum DocumentOp {
         index: String,
         id: String,
         doc: Value,
+        /// Source position this version of the row became visible at, used as
+        /// the target's external document version. `None` where the source has
+        /// no position to offer — poll mode, and the initial load until it
+        /// carries one.
+        ///
+        /// It is deliberately separate from `LsnOp::lsn`: that one is the
+        /// position that may be acknowledged, and an initial-load row must
+        /// never advance it while still needing a version.
+        version: Option<u64>,
     },
     Delete {
         index: String,
         id: String,
+        version: Option<u64>,
     },
 }
 
@@ -76,7 +86,12 @@ pub trait Sink: Send + Sync {
     async fn write(&self, batch: Vec<LsnOp>) -> Result<SinkAck, CoreError>;
 
     /// Clear all documents of an index after a source-side TRUNCATE.
-    async fn truncate_index(&self, index: &str) -> Result<(), CoreError>;
+    ///
+    /// `version` is the position the truncate happened at. A target that
+    /// versions its documents must clear them *at* that position: anything
+    /// written before it has to lose, and anything written after it has to
+    /// survive, including a row re-inserted moments later.
+    async fn truncate_index(&self, index: &str, version: Option<u64>) -> Result<(), CoreError>;
 
     /// Make everything written so far visible to search.
     ///

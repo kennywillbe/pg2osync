@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use opensearch::auth::Credentials;
 use opensearch::http::response::Response;
 use opensearch::http::transport::{SingleNodeConnectionPool, TransportBuilder};
+use opensearch::params::VersionType;
 use opensearch::{BulkOperation, BulkParts, GetParts, IndexParts, OpenSearch};
 use pg2osync_core::checkpoint::Checkpoint;
 use pg2osync_core::error::CoreError;
@@ -157,6 +158,76 @@ impl OpenSearchSink {
     /// killed in between leaves it suspended, and the symptom is the worst
     /// kind: writes are accepted, the pipeline looks healthy, and searches
     /// return nothing.
+    /// Clear an index by deleting each document at the truncate's own position.
+    ///
+    /// Reads a page of ids and deletes them, repeating until a round deletes
+    /// nothing. That termination rule is what makes it correct rather than
+    /// merely bounded: a document written *after* the truncate has a higher
+    /// version, so its delete is refused and it stays — and once every
+    /// remaining document is one of those, the round deletes nothing and the
+    /// loop is done.
+    async fn truncate_at_version(&self, index: &str, version: i64) -> Result<(), CoreError> {
+        const PAGE: usize = 1000;
+        loop {
+            let resp = self
+                .client
+                .search(opensearch::SearchParts::Index(&[index]))
+                .body(json!({"size": PAGE, "_source": false, "query": {"match_all": {}}}))
+                .send()
+                .await
+                .map_err(http_err)?;
+            let body: Value = resp.json().await.map_err(http_err)?;
+            let ids: Vec<String> = body["hits"]["hits"]
+                .as_array()
+                .map(|hits| {
+                    hits.iter()
+                        .filter_map(|hit| hit["_id"].as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if ids.is_empty() {
+                return Ok(());
+            }
+
+            let ops: Vec<BulkOperation<Value>> = ids
+                .iter()
+                .map(|id| {
+                    BulkOperation::delete(id.clone())
+                        .index(index.to_string())
+                        .version(version)
+                        .version_type(VersionType::ExternalGte)
+                        .into()
+                })
+                .collect();
+            let resp = self
+                .client
+                .bulk(opensearch::BulkParts::None)
+                .body(ops)
+                .refresh(opensearch::params::Refresh::True)
+                .send()
+                .await
+                .map_err(http_err)?;
+            let body: Value = resp.json().await.map_err(http_err)?;
+            let deleted = body["items"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter(|item| {
+                            item["delete"]["status"]
+                                .as_u64()
+                                .is_some_and(|s| (200..300).contains(&s))
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            if deleted == 0 {
+                // everything left was written after the truncate
+                return Ok(());
+            }
+        }
+    }
+
     async fn warn_on_suspended_refresh(&self, tables: &[IndexSpec]) {
         if self.serverless || tables.is_empty() {
             return;
@@ -233,16 +304,29 @@ impl OpenSearchSink {
         let ops: Vec<BulkOperation<Value>> = batch
             .iter()
             .map(|op| match &op.op {
-                pg2osync_core::sink::DocumentOp::Upsert { index, id, doc } => {
-                    BulkOperation::index(doc.clone())
+                pg2osync_core::sink::DocumentOp::Upsert {
+                    index,
+                    id,
+                    doc,
+                    version,
+                } => {
+                    let op = BulkOperation::index(doc.clone())
                         .id(id.clone())
-                        .index(index.clone())
-                        .into()
+                        .index(index.clone());
+                    // external_gte, not external: a replay after a crash writes
+                    // the same position again, and `external` rejects an equal
+                    // version while `external_gte` accepts it
+                    match external_version(*version) {
+                        Some(v) => op.version(v).version_type(VersionType::ExternalGte).into(),
+                        None => op.into(),
+                    }
                 }
-                pg2osync_core::sink::DocumentOp::Delete { index, id } => {
-                    BulkOperation::delete(id.clone())
-                        .index(index.clone())
-                        .into()
+                pg2osync_core::sink::DocumentOp::Delete { index, id, version } => {
+                    let op = BulkOperation::delete(id.clone()).index(index.clone());
+                    match external_version(*version) {
+                        Some(v) => op.version(v).version_type(VersionType::ExternalGte).into(),
+                        None => op.into(),
+                    }
                 }
             })
             .collect();
@@ -271,18 +355,30 @@ impl OpenSearchSink {
         let mut retryable_http = false;
         let mut permanent = vec![];
         for item in body["items"].as_array().cloned().unwrap_or_default() {
-            let entry = &item["index"];
+            // the action name keys the result, so a delete's outcome lives
+            // under "delete" — reading only "index" hid every failed delete
+            let entry = item
+                .as_object()
+                .and_then(|fields| fields.values().next())
+                .cloned()
+                .unwrap_or(Value::Null);
             let item_status = entry["status"].as_u64().unwrap_or(0);
+            let error_type = entry["error"]["type"].as_str().unwrap_or("unknown");
             if item_status == 429 || item_status >= 500 {
                 retryable_http = true;
+            } else if error_type == "version_conflict_engine_exception" {
+                // Not a failure: a later position already holds this document,
+                // so declining this write is the ordering rule working. Treating
+                // it as permanent would halt the pipeline on a race it just won.
+                tracing::debug!(target: "pg2osync::sink",
+                    "version conflict on {} left the newer document in place: {}",
+                    entry["_id"].as_str().unwrap_or("?"),
+                    entry["error"]["reason"].as_str().unwrap_or("?"));
             } else if !(200..300).contains(&item_status) {
                 permanent.push((
                     entry["_id"].as_str().unwrap_or("?").to_string(),
                     entry["_index"].as_str().unwrap_or("?").to_string(),
-                    entry["error"]["type"]
-                        .as_str()
-                        .unwrap_or("unknown")
-                        .to_string(),
+                    error_type.to_string(),
                 ));
             }
         }
@@ -338,6 +434,22 @@ fn chrono_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// A source position as the target's external document version.
+///
+/// The version is what makes a write's order at the target independent of the
+/// order it arrives in: a document already at a later position rejects an
+/// earlier write instead of being overwritten by it. That is what allows the
+/// initial load and the change stream to write the same document concurrently.
+///
+/// Positions past `i64::MAX` cannot be expressed as a version. A PostgreSQL LSN
+/// would have to pass 8 exabytes of WAL to get there, so this returns None
+/// rather than pretending, and the write simply goes unversioned.
+pub(crate) fn external_version(position: Option<u64>) -> Option<i64> {
+    position
+        .filter(|p| *p > 0)
+        .and_then(|p| i64::try_from(p).ok())
 }
 
 /// Compare a configured mapping against a live index and act on the answer.
@@ -470,7 +582,7 @@ impl Sink for OpenSearchSink {
         Ok(SinkAck { max_lsn })
     }
 
-    async fn truncate_index(&self, index: &str) -> Result<(), CoreError> {
+    async fn truncate_index(&self, index: &str, version: Option<u64>) -> Result<(), CoreError> {
         // delete_by_query only removes documents a search can see, so writes
         // still sitting in the translog would survive the TRUNCATE and
         // resurrect rows the source has already dropped
@@ -484,6 +596,18 @@ impl Sink for OpenSearchSink {
                 .map_err(http_err)?;
             check_status(resp, "pre-truncate refresh").await?;
         }
+
+        // Where documents carry versions, the truncate must carry one too.
+        // delete_by_query cannot: it is internally versioned, so it leaves a
+        // tombstone one above whatever the document held, and a replay of that
+        // same write after a crash is then rejected forever — the row is lost.
+        // A versioned bulk delete puts the tombstone at the truncate's own
+        // position instead, which is the honest ordering: earlier writes lose,
+        // later ones survive.
+        if let Some(version) = external_version(version) {
+            return self.truncate_at_version(index, version).await;
+        }
+
         let resp = self
             .client
             .delete_by_query(opensearch::DeleteByQueryParts::Index(&[index]))
@@ -731,6 +855,26 @@ impl Sink for OpenSearchSink {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_position_becomes_the_documents_external_version() {
+        assert_eq!(external_version(Some(4096)), Some(4096));
+    }
+
+    #[test]
+    fn a_write_with_nothing_to_version_by_goes_unversioned() {
+        assert_eq!(external_version(None), None);
+        // position zero is the initial load's marker for "no position"
+        assert_eq!(external_version(Some(0)), None);
+    }
+
+    #[test]
+    fn a_position_too_large_to_express_is_left_unversioned() {
+        // rather than wrapping into a negative version and silently reordering
+        // writes; a WAL would have to pass 8 exabytes to get here
+        assert_eq!(external_version(Some(u64::MAX)), None);
+        assert_eq!(external_version(Some(i64::MAX as u64)), Some(i64::MAX));
+    }
+
     use super::*;
     use pg2osync_core::checkpoint::{SOURCE_MYSQL, SOURCE_POSTGRES, StreamId};
 
