@@ -2,3 +2,4 @@
 /spike/
 /pg2osync.toml
 /.pg2osync-state/
+.DS_Store
