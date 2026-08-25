@@ -6,15 +6,20 @@ WORKDIR /build
 # Dependencies change far less often than sources: copying manifests first
 # keeps the dependency layer cached across code-only rebuilds.
 COPY Cargo.toml Cargo.lock ./
+# One line per workspace member: a member missing here fails the stub build
+# below with "failed to load manifest for workspace member", which is exactly
+# how adding crates/tls broke this image without anyone noticing.
 COPY crates/core/Cargo.toml crates/core/
+COPY crates/tls/Cargo.toml crates/tls/
 COPY crates/source/Cargo.toml crates/source/
 COPY crates/source-mysql/Cargo.toml crates/source-mysql/
 COPY crates/sink/Cargo.toml crates/sink/
 COPY crates/engine/Cargo.toml crates/engine/
 COPY crates/bin/Cargo.toml crates/bin/
-RUN mkdir -p crates/core/src crates/source/src crates/source-mysql/src \
+RUN mkdir -p crates/core/src crates/tls/src crates/source/src crates/source-mysql/src \
              crates/sink/src crates/engine/src crates/bin/src \
     && echo "" > crates/core/src/lib.rs \
+    && echo "" > crates/tls/src/lib.rs \
     && echo "" > crates/source/src/lib.rs \
     && echo "" > crates/source-mysql/src/lib.rs \
     && echo "" > crates/sink/src/lib.rs \
