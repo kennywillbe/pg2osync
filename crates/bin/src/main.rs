@@ -43,6 +43,11 @@ enum Command {
         #[arg(short, long, value_name = "FILE")]
         config: PathBuf,
     },
+    /// Print the SQL a DBA needs to run, derived from the config.
+    SetupSql {
+        #[arg(short, long, value_name = "FILE")]
+        config: PathBuf,
+    },
     /// Drop the replication slot and publication (PostgreSQL only).
     DropSlot {
         #[arg(short, long, value_name = "FILE")]
@@ -64,6 +69,7 @@ async fn main() -> Result<()> {
         Command::Bootstrap { config } => pipeline(&config, run::Mode::Bootstrap).await,
         Command::Validate { config } => validate(&config).await,
         Command::Status { config } => status(&config).await,
+        Command::SetupSql { config } => setup_sql(&config),
         Command::DropSlot { config } => drop_slot(&config).await,
     }
 }
@@ -84,6 +90,56 @@ async fn pipeline(path: &Path, mode: run::Mode) -> Result<()> {
         mode,
     )
     .await
+}
+
+
+/// Print the source-side setup script for this config.
+///
+/// Offline on purpose: the point is to hand something to whoever holds the
+/// privileges, which is usually not whoever is running this.
+fn setup_sql(path: &Path) -> Result<()> {
+    let cfg = config::AppConfig::load(path)?;
+    let secrets = cfg.resolve_secrets()?;
+    let url = url::Url::parse(&secrets.source_url).context("source url is not a valid URL")?;
+    let user = match url.username() {
+        "" => "pg2osync",
+        name => name,
+    };
+
+    if cfg.source.flavor == "mysql" {
+        let mut databases: Vec<String> = cfg
+            .sync
+            .values()
+            .filter_map(|t| t.table.split_once('.').map(|(db, _)| db.to_string()))
+            .collect();
+        databases.sort();
+        databases.dedup();
+        print!(
+            "{}",
+            pg2osync_source_mysql::catalog::setup_script(user, &databases)
+        );
+        return Ok(());
+    }
+
+    let mut tables: Vec<String> = cfg.sync.values().map(|t| t.table.clone()).collect();
+    // child tables are read by the initial load too, so they need the grant
+    for table in cfg.sync.values() {
+        for child in &table.children {
+            if !tables.contains(&child.table) {
+                tables.push(child.table.clone());
+            }
+        }
+    }
+    print!(
+        "{}",
+        pg2osync_source::catalog::setup_script(
+            user,
+            &tables,
+            &cfg.source.publication,
+            &cfg.source.slot_name,
+        )
+    );
+    Ok(())
 }
 
 async fn validate(path: &Path) -> Result<()> {

@@ -22,8 +22,10 @@ GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'pg2osync'@'%';
 `binlog_format`/`binlog_row_image` are usually already `ROW`/`FULL`). Put the
 settings in `my.cnf` as well — `SET GLOBAL` does not survive a restart.
 
-`pg2osync validate` checks all three settings, the connection and every
-configured table before you run anything.
+`pg2osync setup-sql -c pg2osync.toml` prints the whole script for your config —
+the `my.cnf` block, the user and the grants — so it can be handed to whoever
+holds the privileges. `pg2osync validate` then checks the settings, the
+connection and every configured table before you run anything.
 
 Every synced table needs a **primary key**; it becomes the document `_id`.
 

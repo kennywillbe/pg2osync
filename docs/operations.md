@@ -74,6 +74,7 @@ stays up. PostgreSQL 13+.
 ## Day-to-day commands
 
 ```sh
+pg2osync setup-sql -c pg2osync.toml  # the SQL a DBA needs, from your config
 pg2osync validate -c pg2osync.toml   # config, connectivity, server settings
 pg2osync status   -c pg2osync.toml   # checkpoint vs the source's position
 pg2osync bootstrap -c pg2osync.toml  # create slot/publication/indices, then exit

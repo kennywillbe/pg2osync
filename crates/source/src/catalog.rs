@@ -104,6 +104,83 @@ impl Preflight {
     }
 }
 
+
+/// The whole script a DBA needs, derived from the config rather than copied
+/// out of documentation.
+///
+/// Printed rather than executed: every statement here needs privileges the
+/// pipeline's own role should not have, and a script someone can read before
+/// running is the difference between a tool that works and one that is
+/// pleasant to adopt.
+pub fn setup_script(user: &str, tables: &[String], publication: &str, slot: &str) -> String {
+    let mut out = String::new();
+    let schemas: Vec<&str> = {
+        let mut seen: Vec<&str> = tables
+            .iter()
+            .filter_map(|t| t.split_once('.').map(|(s, _)| s))
+            .collect();
+        seen.sort_unstable();
+        seen.dedup();
+        seen
+    };
+
+    out.push_str("-- pg2osync source setup. Review before running.\n");
+    out.push_str("-- Run as a superuser or the owner of the tables below.\n\n");
+
+    out.push_str("-- 1. Logical decoding. This one needs a RESTART, not a reload,\n");
+    out.push_str("--    and it is the step people discover last.\n");
+    out.push_str("--    Check first:  SHOW wal_level;\n");
+    out.push_str("ALTER SYSTEM SET wal_level = 'logical';\n");
+    out.push_str("-- then restart PostgreSQL.\n\n");
+
+    out.push_str("-- 2. A role for the pipeline. REPLICATION is what lets it open\n");
+    out.push_str("--    the stream; it does not grant any data access on its own.\n");
+    out.push_str(&format!(
+        "CREATE ROLE {} WITH LOGIN REPLICATION PASSWORD 'change-me';\n\n",
+        quote_ident(user)
+    ));
+
+    out.push_str("-- 3. Read access. The initial load reads every synced table.\n");
+    for schema in &schemas {
+        out.push_str(&format!(
+            "GRANT USAGE ON SCHEMA {} TO {};\n",
+            quote_ident(schema),
+            quote_ident(user)
+        ));
+    }
+    for table in tables {
+        out.push_str(&format!(
+            "GRANT SELECT ON {table} TO {};\n",
+            quote_ident(user)
+        ));
+    }
+
+    out.push_str("\n-- 4. The publication. Publishing a table requires owning it,\n");
+    out.push_str("--    which is why this cannot be done by the pipeline's role.\n");
+    out.push_str(&format!(
+        "CREATE PUBLICATION {publication} FOR TABLE {} \
+         WITH (publish_via_partition_root = true);\n\n",
+        tables.join(", ")
+    ));
+
+    out.push_str("-- 5. The slot. pg2osync creates this itself on first run;\n");
+    out.push_str("--    create it here if the pipeline's role may not.\n");
+    out.push_str(&format!(
+        "-- SELECT pg_create_logical_replication_slot('{slot}', 'pgoutput');\n\n"
+    ));
+
+    out.push_str("-- 6. Cap what an unread slot can retain, so a stopped pipeline\n");
+    out.push_str("--    cannot fill this disk. Past the limit the slot is\n");
+    out.push_str("--    invalidated and pg2osync falls back to a full load.\n");
+    out.push_str("ALTER SYSTEM SET max_slot_wal_keep_size = '10GB';\n");
+    out.push_str("SELECT pg_reload_conf();\n");
+    out
+}
+
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 /// Inspect the current role's privileges against the configured objects.
 pub async fn preflight(
     client: &Client,
@@ -386,6 +463,40 @@ pub async fn confirmed_flush_lsn(client: &Client, slot_name: &str) -> Result<Opt
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_setup_script_covers_what_the_pipeline_cannot_do_itself() {
+        let script = setup_script(
+            "svc",
+            &["public.users".into(), "shop.orders".into()],
+            "pg2osync_pub",
+            "pg2osync_slot",
+        );
+        assert!(script.contains("wal_level = 'logical'"), "{script}");
+        assert!(script.contains("RESTART"), "the step people find last");
+        assert!(script.contains("CREATE ROLE \"svc\" WITH LOGIN REPLICATION"));
+        assert!(script.contains("GRANT SELECT ON public.users TO \"svc\""));
+        assert!(script.contains("CREATE PUBLICATION pg2osync_pub FOR TABLE"));
+        assert!(script.contains("max_slot_wal_keep_size"));
+    }
+
+    #[test]
+    fn every_schema_is_granted_once() {
+        let script = setup_script(
+            "svc",
+            &["public.a".into(), "public.b".into(), "shop.c".into()],
+            "p",
+            "s",
+        );
+        assert_eq!(script.matches("GRANT USAGE ON SCHEMA \"public\"").count(), 1);
+        assert_eq!(script.matches("GRANT USAGE ON SCHEMA \"shop\"").count(), 1);
+    }
+
+    #[test]
+    fn a_role_name_cannot_break_out_of_its_quoting() {
+        let script = setup_script("we\"ird", &["public.a".into()], "p", "s");
+        assert!(script.contains("\"we\"\"ird\""), "{script}");
+    }
+
     use super::*;
 
     #[test]
