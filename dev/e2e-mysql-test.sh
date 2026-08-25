@@ -88,10 +88,10 @@ else
   $BIN validate -c "$CONFIG" 2>&1 | tail -5 | sed 's/^/    /'
 fi
 
-say "2. snapshot"
+say "2. initial load"
 start_sync
 sleep 6; refresh
-check "snapshot indexed all rows" "$(os_count e2e_mysql_users)" "3"
+check "the load indexed all rows" "$(os_count e2e_mysql_users)" "3"
 check "named columns, not ordinals" "$(os_field e2e_mysql_users 1 name)" "alice"
 check "decimal keeps precision" "$(os_field e2e_mysql_users 3 balance)" "99.99"
 check "excluded column absent" "$(os_has e2e_mysql_users 1 password_hash)" "False"
@@ -184,13 +184,13 @@ check "the row is searchable the moment /synced returns" "$found" "1"
 ok "waited $(jqf "d['waited_ms']" <<< "$synced")ms"
 
 say "9. crash recovery resumes from the binlog position"
-snapshots_before=$(grep -c 'snapshot of' "$LOG")
+loads_before=$(grep -c 'rows from sourcedb' "$LOG")
 pkill -9 -f "pg2osync run"; sleep 1
 my "INSERT INTO shop_users (id,name,email) VALUES (5,'eve-during-downtime','eve@test.io');"
 start_sync
 sleep 6; refresh
 check "row written while down is recovered" "$(os_field e2e_mysql_users 5 name)" "eve-during-downtime"
-check "no full re-snapshot needed" "$(( $(grep -c 'snapshot of' "$LOG") - snapshots_before ))" "0"
+check "no full reload needed" "$(( $(grep -c 'rows from sourcedb' "$LOG") - loads_before ))" "0"
 
 say "10. final consistency"
 check "row counts match" "$(my 'SELECT count(*) FROM shop_users;')" "$(os_count e2e_mysql_users)"

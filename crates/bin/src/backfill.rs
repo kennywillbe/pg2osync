@@ -23,7 +23,7 @@
 use anyhow::{Context as _, Result, bail};
 use pg2osync_core::checkpoint::StreamId;
 use pg2osync_core::event::{ChangeEvent, RowKind, TransactionBoundary};
-use pg2osync_core::load::{LoadProgress, load_progress_key};
+use pg2osync_core::load::{LoadCursor, LoadProgress, load_progress_key};
 use pg2osync_core::lsn::Lsn;
 use pg2osync_source::children::ChildSpec;
 use std::collections::HashMap;
@@ -280,27 +280,6 @@ fn child_column(child: &ChildSpec) -> ColMeta {
     }
 }
 
-/// True when a previous load left a table unfinished, so this one has to carry
-/// it on rather than trust the checkpoint and skip it.
-pub async fn unfinished(
-    sink: &dyn pg2osync_core::sink::Sink,
-    cfg: &AppConfig,
-    stream: &StreamId,
-) -> Result<bool> {
-    for tbl in cfg.sync.values() {
-        let key = load_progress_key(stream, &tbl.table);
-        let stored = sink
-            .read_state(&key)
-            .await?
-            .as_ref()
-            .and_then(LoadProgress::from_doc);
-        if stored.is_some_and(|p| !p.finished) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 /// Stream every configured table into the engine channel.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -366,42 +345,48 @@ pub async fn run(
             .await?
             .as_ref()
             .and_then(LoadProgress::from_doc);
-        // Boundaries are stored rather than recomputed: they come from a random
-        // sample, so a second run would cut the table somewhere else and the
-        // count of finished ranges would name a different span of rows.
         let mut progress = match stored {
             Some(p) if p.finished => {
                 tracing::info!(target: "pg2osync::backfill",
                     "{} was fully loaded by an earlier run; skipping", tbl.table);
                 continue;
             }
-            Some(p) => {
-                tracing::info!(target: "pg2osync::backfill",
-                    "resuming the load of {} after {} of {} range(s)",
-                    tbl.table, p.done, p.boundaries.len() + 1);
-                p
-            }
+            Some(p) => p,
             None => {
                 let progress = LoadProgress {
-                    boundaries: key_bounds(
-                        admin,
-                        &tbl.table,
-                        &cols,
-                        cfg.source.load_chunk_rows.max(1),
-                    )
-                    .await?,
-                    done: 0,
+                    cursor: LoadCursor::Ranges {
+                        boundaries: key_bounds(
+                            admin,
+                            &tbl.table,
+                            &cols,
+                            cfg.source.load_chunk_rows.max(1),
+                        )
+                        .await?,
+                        done: 0,
+                    },
                     finished: false,
                 };
                 sink.write_state(&progress_key, &progress.to_doc()).await?;
                 progress
             }
         };
-        let ranges = ranges_from_bounds(&progress.boundaries);
+        let LoadCursor::Ranges { boundaries, done } = &progress.cursor else {
+            bail!(
+                "load progress for {} was written by a loader that cuts the table \
+                 differently; delete {progress_key} from the target to start over",
+                tbl.table
+            );
+        };
+        let (ranges, first) = (ranges_from_bounds(boundaries), *done);
+        if first > 0 {
+            tracing::info!(target: "pg2osync::backfill",
+                "resuming the load of {} after {first} of {} range(s)",
+                tbl.table, ranges.len());
+        }
 
         let started = std::time::Instant::now();
         let mut count: u64 = 0;
-        for (nth, range) in ranges.iter().enumerate().skip(progress.done) {
+        for (nth, range) in ranges.iter().enumerate().skip(first) {
             // Between ranges, never inside one. A `COPY` paused mid-stream would
             // hold its snapshot open for as long as the pause lasts, which is
             // the long transaction this design exists to avoid — and a range is
@@ -474,7 +459,9 @@ pub async fn run(
                 .wait_for(|written| *written >= mark)
                 .await
                 .map_err(|_| anyhow::anyhow!("engine stopped before the range was written"))?;
-            progress.done = nth + 1;
+            if let LoadCursor::Ranges { done, .. } = &mut progress.cursor {
+                *done = nth + 1;
+            }
             sink.write_state(&progress_key, &progress.to_doc()).await?;
         }
         progress.finished = true;
