@@ -69,14 +69,16 @@ Stated up front, because finding these out in production is expensive:
 
 - **One instance per replication slot.** Two processes on the same slot fight
   over its position. Scale by splitting tables across instances.
-- **No schema migration.** DDL drift is detected and reported, never applied.
-  Adding a column is fine (it appears in new documents); renaming or dropping
-  one needs a re-index.
+- **No schema migration.** A column added, dropped or retyped under a running
+  pipeline is reported, never applied: new documents take the new shape and
+  every document written before it keeps the old one until the index is
+  rebuilt. `validate` refuses a `columns` list naming a column that no longer
+  exists.
 - **Poll mode cannot see deletes.** It has no access to the replication log.
 - **Nested children are one level deep**, re-fetched with a query per changed
   parent — a wide fan-out slows the initial load.
-- **MySQL needs `binlog_row_image = FULL`.** `TRUNCATE` is not propagated for
-  MySQL sources (it is not a row-level event in the binlog).
+- **MySQL needs `binlog_row_image = FULL`**, and refuses
+  `binlog_row_value_options = PARTIAL_JSON`.
 - **MySQL nested children are not supported yet.**
 - Ordering is guaranteed per row, not across tables.
 

@@ -118,6 +118,7 @@ Targets: `pg2osync::source`, `::engine`, `::sink`, `::checkpoint`, `::backfill`,
 |---|---|---|
 | `wal_level is 'replica' but must be 'logical'` | Server not configured | Set it in `postgresql.conf` and restart |
 | `publication … covers X but config wants Y` | You changed the table list | Drop and recreate the publication, or align the config. Drift is never auto-applied |
+| `… changed shape: added/removed/retyped …` | A column changed under the running pipeline | Nothing breaks, but documents written earlier keep the old shape. Re-index when you want them to agree |
 | `table … has REPLICA IDENTITY NOTHING` | Updates/deletes cannot be replicated | Run the `ALTER TABLE … REPLICA IDENTITY FULL` from the message |
 | `child row carries NULL <fk>` | Child table lacks `REPLICA IDENTITY FULL` | Set it; a delete without the key cannot find its parent |
 | `halting pipeline: permanent rejection …` | The target refuses the document (usually a mapping conflict) | Fix the mapping or exclude the column, then restart |
