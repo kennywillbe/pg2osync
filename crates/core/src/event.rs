@@ -84,6 +84,11 @@ pub enum RowKind {
 pub enum ChangeEvent {
     Transaction(TransactionBoundary),
     Row(RowChange),
+    /// A request from the initial load to be told, through the pipeline's load
+    /// channel, when everything sent before it is durably written. Progress is
+    /// only recorded behind one, so a crash loses forward progress and never
+    /// claims a range that was not written.
+    LoadMark(u64),
     /// TRUNCATE on a source table; target index content must be cleared.
     /// `version` is the position it happened at, as for a row.
     TableTruncated {

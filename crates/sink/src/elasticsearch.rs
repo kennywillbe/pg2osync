@@ -477,6 +477,49 @@ impl Sink for ElasticsearchSink {
         Ok(())
     }
 
+    async fn read_state(&self, key: &str) -> Result<Option<Value>, CoreError> {
+        let (status, body) = self
+            .send(
+                reqwest::Method::GET,
+                &format!("/{META_INDEX}/_doc/{key}"),
+                None,
+            )
+            .await?;
+        match status {
+            200 => Ok(Some(body["_source"].clone())),
+            404 => Ok(None),
+            other => Err(CoreError::Sink(format!("read state {key}: {other}"))),
+        }
+    }
+
+    async fn write_state(&self, key: &str, doc: &Value) -> Result<(), CoreError> {
+        let (status, _) = self
+            .send(
+                reqwest::Method::PUT,
+                &format!("/{META_INDEX}/_doc/{key}"),
+                Some(doc.to_string()),
+            )
+            .await?;
+        if status != 200 && status != 201 {
+            return Err(CoreError::Sink(format!("write state {key}: {status}")));
+        }
+        Ok(())
+    }
+
+    async fn clear_state(&self, key: &str) -> Result<(), CoreError> {
+        let (status, _) = self
+            .send(
+                reqwest::Method::DELETE,
+                &format!("/{META_INDEX}/_doc/{key}"),
+                None,
+            )
+            .await?;
+        if status != 200 && status != 404 {
+            return Err(CoreError::Sink(format!("clear state {key}: {status}")));
+        }
+        Ok(())
+    }
+
     async fn write_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), CoreError> {
         let doc_id = crate::checkpoint_doc_id(&checkpoint.stream);
         let (status, _) = self

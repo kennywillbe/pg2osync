@@ -13,7 +13,7 @@ holds them for the life of the process; there is no pool and no reconnect storm.
 |---|---|---|
 | replication (`walsender`) | always, for the whole run | `START_REPLICATION SLOT … LOGICAL` — the change stream |
 | client | always | catalog lookups, publication and slot management, column metadata |
-| client | during the initial load only | holds the `REPEATABLE READ` snapshot and runs `COPY` |
+| client | during the initial load only | runs one `COPY` per key range |
 | client | only when nested children are configured | re-fetches parent and child rows |
 
 Measured: **2 connections** in steady state, **3** with nested children
@@ -138,20 +138,25 @@ database-wide.
 
 ## Initial load impact
 
-The load reads inside one `REPEATABLE READ READ ONLY` transaction, so it is a
-long-running transaction for its duration. On a large table that has two
-consequences worth knowing:
+The load reads a table in primary-key ranges, each range one `COPY` in its own
+short transaction, so the longest transaction it holds is one range rather than
+the whole load. That matters for exactly one reason: a read view open across a
+long load stops `VACUUM` cleaning anything that died after it started, and the
+load is the operation that takes an hour.
 
-- `VACUUM` cannot clean up rows that became dead after the snapshot started,
-  for as long as it runs.
-- The snapshot connection holds one `max_connections` slot.
+What it costs the source:
 
-Measured: 20,000 rows loaded in under a second; the snapshot transaction never
-exceeded 1 second. For a table where the load takes minutes, schedule it like
-you would any long analytical read.
+- One `max_connections` slot for the duration.
+- Sequential reads that compete for I/O with your workload, taking no locks
+  that block writers.
+- One cheap `pg_class` lookup and one `TABLESAMPLE` read per table to decide
+  where to cut the ranges, plus one `pg_current_wal_lsn()` per range.
 
-The initial load reads sequentially with `COPY`, which competes for I/O with
-your workload but takes no locks that block writers.
+Measured: 20,000 rows loaded in under a second; a 200,000-row table read in six
+ranges at ~55,000 rows/s, no single transaction lasting longer than a range.
+
+A table smaller than one range, or one with a composite primary key, is still
+read in a single `COPY`, so the common case has none of the extra round trips.
 
 ## The one real risk: retained WAL
 

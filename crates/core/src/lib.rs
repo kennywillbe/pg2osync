@@ -6,6 +6,7 @@
 pub mod checkpoint;
 pub mod error;
 pub mod event;
+pub mod load;
 pub mod lsn;
 pub mod sink;
 

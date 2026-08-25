@@ -146,6 +146,26 @@ pub trait Sink: Send + Sync {
         ))
     }
 
+    /// Read a small named state document from the target.
+    ///
+    /// Initial-load progress lives here for the reason the checkpoint does:
+    /// only the target is visible to both the process that stopped and the one
+    /// that takes over. A target with nowhere to keep it answers `None`, which
+    /// costs a reload and never a gap.
+    async fn read_state(&self, _key: &str) -> Result<Option<Value>, CoreError> {
+        Ok(None)
+    }
+
+    /// Persist a named state document durably.
+    async fn write_state(&self, _key: &str, _doc: &Value) -> Result<(), CoreError> {
+        Ok(())
+    }
+
+    /// Remove a named state document; absent is success.
+    async fn clear_state(&self, _key: &str) -> Result<(), CoreError> {
+        Ok(())
+    }
+
     /// Persist the pipeline checkpoint durably.
     async fn write_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), CoreError>;
 

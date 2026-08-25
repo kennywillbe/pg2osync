@@ -108,6 +108,12 @@ impl MeilisearchSink {
         )
     }
 
+    /// Named state lives beside the checkpoint, for the same reason: there is
+    /// no arbitrary-document storage in Meilisearch to keep it in.
+    fn state_path(&self, key: &str) -> String {
+        format!("{}/{key}.json", self.state_dir)
+    }
+
     /// Where checkpoints lived before they were kept per stream.
     fn legacy_checkpoint_path(&self) -> String {
         format!("{}/checkpoint.json", self.state_dir)
@@ -266,6 +272,36 @@ impl Sink for MeilisearchSink {
         // writes are server-side tasks and the sink already waits for them to
         // complete, so an accepted write is searchable by then
         Ok(())
+    }
+
+    async fn read_state(&self, key: &str) -> Result<Option<Value>, CoreError> {
+        match std::fs::read(self.state_path(key)) {
+            Ok(bytes) => serde_json::from_slice::<Value>(&bytes)
+                .map(Some)
+                .map_err(|e| CoreError::Sink(format!("read state {key}: {e}"))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(CoreError::Sink(format!("read state {key}: {e}"))),
+        }
+    }
+
+    async fn write_state(&self, key: &str, doc: &Value) -> Result<(), CoreError> {
+        let path = self.state_path(key);
+        let tmp = format!("{path}.tmp");
+        let bytes = serde_json::to_vec_pretty(doc).map_err(|e| CoreError::Sink(e.to_string()))?;
+        // write-then-rename, as for the checkpoint: a truncated progress
+        // document would be unreadable, and unreadable means reload
+        std::fs::write(&tmp, bytes)
+            .map_err(|e| CoreError::Sink(format!("write state {key}: {e}")))?;
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| CoreError::Sink(format!("rename state {key}: {e}")))
+    }
+
+    async fn clear_state(&self, key: &str) -> Result<(), CoreError> {
+        match std::fs::remove_file(self.state_path(key)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(CoreError::Sink(format!("clear state {key}: {e}"))),
+        }
     }
 
     async fn write_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), CoreError> {
