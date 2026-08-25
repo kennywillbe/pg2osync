@@ -145,8 +145,9 @@ the downtime, restarting, and asserting nothing is missing.
 
 ## Initial load
 
-**PostgreSQL:** the slot is created first, then a second connection reads each
-table in primary-key ranges, each range one
+**PostgreSQL:** the slot is created first, then the load runs *beside* the
+stream — not before it — on a second connection, reading each table in
+primary-key ranges, each range one
 `COPY (SELECT … WHERE key >= a AND key < b) TO STDOUT (FORMAT text)` in its own
 short transaction. No transaction spans the load: one that did would pin the
 xmin horizon for its whole duration, and autovacuum could clean nothing that
@@ -176,6 +177,50 @@ without ever advancing the checkpoint — they have no position of their own. Th
 do carry a document *version*: the WAL position read before their range, so a
 row that was already stale when it was copied cannot overwrite the streamed
 change that superseded it.
+
+### Why the load and the stream overlap
+
+Loading first and streaming afterwards has a failure that gets worse the larger
+the table is: nothing acknowledges a position for the load's whole duration, so
+the slot's retained WAL grows monotonically until the load ends. Past
+`max_slot_wal_keep_size` PostgreSQL invalidates the slot (`wal_status = lost`),
+which is unrecoverable and forces exactly the full reload that was in progress.
+
+Running both at once is what removes that, and it needs one thing to be safe:
+every document carries the position it became visible at, so a copied row that
+was already stale loses to the streamed change at the target regardless of which
+arrives first. Without that, a chunk read at position 100 and written after a
+streamed event at position 150 for the same key leaves the row silently stale
+until something touches it again.
+
+Three rules keep the overlap from turning into a different problem:
+
+- **Change events have strict priority over copy rows.** They arrive on separate
+  channels and the engine drains the stream first. WAL is retained until it is
+  consumed, so the stream cannot wait; a copy range can.
+- **The copy yields under source pressure.** Before each range the slot's
+  `wal_status` is checked, and while it is anything but `reserved` the copy
+  pauses and lets the stream have the throughput. That is PostgreSQL's own
+  signal rather than a threshold of ours — with no `max_slot_wal_keep_size`
+  configured the status stays `reserved`, which is honest: there is no line to
+  stay behind, and no protection either. `wal_status = lost` fails the load with
+  an explanation instead of continuing into a gap.
+- **Pausing happens between ranges, never inside one.** A `COPY` held mid-stream
+  would keep its snapshot open for the length of the pause, which is the long
+  transaction this design exists to avoid. A range is under a second of work at
+  measured rates, so waiting for one to finish costs nothing worth having.
+
+Measured on the dev stack, 1M rows (361 MB) loading while a writer churned a
+second table throughout: retained WAL oscillated and *fell* while the load was
+still running — 83 MB down to 46 MB — which cannot happen in the sequential
+design. With `max_slot_wal_keep_size` deliberately cut to 48 MB the slot went
+`unreserved`, the load paused for 29 s, the slot recovered to 6.5 MB and
+`reserved`, and the load then finished: 1,000,000 rows indexed, every streamed
+update intact. The incident stayed recoverable, which is the whole point.
+
+For the duration of the load `refresh_interval` is suspended on every
+configured index, so ordinary searches see nothing new while it runs even though
+the stream is live. `/synced` forces a refresh, so read-your-writes still works.
 
 ### Resuming an interrupted load
 

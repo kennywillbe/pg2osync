@@ -334,6 +334,12 @@ pg "UPDATE resume_probe SET v='updated-while-down' WHERE id = 77;" > /dev/null
 src_rows=$(pg "SELECT count(*) FROM resume_probe;")
 
 nohup $BIN run -c "$RCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+# The copy now runs beside the stream, so a row can be changed while the range
+# holding it is still being read. The streamed change carries a higher position
+# than the copy did, so it has to win — the version is the only thing stopping
+# the stale copied row from landing on top of it.
+sleep 1
+pg "UPDATE resume_probe SET v='changed-during-the-copy' WHERE id = 199000;" > /dev/null
 for _ in $(seq 1 180); do
   refresh
   [ "$(os_count e2e_resume)" = "$src_rows" ] && break
@@ -348,6 +354,10 @@ fi
 check "a row deleted while down is gone" "$(os_status e2e_resume 100000)" "404"
 check "a row added while down arrived" "$(os_field e2e_resume 400001 v)" "added-while-down"
 check "a row updated while down is current" "$(os_field e2e_resume 77 v)" "updated-while-down"
+# no /synced endpoint on this config, so give the stream a moment to catch up
+sleep 3; refresh
+check "a row changed during the copy is not overwritten by it" \
+  "$(os_field e2e_resume 199000 v)" "changed-during-the-copy"
 stop_sync
 
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"

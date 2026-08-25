@@ -149,6 +149,7 @@ pub struct PipelineCtx {
 /// rejection — correctness-first failure policy).
 pub async fn run(
     mut events: mpsc::Receiver<ChangeEvent>,
+    mut copy: mpsc::Receiver<ChangeEvent>,
     ctx: Arc<PipelineCtx>,
     stream: StreamId,
     render_position: PositionRenderer,
@@ -227,19 +228,48 @@ pub async fn run(
     let mut pending_mark: Option<u64> = None;
     let txn_cap_bytes = ctx.cfg.txn_buffer_cap_mb.saturating_mul(1024 * 1024);
     let mut cap_warned = false;
+    // A closed channel yields None immediately, which would spin the select; a
+    // flag disables its branch instead. The loop ends when both are closed.
+    let mut events_open = true;
+    let mut copy_open = true;
 
     let result = loop {
-        let ev = match deferred.take() {
+        let ev = match deferred.take().or_else(|| try_next(&mut events, &mut copy)) {
             Some(ev) => ev,
-            None => tokio::select! {
-                ev = events.recv() => match ev {
+            None => {
+                let mut got = None;
+                while got.is_none() {
+                    tokio::select! {
+                        biased;
+                        // The stream comes first, always. A copy chunk can wait
+                        // a moment; the source retains WAL until the stream is
+                        // consumed, so the stream cannot.
+                        ev = events.recv(), if events_open => match ev {
+                            Some(ev) => got = Some(ev),
+                            None => {
+                                events_open = false;
+                                if !copy_open {
+                                    break;
+                                }
+                            }
+                        },
+                        ev = copy.recv(), if copy_open => match ev {
+                            Some(ev) => got = Some(ev),
+                            None => {
+                                copy_open = false;
+                                if !events_open {
+                                    break;
+                                }
+                            }
+                        },
+                        _ = shutdown.changed() => break,
+                    }
+                }
+                match got {
                     Some(ev) => ev,
                     None => break Ok(()),
-                },
-                _ = shutdown.changed() => {
-                    break Ok(());
                 }
-            },
+            }
         };
         tracing::trace!(target: "pg2osync::engine", "engine got event");
         match ev {
@@ -282,12 +312,12 @@ pub async fn run(
                     // batch's highest LSN stays the last commit in it, so an
                     // ack can never run past a transaction that was not fully
                     // written.
-                    let waiting = match events.try_recv() {
-                        Ok(next) => {
+                    let waiting = match try_next(&mut events, &mut copy) {
+                        Some(next) => {
                             deferred = Some(next);
                             true
                         }
-                        Err(_) => false,
+                        None => false,
                     };
                     let overdue = coalescing_since.is_some_and(|since: std::time::Instant| {
                         since.elapsed() >= COALESCE_WINDOW
@@ -347,13 +377,13 @@ pub async fn run(
                 // for, so this costs no latency when rows arrive alone.
                 let mut rows = vec![row];
                 while rows.len() < ctx.cfg.batch_size {
-                    match events.try_recv() {
-                        Ok(ChangeEvent::Row(next)) => rows.push(next),
-                        Ok(other) => {
+                    match try_next(&mut events, &mut copy) {
+                        Some(ChangeEvent::Row(next)) => rows.push(next),
+                        Some(other) => {
                             deferred = Some(other);
                             break;
                         }
-                        Err(_) => break,
+                        None => break,
                     }
                 }
                 ctx.metrics.incr_event_by("row", rows.len() as u64);
@@ -449,6 +479,17 @@ pub async fn run(
     let _ = sink_task.await;
     ckpt_task.abort();
     result
+}
+
+/// Whatever is already waiting, stream before copy.
+///
+/// Used everywhere the engine gathers more work without waiting for it, so a
+/// batch fills from both producers instead of one row at a time from the copy.
+fn try_next(
+    events: &mut mpsc::Receiver<ChangeEvent>,
+    copy: &mut mpsc::Receiver<ChangeEvent>,
+) -> Option<ChangeEvent> {
+    events.try_recv().or_else(|_| copy.try_recv()).ok()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -885,8 +926,20 @@ mod pipeline_tests {
 
     /// As `run_script`, also reporting the highest load mark reported written.
     async fn drive(batch_size: usize, script: Vec<ChangeEvent>) -> (Arc<RecordingSink>, u64) {
+        drive_split(batch_size, script, Vec::new()).await
+    }
+
+    /// As `drive`, with a second script on the copy channel. Both are queued
+    /// before the engine starts, so the order it drains them in is the
+    /// engine's choice and not a race.
+    async fn drive_split(
+        batch_size: usize,
+        script: Vec<ChangeEvent>,
+        copy_script: Vec<ChangeEvent>,
+    ) -> (Arc<RecordingSink>, u64) {
         let sink = Arc::new(RecordingSink::default());
         let (events_tx, events_rx) = mpsc::channel(1024);
+        let (copy_tx, copy_rx) = mpsc::channel(1024);
         let (ack_tx, _ack_rx) = watch::channel(None);
         let (load_done_tx, load_done_rx) = watch::channel(0u64);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -915,8 +968,13 @@ mod pipeline_tests {
             publication: "pub".into(),
         };
         let render: PositionRenderer = Arc::new(|token| Lsn(token).to_string());
+        for event in copy_script {
+            copy_tx.send(event).await.expect("copy channel open");
+        }
+        drop(copy_tx);
         let engine = tokio::spawn(run(
             events_rx,
+            copy_rx,
             ctx,
             stream,
             render,
@@ -932,6 +990,23 @@ mod pipeline_tests {
         engine.await.expect("task joined").expect("engine ran");
         let mark = *load_done_rx.borrow();
         (sink, mark)
+    }
+
+    #[tokio::test]
+    async fn change_events_are_drained_before_copy_rows() {
+        // Both are already queued, so this is the engine's choice: the source
+        // retains WAL until the stream is consumed, and a copy chunk can wait.
+        let (sink, _) = drive_split(
+            500,
+            vec![row_at(1, Some(0x100)), commit(0x100)],
+            vec![row_at(2, None), row_at(3, None), ChangeEvent::LoadMark(1)],
+        )
+        .await;
+        assert_eq!(
+            sink.events(),
+            vec!["write[upsert:1@256 upsert:2 upsert:3]"],
+            "the streamed row is written first even though the copy queued first"
+        );
     }
 
     #[tokio::test]

@@ -71,6 +71,15 @@ the limit PostgreSQL invalidates the slot instead of retaining more WAL, and
 pg2osync then falls back to a full initial load — expensive, but the database
 stays up. PostgreSQL 13+.
 
+The initial load watches the same signal. While the slot is past its budget
+(`wal_status` anything but `reserved`) the load pauses and lets the change stream
+have the throughput, logging `pausing the load: slot … is at wal_status = …`.
+A load that takes noticeably longer than expected with that line in the log is
+telling you the target cannot absorb the copy and the stream at once: give the
+target more capacity, or accept the slower load. If the slot is invalidated
+anyway the load fails with `wal_status = lost` and says what to raise, rather
+than continuing into a gap.
+
 ## Day-to-day commands
 
 ```sh

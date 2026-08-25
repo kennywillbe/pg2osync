@@ -35,6 +35,14 @@ pub enum Mode {
 /// backpressure mechanism: a slow sink must stall the source, not buffer.
 const EVENT_CHANNEL_DEPTH: usize = 10_000;
 
+/// Depth of the separate channel the initial load feeds.
+///
+/// Two pulls in opposite directions: shallow so the copy paces itself to what
+/// the target can absorb rather than piling up ahead of it, deep enough that a
+/// bulk batch still fills from one pull instead of one row at a time. Change
+/// events jump this queue regardless, so its depth costs the stream nothing.
+const COPY_CHANNEL_DEPTH: usize = 2_000;
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_pipeline(
     cfg: AppConfig,
@@ -570,12 +578,14 @@ async fn attempt_postgres(
     }
 
     let (events_tx, events_rx) = mpsc::channel::<ChangeEvent>(EVENT_CHANNEL_DEPTH);
+    let (copy_tx, copy_rx) = mpsc::channel::<ChangeEvent>(COPY_CHANNEL_DEPTH);
     let (load_done_tx, load_done_rx) = watch::channel(0u64);
     let load_sink = sink.clone();
     let load_stream_id = stream_id.clone();
     let ctx = pipeline_ctx(cfg, sink, metrics, ack_tx, load_done_tx)?;
     let engine = spawn_engine(
         events_rx,
+        copy_rx,
         ctx,
         stream_id,
         render,
@@ -583,36 +593,55 @@ async fn attempt_postgres(
         shutdown_rx.clone(),
     );
 
-    if resume_from.is_none() || load_pending {
-        with_bulk_load_settings(&load_sink, cfg, async {
-            crate::backfill::run(
-                cfg,
-                admin_url,
-                tls,
-                admin,
-                children,
-                events_tx.clone(),
-                load_sink.as_ref(),
-                &load_stream_id,
-                load_done_rx,
-            )
+    // The load runs *beside* the stream, not before it. Loading first means
+    // nothing acknowledges a position for the load's whole duration, so the
+    // slot's retained WAL grows monotonically until PostgreSQL invalidates it —
+    // and an invalidated slot forces the full reload the load was trying to
+    // finish. What makes the overlap safe is that every document carries the
+    // position it became visible at, so a copied row that was already stale
+    // loses to the streamed change regardless of which arrives first.
+    let load = async {
+        // moved in, so the copy channel closes when the load is done and the
+        // engine can tell the difference between "paused" and "finished"
+        let copy_tx = copy_tx;
+        if resume_from.is_none() || load_pending {
+            with_bulk_load_settings(&load_sink, cfg, async {
+                crate::backfill::run(
+                    cfg,
+                    admin_url,
+                    tls,
+                    admin,
+                    children,
+                    copy_tx,
+                    load_sink.as_ref(),
+                    &load_stream_id,
+                    load_done_rx,
+                )
+                .await
+            })
             .await
-        })
-        .await?;
-    }
+        } else {
+            Ok(())
+        }
+    };
 
     let started = std::time::Instant::now();
-    let result = if polling {
-        let mut poll =
-            pg2osync_source::poll::PollSource::new(poll_config(cfg, source_url, tls.clone())?);
-        poll.stream(events_tx, shutdown_rx.clone()).await
-    } else {
-        let mut source = WalSource::new(src_cfg.clone());
-        source
-            .stream(events_tx, shutdown_rx.clone(), Some(admin))
-            .await
+    let stream = async {
+        if polling {
+            let mut poll =
+                pg2osync_source::poll::PollSource::new(poll_config(cfg, source_url, tls.clone())?);
+            poll.stream(events_tx, shutdown_rx.clone()).await
+        } else {
+            let mut source = WalSource::new(src_cfg.clone());
+            source
+                .stream(events_tx, shutdown_rx.clone(), Some(admin))
+                .await
+        }
     };
-    // dropping the sender above is what lets the engine drain and exit
+    // Either failing abandons the other: a stream error is a reconnect, and the
+    // load picks up from its recorded progress on the next attempt.
+    let result = futures::future::try_join(load, stream).await.map(|_| ());
+    // dropping both senders above is what lets the engine drain and exit
     let _ = engine.await;
     result?;
 
@@ -916,12 +945,15 @@ async fn attempt_mysql(
     };
 
     let (events_tx, events_rx) = mpsc::channel::<ChangeEvent>(EVENT_CHANNEL_DEPTH);
-    // MySQL's snapshot is not chunked yet, so nothing waits on load marks here.
+    // MySQL's snapshot is neither chunked nor concurrent with the stream yet, so
+    // nothing waits on load marks and the copy channel is closed immediately.
     let (load_done_tx, _load_done_rx) = watch::channel(0u64);
+    let (_, copy_rx) = mpsc::channel::<ChangeEvent>(1);
     let load_sink = sink.clone();
     let ctx = pipeline_ctx(cfg, sink, metrics, ack_tx, load_done_tx)?;
     let engine = spawn_engine(
         events_rx,
+        copy_rx,
         ctx,
         stream_id,
         render,
@@ -1037,6 +1069,7 @@ fn percent_decode(value: &str) -> String {
 
 fn spawn_engine(
     events_rx: mpsc::Receiver<ChangeEvent>,
+    copy_rx: mpsc::Receiver<ChangeEvent>,
     ctx: Arc<PipelineCtx>,
     stream_id: StreamId,
     render: PositionRenderer,
@@ -1044,7 +1077,10 @@ fn spawn_engine(
     shutdown: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<Result<(), pg2osync_core::CoreError>> {
     tokio::spawn(async move {
-        pg2osync_engine::run(events_rx, ctx, stream_id, render, durable, shutdown).await
+        pg2osync_engine::run(
+            events_rx, copy_rx, ctx, stream_id, render, durable, shutdown,
+        )
+        .await
     })
 }
 
