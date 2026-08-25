@@ -21,7 +21,9 @@
 //! physical order.
 
 use anyhow::{Context as _, Result, bail};
+use pg2osync_core::checkpoint::StreamId;
 use pg2osync_core::event::{ChangeEvent, RowKind, TransactionBoundary};
+use pg2osync_core::load::{LoadProgress, load_progress_key};
 use pg2osync_core::lsn::Lsn;
 use pg2osync_source::children::ChildSpec;
 use std::collections::HashMap;
@@ -202,15 +204,12 @@ fn ranges_from_bounds(bounds: &[String]) -> Vec<KeyRange> {
 /// distribution. They are sampled rather than exact: uneven ranges cost a
 /// little throughput, and a full pass to make them exact would cost more than
 /// chunking saves.
-async fn key_ranges(
+async fn key_bounds(
     client: &tokio_postgres::Client,
     qualified_table: &str,
     cols: &[ColMeta],
-) -> Result<Vec<KeyRange>> {
-    let whole = vec![KeyRange {
-        from: None,
-        to: None,
-    }];
+) -> Result<Vec<String>> {
+    let whole: Vec<String> = Vec::new();
 
     // A composite key would need a row-constructor comparison, which is right
     // for PostgreSQL and pathological on MySQL; until that is worth branching
@@ -266,7 +265,7 @@ async fn key_ranges(
     }
     tracing::debug!(target: "pg2osync::backfill",
         "{qualified_table}: ~{estimate:.0} rows, reading in {} range(s)", bounds.len() + 1);
-    Ok(ranges_from_bounds(&bounds))
+    Ok(bounds)
 }
 
 /// A child collection reaches the document as one JSON column, so it can ride
@@ -280,7 +279,29 @@ fn child_column(child: &ChildSpec) -> ColMeta {
     }
 }
 
+/// True when a previous load left a table unfinished, so this one has to carry
+/// it on rather than trust the checkpoint and skip it.
+pub async fn unfinished(
+    sink: &dyn pg2osync_core::sink::Sink,
+    cfg: &AppConfig,
+    stream: &StreamId,
+) -> Result<bool> {
+    for tbl in cfg.sync.values() {
+        let key = load_progress_key(stream, &tbl.table);
+        let stored = sink
+            .read_state(&key)
+            .await?
+            .as_ref()
+            .and_then(LoadProgress::from_doc);
+        if stored.is_some_and(|p| !p.finished) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Stream every configured table into the engine channel.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     cfg: &AppConfig,
     source_url: &str,
@@ -288,6 +309,9 @@ pub async fn run(
     admin: &tokio_postgres::Client,
     children: &HashMap<(String, String), Vec<ChildSpec>>,
     tx: Sender<ChangeEvent>,
+    sink: &dyn pg2osync_core::sink::Sink,
+    stream: &StreamId,
+    mut load_done: tokio::sync::watch::Receiver<u64>,
 ) -> Result<()> {
     // A dedicated connection, but no transaction spanning the load: each range
     // is its own statement and its own snapshot. Holding one open for the whole
@@ -296,6 +320,10 @@ pub async fn run(
     let reader = pg2osync_source::tls::connect(tls, source_url)
         .await
         .context("backfill connection failed")?;
+    // One counter for the whole load: a mark only has to be increasing, and a
+    // single sequence keeps the wait condition a comparison.
+    let mut mark: u64 = 0;
+    let mut progress_keys: Vec<String> = Vec::new();
 
     for tbl in cfg.sync.values() {
         let (schema, table) = split_qualified(&tbl.table);
@@ -329,11 +357,44 @@ pub async fn run(
             .map(|c| c.name.clone())
             .collect::<Vec<_>>();
         let pk_column = (pk_column.len() == 1).then(|| pk_column[0].clone());
-        let ranges = key_ranges(admin, &tbl.table, &cols).await?;
+
+        let progress_key = load_progress_key(stream, &tbl.table);
+        progress_keys.push(progress_key.clone());
+        let stored = sink
+            .read_state(&progress_key)
+            .await?
+            .as_ref()
+            .and_then(LoadProgress::from_doc);
+        // Boundaries are stored rather than recomputed: they come from a random
+        // sample, so a second run would cut the table somewhere else and the
+        // count of finished ranges would name a different span of rows.
+        let mut progress = match stored {
+            Some(p) if p.finished => {
+                tracing::info!(target: "pg2osync::backfill",
+                    "{} was fully loaded by an earlier run; skipping", tbl.table);
+                continue;
+            }
+            Some(p) => {
+                tracing::info!(target: "pg2osync::backfill",
+                    "resuming the load of {} after {} of {} range(s)",
+                    tbl.table, p.done, p.boundaries.len() + 1);
+                p
+            }
+            None => {
+                let progress = LoadProgress {
+                    boundaries: key_bounds(admin, &tbl.table, &cols).await?,
+                    done: 0,
+                    finished: false,
+                };
+                sink.write_state(&progress_key, &progress.to_doc()).await?;
+                progress
+            }
+        };
+        let ranges = ranges_from_bounds(&progress.boundaries);
 
         let started = std::time::Instant::now();
         let mut count: u64 = 0;
-        for range in &ranges {
+        for (nth, range) in ranges.iter().enumerate().skip(progress.done) {
             // The position read before the range becomes the version of every
             // document the range produces. A change committed after this point
             // necessarily has a higher position, so it wins at the target
@@ -388,12 +449,35 @@ pub async fn run(
                 // one compaction per network chunk, not one per row
                 pending.drain(..consumed);
             }
+            // Strict order: rows, then the mark, then the progress document. A
+            // crash anywhere in it can only lose the range and redo it, which an
+            // idempotent write makes free — the reverse order would claim a
+            // range that was never written.
+            mark += 1;
+            tx.send(ChangeEvent::LoadMark(mark))
+                .await
+                .map_err(|_| anyhow::anyhow!("engine closed during backfill"))?;
+            load_done
+                .wait_for(|written| *written >= mark)
+                .await
+                .map_err(|_| anyhow::anyhow!("engine stopped before the range was written"))?;
+            progress.done = nth + 1;
+            sink.write_state(&progress_key, &progress.to_doc()).await?;
         }
-        send_boundary(&tx).await?;
+        progress.finished = true;
+        sink.write_state(&progress_key, &progress.to_doc()).await?;
         let secs = started.elapsed().as_secs_f64();
         tracing::info!(target: "pg2osync::backfill",
             "backfilled {} rows from {} in {:.1}s (~{:.0} rows/s) over {} range(s)",
             count, tbl.table, secs, count as f64 / secs.max(f64::EPSILON), ranges.len());
+    }
+    // Nothing left to resume, so nothing should claim otherwise on the next
+    // start. Left behind, a finished document is merely a wasted read.
+    for key in progress_keys {
+        if let Err(e) = sink.clear_state(&key).await {
+            tracing::warn!(target: "pg2osync::backfill",
+                "could not remove load progress {key}: {e}");
+        }
     }
     Ok(())
 }

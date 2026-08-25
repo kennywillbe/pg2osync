@@ -278,5 +278,77 @@ check "publication left alone by default" "$(pg "SELECT count(*) FROM pg_publica
 $BIN drop-slot -c "$CONFIG" --publication > /dev/null
 check "publication dropped when asked" "$(pg "SELECT count(*) FROM pg_publication WHERE pubname='pg2osync_e2e_pub';")" "0"
 
+say "15. an interrupted initial load resumes where it stopped"
+# Its own config, slot and table: the table has to be large enough to be read
+# in several ranges, and every other section would then pay for it on restart.
+RCONFIG=$(mktemp /tmp/pg2osync-e2e-resume.XXXXXX)
+RSLOT=pg2osync_e2e_resume
+cat > "$RCONFIG" <<TOML
+[source]
+url_env = "PG2OSYNC_SOURCE_URL"
+slot_name = "$RSLOT"
+publication = "${RSLOT}_pub"
+
+[target]
+url = "http://localhost:9200"
+
+[metrics]
+bind = "127.0.0.1:9112"
+
+[sync.big]
+table = "public.resume_probe"
+index = "e2e_resume"
+TOML
+resume_cleanup() {
+  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  pg "SELECT pg_drop_replication_slot('$RSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$RSLOT');" > /dev/null 2>&1 || true
+  pg "DROP PUBLICATION IF EXISTS ${RSLOT}_pub; DROP TABLE IF EXISTS resume_probe;" > /dev/null 2>&1 || true
+  rm -f "$RCONFIG"
+}
+trap 'cleanup; resume_cleanup' EXIT
+
+pg "DROP TABLE IF EXISTS resume_probe; CREATE TABLE resume_probe(id bigint primary key, v text);" > /dev/null 2>&1
+pg "INSERT INTO resume_probe SELECT g, repeat('x',200)||g FROM generate_series(1,200000) g;" > /dev/null
+# reltuples is what decides how many ranges to read in, and it is only set by ANALYZE
+pg "ANALYZE resume_probe;" > /dev/null
+pg "DROP PUBLICATION IF EXISTS ${RSLOT}_pub; CREATE PUBLICATION ${RSLOT}_pub FOR TABLE resume_probe;" > /dev/null 2>&1
+curl -s -XDELETE "$OS/e2e_resume" > /dev/null
+PROG=load-postgres-$RSLOT-public_resume_probe
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/$PROG" > /dev/null
+
+progress_done() { curl -s "$OS/.pg2osync_meta/_doc/$PROG" | jqf "(d.get('_source') or {}).get('done', -1)"; }
+nohup $BIN run -c "$RCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+for _ in $(seq 1 120); do
+  [ "$(progress_done)" -ge 2 ] 2> /dev/null && break
+  sleep 0.5
+done
+done_at_kill=$(progress_done)
+pkill -9 -f "pg2osync run"; sleep 1
+if [ "$done_at_kill" -ge 2 ]; then ok "progress recorded per range ($done_at_kill done)"; else bad "no per-range progress recorded (got '$done_at_kill')"; fi
+
+# the interesting part: the source moves while nothing is watching it, so the
+# replay argument the chunked load rests on is what has to repair the result
+pg "DELETE FROM resume_probe WHERE id IN (5, 100000);" > /dev/null
+pg "INSERT INTO resume_probe VALUES (400001,'added-while-down');" > /dev/null
+pg "UPDATE resume_probe SET v='updated-while-down' WHERE id = 77;" > /dev/null
+src_rows=$(pg "SELECT count(*) FROM resume_probe;")
+
+nohup $BIN run -c "$RCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+for _ in $(seq 1 180); do
+  refresh
+  [ "$(os_count e2e_resume)" = "$src_rows" ] && break
+  sleep 1
+done
+check "every row is indexed after the restart" "$(os_count e2e_resume)" "$src_rows"
+if grep -q "resuming the load of public.resume_probe" "$LOG"; then
+  ok "the load resumed instead of starting over"
+else
+  bad "the load restarted from the beginning"
+fi
+check "a row deleted while down is gone" "$(os_status e2e_resume 100000)" "404"
+check "a row added while down arrived" "$(os_field e2e_resume 400001 v)" "added-while-down"
+check "a row updated while down is current" "$(os_field e2e_resume 77 v)" "updated-while-down"
+stop_sync
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

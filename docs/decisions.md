@@ -75,6 +75,41 @@ widen the divergence.
 `server_id`, and the publication. A checkpoint from another stream is rejected
 rather than used to resume into an unrelated position space.
 
+## Initial load
+
+**No exported snapshot; short transactions and replay instead.** The obvious
+design exports one transaction snapshot and reads every chunk from it, which
+keeps a read view open for the whole load: `VACUUM` cannot then clean anything
+that died after it started, and on MySQL a long read view makes purge block
+rather than lag. What makes our load safe is not snapshot consistency but that
+the slot exists *before* the first range and nothing advances it during the
+load, so streaming afterwards resumes from a position that predates every
+range. Anything a range missed or read stale is still in the log and replays
+onto an idempotent write. Two conditions that argument rests on: writes are
+whole-document upserts keyed by the row's primary key, and an update whose
+unchanged TOASTed columns arrive as markers is completed from the stored
+document — without that, a replayed update would erase a value a range read
+correctly.
+
+**Every document carries the position it became visible at, as a target
+document version.** Streamed rows carry their commit position, copied rows the
+position read before their range. A copied row that is already stale therefore
+loses to the streamed change at the target, whichever order the two arrive in,
+and a version conflict is success rather than a rejection. It is deliberately
+separate from the checkpoint token: a copied row needs a version and must never
+advance a position. Sources with no monotonic position — poll mode, and MySQL's
+file-and-offset coordinate — write no version and rely on ordering alone.
+
+**Load progress is recorded per range, in the target, behind a durability
+barrier.** The order is strict: rows, then a mark the sink reports once they are
+written, then the progress document. A crash can therefore lose forward
+progress and redo a range, which idempotent writes make free, but can never
+claim a range that was not written. The range boundaries are stored with the
+progress rather than recomputed, because they come from a random sample and a
+second run would cut the table elsewhere. A checkpoint alone is not proof the
+load finished — the two are separate facts, and conflating them is what
+silently skips a load.
+
 ## Checkpoints
 
 **State lives in the target.** A hidden `.pg2osync_meta` index holds one

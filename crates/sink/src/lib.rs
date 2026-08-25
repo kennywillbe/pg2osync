@@ -782,6 +782,54 @@ impl Sink for OpenSearchSink {
         check_status(resp, &format!("point alias {alias} at {index}")).await
     }
 
+    async fn read_state(&self, key: &str) -> Result<Option<Value>, CoreError> {
+        let resp = self
+            .client
+            .get(GetParts::IndexId(META_INDEX, key))
+            .send()
+            .await
+            .map_err(http_err)?;
+        if resp.status_code().as_u16() == 404 {
+            return Ok(None);
+        }
+        if !resp.status_code().is_success() {
+            return Err(CoreError::Sink(format!(
+                "read state {key}: {}",
+                resp.status_code()
+            )));
+        }
+        let body: Value = resp
+            .json()
+            .await
+            .map_err(|e| CoreError::Sink(e.to_string()))?;
+        Ok(Some(body["_source"].clone()))
+    }
+
+    async fn write_state(&self, key: &str, doc: &Value) -> Result<(), CoreError> {
+        self.ensure_meta_index().await?;
+        let resp = self
+            .client
+            .index(IndexParts::IndexId(META_INDEX, key))
+            .body(doc.clone())
+            .send()
+            .await
+            .map_err(http_err)?;
+        check_status(resp, &format!("write state {key}")).await
+    }
+
+    async fn clear_state(&self, key: &str) -> Result<(), CoreError> {
+        let resp = self
+            .client
+            .delete(opensearch::DeleteParts::IndexId(META_INDEX, key))
+            .send()
+            .await
+            .map_err(http_err)?;
+        if resp.status_code().as_u16() == 404 {
+            return Ok(());
+        }
+        check_status(resp, &format!("clear state {key}")).await
+    }
+
     async fn write_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), CoreError> {
         self.ensure_meta_index().await?;
         let doc_id = crate::checkpoint_doc_id(&checkpoint.stream);

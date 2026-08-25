@@ -145,20 +145,57 @@ the downtime, restarting, and asserting nothing is missing.
 
 ## Initial load
 
-**PostgreSQL:** the slot is created first, then a second connection opens a
-`REPEATABLE READ READ ONLY` transaction and reads each table with
-`COPY (SELECT …) TO STDOUT (FORMAT text)`. Because the snapshot is taken after
-the slot exists, the overlap between snapshot and stream can only produce
-duplicates, never a gap — and duplicates are harmless. Synthetic commit
-boundaries every few thousand rows keep the engine flushing during large loads.
+**PostgreSQL:** the slot is created first, then a second connection reads each
+table in primary-key ranges, each range one
+`COPY (SELECT … WHERE key >= a AND key < b) TO STDOUT (FORMAT text)` in its own
+short transaction. No transaction spans the load: one that did would pin the
+xmin horizon for its whole duration, and autovacuum could clean nothing that
+died meanwhile.
+
+What makes that safe is not snapshot consistency. The slot exists before the
+first range and nothing advances it during the load, so streaming afterwards
+resumes from a position that predates every range — anything a range missed or
+read stale is still in the WAL and replays onto an idempotent write.
+
+Ranges are cut at boundaries sampled from the table itself
+(`percentile_disc` over `TABLESAMPLE SYSTEM`), so they follow the real key
+distribution and work for any orderable key type. They are read *unordered* on
+purpose: `ORDER BY key LIMIT n` forbids a bitmap heap scan, so a row-estimate
+miss degrades to a sort per range, and index order costs random heap access on
+any key that is not physically correlated. A table below the range size, or one
+with a composite key, is read in one piece as before.
 
 **MySQL:** `START TRANSACTION WITH CONSISTENT SNAPSHOT`, then the binlog
 coordinate is read *inside* that transaction and every table is selected. InnoDB
 establishes the read view at the start of the transaction, so streaming from
-that coordinate can only re-deliver rows.
+that coordinate can only re-deliver rows. This is the one place a load still
+holds a long read view.
 
 Rows produced by an initial load carry position token `0`, which flushes batches
-without ever advancing the checkpoint — they have no position of their own.
+without ever advancing the checkpoint — they have no position of their own. They
+do carry a document *version*: the WAL position read before their range, so a
+row that was already stale when it was copied cannot overwrite the streamed
+change that superseded it.
+
+### Resuming an interrupted load
+
+Progress is recorded per range in the target, one document per stream and table
+in `.pg2osync_meta`, holding the boundaries the table was cut at, how many
+leading ranges are durably written, and whether the table finished. The order is
+strict — rows, then a mark the sink reports once they are written, then the
+progress document — so a crash can lose forward progress and redo a range, but
+can never claim a range that was not written.
+
+The boundaries are stored rather than recomputed because they come from a random
+sample: a second run would cut the table elsewhere, and "two ranges done" would
+then name a different span of rows.
+
+A checkpoint is not proof that the load finished. Startup checks both, and an
+unfinished table is carried on even when a checkpoint exists — trusting the
+checkpoint alone is how a pipeline silently skips its load and reports success.
+`dev/e2e-test.sh` kills a load mid-range, changes the source while nothing is
+watching, restarts, and asserts both that the load resumed and that the index
+matches the source exactly.
 
 ### Target-side cost
 

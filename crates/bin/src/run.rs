@@ -203,6 +203,7 @@ fn pipeline_ctx(
     sink: Arc<dyn Sink>,
     metrics: SharedMetrics,
     ack_tx: watch::Sender<Option<Lsn>>,
+    load_done_tx: watch::Sender<u64>,
 ) -> Result<Arc<PipelineCtx>> {
     Ok(Arc::new(PipelineCtx {
         sink,
@@ -211,6 +212,7 @@ fn pipeline_ctx(
         transforms: transforms(cfg)?,
         cfg: cfg.engine.clone(),
         ack_tx,
+        load_done_tx,
         metrics,
     }))
 }
@@ -554,16 +556,24 @@ async fn attempt_postgres(
             resume_from = None;
         }
     }
-    match &resume_from {
-        Some(lsn) => {
+    // A checkpoint is not proof that the load finished: it says where streaming
+    // got to, and with a load recording its own progress the two are separate
+    // facts. Trusting the checkpoint alone is what silently skips a load.
+    let load_pending = crate::backfill::unfinished(sink.as_ref(), cfg, &stream_id).await?;
+    match (&resume_from, load_pending) {
+        (Some(lsn), false) => {
             tracing::info!(target: "pg2osync::run", "resuming from checkpoint {lsn}")
         }
-        None => tracing::info!(target: "pg2osync::run", "no usable checkpoint; initial load"),
+        (Some(lsn), true) => tracing::info!(target: "pg2osync::run",
+            "resuming from checkpoint {lsn}, with an initial load still to finish"),
+        (None, _) => tracing::info!(target: "pg2osync::run", "no usable checkpoint; initial load"),
     }
 
     let (events_tx, events_rx) = mpsc::channel::<ChangeEvent>(EVENT_CHANNEL_DEPTH);
+    let (load_done_tx, load_done_rx) = watch::channel(0u64);
     let load_sink = sink.clone();
-    let ctx = pipeline_ctx(cfg, sink, metrics, ack_tx)?;
+    let load_stream_id = stream_id.clone();
+    let ctx = pipeline_ctx(cfg, sink, metrics, ack_tx, load_done_tx)?;
     let engine = spawn_engine(
         events_rx,
         ctx,
@@ -573,9 +583,20 @@ async fn attempt_postgres(
         shutdown_rx.clone(),
     );
 
-    if resume_from.is_none() {
+    if resume_from.is_none() || load_pending {
         with_bulk_load_settings(&load_sink, cfg, async {
-            crate::backfill::run(cfg, admin_url, tls, admin, children, events_tx.clone()).await
+            crate::backfill::run(
+                cfg,
+                admin_url,
+                tls,
+                admin,
+                children,
+                events_tx.clone(),
+                load_sink.as_ref(),
+                &load_stream_id,
+                load_done_rx,
+            )
+            .await
         })
         .await?;
     }
@@ -895,8 +916,10 @@ async fn attempt_mysql(
     };
 
     let (events_tx, events_rx) = mpsc::channel::<ChangeEvent>(EVENT_CHANNEL_DEPTH);
+    // MySQL's snapshot is not chunked yet, so nothing waits on load marks here.
+    let (load_done_tx, _load_done_rx) = watch::channel(0u64);
     let load_sink = sink.clone();
-    let ctx = pipeline_ctx(cfg, sink, metrics, ack_tx)?;
+    let ctx = pipeline_ctx(cfg, sink, metrics, ack_tx, load_done_tx)?;
     let engine = spawn_engine(
         events_rx,
         ctx,

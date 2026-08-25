@@ -105,6 +105,9 @@ enum SinkCommand {
     /// Clearing an index, carrying the position it happened at so a versioned
     /// target can order it against the writes around it.
     Truncate(String, Option<u64>),
+    /// Everything before this mark has been handed to the sink; the sink task
+    /// publishes it once written, which is what the initial load waits on.
+    LoadMark(u64),
     /// A commit whose rows were already handed over — an empty transaction, or
     /// one whose row count was an exact multiple of the batch size. The
     /// position still has to be acknowledged, and it travels through this
@@ -134,6 +137,9 @@ pub struct PipelineCtx {
     pub cfg: EngineConfig,
     /// Updated by the sink task after every successful flush.
     pub ack_tx: watch::Sender<Option<Lsn>>,
+    /// Highest initial-load mark whose rows are durably written. The load
+    /// records its progress behind this and nothing else.
+    pub load_done_tx: watch::Sender<u64>,
     pub metrics: Arc<crate::metrics::Metrics>,
 }
 
@@ -157,6 +163,7 @@ pub async fn run(
         ctx.sink.clone(),
         ctx.ack_tx.clone(),
         ckpt_done_tx.clone(),
+        ctx.load_done_tx.clone(),
         ctx.metrics.clone(),
     ));
 
@@ -211,6 +218,13 @@ pub async fn run(
     // cannot postpone a flush indefinitely
     let mut coalescing_since: Option<std::time::Instant> = None;
     let mut break_err: Option<CoreError> = None;
+    // A transaction is open from its BEGIN until its COMMIT. While one is, no
+    // other producer's boundary may flush the buffer, or the transaction would
+    // reach the target in two pieces.
+    let mut stream_txn_open = false;
+    // A load mark that arrived mid-transaction, released once the transaction
+    // it interrupted has been handed over.
+    let mut pending_mark: Option<u64> = None;
     let txn_cap_bytes = ctx.cfg.txn_buffer_cap_mb.saturating_mul(1024 * 1024);
     let mut cap_warned = false;
 
@@ -231,6 +245,7 @@ pub async fn run(
         match ev {
             ChangeEvent::Transaction(TransactionBoundary::Begin { lsn }) => {
                 tracing::debug!(target: "pg2osync::engine", "BEGIN at {lsn}");
+                stream_txn_open = true;
             }
             ChangeEvent::Transaction(TransactionBoundary::Commit {
                 lsn,
@@ -253,6 +268,7 @@ pub async fn run(
                 let backfill_boundary = lsn.0 == 0;
                 if !backfill_boundary {
                     ctx.metrics.set_current_position(lsn.0);
+                    stream_txn_open = false;
                 }
                 if !txn_buffer.is_empty() {
                     if !backfill_boundary && let Some(last) = txn_buffer.last_mut() {
@@ -292,6 +308,35 @@ pub async fn run(
                 } else if !backfill_boundary
                     && batch_tx.send(SinkCommand::Position(lsn)).await.is_err()
                 {
+                    break Err(CoreError::Other("batch channel closed".into()));
+                }
+                // An empty buffer here means everything before the held mark is
+                // on its way to the sink, which is the condition it waits for.
+                if txn_buffer.is_empty()
+                    && !stream_txn_open
+                    && let Some(mark) = pending_mark.take()
+                    && batch_tx.send(SinkCommand::LoadMark(mark)).await.is_err()
+                {
+                    break Err(CoreError::Other("batch channel closed".into()));
+                }
+            }
+            ChangeEvent::LoadMark(mark) => {
+                if stream_txn_open {
+                    pending_mark = Some(mark);
+                    continue;
+                }
+                if !txn_buffer.is_empty() {
+                    txn_bytes = 0;
+                    coalescing_since = None;
+                    if batch_tx
+                        .send(SinkCommand::Write(std::mem::take(&mut txn_buffer)))
+                        .await
+                        .is_err()
+                    {
+                        break Err(CoreError::Other("batch channel closed".into()));
+                    }
+                }
+                if batch_tx.send(SinkCommand::LoadMark(mark)).await.is_err() {
                     break Err(CoreError::Other("batch channel closed".into()));
                 }
             }
@@ -412,6 +457,7 @@ async fn sink_loop(
     sink: Arc<dyn Sink>,
     ack_tx: watch::Sender<Option<Lsn>>,
     ckpt_done_tx: watch::Sender<Option<Lsn>>,
+    load_done_tx: watch::Sender<u64>,
     metrics: Arc<crate::metrics::Metrics>,
 ) {
     while let Some(command) = commands.recv().await {
@@ -419,6 +465,12 @@ async fn sink_loop(
         let result = match command {
             SinkCommand::Write(batch) => sink.write(batch).await.map(Some),
             SinkCommand::Position(lsn) => Ok(Some(SinkAck { max_lsn: lsn })),
+            SinkCommand::LoadMark(mark) => {
+                // reached only after every write queued ahead of it succeeded,
+                // which is exactly what the load needs to know
+                load_done_tx.send_replace(mark);
+                Ok(None)
+            }
             SinkCommand::Truncate(index, version) => {
                 match sink.truncate_index(&index, version).await {
                     Ok(()) => {
@@ -828,9 +880,15 @@ mod pipeline_tests {
 
     /// Drives the engine over a fixed event script and returns the sink.
     async fn run_script(batch_size: usize, script: Vec<ChangeEvent>) -> Arc<RecordingSink> {
+        drive(batch_size, script).await.0
+    }
+
+    /// As `run_script`, also reporting the highest load mark reported written.
+    async fn drive(batch_size: usize, script: Vec<ChangeEvent>) -> (Arc<RecordingSink>, u64) {
         let sink = Arc::new(RecordingSink::default());
         let (events_tx, events_rx) = mpsc::channel(1024);
         let (ack_tx, _ack_rx) = watch::channel(None);
+        let (load_done_tx, load_done_rx) = watch::channel(0u64);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let ctx = Arc::new(PipelineCtx {
             sink: sink.clone(),
@@ -848,6 +906,7 @@ mod pipeline_tests {
                 ..EngineConfig::default()
             },
             ack_tx,
+            load_done_tx,
             metrics: Arc::new(crate::metrics::Metrics::default()),
         });
         let stream = StreamId {
@@ -871,7 +930,35 @@ mod pipeline_tests {
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         drop(events_tx);
         engine.await.expect("task joined").expect("engine ran");
-        sink
+        let mark = *load_done_rx.borrow();
+        (sink, mark)
+    }
+
+    #[tokio::test]
+    async fn a_load_mark_waits_for_the_transaction_it_landed_inside() {
+        // The load runs beside the stream, so its marks arrive at arbitrary
+        // points. Acting on one mid-transaction would flush half a transaction
+        // to the target, which is the one thing the buffer exists to prevent.
+        let (sink, mark) = drive(
+            500,
+            vec![
+                begin(0x100),
+                row(1),
+                ChangeEvent::LoadMark(1),
+                row(2),
+                commit(0x100),
+            ],
+        )
+        .await;
+        assert_eq!(sink.events(), vec!["write[upsert:1 upsert:2]"]);
+        assert_eq!(mark, 1, "the mark is still reported, just not early");
+    }
+
+    #[tokio::test]
+    async fn a_load_mark_is_reported_only_after_the_rows_before_it() {
+        let (sink, mark) = drive(500, vec![row(1), ChangeEvent::LoadMark(7)]).await;
+        assert_eq!(sink.events(), vec!["write[upsert:1]"]);
+        assert_eq!(mark, 7);
     }
 
     #[tokio::test]
