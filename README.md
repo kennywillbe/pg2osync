@@ -243,7 +243,7 @@ read this as an order of magnitude, not a capacity plan:
 | Metric | Value |
 |---|---|
 | Initial load | 200K docs in ~5.8 s (**~35,000 docs/s**) |
-| Pipeline latency, commit to indexed | **p50 1 ms**, p99 2 ms |
+| Pipeline latency, commit to indexed | **p50 2 ms**, p99 3 ms |
 | Commit to searchable, single row | ~80 ms including the client round-trip and a forced index refresh |
 | One 50K-row transaction | propagated in ~1.4 s |
 | Resident memory under load | ~90 MB |
@@ -253,14 +253,15 @@ machine), where the limits actually sit:
 
 | Metric | Value |
 |---|---|
-| Single-row transactions | **~1,100 rows/s**, flat past that while WAL lag grows |
-| 100-row transactions | **~4,100 rows/s** — the per-commit flush is the cost, not the rows |
-| Target paused for 10 s at 2,000 rows/s | memory stayed at 28 MB, the slot retained ~390 MB of WAL |
-| Recovery after `kill -9` at load | caught up in ~14 s, source and index counts equal |
+| Single-row transactions | **~11,800 rows/s** with WAL lag at zero — the writers ran out of speed first |
+| 100-row transactions | **~57,700 rows/s** |
+| Target paused for 15 s at 2,000 rows/s | memory stayed at 38 MB, the slot retained ~510 MB of WAL |
+| Recovery after `kill -9` at load | caught up in ~2 s, source and index counts equal |
 
-The first two rows are the same pipeline doing the same work: a commit is what
-forces a batch, so a thousand single-row transactions become a thousand
-requests. Batch your writes if you can.
+A commit is what forces a batch, so a stream of single-row transactions used to
+cost one request each and topped out near 1,100 rows/s. Whole transactions now
+accumulate for up to 10 ms before the batch is written, which is where the rest
+of that number comes from; end-to-end latency moved from p50 1 ms to 2 ms.
 
 The two latency rows measure different things on purpose. "Commit to indexed" is
 what pg2osync controls, taken from its own `pg2osync_latency_ms`. "Commit to

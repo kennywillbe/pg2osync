@@ -205,6 +205,9 @@ pub async fn run(
     // an event pulled off the channel while gathering rows, to be handled on
     // the next turn rather than dropped
     let mut deferred: Option<ChangeEvent> = None;
+    // when the current run of coalesced transactions started, so a busy stream
+    // cannot postpone a flush indefinitely
+    let mut coalescing_since: Option<std::time::Instant> = None;
     let mut break_err: Option<CoreError> = None;
     let txn_cap_bytes = ctx.cfg.txn_buffer_cap_mb.saturating_mul(1024 * 1024);
     let mut cap_warned = false;
@@ -250,16 +253,38 @@ pub async fn run(
                     ctx.metrics.set_current_position(lsn.0);
                 }
                 if !txn_buffer.is_empty() {
-                    txn_bytes = 0;
                     if !backfill_boundary && let Some(last) = txn_buffer.last_mut() {
                         last.lsn = lsn;
                     }
-                    if batch_tx
-                        .send(SinkCommand::Write(std::mem::take(&mut txn_buffer)))
-                        .await
-                        .is_err()
-                    {
-                        break Err(CoreError::Other("batch channel closed".into()));
+                    // Hold the buffer when another event is already waiting:
+                    // a commit is what forces a batch, so a stream of
+                    // single-row transactions would otherwise cost one request
+                    // per row. Only whole transactions accumulate — the ops of
+                    // an open one are still in the buffer either way — and the
+                    // batch's highest LSN stays the last commit in it, so an
+                    // ack can never run past a transaction that was not fully
+                    // written.
+                    let waiting = match events.try_recv() {
+                        Ok(next) => {
+                            deferred = Some(next);
+                            true
+                        }
+                        Err(_) => false,
+                    };
+                    let overdue = coalescing_since
+                        .is_some_and(|since: std::time::Instant| since.elapsed() >= COALESCE_WINDOW);
+                    if waiting && !overdue {
+                        coalescing_since.get_or_insert_with(std::time::Instant::now);
+                    } else {
+                        txn_bytes = 0;
+                        coalescing_since = None;
+                        if batch_tx
+                            .send(SinkCommand::Write(std::mem::take(&mut txn_buffer)))
+                            .await
+                            .is_err()
+                        {
+                            break Err(CoreError::Other("batch channel closed".into()));
+                        }
                     }
                 } else if !backfill_boundary
                     && batch_tx.send(SinkCommand::Position(lsn)).await.is_err()
@@ -485,6 +510,14 @@ async fn fetch_completions(
     }
     Ok(out)
 }
+
+/// How long a committed transaction may wait for company before its batch is
+/// written anyway.
+///
+/// Short enough not to show up next to the end-to-end latency the pipeline
+/// already reports (p50 1 ms), long enough that a thousand commits a second
+/// arrive ten to a batch instead of one.
+const COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// The document id whose stored copy completes this change, if one is needed.
 ///
