@@ -29,6 +29,29 @@ pub struct Metrics {
     pub position_current: AtomicU64,
     /// Highest position token whose checkpoint is durably persisted.
     pub position_confirmed: AtomicU64,
+    /// What each replication slot on the source is holding, refreshed by a
+    /// poller rather than counted here.
+    ///
+    /// This is the number that takes a database down, and nothing else here
+    /// reports it: `position_lag` is the gap between received and checkpointed,
+    /// which stays kilobytes even while a slot pins gigabytes.
+    pub slots: Mutex<Vec<SlotState>>,
+}
+
+/// One replication slot as the source describes it.
+#[derive(Debug, Clone)]
+pub struct SlotState {
+    pub name: String,
+    pub active: bool,
+    /// WAL the slot forbids recycling, in bytes. `None` when the slot has never
+    /// reserved a position.
+    pub retained_bytes: Option<u64>,
+    /// How much more WAL can be written before the slot is lost. The server
+    /// leaves this null when `max_slot_wal_keep_size` is unlimited — which is
+    /// precisely the case that fills a disk, so its absence is the warning.
+    pub safe_wal_size: Option<u64>,
+    /// `reserved`, `extended`, `unreserved` or `lost`.
+    pub wal_status: String,
 }
 
 pub type SharedMetrics = Arc<Metrics>;
@@ -58,6 +81,15 @@ impl Metrics {
 
     pub fn set_confirmed_position(&self, token: u64) {
         self.position_confirmed.store(token, Ordering::Relaxed);
+    }
+
+    /// Replace what is known about the source's slots.
+    ///
+    /// Wholesale rather than per slot: a slot that has been dropped must stop
+    /// being reported, and a stale gauge for it would keep an alert firing
+    /// against something that no longer exists.
+    pub fn set_slots(&self, slots: Vec<SlotState>) {
+        *self.slots.lock().unwrap() = slots;
     }
 
     pub fn record_latency(&self, ms: u64) {
@@ -136,6 +168,68 @@ impl Metrics {
             "gauge",
             self.source_connected.load(Ordering::Relaxed).to_string(),
         );
+        let slots = self.slots.lock().unwrap();
+        if !slots.is_empty() {
+            let mut retained = Vec::new();
+            let mut safe = Vec::new();
+            let mut active = Vec::new();
+            let mut status = Vec::new();
+            for slot in slots.iter() {
+                let name = &slot.name;
+                if let Some(bytes) = slot.retained_bytes {
+                    retained.push(format!(
+                        "pg2osync_slot_retained_bytes{{slot=\"{name}\"}} {bytes}"
+                    ));
+                }
+                if let Some(bytes) = slot.safe_wal_size {
+                    safe.push(format!(
+                        "pg2osync_slot_safe_wal_size_bytes{{slot=\"{name}\"}} {bytes}"
+                    ));
+                }
+                active.push(format!(
+                    "pg2osync_slot_active{{slot=\"{name}\"}} {}",
+                    u8::from(slot.active)
+                ));
+                // A state set rather than an encoded number: an alert wants to
+                // name `lost`, not remember which integer it was.
+                for known in ["reserved", "extended", "unreserved", "lost"] {
+                    status.push(format!(
+                        "pg2osync_slot_wal_status{{slot=\"{name}\",status=\"{known}\"}} {}",
+                        u8::from(slot.wal_status == known)
+                    ));
+                }
+            }
+            let mut series = |name: &str, help: &str, lines: Vec<String>| {
+                if lines.is_empty() {
+                    return;
+                }
+                out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} gauge\n"));
+                out.push_str(&lines.join("\n"));
+                out.push('\n');
+            };
+            series(
+                "pg2osync_slot_retained_bytes",
+                "WAL bytes a replication slot forbids the source from recycling",
+                retained,
+            );
+            series(
+                "pg2osync_slot_safe_wal_size_bytes",
+                "WAL bytes that may still be written before the slot is lost; \
+                 absent when max_slot_wal_keep_size is unlimited",
+                safe,
+            );
+            series(
+                "pg2osync_slot_active",
+                "1 while something is streaming the slot",
+                active,
+            );
+            series(
+                "pg2osync_slot_wal_status",
+                "The source's own assessment of the slot: reserved, extended, unreserved or lost",
+                status,
+            );
+        }
+        drop(slots);
         let lat = self.latencies_ms.lock().unwrap();
         if !lat.is_empty() {
             let mut sorted = lat.clone();
@@ -333,5 +427,43 @@ mod tests {
     fn only_get_is_answered() {
         let post = "POST /metrics HTTP/1.1\r\nHost: h\r\n\r\n";
         assert_eq!(body(post, None).0, "405 Method Not Allowed");
+    }
+
+    fn slot(name: &str, retained: Option<u64>, safe: Option<u64>, status: &str) -> SlotState {
+        SlotState {
+            name: name.into(),
+            active: false,
+            retained_bytes: retained,
+            safe_wal_size: safe,
+            wal_status: status.into(),
+        }
+    }
+
+    #[test]
+    fn a_slot_reports_what_it_holds_and_how_the_server_judges_it() {
+        let metrics = Metrics::default();
+        metrics.set_slots(vec![slot("s", Some(4096), None, "lost")]);
+        let out = metrics.render();
+        assert!(out.contains("pg2osync_slot_retained_bytes{slot=\"s\"} 4096"));
+        assert!(out.contains("pg2osync_slot_wal_status{slot=\"s\",status=\"lost\"} 1"));
+        assert!(out.contains("pg2osync_slot_wal_status{slot=\"s\",status=\"reserved\"} 0"));
+        assert!(
+            !out.contains("pg2osync_slot_safe_wal_size_bytes"),
+            "the server leaves it null when nothing bounds the slot, and a zero \
+             there would read as no headroom left"
+        );
+    }
+
+    #[test]
+    fn a_dropped_slot_stops_being_reported() {
+        let metrics = Metrics::default();
+        metrics.set_slots(vec![slot("gone", Some(1), None, "reserved")]);
+        metrics.set_slots(vec![slot("kept", Some(2), Some(9), "reserved")]);
+        let out = metrics.render();
+        assert!(
+            !out.contains("slot=\"gone\""),
+            "a stale gauge keeps an alert firing against something that is gone"
+        );
+        assert!(out.contains("pg2osync_slot_safe_wal_size_bytes{slot=\"kept\"} 9"));
     }
 }

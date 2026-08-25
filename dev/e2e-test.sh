@@ -239,6 +239,36 @@ if grep -q "pg2osync_position_confirmed" <<< "$metrics" && grep -q "pg2osync_eve
 else
   bad "metrics missing expected series"
 fi
+# Retained WAL is the number that takes the source down, and nothing else here
+# reports it: position_lag stays kilobytes while a slot can pin gigabytes. The
+# poller runs on its own interval, so this waits for the first sample.
+for _ in $(seq 1 40); do
+  metrics=$(curl -s http://127.0.0.1:9111/metrics)
+  grep -q "pg2osync_slot_retained_bytes{slot=\"pg2osync_e2e\"}" <<< "$metrics" && break
+  sleep 1
+done
+if grep -q "pg2osync_slot_retained_bytes{slot=\"pg2osync_e2e\"}" <<< "$metrics"; then
+  ok "the configured slot's retained WAL is reported"
+else
+  bad "no retained-WAL series for the configured slot"
+fi
+if grep -q "pg2osync_slot_wal_status{slot=\"pg2osync_e2e\",status=\"lost\"} 0" <<< "$metrics"; then
+  ok "and the server's own verdict on it"
+else
+  bad "no wal_status series for the configured slot"
+fi
+# The check that has to work when the pipeline is *not* running, which is the
+# case that fills a disk. A limit of 0 MB is over by definition.
+if $BIN status -c "$CONFIG" --max-retained-mb 0 > /dev/null 2>&1; then
+  bad "a slot over the retention limit exited zero"
+else
+  ok "status exits non-zero over the retention limit"
+fi
+if $BIN status -c "$CONFIG" --max-retained-mb 1048576 > /dev/null 2>&1; then
+  ok "and zero under it"
+else
+  bad "status failed under the retention limit"
+fi
 check "health answers for probes" "$(curl -s http://127.0.0.1:9111/healthz)" "ok"
 check "an unknown path is not the exposition" \
   "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9111/)" "404"

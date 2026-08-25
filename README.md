@@ -241,10 +241,16 @@ replays overwrite rather than duplicate. The acknowledgement sent back to the
 source is clamped to the durable checkpoint, so the database never recycles
 history for rows that are not indexed yet.
 
-**Watch the slot** — `pg2osync status` shows the checkpoint against the
-source's position. A growing gap means WAL or binlogs are accumulating on the
-database. If you stop syncing for good, run `drop-slot`; an abandoned slot will
-fill the source's disk.
+**Watch the slot** — an abandoned replication slot fills the source's disk, and
+that is the one failure that takes the *database* down rather than the pipeline.
+`pg2osync_slot_retained_bytes` reports what every slot on the server is pinning,
+with the server's own `wal_status` beside it, so it can be alerted on before it
+matters. Measured: a 110-byte row retains 238 bytes of WAL, about 820 MB an hour
+at a thousand writes a second.
+
+While the pipeline is *down* nothing is there to report, which is exactly when it
+grows — so `pg2osync status --max-retained-mb 10240` exits non-zero over a limit
+and a cron job can own the check. If you stop syncing for good, run `drop-slot`.
 
 More in [docs/operations.md](docs/operations.md).
 

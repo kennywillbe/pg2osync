@@ -428,6 +428,27 @@ bitmask, a byte string — and none of them is searchable, which is the only rea
 the document exists. A `set` is an array rather than a joined string so each
 label matches on its own. `bit` fits a number because MySQL caps it at 64 bits.
 
+## Operating limits
+
+**Retention is reported, never capped by us.** A slot nothing is reading pins WAL
+until the disk fills, and `max_slot_wal_keep_size` is the one setting that turns
+that into a recoverable incident. pg2osync still will not set it: it is a
+server-wide setting, and writing to the source's configuration is the same
+refusal as not running DDL and not writing a signal table. What is owed instead
+is that the number cannot be missed — `pg2osync_slot_retained_bytes` for every
+slot on the server, the server's own `wal_status` beside it, and a startup
+warning naming what an idle slot already holds.
+
+Measured, so the risk is a number rather than a caution: a 110-byte row retains
+238 bytes of WAL, which is ~820 MB an hour at a thousand writes a second.
+
+**The check has to work while the pipeline is down.** That is the case that takes
+a database out — a process stopped on Friday, nobody reading logs for something
+that is not running, metrics unscraped because nothing is serving them. So
+`pg2osync status --max-retained-mb` exits non-zero over a limit, which makes it
+something a cron job can own, and it looks at every slot rather than the
+configured one: an orphan from a former `slot_name` fills the same disk.
+
 ## Scope
 
 **One-way replication only.** No bidirectional sync, no conflict resolution.

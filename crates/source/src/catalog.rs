@@ -300,6 +300,10 @@ pub struct SlotInfo {
     /// WAL the slot is holding back, in bytes. `None` before the slot's first
     /// use, when it has no confirmed position yet.
     pub retained_bytes: Option<i64>,
+    /// The server's own verdict: `reserved`, `extended`, `unreserved` or
+    /// `lost`. A lost slot cannot be resumed from at all, which is worth
+    /// naming rather than leaving to be inferred from a large number.
+    pub wal_status: String,
 }
 
 impl SlotInfo {
@@ -329,7 +333,8 @@ pub async fn all_slots(client: &Client) -> Result<Vec<SlotInfo>> {
     let rows = client
         .query(
             "SELECT slot_name, active, \
-                    pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)::bigint \
+                    pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)::bigint, \
+                    wal_status \
              FROM pg_replication_slots \
              WHERE slot_type = 'logical' \
              ORDER BY 3 DESC NULLS LAST, 1",
@@ -343,6 +348,7 @@ pub async fn all_slots(client: &Client) -> Result<Vec<SlotInfo>> {
             name: r.get(0),
             active: r.get(1),
             retained_bytes: r.get(2),
+            wal_status: r.get::<_, Option<String>>(3).unwrap_or_default(),
         })
         .collect())
 }
@@ -499,6 +505,38 @@ pub async fn slot_pressure(client: &Client, slot_name: &str) -> Result<Option<Sl
     }))
 }
 
+/// Every logical slot on the server, with what it is holding.
+///
+/// All of them and not only ours: an abandoned slot from a former `slot_name`
+/// pins WAL just as effectively, and it is invisible to anyone who only asks
+/// about the name in the config. Reporting it is the difference between an
+/// alert that fires and an outage nobody saw coming.
+pub async fn all_slot_pressure(client: &Client) -> Result<Vec<(String, bool, SlotPressure)>> {
+    let rows = client
+        .query(
+            "SELECT slot_name, active, wal_status, safe_wal_size::bigint, \
+                    pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint \
+             FROM pg_replication_slots WHERE slot_type = 'logical' ORDER BY slot_name",
+            &[],
+        )
+        .await
+        .context("cannot read replication slots")?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            (
+                r.get::<_, String>(0),
+                r.get::<_, bool>(1),
+                SlotPressure {
+                    wal_status: r.get::<_, Option<String>>(2).unwrap_or_default(),
+                    safe_wal_size: r.get(3),
+                    retained_bytes: r.get(4),
+                },
+            )
+        })
+        .collect())
+}
+
 /// Current confirmed_flush_lsn of a slot, if it exists.
 pub async fn confirmed_flush_lsn(client: &Client, slot_name: &str) -> Result<Option<Lsn>> {
     let row = client
@@ -561,6 +599,7 @@ mod tests {
             name: "s".into(),
             active: false,
             retained_bytes: bytes,
+            wal_status: "reserved".into(),
         };
         assert_eq!(slot(Some(512)).retained_pretty(), "512 B");
         assert_eq!(slot(Some(3 * 1024 * 1024 * 1024)).retained_pretty(), "3 GB");

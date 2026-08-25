@@ -220,6 +220,67 @@ fn start_metrics(cfg: &AppConfig) -> Result<SharedMetrics> {
     Ok(metrics)
 }
 
+/// Report what the source's replication slots are holding, for as long as this
+/// process runs.
+///
+/// Started outside the retry loop on purpose: a pipeline that cannot connect is
+/// exactly when retention grows, so the number has to keep being reported while
+/// the stream is being retried rather than only while it is healthy.
+///
+/// Its own connection, opened per poll. Holding one for the process's lifetime
+/// would pin a backend against a database this is supposed to be cheap for, and
+/// reconnecting is what lets it survive a source restart.
+fn start_slot_watch(cfg: &AppConfig, admin_url: String, metrics: SharedMetrics) -> Result<()> {
+    if !cfg.metrics.enabled || cfg.source.flavor == "mysql" {
+        return Ok(());
+    }
+    let tls = cfg.tls_settings(&admin_url)?;
+    tokio::spawn(async move {
+        // `pg_replication_slots` is a shared-memory read, so this is cheap; the
+        // interval is about not being noisy in a log when the source is down,
+        // not about the query's cost.
+        const EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+        let mut complained = false;
+        loop {
+            match slot_snapshot(&tls, &admin_url).await {
+                Ok(slots) => {
+                    complained = false;
+                    metrics.set_slots(slots);
+                }
+                Err(e) => {
+                    if !complained {
+                        complained = true;
+                        tracing::warn!(target: "pg2osync::metrics",
+                            "cannot read what the replication slots are holding: {e}");
+                    }
+                }
+            }
+            tokio::time::sleep(EVERY).await;
+        }
+    });
+    Ok(())
+}
+
+async fn slot_snapshot(
+    tls: &pg2osync_source::tls::TlsSettings,
+    admin_url: &str,
+) -> Result<Vec<pg2osync_engine::metrics::SlotState>> {
+    let client = pg2osync_source::tls::connect(tls, admin_url).await?;
+    let slots = pg2osync_source::catalog::all_slot_pressure(&client).await?;
+    Ok(slots
+        .into_iter()
+        .map(
+            |(name, active, pressure)| pg2osync_engine::metrics::SlotState {
+                name,
+                active,
+                retained_bytes: pressure.retained_bytes.map(|b| b.max(0) as u64),
+                safe_wal_size: pressure.safe_wal_size.map(|b| b.max(0) as u64),
+                wal_status: pressure.wal_status,
+            },
+        )
+        .collect())
+}
+
 /// Resolve a bearer token from the environment.
 ///
 /// The token is named by variable rather than written in the config so it never
@@ -463,6 +524,7 @@ async fn run_postgres(
     let parse: pg2osync_engine::PositionParser =
         Arc::new(|text| text.trim().parse::<Lsn>().ok().map(|lsn| lsn.0));
     let metrics = start_metrics(&cfg)?;
+    start_slot_watch(&cfg, admin_url.clone(), metrics.clone())?;
     let (ack_tx, ack_rx) = watch::channel(None);
     let nudge: Option<pg2osync_engine::api::StreamNudge> = if cfg.api.enabled {
         let url = admin_url.clone();
