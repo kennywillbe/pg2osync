@@ -637,7 +637,7 @@ conc_cleanup() {
   pg "DROP PUBLICATION IF EXISTS ${WSLOT}_pub;" > /dev/null 2>&1 || true
   rm -f "$WCONFIG"
 }
-trap 'cleanup; resume_cleanup; conc_cleanup' EXIT
+trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup' EXIT
 pg "DROP PUBLICATION IF EXISTS ${WSLOT}_pub; CREATE PUBLICATION ${WSLOT}_pub FOR TABLE resume_probe;" > /dev/null 2>&1
 curl -s -XDELETE "$OS/e2e_conc" > /dev/null
 src_rows=$(pg "SELECT count(*) FROM resume_probe;")
@@ -691,7 +691,7 @@ rename_cleanup() {
   pg "DROP TABLE IF EXISTS rename_probe;" > /dev/null 2>&1 || true
   rm -f "$RNCONFIG"
 }
-trap 'cleanup; resume_cleanup; conc_cleanup; rename_cleanup' EXIT
+trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup' EXIT
 pg "DROP TABLE IF EXISTS rename_probe, renamed_probe;" > /dev/null 2>&1
 pg "CREATE TABLE rename_probe(id bigint primary key, v text);" > /dev/null
 pg "INSERT INTO rename_probe VALUES (1,'before');" > /dev/null
@@ -770,7 +770,7 @@ workers_cleanup() {
   pg "DROP PUBLICATION IF EXISTS ${PWSLOT}_pub;" > /dev/null 2>&1 || true
   rm -f "$PWCONFIG"
 }
-trap 'cleanup; resume_cleanup; conc_cleanup; rename_cleanup; workers_cleanup' EXIT
+trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup' EXIT
 pg "DROP PUBLICATION IF EXISTS ${PWSLOT}_pub; CREATE PUBLICATION ${PWSLOT}_pub FOR TABLE resume_probe;" > /dev/null 2>&1
 curl -s -XDELETE "$OS/e2e_workers?ignore_unavailable=true" > /dev/null
 PWPROG=load-postgres-$PWSLOT-public_resume_probe
