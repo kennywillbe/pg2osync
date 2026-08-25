@@ -90,18 +90,25 @@ sends changes over the replication connection, and there is no polling.
 **pg2osync writes no WAL.** It only reads. The WAL your writes generate is
 charged to the database whether pg2osync runs or not — with one exception below.
 
-**Nested children are the one real query cost.** They re-fetch, so:
+**Nested children cost one query per changed parent, and nothing extra during
+the initial load.** The load reads each child collection once, aggregated, and
+joins it to the parent in the same `COPY`:
 
 | Situation | Queries |
 |---|---|
 | One changed row, no children | 0 |
 | One changed parent, one child collection | 1 per collection |
 | One changed child row | 1 parent re-fetch + 1 per collection |
-| Initial load of N parents with children | **N × collections** |
+| Initial load of N parents with children | **1 per table**, whatever N is |
 
-Measured: the initial load of 20,000 parents with one child collection ran
-20,000 child queries. That is the dominant cost of nested children, and it is
-why they are documented as a feature you opt into per table.
+Measured: loading 20,000 parents with one child collection issued **20,000
+child queries** before this was fixed and **zero** afterwards.
+
+The join compares the key in its own type. That matters more than the query
+count: casting either side to text makes the index unusable. On 50,000 parents,
+the same work took 165s with a text cast and 74ms without it. The live
+re-fetches compare in their own type for the same reason — **index the child's
+foreign key**, or every changed parent scans the whole child table.
 
 Without children, the initial load runs exactly one `COPY` per table plus a
 handful of catalog queries:

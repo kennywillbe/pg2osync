@@ -60,6 +60,53 @@ pub async fn columns_of(
         .collect())
 }
 
+/// Build the `COPY` statement for one table, embedding each child collection
+/// as a pre-aggregated JSON column.
+///
+/// Aggregating child rows once and hash-joining beats fetching them per parent
+/// by orders of magnitude, and unlike a correlated lateral it does not depend
+/// on the child's foreign key being indexed — which a general-purpose tool
+/// cannot assume.
+fn copy_statement(qualified_table: &str, cols: &[ColMeta], children: &[ChildSpec]) -> String {
+    let mut selected: Vec<String> = cols
+        .iter()
+        .map(|c| format!("p.{}::text", quote_ident(&c.name)))
+        .collect();
+    let mut joins = String::new();
+
+    for (i, child) in children.iter().enumerate() {
+        let alias = format!("c{i}");
+        selected.push(format!("COALESCE({alias}.agg, '[]'::jsonb)::text"));
+        // the key is compared in its own type: a ::text cast on either side
+        // makes the index unusable and turns this into a sequential scan
+        joins.push_str(&format!(
+            " LEFT JOIN (SELECT {fk} AS k, jsonb_agg(to_jsonb(t)) AS agg \
+             FROM {child_table} t GROUP BY {fk}) {alias} ON {alias}.k = p.{parent_key}",
+            fk = quote_ident(&child.foreign_key),
+            child_table = qualify(&child.qualified()),
+            parent_key = quote_ident(&child.parent_column),
+        ));
+    }
+
+    format!(
+        "COPY (SELECT {} FROM {} p{}) TO STDOUT (FORMAT text)",
+        selected.join(", "),
+        qualify(qualified_table),
+        joins
+    )
+}
+
+/// A child collection reaches the document as one JSON column, so it can ride
+/// along in the same `COPY` as an ordinary column of type `jsonb`.
+fn child_column(child: &ChildSpec) -> ColMeta {
+    const JSONB_OID: u32 = 3802;
+    ColMeta {
+        name: child.field.clone(),
+        type_oid: JSONB_OID,
+        is_pk: false,
+    }
+}
+
 /// Stream every configured table into the engine channel.
 pub async fn run(
     cfg: &AppConfig,
@@ -84,16 +131,29 @@ pub async fn run(
 
     for tbl in cfg.sync.values() {
         let (schema, table) = split_qualified(&tbl.table);
-        let cols = columns_of(admin, &tbl.table).await?;
-        let child_specs = children.get(&(schema.to_string(), table.to_string()));
-        let select_cols: Vec<String> = cols
-            .iter()
-            .map(|c| format!("{}::text", quote_ident(&c.name)))
-            .collect();
-        let sql = format!(
-            "COPY (SELECT {} FROM {}) TO STDOUT (FORMAT text)",
-            select_cols.join(", "),
-            qualify(&tbl.table)
+        let mut cols = columns_of(admin, &tbl.table).await?;
+        let child_specs: &[ChildSpec] = children
+            .get(&(schema.to_string(), table.to_string()))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+
+        for child in child_specs {
+            // shadowing a real column would produce a document that quietly
+            // disagrees with the row it came from
+            if cols.iter().any(|c| c.name == child.field) {
+                bail!(
+                    "[sync] child field {:?} collides with a column of {}; \
+                     choose another field name",
+                    child.field,
+                    tbl.table
+                );
+            }
+            cols.push(child_column(child));
+        }
+        let sql = copy_statement(
+            &tbl.table,
+            &cols[..cols.len() - child_specs.len()],
+            child_specs,
         );
 
         let started = std::time::Instant::now();
@@ -114,16 +174,9 @@ pub async fn run(
                 count += 1;
                 let fields: Vec<Option<Vec<u8>>> =
                     split_copy_line(line).iter().map(unescape_copy).collect();
-                let mut change = build_change(schema, table, &cols, &fields)?;
-                // children are attached here too: without this the initial
-                // load would ship parents with empty nested arrays until the
-                // parent row happens to be updated
-                if let Some(specs) = child_specs {
-                    let pk = change.pk().clone();
-                    if let Some(doc) = change.doc_mut() {
-                        pg2osync_source::children::attach_children(doc, &pk, specs, admin).await?;
-                    }
-                }
+                // child collections arrive as ordinary jsonb columns of this
+                // very row, so nothing extra is fetched per parent
+                let change = build_change(schema, table, &cols, &fields)?;
                 if tx.send(ChangeEvent::Row(change)).await.is_err() {
                     bail!("engine closed during backfill");
                 }
@@ -265,6 +318,80 @@ mod tests {
         assert_eq!(fields, vec!["1\\tx", "a\\nb", "\\N"]);
         assert_eq!(unescape_copy(&fields[0]), Some(b"1\tx".to_vec()));
         assert_eq!(unescape_copy(&fields[2]), None);
+    }
+
+    fn child(field: &str, table: &str, fk: &str, parent_key: &str) -> ChildSpec {
+        ChildSpec::new(table, field, fk, parent_key).expect("qualified")
+    }
+
+    fn col(name: &str) -> ColMeta {
+        ColMeta {
+            name: name.into(),
+            type_oid: 25,
+            is_pk: false,
+        }
+    }
+
+    #[test]
+    fn a_table_without_children_reads_straight_through() {
+        let sql = copy_statement("public.users", &[col("id"), col("name")], &[]);
+        assert_eq!(
+            sql,
+            concat!(
+                "COPY (SELECT p.\"id\"::text, p.\"name\"::text ",
+                "FROM \"public\".\"users\" p) TO STDOUT (FORMAT text)"
+            )
+        );
+    }
+
+    #[test]
+    fn a_child_collection_becomes_one_aggregated_column() {
+        let sql = copy_statement(
+            "public.customers",
+            &[col("id")],
+            &[child("orders", "public.orders", "customer_id", "id")],
+        );
+        assert!(
+            sql.contains("COALESCE(c0.agg, '[]'::jsonb)::text"),
+            "a parent with no children must still get an empty array: {sql}"
+        );
+        assert!(sql.contains("GROUP BY \"customer_id\""), "{sql}");
+        assert!(
+            sql.contains("c0.k = p.\"id\""),
+            "the key is compared in its own type, or the index goes unused: {sql}"
+        );
+        assert!(
+            !sql.contains("::text = "),
+            "no cast may appear on either side of the join: {sql}"
+        );
+    }
+
+    #[test]
+    fn several_collections_each_get_their_own_join() {
+        let sql = copy_statement(
+            "public.customers",
+            &[col("id")],
+            &[
+                child("orders", "public.orders", "customer_id", "id"),
+                child("tickets", "support.tickets", "cust", "id"),
+            ],
+        );
+        assert!(sql.contains("c0.k = p.\"id\""), "{sql}");
+        assert!(sql.contains("c1.k = p.\"id\""), "{sql}");
+        assert!(sql.contains("\"support\".\"tickets\""), "{sql}");
+        assert_eq!(sql.matches("LEFT JOIN").count(), 2);
+    }
+
+    #[test]
+    fn identifiers_are_quoted_everywhere_they_appear() {
+        let sql = copy_statement(
+            "public.we\"ird",
+            &[col("od\"d")],
+            &[child("kids", "public.ch\"ild", "fk\"y", "pk\"y")],
+        );
+        assert!(sql.contains("\"we\"\"ird\""), "{sql}");
+        assert!(sql.contains("\"od\"\"d\""), "{sql}");
+        assert!(sql.contains("\"fk\"\"y\""), "{sql}");
     }
 
     #[test]

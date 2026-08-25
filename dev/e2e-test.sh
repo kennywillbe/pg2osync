@@ -67,19 +67,25 @@ index = "e2e_customers"
 table = "public.orders"
 field = "orders"
 foreign_key = "customer_id"
+
+[[sync.customers.children]]
+table = "public.tickets"
+field = "tickets"
+foreign_key = "customer_id"
 TOML
 
 say "0. Reset state"
 stop_sync
 pg "DROP PUBLICATION IF EXISTS pg2osync_e2e_pub;" > /dev/null
 pg "SELECT pg_drop_replication_slot('pg2osync_e2e') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='pg2osync_e2e');" > /dev/null
-pg "TRUNCATE users; TRUNCATE orders, customers;" > /dev/null
+pg "TRUNCATE users; TRUNCATE tickets, orders, customers;" > /dev/null
 pg "INSERT INTO users (id,name,email,password_hash,metadata) VALUES
       (1,'alice','alice@test.io','secret-1','{\"role\":\"admin\"}'),
       (2,'bob','bob@test.io','secret-2','{\"role\":\"user\"}'),
       (3,'carol','carol@test.io','secret-3','{}');" > /dev/null
-pg "INSERT INTO customers (id,name) VALUES (1,'acme'),(2,'globex');" > /dev/null
+pg "INSERT INTO customers (id,name) VALUES (1,'acme'),(2,'globex'),(3,'no-children');" > /dev/null
 pg "INSERT INTO orders (id,customer_id,total) VALUES (10,1,99.90),(11,1,5.00),(12,2,42.00);" > /dev/null
+pg "INSERT INTO tickets (id,customer_id,subject) VALUES (20,1,'late delivery');" > /dev/null
 curl -s -XDELETE "$OS/e2e_users,e2e_customers,.pg2osync_meta" > /dev/null
 ok "seeded 3 users, 2 customers, 3 orders; indices cleared"
 
@@ -102,10 +108,15 @@ start_sync
 sleep 5
 refresh
 check "users backfilled" "$(os_count e2e_users)" "3"
-check "customers backfilled" "$(os_count e2e_customers)" "2"
+check "customers backfilled" "$(os_count e2e_customers)" "3"
 check "excluded column absent" "$(os_has e2e_users 1 password_hash)" "False"
 check "transform applied on backfill" "$(os_field e2e_users 1 email)" "***"
 check "children attached during backfill" "$(os_len e2e_customers 1 orders)" "2"
+# a second collection exercises the multi-join path of the initial load
+check "second collection attached too" "$(os_len e2e_customers 1 tickets)" "1"
+# a parent with no children must get an empty array, never null
+check "childless parent gets an empty array" "$(os_len e2e_customers 3 orders)" "0"
+check "childless parent has the field at all" "$(os_has e2e_customers 3 orders)" "True"
 
 say "4. live streaming"
 pg "INSERT INTO users (id,name,email,password_hash) VALUES (4,'dave','dave@test.io','secret-4');" > /dev/null

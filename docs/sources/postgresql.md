@@ -133,6 +133,19 @@ Limitations:
 - `poll_page_size` (default 5000) bounds how many rows one cycle reads per
   table; a large backlog drains over several cycles.
 
+## Nested children
+
+Child collections are embedded during the initial load with a single
+aggregating join per table, and re-fetched afterwards whenever the parent or one
+of its children changes.
+
+Index the child's foreign key. Both paths compare the key in its own type so an
+index can be used, but if none exists PostgreSQL still has to scan.
+
+```sql
+CREATE INDEX ON public.orders (customer_id);
+```
+
 ## Truncates and deletes
 
 `TRUNCATE` on a synced table clears the target index. It is ordered against
