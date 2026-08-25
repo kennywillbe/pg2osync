@@ -262,6 +262,26 @@ this cost model — PGSync asks the *index* which documents a child row affects 
 was measured at 108s per batch; asking the source, once per batch, is the whole
 difference.
 
+**A MySQL child array is aggregated in Rust, not by `JSON_ARRAYAGG`.** The
+obvious tool is the wrong one, measured on both servers: `JSON_OBJECT` renders a
+`varbinary` as `"base64:type15:AP8Q"` on MySQL and as raw escaped bytes on
+MariaDB where the pipeline says `"AP8Q"`, a `set` as `"a,b"` where the pipeline
+says `["a","b"]`, a `decimal` as a JSON number where the pipeline keeps the
+string so the precision survives, and a `bit` as base64 on MySQL and as *invalid
+JSON* on MariaDB — its own `JSON_VALID` returns 0 for it.
+
+Casting each column (`TO_BASE64`, `CAST(… AS CHAR)`, `CAST(… AS UNSIGNED)`) gets
+closer and still fails: `TO_BASE64` wraps at 76 characters, so any value over 57
+bytes disagrees with the pipeline's base64, and a `set` cannot become an array
+without `JSON_TABLE` per row. And where it does work it means writing the type
+mapping a second time, in SQL, for the two to agree.
+
+So child rows come back as ordinary rows and go through the same
+`build_document` that builds a parent. A value inside an array is then identical
+to the same value as a document because it is the same code, and the cost stays
+one query per collection per batch — the server still does the ordering, the cap
+and the count.
+
 **The child aggregation is built in one place.** The initial load's `COPY` and the
 streaming re-fetch use the same subquery, so the array's contents, order and cap
 cannot drift between them. Two builders would disagree the moment either changed,

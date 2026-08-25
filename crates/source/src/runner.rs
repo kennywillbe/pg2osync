@@ -120,7 +120,7 @@ impl WalSource {
         // it mid-transaction would acknowledge a position the buffered rows
         // have not reached yet.
         let mut in_transaction = false;
-        let mut pending = Pending::default();
+        let mut pending = crate::children::Pending::default();
         // The commit position of the open transaction, stamped onto each row it
         // produces so the engine never has to infer it from event order.
         let mut txn_version: Option<u64> = None;
@@ -414,72 +414,13 @@ enum Classified {
     Skip,
 }
 
-/// Rows held back until their children can be resolved for the whole group.
-///
-/// A parent row keeps its decoded change, because its document comes from the
-/// WAL tuple and only the arrays are missing. A child row keeps nothing but the
-/// parent key it names, deduplicated — which is why a transaction touching a
-/// thousand children of one parent holds one key rather than a thousand rows.
-#[derive(Default)]
-struct Pending {
-    parents: HashMap<(String, String), Vec<pg2osync_core::event::RowChange>>,
-    named: HashMap<(String, String), Vec<serde_json::Value>>,
-    seen: std::collections::HashSet<(String, String, String)>,
-}
-
-impl Pending {
-    fn hold_parent(&mut self, table: (String, String), change: pg2osync_core::event::RowChange) {
-        self.parents.entry(table).or_default().push(change);
-    }
-
-    fn name_parent(&mut self, table: (String, String), key: serde_json::Value) {
-        let id = (
-            table.0.clone(),
-            table.1.clone(),
-            crate::children::key_lookup(&key),
-        );
-        if self.seen.insert(id) {
-            self.named.entry(table).or_default().push(key);
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.parents.is_empty() && self.named.is_empty()
-    }
-
-    /// How much is held, for the cap that keeps one enormous transaction from
-    /// living entirely in memory.
-    fn len(&self) -> usize {
-        self.parents.values().map(Vec::len).sum::<usize>()
-            + self.named.values().map(Vec::len).sum::<usize>()
-    }
-}
-
-/// Which named parent keys still need reading.
-///
-/// A key a parent row in this group already carries needs no re-read: that row's
-/// document came from the WAL, which is the fresher of the two and saves a query.
-fn keys_needing_refetch(
-    rows: &[pg2osync_core::event::RowChange],
-    named: Vec<serde_json::Value>,
-) -> Vec<serde_json::Value> {
-    let covered: std::collections::HashSet<String> = rows
-        .iter()
-        .map(|r| crate::children::key_lookup(r.pk()))
-        .collect();
-    named
-        .into_iter()
-        .filter(|k| !covered.contains(&crate::children::key_lookup(k)))
-        .collect()
-}
-
 /// Resolve everything held and emit it.
 ///
 /// One query per child collection and one per parent table, for the whole group,
 /// rather than two per changed row.
 async fn flush_pending(
     cfg: &WalSourceConfig,
-    pending: &mut Pending,
+    pending: &mut crate::children::Pending,
     admin: &tokio_postgres::Client,
     tx: &tokio::sync::mpsc::Sender<ChangeEvent>,
     version: Option<u64>,
@@ -487,20 +428,11 @@ async fn flush_pending(
     if pending.is_empty() {
         return Ok(());
     }
-    let tables: Vec<(String, String)> = pending
-        .parents
-        .keys()
-        .chain(pending.named.keys())
-        .cloned()
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .collect();
-    for table in tables {
-        let mut emitted = pending.parents.remove(&table).unwrap_or_default();
-        let named = pending.named.remove(&table).unwrap_or_default();
+    for table in pending.tables() {
+        let (mut emitted, named) = pending.take(&table);
         let specs = cfg.children.get(&table).cloned().unwrap_or_default();
 
-        let missing = keys_needing_refetch(&emitted, named);
+        let missing = crate::children::keys_needing_refetch(&emitted, named);
         if !missing.is_empty() {
             let pk_column = cfg.parent_pk_column(&table.0, &table.1);
             let found =
@@ -538,7 +470,7 @@ async fn flush_pending(
             send_change(tx, change).await?;
         }
     }
-    pending.seen.clear();
+    pending.clear_seen();
     Ok(())
 }
 
@@ -559,76 +491,5 @@ impl WalSourceConfig {
             .get(&(schema.to_string(), table.to_string()))
             .cloned()
             .unwrap_or_else(|| "id".to_string())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use pg2osync_core::event::{RowChange, RowKind};
-    use serde_json::json;
-
-    fn parent_row(id: i64) -> RowChange {
-        RowChange {
-            schema: "public".into(),
-            table: "customers".into(),
-            kind: RowKind::Insert {
-                pk: json!(id),
-                doc: json!({"id": id}),
-            },
-            version: None,
-        }
-    }
-
-    fn table() -> (String, String) {
-        ("public".to_string(), "customers".to_string())
-    }
-
-    #[test]
-    fn many_children_of_one_parent_hold_one_key() {
-        // The whole point: 500 child rows on one parent must not become 500
-        // held rows, 500 queries and 500 identical documents.
-        let mut pending = Pending::default();
-        for _ in 0..500 {
-            pending.name_parent(table(), json!(7));
-        }
-        assert_eq!(pending.len(), 1);
-    }
-
-    #[test]
-    fn the_same_key_on_two_parent_tables_is_two_keys() {
-        let mut pending = Pending::default();
-        pending.name_parent(("public".into(), "customers".into()), json!(1));
-        pending.name_parent(("public".into(), "invoices".into()), json!(1));
-        assert_eq!(pending.len(), 2, "different documents, same key value");
-    }
-
-    #[test]
-    fn a_parent_row_in_the_group_saves_the_re_read() {
-        // Its document came from the WAL, so re-reading the same key would be a
-        // query for something already in hand.
-        let needed = keys_needing_refetch(&[parent_row(1)], vec![json!(1), json!(2)]);
-        assert_eq!(needed, vec![json!(2)]);
-    }
-
-    #[test]
-    fn a_deleted_parent_still_suppresses_the_re_read() {
-        // The delete is what removes the document; re-reading the key would find
-        // nothing and emit nothing, so the query is pure waste.
-        let deleted = RowChange {
-            schema: "public".into(),
-            table: "customers".into(),
-            kind: RowKind::Delete { pk: json!(9) },
-            version: None,
-        };
-        assert!(keys_needing_refetch(&[deleted], vec![json!(9)]).is_empty());
-    }
-
-    #[test]
-    fn nothing_held_is_nothing_to_resolve() {
-        let mut pending = Pending::default();
-        assert!(pending.is_empty());
-        pending.hold_parent(table(), parent_row(1));
-        assert!(!pending.is_empty());
     }
 }

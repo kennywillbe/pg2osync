@@ -19,6 +19,7 @@ use crate::connection::MySqlConnection;
 use crate::typemap::ValueShape;
 use anyhow::{Context as _, Result};
 use pg2osync_core::checkpoint::StreamId;
+use pg2osync_core::children::ChildSpec;
 use pg2osync_core::event::{ChangeEvent, RowChange, RowKind, TransactionBoundary};
 use pg2osync_core::load::{LoadCursor, LoadProgress, LoadScope, load_progress_key};
 use pg2osync_core::lsn::Lsn;
@@ -41,6 +42,7 @@ pub async fn run(
     stream: &StreamId,
     mut load_done: watch::Receiver<u64>,
     scope: &LoadScope,
+    children: &std::collections::HashMap<(String, String), Vec<ChildSpec>>,
 ) -> Result<()> {
     // No explicit transaction, and READ COMMITTED so that an implicit one
     // cannot outlive its statement either. A read view held for the length of a
@@ -63,6 +65,10 @@ pub async fn run(
         }
         let progress_key = load_progress_key(stream, &qualified);
         let resolved = catalog::table_schema(conn, schema, table).await?;
+        let specs = children
+            .get(&(schema.clone(), table.clone()))
+            .cloned()
+            .unwrap_or_default();
 
         let stored = if scope.resumable {
             progress_keys.push(progress_key.clone());
@@ -142,6 +148,11 @@ pub async fn run(
                 .with_context(|| format!("initial load of {qualified} failed reading a chunk"))?;
             let mut in_chunk: u64 = 0;
             let mut last: Option<Vec<String>> = None;
+            // Held only when there are collections to attach: their read needs the
+            // connection this chunk is still using, and one query for the chunk is
+            // the whole point. Without children the rows go straight out, as
+            // before.
+            let mut held: Vec<RowChange> = Vec::new();
             while let Some(row) = rows.next().await? {
                 in_chunk += 1;
                 count += 1;
@@ -149,16 +160,34 @@ pub async fn run(
                     last = key_literals(&resolved, &row);
                 }
                 let (doc, pk) = catalog::build_document(&resolved, &row);
-                tx.send(ChangeEvent::Row(RowChange {
+                let change = RowChange {
                     schema: schema.clone(),
                     table: table.clone(),
                     kind: RowKind::Insert { pk, doc },
                     version,
-                }))
-                .await
-                .context("engine closed during the initial load")?;
-                if count.is_multiple_of(ROWS_PER_BOUNDARY) {
-                    send_boundary(tx).await?;
+                };
+                if specs.is_empty() {
+                    tx.send(ChangeEvent::Row(change))
+                        .await
+                        .context("engine closed during the initial load")?;
+                    if count.is_multiple_of(ROWS_PER_BOUNDARY) {
+                        send_boundary(tx).await?;
+                    }
+                } else {
+                    held.push(change);
+                }
+            }
+            // The cursor's borrow of the connection ends with the loop above,
+            // which is what leaves the connection free to read the collections.
+            if !specs.is_empty() {
+                attach_to_chunk(conn, &specs, &mut held).await?;
+                for (nth, change) in held.into_iter().enumerate() {
+                    tx.send(ChangeEvent::Row(change))
+                        .await
+                        .context("engine closed during the initial load")?;
+                    if (nth as u64 + 1).is_multiple_of(ROWS_PER_BOUNDARY) {
+                        send_boundary(tx).await?;
+                    }
                 }
             }
             chunks += 1;
@@ -213,6 +242,44 @@ pub async fn run(
         if let Err(e) = sink.clear_state(&key).await {
             tracing::warn!(target: "pg2osync::load",
                 "could not remove load progress {key}: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// Attach every configured collection to one chunk's documents.
+///
+/// One query per collection for the whole chunk, which is what keeps the load's
+/// cost independent of how many parents it walks.
+async fn attach_to_chunk(
+    conn: &mut MySqlConnection,
+    specs: &[ChildSpec],
+    held: &mut [RowChange],
+) -> Result<()> {
+    if held.is_empty() {
+        return Ok(());
+    }
+    let keys: Vec<serde_json::Value> = held.iter().map(|r| r.pk().clone()).collect();
+    for spec in specs {
+        let by_key = crate::children::fetch_many(spec, conn, &keys).await?;
+        let mut cut = 0usize;
+        for change in held.iter_mut() {
+            let key = change.pk().clone();
+            let Some(doc) = change.doc_mut() else {
+                continue;
+            };
+            let (arr, total) = match by_key.get(&pg2osync_core::children::key_lookup(&key)) {
+                Some((arr, total)) => (arr.clone(), *total),
+                None => (serde_json::Value::Array(Vec::new()), 0),
+            };
+            if pg2osync_core::children::apply_collection(doc, spec, arr, total) {
+                cut += 1;
+            }
+        }
+        if cut > 0 {
+            tracing::warn!(target: "pg2osync::load",
+                "{cut} document(s) embed only max_rows of {}, and say so in {} and {}",
+                spec.qualified(), spec.truncated_field(), spec.total_field());
         }
     }
     Ok(())

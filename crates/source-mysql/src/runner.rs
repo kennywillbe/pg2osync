@@ -28,6 +28,10 @@ pub struct MySqlSourceConfig {
     pub start_file: Option<String>,
     pub start_pos: u32,
     pub tls: pg2osync_tls::TlsSettings,
+    /// Child collections keyed by PARENT (schema, table).
+    pub children: HashMap<(String, String), Vec<pg2osync_core::children::ChildSpec>>,
+    /// Reverse routing: CHILD (schema, table) -> parent (schema, table).
+    pub child_parents: HashMap<(String, String), (String, String)>,
 }
 
 impl MySqlSourceConfig {
@@ -120,6 +124,7 @@ impl MySqlSource {
             "mysql binlog dump from {current_file}@{start_pos}");
 
         let mut registered: HashMap<u64, RegisteredTable> = HashMap::new();
+        let mut pending = pg2osync_core::children::Pending::default();
         let mut checksum_len: usize = 4;
 
         loop {
@@ -246,6 +251,17 @@ impl MySqlSource {
                     .context("change channel closed")?;
                 }
                 binlog::T_XID => {
+                    // Everything held for this transaction resolves here, before
+                    // the boundary that flushes the batch — one query per
+                    // collection for the whole group rather than two per row.
+                    flush_pending(
+                        &self.cfg,
+                        &mut pending,
+                        &mut admin,
+                        &tx,
+                        Some(catalog::position_token(&current_file, end_pos)),
+                    )
+                    .await?;
                     // XID closes a transaction: this is the only point where a
                     // position may be acknowledged
                     tx.send(ChangeEvent::Transaction(TransactionBoundary::Commit {
@@ -312,9 +328,35 @@ impl MySqlSource {
                     };
                     let set = binlog::parse_rows(h.event_type, body, &rt.meta)?;
                     let version = catalog::position_token(&current_file, end_pos);
-                    for row in &set.rows {
-                        let change = build_change(rt, &set.kind, row, version)?;
-                        tx.send(change).await.context("change channel closed")?;
+                    let table = (rt.schema.clone(), rt.table.clone());
+                    // A child row is not a document: it names a parent to re-read.
+                    // Naming it rather than emitting it is what lets a thousand
+                    // children of one parent cost one query and one document.
+                    if let Some(parent) = self.cfg.child_parents.get(&table).cloned() {
+                        for row in &set.rows {
+                            let key = child_foreign_key(rt, &self.cfg, &table, row)?;
+                            pending.name_parent(parent.clone(), key);
+                        }
+                    } else if self.cfg.children.contains_key(&table) {
+                        // a parent row: its document is here, only the arrays are
+                        // missing, so it waits for the group's read
+                        for row in &set.rows {
+                            let ChangeEvent::Row(change) =
+                                build_change(rt, &set.kind, row, version)?
+                            else {
+                                continue;
+                            };
+                            pending.hold_parent(table.clone(), change);
+                        }
+                    } else {
+                        for row in &set.rows {
+                            let change = build_change(rt, &set.kind, row, version)?;
+                            tx.send(change).await.context("change channel closed")?;
+                        }
+                    }
+                    if pending.len() >= PENDING_FLUSH_ROWS {
+                        flush_pending(&self.cfg, &mut pending, &mut admin, &tx, Some(version))
+                            .await?;
                     }
                 }
                 binlog::T_PARTIAL_UPDATE_ROWS => {
@@ -336,6 +378,141 @@ impl MySqlSource {
             .iter()
             .any(|(s, t)| s == schema && t == table)
     }
+}
+
+/// How many held rows and parent keys resolve in one go.
+///
+/// Bounds what one transaction can hold before it is resolved in pieces. Rows of
+/// tables with no children never reach this: they are their own document and go
+/// straight out.
+const PENDING_FLUSH_ROWS: usize = 5_000;
+
+/// The parent key a child row names.
+///
+/// `binlog_row_image = FULL` is a startup requirement, so a delete carries its
+/// whole before-image and the foreign key is always there — the case PostgreSQL
+/// needs `REPLICA IDENTITY FULL` for, and warns about, cannot arise here.
+fn child_foreign_key(
+    rt: &RegisteredTable,
+    cfg: &MySqlSourceConfig,
+    table: &(String, String),
+    row: &binlog::RowsRow,
+) -> Result<serde_json::Value> {
+    let parent = cfg
+        .child_parents
+        .get(table)
+        .ok_or_else(|| anyhow::anyhow!("{}.{} is not a configured child", table.0, table.1))?;
+    let spec = cfg
+        .children
+        .get(parent)
+        .and_then(|specs| {
+            specs
+                .iter()
+                .find(|s| s.schema == table.0 && s.table == table.1)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "child {}.{} has no matching children entry",
+                table.0,
+                table.1
+            )
+        })?;
+    let values = row
+        .after
+        .as_ref()
+        .or(row.before.as_ref())
+        .ok_or_else(|| anyhow::anyhow!("child row carries no image"))?;
+    let idx = rt
+        .columns
+        .iter()
+        .position(|c| c == &spec.foreign_key)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "fk column {} missing on {}.{}",
+                spec.foreign_key,
+                table.0,
+                table.1
+            )
+        })?;
+    values.get(idx).and_then(|v| v.clone()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "child row of {}.{} carries no {}; cannot locate its parent",
+            table.0,
+            table.1,
+            spec.foreign_key
+        )
+    })
+}
+
+/// Resolve everything held and emit it.
+///
+/// One query per child collection and one per parent table, for the whole group,
+/// rather than two per changed row.
+async fn flush_pending(
+    cfg: &MySqlSourceConfig,
+    pending: &mut pg2osync_core::children::Pending,
+    conn: &mut MySqlConnection,
+    tx: &tokio::sync::mpsc::Sender<ChangeEvent>,
+    version: Option<u64>,
+) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    for table in pending.tables() {
+        let (mut emitted, named) = pending.take(&table);
+        let specs = cfg.children.get(&table).cloned().unwrap_or_default();
+        let missing = pg2osync_core::children::keys_needing_refetch(&emitted, named);
+        if !missing.is_empty() {
+            let found =
+                crate::children::refetch_parents(conn, &table.0, &table.1, &missing).await?;
+            for key in missing {
+                // a parent that no longer exists emits nothing: the delete of the
+                // parent itself is what removes the document
+                if let Some(doc) = found.get(&pg2osync_core::children::key_lookup(&key)) {
+                    emitted.push(RowChange {
+                        schema: table.0.clone(),
+                        table: table.1.clone(),
+                        kind: RowKind::Insert {
+                            pk: key,
+                            doc: doc.clone(),
+                        },
+                        version: None,
+                    });
+                }
+            }
+        }
+        for spec in &specs {
+            let keys: Vec<serde_json::Value> = emitted.iter().map(|r| r.pk().clone()).collect();
+            let by_key = crate::children::fetch_many(spec, conn, &keys).await?;
+            let mut cut = 0usize;
+            for change in emitted.iter_mut() {
+                let key = change.pk().clone();
+                let Some(doc) = change.doc_mut() else {
+                    continue;
+                };
+                let (arr, total) = match by_key.get(&pg2osync_core::children::key_lookup(&key)) {
+                    Some((arr, total)) => (arr.clone(), *total),
+                    None => (serde_json::Value::Array(Vec::new()), 0),
+                };
+                if pg2osync_core::children::apply_collection(doc, spec, arr, total) {
+                    cut += 1;
+                }
+            }
+            if cut > 0 {
+                tracing::warn!(target: "pg2osync::source",
+                    "{cut} document(s) embed only max_rows of {}, and say so in {} and {}",
+                    spec.qualified(), spec.truncated_field(), spec.total_field());
+            }
+        }
+        for mut change in emitted {
+            change.version = version;
+            tx.send(ChangeEvent::Row(change))
+                .await
+                .context("change channel closed")?;
+        }
+    }
+    pending.clear_seen();
+    Ok(())
 }
 
 async fn wait_shutdown(shutdown: &tokio::sync::watch::Receiver<bool>) {

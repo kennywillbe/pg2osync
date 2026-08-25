@@ -190,8 +190,10 @@ async fn mysql(
 ) -> Result<()> {
     let src_cfg = run::mysql_config_for(cfg, source_url)?;
     let tables = src_cfg.tables.clone();
+    let mut children = src_cfg.children.clone();
     let source = pg2osync_source_mysql::runner::MySqlSource::new(src_cfg);
     let mut conn = source.admin_connection().await?;
+    run::resolve_mysql_child_order(&mut children, &mut conn).await?;
     pg2osync_source_mysql::load::run(
         &mut conn,
         &tables,
@@ -201,6 +203,7 @@ async fn mysql(
         stream_id,
         load_done,
         scope,
+        &children,
     )
     .await
 }

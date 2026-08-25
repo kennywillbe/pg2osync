@@ -56,7 +56,7 @@ replay, and no transformation language — if you need those, you want Kafka.
 | **MySQL 8.0 / MariaDB 10.6+ → any of the above** | ✅ verified end to end |
 | Consistent initial load, then live streaming | ✅ |
 | Crash recovery with no data loss (`kill -9` safe) | ✅ verified by the e2e suite |
-| Nested child collections (one level) | ✅ parent document embeds child arrays |
+| Nested child collections (one level) | ✅ PostgreSQL and MySQL/MariaDB; the parent document embeds child arrays, resolved once per collection per transaction |
 | Column projection (`columns` / `exclude_columns`) | ✅ |
 | Column transforms (`hash`, `redact`) | ✅ |
 | TRUNCATE propagation | ✅ PostgreSQL and MySQL/MariaDB |
@@ -87,7 +87,6 @@ Stated up front, because finding these out in production is expensive:
   `max_rows` bounds a collection, and a document whose array was cut says so.
 - **MySQL needs `binlog_row_image = FULL`**, and refuses
   `binlog_row_value_options = PARTIAL_JSON`.
-- **MySQL nested children are not supported yet.**
 - Ordering is guaranteed per row, not across tables.
 
 ## Requirements

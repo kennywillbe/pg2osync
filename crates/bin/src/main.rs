@@ -788,6 +788,8 @@ fn mysql_source(
                 .collect(),
             start_file: None,
             start_pos: 0,
+            children: Default::default(),
+            child_parents: Default::default(),
             tls: cfg.tls_settings(source_url)?,
         },
     ))
