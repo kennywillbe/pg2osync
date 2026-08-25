@@ -239,7 +239,13 @@ impl Sink for MeilisearchSink {
         })
     }
 
-    async fn truncate_index(&self, index: &str) -> Result<(), CoreError> {
+    async fn truncate_index(
+        &self,
+        index: &str,
+        // Meilisearch has no document versions, so there is no ordering to
+        // preserve and nothing to carry here
+        _version: Option<u64>,
+    ) -> Result<(), CoreError> {
         let (status, body) = self
             .send(
                 reqwest::Method::DELETE,

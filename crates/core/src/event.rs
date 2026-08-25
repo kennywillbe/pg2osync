@@ -13,15 +13,15 @@ use serde_json::Value;
 /// buffering until COMMIT is a correctness invariant, not an optimization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionBoundary {
-    Begin,
+    /// `lsn` is the position this transaction will commit at, which pgoutput
+    /// reports up front. Known before any of its rows arrive, which is what
+    /// lets every document it produces carry a version.
+    Begin { lsn: Lsn },
     /// `lsn` is the commit LSN; it is the highest position that may be
     /// acknowledged to the source once this transaction's rows are durable.
     /// `commit_ts_micros` is microseconds since 2000-01-01 (PG epoch), or 0
     /// when unavailable (backfill boundaries).
-    Commit {
-        lsn: Lsn,
-        commit_ts_micros: i64,
-    },
+    Commit { lsn: Lsn, commit_ts_micros: i64 },
 }
 
 /// A single committed row change.

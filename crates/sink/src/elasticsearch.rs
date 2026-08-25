@@ -31,7 +31,82 @@ pub struct ElasticsearchSinkConfig {
     pub retry: crate::RetryPolicy,
 }
 
+/// The version fields of a bulk action header, or nothing when the source has
+/// no position to version by.
+///
+/// `external_gte` rather than `external`: a replay after a crash writes the
+/// same position again, which `external` rejects and `external_gte` accepts.
+fn version_fields(position: Option<u64>) -> String {
+    match crate::external_version(position) {
+        Some(v) => format!(",\"version\":{v},\"version_type\":\"external_gte\""),
+        None => String::new(),
+    }
+}
+
 impl ElasticsearchSink {
+    /// Clear an index by deleting each document at the truncate's own position.
+    ///
+    /// The loop stops when a round deletes nothing, which is also what makes it
+    /// correct: a document written after the truncate carries a higher version,
+    /// its delete is refused, and it survives.
+    async fn truncate_at_version(&self, index: &str, version: i64) -> Result<(), CoreError> {
+        const PAGE: usize = 1000;
+        loop {
+            let (_, body) = self
+                .send(
+                    reqwest::Method::POST,
+                    &format!("/{index}/_search"),
+                    Some(
+                        json!({"size": PAGE, "_source": false, "query": {"match_all": {}}})
+                            .to_string(),
+                    ),
+                )
+                .await?;
+            let ids: Vec<String> = body["hits"]["hits"]
+                .as_array()
+                .map(|hits| {
+                    hits.iter()
+                        .filter_map(|hit| hit["_id"].as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if ids.is_empty() {
+                return Ok(());
+            }
+            let mut ndjson = String::new();
+            for id in &ids {
+                ndjson.push_str(&format!(
+                    "{{\"delete\":{{\"_index\":{},\"_id\":{},\"version\":{version},\
+                     \"version_type\":\"external_gte\"}}}}\n",
+                    serde_json::to_string(index).unwrap(),
+                    serde_json::to_string(id).unwrap(),
+                ));
+            }
+            let (status, body) = self
+                .send(reqwest::Method::POST, "/_bulk?refresh=true", Some(ndjson))
+                .await?;
+            if status != 200 {
+                return Err(CoreError::Sink(format!("truncate {index}: {status}")));
+            }
+            let deleted = body["items"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter(|item| {
+                            item["delete"]["status"]
+                                .as_u64()
+                                .is_some_and(|s| (200..300).contains(&s))
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            if deleted == 0 {
+                return Ok(());
+            }
+        }
+    }
+
     async fn put_settings(&self, index: &str, body: serde_json::Value) -> Result<(), CoreError> {
         let (status, body) = self
             .send(
@@ -112,20 +187,27 @@ impl ElasticsearchSink {
         let mut ndjson = String::new();
         for op in batch {
             match &op.op {
-                DocumentOp::Upsert { index, id, doc } => {
+                DocumentOp::Upsert {
+                    index,
+                    id,
+                    doc,
+                    version,
+                } => {
                     ndjson.push_str(&format!(
-                        "{{\"index\":{{\"_index\":{},\"_id\":{}}}}}\n",
+                        "{{\"index\":{{\"_index\":{},\"_id\":{}{}}}}}\n",
                         serde_json::to_string(index).unwrap(),
-                        serde_json::to_string(id).unwrap()
+                        serde_json::to_string(id).unwrap(),
+                        version_fields(*version)
                     ));
                     ndjson.push_str(&serde_json::to_string(doc).unwrap());
                     ndjson.push('\n');
                 }
-                DocumentOp::Delete { index, id } => {
+                DocumentOp::Delete { index, id, version } => {
                     ndjson.push_str(&format!(
-                        "{{\"delete\":{{\"_index\":{},\"_id\":{}}}}}\n",
+                        "{{\"delete\":{{\"_index\":{},\"_id\":{}{}}}}}\n",
                         serde_json::to_string(index).unwrap(),
-                        serde_json::to_string(id).unwrap()
+                        serde_json::to_string(id).unwrap(),
+                        version_fields(*version)
                     ));
                 }
             }
@@ -161,13 +243,20 @@ impl ElasticsearchSink {
                 .cloned()
                 .unwrap_or(Value::Null);
             let s = entry["status"].as_u64().unwrap_or(0);
+            let error_type = entry["error"]["type"].as_str().unwrap_or("unknown");
             if s == 429 || s >= 500 {
                 retryable = true;
+            } else if error_type == "version_conflict_engine_exception" {
+                // a later position already holds this document, so declining
+                // the write is the ordering rule working rather than a failure
+                tracing::trace!(target: "pg2osync::sink",
+                    "version conflict on {} left the newer document in place",
+                    entry["_id"].as_str().unwrap_or("?"));
             } else if !(200..300).contains(&s) {
                 permanent.push((
                     entry["_id"].as_str().unwrap_or("?").into(),
                     entry["_index"].as_str().unwrap_or("?").into(),
-                    entry["error"]["type"].as_str().unwrap_or("unknown").into(),
+                    error_type.into(),
                 ));
             }
         }
@@ -291,12 +380,19 @@ impl Sink for ElasticsearchSink {
         }
     }
 
-    async fn truncate_index(&self, index: &str) -> Result<(), CoreError> {
+    async fn truncate_index(&self, index: &str, version: Option<u64>) -> Result<(), CoreError> {
         // an unrefreshed write is invisible to _delete_by_query and would
         // outlive the TRUNCATE that is supposed to remove it
         let _ = self
             .send(reqwest::Method::POST, &format!("/{index}/_refresh"), None)
             .await;
+        // delete_by_query is internally versioned, so it leaves a tombstone
+        // above the document's own version and a replayed write is then
+        // rejected forever. A versioned bulk delete puts the tombstone at the
+        // truncate's position instead.
+        if let Some(version) = crate::external_version(version) {
+            return self.truncate_at_version(index, version).await;
+        }
         let (status, _) = self
             .send(
                 reqwest::Method::POST,

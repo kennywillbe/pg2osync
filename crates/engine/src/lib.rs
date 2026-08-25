@@ -102,7 +102,9 @@ impl DurableLsn {
 /// documents the source has already dropped.
 enum SinkCommand {
     Write(Vec<LsnOp>),
-    Truncate(String),
+    /// Clearing an index, carrying the position it happened at so a versioned
+    /// target can order it against the writes around it.
+    Truncate(String, Option<u64>),
     /// A commit whose rows were already handed over — an empty transaction, or
     /// one whose row count was an exact multiple of the batch size. The
     /// position still has to be acknowledged, and it travels through this
@@ -205,6 +207,9 @@ pub async fn run(
     // an event pulled off the channel while gathering rows, to be handled on
     // the next turn rather than dropped
     let mut deferred: Option<ChangeEvent> = None;
+    // the position the open transaction commits at, which is the document
+    // version for every row it produces
+    let mut version: Option<u64> = None;
     // when the current run of coalesced transactions started, so a busy stream
     // cannot postpone a flush indefinitely
     let mut coalescing_since: Option<std::time::Instant> = None;
@@ -227,8 +232,12 @@ pub async fn run(
         };
         tracing::trace!(target: "pg2osync::engine", "engine got event");
         match ev {
-            ChangeEvent::Transaction(TransactionBoundary::Begin) => {
-                tracing::debug!(target: "pg2osync::engine", "BEGIN");
+            ChangeEvent::Transaction(TransactionBoundary::Begin { lsn }) => {
+                tracing::debug!(target: "pg2osync::engine", "BEGIN at {lsn}");
+                // every document this transaction writes is versioned by the
+                // position it becomes visible at, so a write carrying an older
+                // position can never overwrite a newer one at the target
+                version = Some(lsn.0);
             }
             ChangeEvent::Transaction(TransactionBoundary::Commit {
                 lsn,
@@ -330,6 +339,7 @@ pub async fn run(
                         &ctx.projections,
                         &ctx.transforms,
                         previous,
+                        version,
                     ) {
                         Ok(ops) => ops,
                         Err(e) => {
@@ -382,7 +392,11 @@ pub async fn run(
                     break Err(CoreError::Other("batch channel closed".into()));
                 }
                 txn_bytes = 0;
-                if batch_tx.send(SinkCommand::Truncate(index)).await.is_err() {
+                if batch_tx
+                    .send(SinkCommand::Truncate(index, version))
+                    .await
+                    .is_err()
+                {
                     break Err(CoreError::Other("batch channel closed".into()));
                 }
             }
@@ -408,14 +422,16 @@ async fn sink_loop(
         let result = match command {
             SinkCommand::Write(batch) => sink.write(batch).await.map(Some),
             SinkCommand::Position(lsn) => Ok(Some(SinkAck { max_lsn: lsn })),
-            SinkCommand::Truncate(index) => match sink.truncate_index(&index).await {
-                Ok(()) => {
-                    tracing::info!(target: "pg2osync::sink",
+            SinkCommand::Truncate(index, version) => {
+                match sink.truncate_index(&index, version).await {
+                    Ok(()) => {
+                        tracing::info!(target: "pg2osync::sink",
                         "index {index} cleared after TRUNCATE");
-                    Ok(None)
+                        Ok(None)
+                    }
+                    Err(e) => Err(e),
                 }
-                Err(e) => Err(e),
-            },
+            }
         };
         match result {
             Ok(Some(ack)) => {
@@ -456,10 +472,10 @@ async fn sink_loop(
 fn op_size(op: &LsnOp) -> usize {
     const OVERHEAD: usize = 64;
     match &op.op {
-        DocumentOp::Upsert { index, id, doc } => {
+        DocumentOp::Upsert { index, id, doc, .. } => {
             index.len() + id.len() + estimate_json(doc) + OVERHEAD
         }
-        DocumentOp::Delete { index, id } => index.len() + id.len() + OVERHEAD,
+        DocumentOp::Delete { index, id, .. } => index.len() + id.len() + OVERHEAD,
     }
 }
 
@@ -559,6 +575,7 @@ fn materialize<'a>(
     projections: &crate::mapping::Projections,
     transforms: &crate::mapping::Transforms,
     previous: Option<&Value>,
+    version: Option<u64>,
 ) -> Result<Vec<LsnOp>, CoreError> {
     // PENDING_LSN is overwritten by the commit handler before any ack can
     // reference it: rows never leave the buffer without their commit attached.
@@ -578,6 +595,7 @@ fn materialize<'a>(
                 index: index.into(),
                 id: pk_to_id(pk),
                 doc,
+                version,
             }))
         }
         RowKind::Update {
@@ -613,6 +631,7 @@ fn materialize<'a>(
                 index: index.into(),
                 id,
                 doc,
+                version,
             });
             // write first, delete second: a crash between them leaves a
             // duplicate that the replay repairs, where the reverse order would
@@ -623,6 +642,7 @@ fn materialize<'a>(
                     op: DocumentOp::Delete {
                         index: index.into(),
                         id: previous,
+                        version,
                     },
                 });
             }
@@ -631,6 +651,7 @@ fn materialize<'a>(
         RowKind::Delete { pk } => Ok(mk(DocumentOp::Delete {
             index: index.into(),
             id: pk_to_id(pk),
+            version,
         })),
     }
 }
@@ -727,7 +748,10 @@ mod pipeline_tests {
             let rendered: Vec<String> = batch
                 .iter()
                 .map(|op| match &op.op {
-                    DocumentOp::Upsert { id, .. } => format!("upsert:{id}"),
+                    DocumentOp::Upsert { id, version, .. } => match version {
+                        Some(v) => format!("upsert:{id}@{v}"),
+                        None => format!("upsert:{id}"),
+                    },
                     DocumentOp::Delete { id, .. } => format!("delete:{id}"),
                 })
                 .collect();
@@ -746,7 +770,11 @@ mod pipeline_tests {
             Ok(())
         }
 
-        async fn truncate_index(&self, index: &str) -> Result<(), CoreError> {
+        async fn truncate_index(
+            &self,
+            index: &str,
+            _version: Option<u64>,
+        ) -> Result<(), CoreError> {
             self.events
                 .lock()
                 .expect("not poisoned")
@@ -783,6 +811,10 @@ mod pipeline_tests {
                 doc: json!({"id": id}),
             },
         })
+    }
+
+    fn begin(lsn: u64) -> ChangeEvent {
+        ChangeEvent::Transaction(TransactionBoundary::Begin { lsn: Lsn(lsn) })
     }
 
     fn commit(lsn: u64) -> ChangeEvent {
@@ -847,6 +879,42 @@ mod pipeline_tests {
         let ckpt = sink.last_checkpoint().expect("checkpoint persisted");
         assert_eq!(ckpt.token, 0x100);
         assert_eq!(ckpt.position, "0/100", "position is rendered by the source");
+    }
+
+    #[tokio::test]
+    async fn a_transaction_versions_its_documents_by_the_position_it_commits_at() {
+        // pgoutput reports the commit position at BEGIN, so the version is known
+        // before the rows arrive. It is what stops a stale write from
+        // overwriting a newer document at the target.
+        let sink = run_script(10, vec![begin(0x200), row(1), row(2), commit(0x200)]).await;
+        assert_eq!(sink.events(), vec!["write[upsert:1@512 upsert:2@512]"]);
+    }
+
+    #[tokio::test]
+    async fn coalescing_transactions_into_one_batch_does_not_blur_their_versions() {
+        let sink = run_script(
+            10,
+            vec![
+                begin(0x100),
+                row(1),
+                commit(0x100),
+                begin(0x300),
+                row(2),
+                commit(0x300),
+            ],
+        )
+        .await;
+        // whole transactions share a batch, and each row still carries the
+        // position of the transaction it belongs to
+        assert_eq!(sink.events(), vec!["write[upsert:1@256 upsert:2@768]"]);
+    }
+
+    #[tokio::test]
+    async fn rows_with_no_transaction_of_their_own_go_unversioned() {
+        // the initial load sends rows without a BEGIN, because it has no
+        // position to offer yet
+        let sink = run_script(10, vec![row(1), commit(0)]).await;
+        assert_eq!(sink.events(), vec!["write[upsert:1]"]);
     }
 
     #[tokio::test]

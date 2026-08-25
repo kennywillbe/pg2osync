@@ -78,6 +78,10 @@ pub async fn table(
                 op: DocumentOp::Delete {
                     index: table.index.clone(),
                     id: id.clone(),
+                    // unversioned on purpose: the row is gone from the source,
+                    // so there is no position that says when it went, and a
+                    // guessed version could lose to a stale document
+                    version: None,
                 },
             })
             .collect();
