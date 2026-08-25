@@ -139,8 +139,30 @@ impl Default for RetryPolicy {
     }
 }
 
+/// Whether a URL points straight at an OpenSearch Serverless collection.
+///
+/// Every request to one has to be signed with SigV4 and this client cannot sign
+/// anything, so the endpoint answers 403 to all of it. Naming that at startup
+/// is the difference between a configuration error and an afternoon spent
+/// reading rejected requests. A signing proxy is addressed by its own host, so
+/// the supported arrangement does not trip on this.
+fn is_serverless_endpoint(url: &str) -> bool {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let host = after_scheme.split(['/', ':']).next().unwrap_or("");
+    host.to_ascii_lowercase().ends_with(".aoss.amazonaws.com")
+}
+
 impl OpenSearchSink {
     pub fn new(cfg: OpenSearchSinkConfig) -> Result<Self, CoreError> {
+        if is_serverless_endpoint(&cfg.url) {
+            return Err(CoreError::Sink(format!(
+                "{} is an OpenSearch Serverless endpoint, and every request to one must be \
+                 signed with SigV4 — which pg2osync does not do. Point [target] url at a \
+                 signing proxy that forwards to the collection, and keep serverless = true \
+                 so the calls AOSS rejects are skipped",
+                cfg.url
+            )));
+        }
         let pool_url = cfg
             .url
             .parse()
@@ -1313,5 +1335,29 @@ mod tests {
         let stored = reject_from_doc("orders-7", &reject_doc(&r)).expect("readable");
         assert_eq!(stored.rejection, r, "a delete keeps being a delete");
         assert_eq!(stored.id, "orders-7");
+    }
+
+    #[test]
+    fn a_collection_endpoint_is_refused_rather_than_left_to_403() {
+        assert!(super::is_serverless_endpoint(
+            "https://abc123.eu-west-1.aoss.amazonaws.com"
+        ));
+        assert!(super::is_serverless_endpoint(
+            "https://ABC123.US-EAST-1.AOSS.AMAZONAWS.COM/"
+        ));
+    }
+
+    #[test]
+    fn a_signing_proxy_is_the_supported_arrangement_and_passes() {
+        // What the docs tell an operator to run: the proxy holds the credentials
+        // and is addressed by its own host, so this must not be refused.
+        assert!(!super::is_serverless_endpoint("http://localhost:8080"));
+        assert!(!super::is_serverless_endpoint(
+            "https://aoss-proxy.internal:9200"
+        ));
+        // and a provisioned domain, which is a different service entirely
+        assert!(!super::is_serverless_endpoint(
+            "https://search-mine-xyz.eu-west-1.es.amazonaws.com"
+        ));
     }
 }
