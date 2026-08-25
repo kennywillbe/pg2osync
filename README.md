@@ -51,7 +51,7 @@ replay, and no transformation language — if you need those, you want Kafka.
 | **PostgreSQL → OpenSearch** (logical replication) | ✅ verified end to end |
 | PostgreSQL → Elasticsearch 8.x | ✅ verified end to end |
 | PostgreSQL → Meilisearch 1.x | ✅ verified end to end (file-based checkpoint) |
-| PostgreSQL → Amazon OpenSearch Serverless | ✅ serverless-safe profile |
+| PostgreSQL → Amazon OpenSearch Serverless | ⚠️ profile exists, never run against a real collection — [see the caveats](docs/sinks/opensearch.md#amazon-opensearch-serverless) |
 | **MySQL 8.0 / MariaDB 10.6+ → any of the above** | ✅ verified end to end |
 | Consistent initial load, then live streaming | ✅ |
 | Crash recovery with no data loss (`kill -9` safe) | ✅ verified by the e2e suite |
