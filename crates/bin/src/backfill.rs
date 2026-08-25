@@ -1,9 +1,24 @@
-//! Consistent initial load for the PostgreSQL source.
+//! Initial load for the PostgreSQL source.
 //!
-//! Reads every configured table inside one repeatable-read snapshot taken
-//! *after* the replication slot exists, so the streaming phase can only
-//! re-deliver rows, never skip them. Duplicates are harmless under
-//! at-least-once delivery with idempotent writes.
+//! A table is read in primary-key ranges, each range in its own short
+//! transaction, rather than all tables inside one long-lived snapshot. What
+//! makes that safe is not snapshot consistency: it is that the replication slot
+//! exists *before* the first range is read and nothing advances it during the
+//! load, so streaming afterwards resumes from a position that predates every
+//! range. Anything a range missed or read stale is still in the WAL and is
+//! replayed onto an idempotent write.
+//!
+//! Two conditions that argument depends on, both already true here: writes are
+//! whole-document upserts keyed by the row's primary key, and an update whose
+//! TOASTed columns arrive as markers is completed from the stored document
+//! before it is written — otherwise a replayed update would erase a value a
+//! range had read correctly.
+//!
+//! Ranges are read unordered on purpose. `ORDER BY pk LIMIT n` forbids a bitmap
+//! heap scan, so a row-estimate miss degrades to a sort per chunk, and index
+//! order costs random heap access on any key that is not physically correlated.
+//! `WHERE pk >= a AND pk < b` leaves the planner free to read the heap in
+//! physical order.
 
 use anyhow::{Context as _, Result, bail};
 use pg2osync_core::event::{ChangeEvent, RowKind, TransactionBoundary};
@@ -25,6 +40,15 @@ pub struct ColMeta {
 /// Rows between synthetic commit boundaries. Large tables would otherwise
 /// buffer entirely in the engine before the first flush.
 const ROWS_PER_BOUNDARY: u64 = 5_000;
+
+/// Rows a single range should cover. A range is read as one statement and
+/// cannot be interrupted, so this also bounds how long the load goes without
+/// checking anything — which is the argument for sizing chunks at all.
+const TARGET_ROWS_PER_CHUNK: i64 = 50_000;
+
+/// Enough sampled rows per boundary that an uneven key distribution produces
+/// uneven ranges rather than empty ones.
+const SAMPLE_ROWS_PER_BOUNDARY: f64 = 20.0;
 
 pub async fn columns_of(
     client: &tokio_postgres::Client,
@@ -72,6 +96,8 @@ fn copy_statement(
     cols: &[ColMeta],
     children: &[ChildSpec],
     soft_delete: Option<&str>,
+    range: &KeyRange,
+    pk_column: Option<&str>,
 ) -> String {
     let mut selected: Vec<String> = cols
         .iter()
@@ -93,11 +119,22 @@ fn copy_statement(
         ));
     }
 
+    let mut conditions: Vec<String> = Vec::new();
+    if let Some(key) = pk_column {
+        let predicate = range.predicate(&format!("p.{}", quote_ident(key)));
+        if !predicate.is_empty() {
+            conditions.push(predicate);
+        }
+    }
     // a row that is already deleted has no business being indexed and then
     // deleted again on the first poll cycle
-    let filter = match soft_delete {
-        Some(predicate) => format!(" WHERE NOT ({predicate})"),
-        None => String::new(),
+    if let Some(predicate) = soft_delete {
+        conditions.push(format!("NOT ({predicate})"));
+    }
+    let filter = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conditions.join(" AND "))
     };
     format!(
         "COPY (SELECT {} FROM {} p{}{}) TO STDOUT (FORMAT text)",
@@ -106,6 +143,130 @@ fn copy_statement(
         joins,
         filter
     )
+}
+
+/// One primary-key range to read, as already-quoted SQL literals.
+///
+/// `None` on either side means the range is open there, so a table read in one
+/// piece is a single range open at both ends — exactly the statement this code
+/// issued before it could chunk at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyRange {
+    pub from: Option<String>,
+    pub to: Option<String>,
+}
+
+impl KeyRange {
+    /// The predicate for this range, or the empty string when it covers
+    /// everything.
+    fn predicate(&self, quoted_key: &str) -> String {
+        match (&self.from, &self.to) {
+            (None, None) => String::new(),
+            (Some(from), None) => format!("{quoted_key} >= {from}"),
+            (None, Some(to)) => format!("{quoted_key} < {to}"),
+            (Some(from), Some(to)) => format!("{quoted_key} >= {from} AND {quoted_key} < {to}"),
+        }
+    }
+}
+
+/// Turn a list of interior boundaries into the ranges between them.
+fn ranges_from_bounds(bounds: &[String]) -> Vec<KeyRange> {
+    if bounds.is_empty() {
+        return vec![KeyRange {
+            from: None,
+            to: None,
+        }];
+    }
+    let mut ranges = Vec::with_capacity(bounds.len() + 1);
+    ranges.push(KeyRange {
+        from: None,
+        to: Some(bounds[0].clone()),
+    });
+    for pair in bounds.windows(2) {
+        ranges.push(KeyRange {
+            from: Some(pair[0].clone()),
+            to: Some(pair[1].clone()),
+        });
+    }
+    ranges.push(KeyRange {
+        from: Some(bounds[bounds.len() - 1].clone()),
+        to: None,
+    });
+    ranges
+}
+
+/// Work out where to split a table, or decide not to split it.
+///
+/// The boundaries come from the database rather than from arithmetic on the
+/// keys, so they work for any orderable key type and follow the actual
+/// distribution. They are sampled rather than exact: uneven ranges cost a
+/// little throughput, and a full pass to make them exact would cost more than
+/// chunking saves.
+async fn key_ranges(
+    client: &tokio_postgres::Client,
+    qualified_table: &str,
+    cols: &[ColMeta],
+) -> Result<Vec<KeyRange>> {
+    let whole = vec![KeyRange {
+        from: None,
+        to: None,
+    }];
+
+    // A composite key would need a row-constructor comparison, which is right
+    // for PostgreSQL and pathological on MySQL; until that is worth branching
+    // for, such a table is read in one piece as before.
+    let pk: Vec<&ColMeta> = cols.iter().filter(|c| c.is_pk).collect();
+    let [key] = pk.as_slice() else {
+        return Ok(whole);
+    };
+
+    // reltuples is an estimate maintained by ANALYZE, and -1 means never
+    // analysed. Reading it costs nothing, which is the point: deciding whether
+    // to chunk must not itself scan the table.
+    let estimate: f64 = client
+        .query_one(
+            "SELECT reltuples::float8 FROM pg_class WHERE oid = ($1::text)::regclass",
+            &[&qualified_table],
+        )
+        .await
+        .context("cannot estimate table size")?
+        .get(0);
+    if estimate < TARGET_ROWS_PER_CHUNK as f64 {
+        return Ok(whole);
+    }
+
+    let chunks = (estimate / TARGET_ROWS_PER_CHUNK as f64).ceil() as i64;
+    let boundaries = chunks - 1;
+    if boundaries < 1 {
+        return Ok(whole);
+    }
+    let fractions: Vec<f64> = (1..=boundaries).map(|i| i as f64 / chunks as f64).collect();
+
+    // Sample a fraction of pages rather than reading the table: SYSTEM is the
+    // cheap sampling method, and its page-level bias only makes the ranges less
+    // even, which they already are.
+    let percent =
+        ((boundaries as f64 * SAMPLE_ROWS_PER_BOUNDARY / estimate) * 100.0).clamp(0.5, 100.0);
+    let sql = format!(
+        "SELECT quote_literal(v::text) FROM (              SELECT unnest(percentile_disc($1::float8[]) WITHIN GROUP (ORDER BY {key})) AS v              FROM {table} TABLESAMPLE SYSTEM ($2::float8)          ) s WHERE v IS NOT NULL",
+        key = quote_ident(&key.name),
+        table = qualify(qualified_table),
+    );
+    let rows = client
+        .query(&sql, &[&fractions, &percent])
+        .await
+        .with_context(|| format!("cannot sample key boundaries of {qualified_table}"))?;
+
+    // The sample can repeat a boundary where keys are dense; duplicates would
+    // produce empty ranges, which are harmless but pointless.
+    let mut bounds: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
+    bounds.dedup();
+    if bounds.is_empty() {
+        return Ok(whole);
+    }
+    tracing::debug!(target: "pg2osync::backfill",
+        "{qualified_table}: ~{estimate:.0} rows, reading in {} range(s)", bounds.len() + 1);
+    Ok(ranges_from_bounds(&bounds))
 }
 
 /// A child collection reaches the document as one JSON column, so it can ride
@@ -128,18 +289,13 @@ pub async fn run(
     children: &HashMap<(String, String), Vec<ChildSpec>>,
     tx: Sender<ChangeEvent>,
 ) -> Result<()> {
-    // a dedicated connection holds the snapshot so the admin connection stays
-    // free for catalog work
-    let mut reader = pg2osync_source::tls::connect(tls, source_url)
+    // A dedicated connection, but no transaction spanning the load: each range
+    // is its own statement and its own snapshot. Holding one open for the whole
+    // load pins the xmin horizon, so autovacuum cannot clean anything that died
+    // after it started — minutes are fine, an hour on a busy table is not.
+    let reader = pg2osync_source::tls::connect(tls, source_url)
         .await
         .context("backfill connection failed")?;
-    let snapshot = reader.transaction().await?;
-    snapshot
-        .execute(
-            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
-            &[],
-        )
-        .await?;
 
     for tbl in cfg.sync.values() {
         let (schema, table) = split_qualified(&tbl.table);
@@ -162,49 +318,76 @@ pub async fn run(
             }
             cols.push(child_column(child));
         }
-        let sql = copy_statement(
-            &tbl.table,
-            &cols[..cols.len() - child_specs.len()],
-            child_specs,
-            tbl.soft_delete.as_deref(),
-        );
+        // The column list is pinned here and reused for every range. A column
+        // added mid-load would otherwise leave earlier ranges shaped one way
+        // and later ranges another, and no WAL event repairs that: ADD COLUMN
+        // with a constant default does not rewrite existing rows.
+        let data_cols = &cols[..cols.len() - child_specs.len()];
+        let pk_column = cols
+            .iter()
+            .filter(|c| c.is_pk)
+            .map(|c| c.name.clone())
+            .collect::<Vec<_>>();
+        let pk_column = (pk_column.len() == 1).then(|| pk_column[0].clone());
+        let ranges = key_ranges(admin, &tbl.table, &cols).await?;
 
         let started = std::time::Instant::now();
         let mut count: u64 = 0;
-        let copy_stream = snapshot.copy_out(&sql).await?;
-        use futures::StreamExt;
-        let mut pending = String::new();
-        let mut stream = std::pin::pin!(copy_stream);
-        while let Some(chunk) = stream.next().await {
-            let chunk: bytes::Bytes = chunk.context("copy stream failed")?;
-            pending.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(pos) = pending.find('\n') {
-                let line: String = pending.drain(..pos + 1).collect();
-                let line = line.trim_end_matches('\n');
-                if line.is_empty() {
-                    continue;
+        for range in &ranges {
+            let sql = copy_statement(
+                &tbl.table,
+                data_cols,
+                child_specs,
+                tbl.soft_delete.as_deref(),
+                range,
+                pk_column.as_deref(),
+            );
+            let copy_stream = reader.copy_out(&sql).await?;
+            use futures::StreamExt;
+            // A cursor rather than draining each line off the front: draining
+            // from the front shifts everything behind it, so a network chunk
+            // full of short rows paid one memmove of the whole chunk per row.
+            // Measured no faster on a load this size — the target's indexing
+            // rate dominates by two orders of magnitude — but the quadratic
+            // shape is gone and there is one allocation less per row.
+            let mut pending: Vec<u8> = Vec::new();
+            let mut stream = std::pin::pin!(copy_stream);
+            while let Some(chunk) = stream.next().await {
+                let chunk: bytes::Bytes = chunk.context("copy stream failed")?;
+                pending.extend_from_slice(&chunk);
+                let mut consumed = 0usize;
+                while let Some(nl) = pending[consumed..].iter().position(|&b| b == b'\n') {
+                    let line = &pending[consumed..consumed + nl];
+                    consumed += nl + 1;
+                    if line.is_empty() {
+                        continue;
+                    }
+                    count += 1;
+                    // child collections arrive as ordinary jsonb columns of this
+                    // very row, so nothing extra is fetched per parent
+                    let change = {
+                        let text = String::from_utf8_lossy(line);
+                        let fields: Vec<Option<Vec<u8>>> =
+                            split_copy_line(&text).iter().map(unescape_copy).collect();
+                        build_change(schema, table, &cols, &fields)?
+                    };
+                    if tx.send(ChangeEvent::Row(change)).await.is_err() {
+                        bail!("engine closed during backfill");
+                    }
+                    if count.is_multiple_of(ROWS_PER_BOUNDARY) {
+                        send_boundary(&tx).await?;
+                    }
                 }
-                count += 1;
-                let fields: Vec<Option<Vec<u8>>> =
-                    split_copy_line(line).iter().map(unescape_copy).collect();
-                // child collections arrive as ordinary jsonb columns of this
-                // very row, so nothing extra is fetched per parent
-                let change = build_change(schema, table, &cols, &fields)?;
-                if tx.send(ChangeEvent::Row(change)).await.is_err() {
-                    bail!("engine closed during backfill");
-                }
-                if count.is_multiple_of(ROWS_PER_BOUNDARY) {
-                    send_boundary(&tx).await?;
-                }
+                // one compaction per network chunk, not one per row
+                pending.drain(..consumed);
             }
         }
         send_boundary(&tx).await?;
         let secs = started.elapsed().as_secs_f64();
         tracing::info!(target: "pg2osync::backfill",
-            "backfilled {} rows from {} in {:.1}s (~{:.0} rows/s)",
-            count, tbl.table, secs, count as f64 / secs.max(f64::EPSILON));
+            "backfilled {} rows from {} in {:.1}s (~{:.0} rows/s) over {} range(s)",
+            count, tbl.table, secs, count as f64 / secs.max(f64::EPSILON), ranges.len());
     }
-    drop(snapshot);
     Ok(())
 }
 
@@ -324,12 +507,114 @@ fn quote_ident(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn one_boundary_makes_two_ranges_that_meet_without_overlapping() {
+        let ranges = ranges_from_bounds(&["'500'".into()]);
+        assert_eq!(
+            ranges,
+            vec![
+                KeyRange {
+                    from: None,
+                    to: Some("'500'".into())
+                },
+                KeyRange {
+                    from: Some("'500'".into()),
+                    to: None
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn the_ends_stay_open_so_no_row_falls_outside_every_range() {
+        let ranges = ranges_from_bounds(&["'10'".into(), "'20'".into(), "'30'".into()]);
+        assert_eq!(ranges.len(), 4);
+        assert!(
+            ranges.first().expect("first").from.is_none(),
+            "no lower bound"
+        );
+        assert!(ranges.last().expect("last").to.is_none(), "no upper bound");
+        // each range starts where the previous one ended: half-open, so a key
+        // equal to a boundary belongs to exactly one range
+        for pair in ranges.windows(2) {
+            assert_eq!(pair[0].to, pair[1].from);
+        }
+    }
+
+    #[test]
+    fn no_boundaries_means_one_range_over_everything() {
+        assert_eq!(ranges_from_bounds(&[]), vec![whole()]);
+        assert_eq!(whole().predicate("\"id\""), "", "and no predicate at all");
+    }
+
+    #[test]
+    fn a_range_predicate_is_closed_below_and_open_above() {
+        let range = KeyRange {
+            from: Some("'10'".into()),
+            to: Some("'20'".into()),
+        };
+        assert_eq!(
+            range.predicate("p.\"id\""),
+            "p.\"id\" >= '10' AND p.\"id\" < '20'"
+        );
+        let first = KeyRange {
+            from: None,
+            to: Some("'10'".into()),
+        };
+        assert_eq!(first.predicate("p.\"id\""), "p.\"id\" < '10'");
+        let last = KeyRange {
+            from: Some("'20'".into()),
+            to: None,
+        };
+        assert_eq!(last.predicate("p.\"id\""), "p.\"id\" >= '20'");
+    }
+
+    #[test]
+    fn a_range_and_a_soft_delete_filter_both_apply() {
+        let sql = copy_statement(
+            "public.users",
+            &[col("id")],
+            &[],
+            Some("deleted_at IS NOT NULL"),
+            &KeyRange {
+                from: Some("'1'".into()),
+                to: Some("'9'".into()),
+            },
+            Some("id"),
+        );
+        assert!(sql.contains("p.\"id\" >= '1' AND p.\"id\" < '9'"), "{sql}");
+        assert!(sql.contains("NOT (deleted_at IS NOT NULL)"), "{sql}");
+        assert_eq!(sql.matches("WHERE").count(), 1, "one WHERE, not two: {sql}");
+    }
+
+    #[test]
+    fn a_composite_key_reads_the_table_in_one_piece() {
+        // a row-constructor comparison is right for PostgreSQL and pathological
+        // on MySQL, so chunking waits until that is worth branching for
+        let mut a = col("a");
+        let mut b = col("b");
+        a.is_pk = true;
+        b.is_pk = true;
+        let sql = copy_statement("public.t", &[a, b], &[], None, &whole(), None);
+        assert!(!sql.contains("WHERE"), "{sql}");
+    }
+
+    /// The range that covers the whole table — what an unchunked read uses.
+    fn whole() -> KeyRange {
+        KeyRange {
+            from: None,
+            to: None,
+        }
+    }
+
+    #[test]
     fn a_soft_deleted_row_is_not_loaded_only_to_be_deleted_later() {
         let sql = copy_statement(
             "public.users",
             &[col("id")],
             &[],
             Some("deleted_at IS NOT NULL"),
+            &whole(),
+            None,
         );
         assert!(sql.contains("WHERE NOT (deleted_at IS NOT NULL)"), "{sql}");
     }
@@ -358,7 +643,14 @@ mod tests {
 
     #[test]
     fn a_table_without_children_reads_straight_through() {
-        let sql = copy_statement("public.users", &[col("id"), col("name")], &[], None);
+        let sql = copy_statement(
+            "public.users",
+            &[col("id"), col("name")],
+            &[],
+            None,
+            &whole(),
+            None,
+        );
         assert_eq!(
             sql,
             concat!(
@@ -374,6 +666,8 @@ mod tests {
             "public.customers",
             &[col("id")],
             &[child("orders", "public.orders", "customer_id", "id")],
+            None,
+            &whole(),
             None,
         );
         assert!(
@@ -401,6 +695,8 @@ mod tests {
                 child("tickets", "support.tickets", "cust", "id"),
             ],
             None,
+            &whole(),
+            None,
         );
         assert!(sql.contains("c0.k = p.\"id\""), "{sql}");
         assert!(sql.contains("c1.k = p.\"id\""), "{sql}");
@@ -414,6 +710,8 @@ mod tests {
             "public.we\"ird",
             &[col("od\"d")],
             &[child("kids", "public.ch\"ild", "fk\"y", "pk\"y")],
+            None,
+            &whole(),
             None,
         );
         assert!(sql.contains("\"we\"\"ird\""), "{sql}");
