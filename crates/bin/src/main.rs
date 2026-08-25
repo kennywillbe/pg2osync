@@ -252,23 +252,41 @@ async fn status(path: &Path) -> Result<()> {
     }
 
     let client = connect_pg(&cfg, &secrets.source_url).await?;
-    match client
-        .query_opt(
-            "SELECT active, confirmed_flush_lsn::text, \
-                    pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)) \
-             FROM pg_replication_slots WHERE slot_name = $1",
-            &[&cfg.source.slot_name],
-        )
-        .await?
-    {
-        Some(row) => println!(
-            "slot {}: active={} confirmed_flush={} retained_wal={}",
-            cfg.source.slot_name,
-            row.get::<_, bool>(0),
-            row.get::<_, String>(1),
-            row.get::<_, String>(2),
-        ),
-        None => println!("slot {} does not exist", cfg.source.slot_name),
+    // every slot, not just ours: an orphan retains WAL until someone drops it,
+    // and it is invisible to anyone who only asks about the configured name
+    let slots = pg2osync_source::catalog::all_slots(&client).await?;
+    if !slots.iter().any(|s| s.name == cfg.source.slot_name) {
+        println!("slot {} does not exist", cfg.source.slot_name);
+    }
+    for slot in &slots {
+        let mine = if slot.name == cfg.source.slot_name {
+            " (configured)"
+        } else {
+            ""
+        };
+        println!(
+            "slot {}{mine}: active={} retained_wal={}",
+            slot.name,
+            slot.active,
+            slot.retained_pretty(),
+        );
+    }
+    let idle: Vec<&str> = slots
+        .iter()
+        .filter(|s| !s.active && s.name != cfg.source.slot_name)
+        .map(|s| s.name.as_str())
+        .collect();
+    if !idle.is_empty() {
+        println!(
+            "\n{} inactive slot(s) not named in this config: {}",
+            idle.len(),
+            idle.join(", ")
+        );
+        println!(
+            "each holds WAL until it is dropped. If one is a former slot_name of \
+             this pipeline: SELECT pg_drop_replication_slot('{}');",
+            idle[0]
+        );
     }
     Ok(())
 }

@@ -23,7 +23,8 @@ wal()  { pg "SELECT pg_current_wal_lsn() - '0/0'::pg_lsn;"; }
 human(){ python3 -c "import sys;n=int(sys.argv[1]);print(f'{n/1048576:.1f} MB' if n>1048576 else f'{n/1024:.0f} kB')" "$1"; }
 
 stop_sync() { pkill -f "pg2osync run" 2> /dev/null || true; }
-cleanup()   { stop_sync; rm -f "$CONFIG"; }
+drop_own_slot() { pg "SELECT pg_drop_replication_slot('pg2osync_impact') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='pg2osync_impact');" > /dev/null 2>&1 || true; }
+cleanup()   { stop_sync; drop_own_slot; rm -f "$CONFIG"; }
 trap cleanup EXIT
 
 cat > "$CONFIG" <<'TOML'

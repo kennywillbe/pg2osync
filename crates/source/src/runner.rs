@@ -61,6 +61,7 @@ impl WalSource {
         catalog::check_wal_level(admin).await?;
         catalog::ensure_publication(admin, &self.cfg.publication, &self.cfg.tables).await?;
         catalog::ensure_slot(admin, &self.cfg.slot_name).await?;
+        catalog::warn_about_idle_slots(admin, &self.cfg.slot_name).await;
         Ok(())
     }
 

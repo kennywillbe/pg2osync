@@ -37,7 +37,8 @@ start_sync() {
   nohup $BIN run -c "$CONFIG" >> "$LOG" 2>&1 < /dev/null & disown
 }
 stop_sync() { pkill -f "pg2osync run" 2> /dev/null || true; }
-cleanup()   { stop_sync; rm -f "$CONFIG"; }
+drop_own_slot() { pg "SELECT pg_drop_replication_slot('pg2osync_e2e') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='pg2osync_e2e');" > /dev/null 2>&1 || true; }
+cleanup()   { stop_sync; drop_own_slot; rm -f "$CONFIG"; }
 trap cleanup EXIT
 
 cat > "$CONFIG" <<'TOML'
