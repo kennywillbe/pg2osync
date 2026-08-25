@@ -208,6 +208,23 @@ check "health answers for probes" "$(curl -s http://127.0.0.1:9111/healthz)" "ok
 check "an unknown path is not the exposition" \
   "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9111/)" "404"
 
+say "9b. reconcile finds a document whose row is gone"
+# the count here depends on what earlier steps left behind, so it is measured
+# rather than assumed
+before_reconcile=$(os_count e2e_users)
+curl -s -XPUT "$OS/e2e_users/_doc/9999" -H 'Content-Type: application/json' \
+  -d '{"id":9999,"name":"ghost"}' > /dev/null
+refresh
+out=$($BIN reconcile -c "$CONFIG" 2>&1)
+case "$out" in
+  *"1 found with no row"*) ok "reconcile named the orphan and nothing else" ;;
+  *) bad "reconcile did not find exactly the orphan: $out" ;;
+esac
+$BIN reconcile -c "$CONFIG" --delete > /dev/null
+refresh
+check "reconcile --delete removed it" "$(os_status e2e_users 9999)" "404"
+check "reconcile left the real documents alone" "$(os_count e2e_users)" "$before_reconcile"
+
 say "10. reconnects after the server drops the stream"
 before_pid=$(pgrep -f "pg2osync run" | head -1)
 pg "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE backend_type='walsender';" > /dev/null

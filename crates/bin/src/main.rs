@@ -3,6 +3,7 @@
 
 mod backfill;
 mod config;
+mod reconcile;
 mod run;
 
 use anyhow::{Context, Result, bail};
@@ -43,6 +44,15 @@ enum Command {
         #[arg(short, long, value_name = "FILE")]
         config: PathBuf,
     },
+    /// Compare each index against its source table and report documents whose
+    /// row is gone. Reports only unless --delete is given.
+    Reconcile {
+        #[arg(short, long, value_name = "FILE")]
+        config: PathBuf,
+        /// Remove the documents instead of only naming them.
+        #[arg(long)]
+        delete: bool,
+    },
     /// Print the SQL a DBA needs to run, derived from the config.
     SetupSql {
         #[arg(short, long, value_name = "FILE")]
@@ -69,6 +79,7 @@ async fn main() -> Result<()> {
         Command::Bootstrap { config } => pipeline(&config, run::Mode::Bootstrap).await,
         Command::Validate { config } => validate(&config).await,
         Command::Status { config } => status(&config).await,
+        Command::Reconcile { config, delete } => reconcile_cmd(&config, delete).await,
         Command::SetupSql { config } => setup_sql(&config),
         Command::DropSlot { config } => drop_slot(&config).await,
     }
@@ -139,6 +150,53 @@ fn setup_sql(path: &Path) -> Result<()> {
             &cfg.source.slot_name,
         )
     );
+    Ok(())
+}
+
+
+/// Compare every configured index against its table.
+///
+/// Run it when the pipeline is caught up: a document whose row was inserted
+/// seconds ago and has not been loaded yet looks exactly like an orphan.
+async fn reconcile_cmd(path: &Path, delete: bool) -> Result<()> {
+    let cfg = config::AppConfig::load(path)?;
+    if cfg.source.flavor == "mysql" {
+        bail!("reconcile is PostgreSQL-only for now");
+    }
+    let secrets = cfg.resolve_secrets()?;
+    let sink = run::build_sink(&cfg, secrets.target_password)?;
+    let client = connect_pg(&cfg, &secrets.source_url).await?;
+
+    let mut total_orphans = 0usize;
+    for (key, table) in &cfg.sync {
+        let spec = reconcile::Table {
+            qualified: table.table.clone(),
+            index: table.index_name(key),
+            key_column: table.primary_key.clone().unwrap_or_else(|| "id".into()),
+            soft_delete: table.soft_delete.clone(),
+        };
+        let report = reconcile::table(&client, &sink, &spec, delete).await?;
+        total_orphans += report.orphaned.len();
+        let verb = if delete { "removed" } else { "found" };
+        println!(
+            "{}: {} document(s) scanned, {} {verb} with no row in {}",
+            spec.index,
+            report.scanned,
+            report.orphaned.len(),
+            spec.qualified
+        );
+        // enough to investigate with, without pasting a whole index into a
+        // terminal when something has gone badly wrong
+        for id in report.orphaned.iter().take(10) {
+            println!("  {id}");
+        }
+        if report.orphaned.len() > 10 {
+            println!("  … and {} more", report.orphaned.len() - 10);
+        }
+    }
+    if total_orphans > 0 && !delete {
+        println!("\nRe-run with --delete to remove them.");
+    }
     Ok(())
 }
 

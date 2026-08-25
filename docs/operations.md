@@ -75,6 +75,7 @@ stays up. PostgreSQL 13+.
 
 ```sh
 pg2osync setup-sql -c pg2osync.toml  # the SQL a DBA needs, from your config
+pg2osync reconcile -c pg2osync.toml  # find index documents whose row is gone
 pg2osync validate -c pg2osync.toml   # config, connectivity, server settings
 pg2osync status   -c pg2osync.toml   # checkpoint vs the source's position
 pg2osync bootstrap -c pg2osync.toml  # create slot/publication/indices, then exit
@@ -102,6 +103,30 @@ reading it, and that orphan is invisible to anyone who only asks about the name
 in the config. `drop-slot` only ever touches the configured slot, so an orphan
 is dropped with the SQL above — deliberately, since a slot may belong to
 another consumer.
+
+## Reconciling an index against its source
+
+```sh
+pg2osync reconcile -c pg2osync.toml            # report only
+pg2osync reconcile -c pg2osync.toml --delete   # and remove them
+```
+
+Each index is paged in primary-key order and each page of keys is checked
+against the table. A document whose row is gone is named; with `--delete` it is
+removed. Only keys move between the two sides, which is what makes this far
+cheaper than a reindex.
+
+Reporting is the default because a wrong `primary_key` would otherwise empty an
+index, and that is not a recoverable mistake.
+
+Run it when the pipeline is caught up. A row inserted seconds ago and not yet
+indexed looks exactly like an orphan, so a reconcile mid-load will name rows
+that are simply on their way.
+
+It is the tool for three situations: poll mode, which cannot see a hard delete
+at all; after an incident where the index and the database might have diverged;
+and answering "are these two actually in step" at all, which nothing else here
+does. PostgreSQL sources only for now.
 
 ## Logging
 
