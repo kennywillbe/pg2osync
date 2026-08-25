@@ -46,6 +46,11 @@ What the AWS documentation says, and what each point means here:
   AWS-supported proxy that provides one. `aws-sigv4-proxy` is an AWS Labs
   sample rather than a documented AOSS component. Whatever you put in front,
   it is yours to run.
+
+  pg2osync refuses to start when `[target] url` is an `*.aoss.amazonaws.com`
+  host, because it cannot sign anything and every request would come back 403.
+  Point the url at your proxy and keep `serverless = true`; the proxy is
+  addressed by its own host, so the supported arrangement is unaffected.
 - **Your collection must be a SEARCH collection.** Time-series and vector
   collections reject a custom document id
   (`illegal_argument_exception: Document ID is not supported in create/index
@@ -68,6 +73,29 @@ What the AWS documentation says, and what each point means here:
 None of that is fatal to the idea — a search collection, a signing proxy, no
 truncates and no `/synced` is a real configuration. It is simply not one that
 has been demonstrated, and the matrix in the README now says so.
+
+### What a verification run would have to cover
+
+Written down so whoever has an AWS account can do it without rediscovering the
+list. Each item is a claim above that nobody has tested:
+
+1. A **SEARCH** collection, a data access policy granting the index and document
+   permissions, and a SigV4 proxy in front. Anything else fails at step 3.
+2. `pg2osync bootstrap` — does creating `.pg2osync_meta` succeed, and does a
+   dot-prefixed index name behave like an ordinary one?
+3. An initial load — do writes with an explicit `_id` land? This is the one that
+   decides whether a non-search collection is usable at all.
+4. Streaming an update and a delete, then a restart — does the checkpoint
+   round-trip through `.pg2osync_meta`?
+5. A `TRUNCATE` on the source — `_delete_by_query` is not listed as supported,
+   so the expected outcome is a clear failure rather than a silent no-op.
+6. An update to a row whose TOASTed column did not change — the completion path
+   reads documents back with `_mget` as a POST, which AOSS lists only as a GET.
+7. `GET /synced` — refresh is the service's business, so the honest expectation
+   is that read-your-writes cannot be offered here.
+
+Until that has been run, the matrix says unverified. Guessing at it from the
+documentation is how a support claim becomes a lie.
 
 ## Index naming rules
 

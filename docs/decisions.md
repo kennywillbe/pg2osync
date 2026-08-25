@@ -482,6 +482,38 @@ running pipeline is logged, naming what was added, removed or retyped — the
 index and the database now disagree about what a row looks like, and only a
 rebuild closes that. Which is why the index name is configuration.
 
+**No event trigger in the user's database.** The attractive version of DDL
+detection puts a `CREATE EVENT TRIGGER` in the source, which writes each schema
+change into the WAL as a logical message so it arrives inline and correctly
+ordered ahead of the data that depends on it. pgstream does this, and the
+machinery is already here — `/synced` emits logical messages and the decoder
+already advances on them.
+
+It is still refused, for two reasons that were measured rather than assumed.
+
+The first is that pgoutput already does the ordering. PostgreSQL re-sends a
+RELATION message whenever a replicated table's shape changes, before the first
+row event that depends on it, and `column_drift` reports exactly what changed.
+Verified against a live database: an `ALTER TABLE ... ADD COLUMN` between two row
+events logs `added later_col` and the next document carries the new column, in
+order, with no trigger involved. The problem the trigger exists to solve is not
+one we have.
+
+The second is the cost. `CREATE EVENT TRIGGER` needs superuser — PostgreSQL's
+own documentation says so plainly — which many managed providers do not grant,
+and it would put an object of ours inside the user's database. That is the same
+refusal as not running DDL on the source and not writing a signal table into it,
+and the refusal is itself something people choose this tool for.
+
+What the trigger would add over what pgoutput gives us is the DDL text, earlier
+notice on a table nobody is writing to, and DDL that does not touch a replicated
+table's shape at all. None of those change what a document looks like, which is
+the only thing the index can disagree with the database about.
+
+Worth revisiting only if pg2osync ever *applies* schema changes to the target —
+a different product than this one, and the point at which knowing the statement
+rather than the resulting shape starts to matter.
+
 **No relational sources beyond PostgreSQL and MySQL/MariaDB**, and no
 non-relational sources. The value is depth on these, not breadth.
 
