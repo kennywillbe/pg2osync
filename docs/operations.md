@@ -23,6 +23,7 @@ Probes use `/healthz`, which is never authenticated.
 |---|---|---|
 | `pg2osync_events_total{type}` | counter | Change events received from the source |
 | `pg2osync_batches_flushed` | counter | Requests the target accepted |
+| `pg2osync_toast_readbacks_total` | counter | Reads of the target to complete unchanged TOASTed columns |
 | `pg2osync_sink_errors_total` | counter | Requests that failed permanently |
 | `pg2osync_reconnects_total` | counter | Source reconnect attempts |
 | `pg2osync_source_connected` | gauge | 1 while streaming, 0 while reconnecting |
