@@ -209,3 +209,13 @@ checkpoint and re-run the initial load, which is safe but expensive.
 - The initial load's cost is dominated by the target's indexing throughput, not
   by pg2osync. `dev/benchmark.sh` reproduces the numbers in the README against a
   local stack.
+- **Sustained writes**: `dev/load-test.sh` drives concurrent writers and reports
+  where the pipeline stops keeping up, what happens while the target is
+  unavailable, and whether a `kill -9` at load loses anything. On an 8-core
+  laptop against a single-node stack it sits at roughly 1,100 rows/s for
+  single-row transactions and 4,100 rows/s for 100-row ones. The difference is
+  the per-commit flush, not the rows: a commit is what forces a batch, so a
+  thousand single-row transactions become a thousand requests.
+- Past that limit nothing grows without bound. The bounded channels held memory
+  at 28 MB through a paused target, and the backlog accumulated as retained WAL
+  on the source instead — which is the pressure `max_slot_wal_keep_size` caps.

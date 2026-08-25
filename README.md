@@ -248,6 +248,20 @@ read this as an order of magnitude, not a capacity plan:
 | One 50K-row transaction | propagated in ~1.4 s |
 | Resident memory under load | ~90 MB |
 
+Under sustained concurrent writers (`dev/load-test.sh`, 8 clients on the same
+machine), where the limits actually sit:
+
+| Metric | Value |
+|---|---|
+| Single-row transactions | **~1,100 rows/s**, flat past that while WAL lag grows |
+| 100-row transactions | **~4,100 rows/s** — the per-commit flush is the cost, not the rows |
+| Target paused for 10 s at 2,000 rows/s | memory stayed at 28 MB, the slot retained ~390 MB of WAL |
+| Recovery after `kill -9` at load | caught up in ~14 s, source and index counts equal |
+
+The first two rows are the same pipeline doing the same work: a commit is what
+forces a batch, so a thousand single-row transactions become a thousand
+requests. Batch your writes if you can.
+
 The two latency rows measure different things on purpose. "Commit to indexed" is
 what pg2osync controls, taken from its own `pg2osync_latency_ms`. "Commit to
 searchable" adds your client's round-trip and the target's refresh interval,
@@ -260,6 +274,7 @@ Reproduce it yourself:
 docker compose -f dev/docker-compose.yml up -d
 cargo build --release
 ROWS=200000 ./dev/benchmark.sh
+./dev/load-test.sh          # sustained writers, backpressure, recovery
 ```
 
 Tuning knobs live under `[engine]`: batch size, byte ceiling, transaction
