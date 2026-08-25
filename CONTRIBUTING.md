@@ -29,7 +29,13 @@ cargo test --workspace
 cargo build --release
 ./dev/e2e-test.sh                    # PostgreSQL -> OpenSearch, full pipeline
 ./dev/e2e-mysql-test.sh              # MySQL source (needs a MySQL container)
+./dev/failover-probe.sh              # MySQL failover; builds its own primary and replica
 ```
+
+`failover-probe.sh` is separate because it is the only check that needs two
+servers: it promotes a replica and asserts that the stream resumes *and* that
+documents written afterwards still land. Run it when touching checkpoints,
+versions or the MySQL protocol.
 
 Every bug fix needs a regression test that fails without the fix. Protocol
 decoders (`pgoutput.rs`, `binlog.rs`) are tested with byte-level vectors — add

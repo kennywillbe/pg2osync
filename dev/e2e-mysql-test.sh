@@ -547,5 +547,105 @@ check "and it is the pipeline's own binary form, not MySQL's" \
   "$(curl -s "$OS/e2e_mysql_kid_item/_doc/10" | jqf "(d.get('_source') or {}).get('b')")" "AP8Q"
 stop_sync
 
+say "16. GTID positions in the checkpoint"
+# A file name and offset only mean anything on the server they came from, so the
+# checkpoint has to say which transactions were consumed. MariaDB always has
+# GTIDs; MySQL only when it was started with them, which is why this section
+# says what it skipped rather than passing on a server that cannot show it.
+# Asked in two steps: MariaDB has no `gtid_mode` at all, and naming it in a
+# branch that MariaDB never takes still fails when the statement is resolved.
+if [ "$(my "SELECT VERSION() LIKE '%MariaDB%';")" = "1" ]; then
+  gtid_capable=yes
+elif [ "$(my "SELECT @@global.gtid_mode;")" = "ON" ]; then
+  gtid_capable=yes
+else
+  gtid_capable=no
+fi
+if [ "$gtid_capable" != "yes" ]; then
+  echo "  - skipped: this server has GTIDs off (gtid_mode = $(my "SELECT @@global.gtid_mode;"))"
+else
+  my "DROP TABLE IF EXISTS gtid_probe; CREATE TABLE gtid_probe(id int primary key, v varchar(40));"
+  my "INSERT INTO gtid_probe VALUES (1,'loaded');"
+  # Written out rather than derived from $CONFIG: rewriting its [sync.*] header
+  # renames every one of them to the same key, which is a duplicate-key error.
+  GCONFIG=$(mktemp /tmp/pg2osync-mysql-gtid.XXXXXX)
+  cat > "$GCONFIG" <<TOML
+[source]
+flavor = "mysql"
+url_env = "PG2OSYNC_MYSQL_URL"
+server_id = 990016
+
+[target]
+url = "$OS"
+
+[metrics]
+enabled = false
+
+[sync.gtid_probe]
+table = "sourcedb.gtid_probe"
+index = "e2e_mysql_gtid"
+TOML
+  curl -s -XDELETE "$OS/e2e_mysql_gtid,.pg2osync_meta?ignore_unavailable=true" > /dev/null
+  nohup $BIN run -c "$GCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+  for _ in $(seq 1 30); do
+    refresh
+    [ "$(os_count e2e_mysql_gtid)" = "1" ] && break
+    sleep 1
+  done
+  # a streamed transaction, which is what a recorded position has to cover
+  my "INSERT INTO gtid_probe VALUES (2,'streamed');"
+  for _ in $(seq 1 30); do
+    refresh
+    [ "$(os_count e2e_mysql_gtid)" = "2" ] && break
+    sleep 1
+  done
+  # Read while the pipeline is still running, and waited for rather than taken
+  # once: the checkpoint task persists on its own interval, so killing the
+  # process first and comparing immediately races it.
+  checkpoint_gtid() {
+    curl -s "$OS/.pg2osync_meta/_search?q=*:*&size=10" \
+      | jqf "next((h['_source'].get('position','').split(';gtid=')[-1].split(';')[0] \
+              for h in d.get('hits',{}).get('hits',[]) \
+              if 'gtid=' in h['_source'].get('position','')), '')"
+  }
+  mariadb_source=$([ "$(my "SELECT VERSION() LIKE '%MariaDB%';")" = "1" ] && echo yes || echo no)
+  for _ in $(seq 1 30); do
+    position=$(checkpoint_gtid)
+    [ -n "$position" ] || { sleep 1; continue; }
+    # The server's own position is the only external check on ours: a set built
+    # from the stream has to converge on what the server says it has written.
+    [ "$mariadb_source" != "yes" ] && break
+    [ "$position" = "$(my "SELECT @@global.gtid_binlog_pos;")" ] && break
+    sleep 1
+  done
+  if [ -n "$position" ]; then
+    ok "the checkpoint carries a GTID position ($position)"
+  else
+    bad "the checkpoint has no GTID position"
+  fi
+  if [ "$mariadb_source" = "yes" ]; then
+    check "it converged on the server's own position" \
+      "$position" "$(my "SELECT @@global.gtid_binlog_pos;")"
+  fi
+  stop_sync; sleep 1
+  # And it resumes from it, without losing what happened while it was down
+  my "INSERT INTO gtid_probe VALUES (3,'while-down');"
+  nohup $BIN run -c "$GCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+  for _ in $(seq 1 30); do
+    refresh
+    [ "$(os_count e2e_mysql_gtid)" = "3" ] && break
+    sleep 1
+  done
+  check "a row written while down arrived after the resume" \
+    "$(os_field e2e_mysql_gtid 3 v)" "while-down"
+  if grep -q "binlog dump from gtid" "$LOG"; then
+    ok "the stream was asked for by GTID, not by coordinate"
+  else
+    bad "the stream was asked for by coordinate despite a GTID position"
+  fi
+  stop_sync
+  rm -f "$GCONFIG"
+fi
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

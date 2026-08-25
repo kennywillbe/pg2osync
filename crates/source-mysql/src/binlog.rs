@@ -103,6 +103,10 @@ pub struct EventHeader {
     /// Offset of the *next* event in the current binlog file: this is what a
     /// resume position must be, not the offset of this event.
     pub log_pos: u32,
+    /// The server that originated the event. MariaDB puts it only here, and its
+    /// GTID needs it, so a group written by a former primary keeps that
+    /// primary's id rather than being relabelled by whoever streams it.
+    pub server_id: u32,
 }
 
 pub const T_ROTATE: u8 = 4;
@@ -122,6 +126,18 @@ pub const T_DELETE_ROWS_V1: u8 = 22;
 pub const T_WRITE_ROWS_V2: u8 = 30;
 pub const T_UPDATE_ROWS_V2: u8 = 31;
 pub const T_DELETE_ROWS_V2: u8 = 32;
+/// MySQL's GTID for the transaction that follows.
+pub const T_GTID: u8 = 33;
+/// A transaction with no GTID, which `gtid_mode = ON_PERMISSIVE` still allows.
+/// Nothing can record it, so seeing one means the set is not the whole story.
+pub const T_ANONYMOUS_GTID: u8 = 34;
+/// MySQL 8.4's tagged GTID, an event type of its own rather than a variant of
+/// [`T_GTID`]. Its set cannot be built by the untagged reader below, so it is
+/// recognised only to refuse rather than to be quietly skipped.
+pub const T_GTID_TAGGED: u8 = 42;
+/// MariaDB's GTID, which opens a transaction group.
+pub const T_MARIA_GTID: u8 = 162;
+
 // MariaDB renumbered the v2 row events (live-verified against MariaDB 11.8):
 pub const T_MARIA_WRITE_ROWS_V2: u8 = 23;
 pub const T_MARIA_UPDATE_ROWS_V2: u8 = 24;
@@ -138,7 +154,53 @@ pub fn parse_header(ev: &[u8]) -> Option<EventHeader> {
         //                log_pos(4) flags(2)
         event_size: u32::from_le_bytes(ev[9..13].try_into().unwrap()),
         log_pos: u32::from_le_bytes(ev[13..17].try_into().unwrap()),
+        server_id: u32::from_le_bytes(ev[5..9].try_into().unwrap()),
     })
+}
+
+// ---- GTID -------------------------------------------------------------------
+
+/// MySQL's GTID: the uuid and number of the transaction that follows.
+///
+/// Layout from the server's own decoder: flags(1), the uuid's 16 raw bytes,
+/// then the number as 8 bytes. Everything after that is commit-order and
+/// timestamp bookkeeping this does not need.
+pub fn parse_mysql_gtid(body: &[u8]) -> Option<(String, u64)> {
+    if body.len() < 25 {
+        return None;
+    }
+    let gno = i64::from_le_bytes(body[17..25].try_into().unwrap());
+    // A number at or below zero is not a transaction; treating one as a GTID
+    // would put a nonsense interval in the set the server has to accept back.
+    let gno = u64::try_from(gno).ok().filter(|n| *n > 0)?;
+    Some((format_uuid(&body[1..17]), gno))
+}
+
+/// MariaDB's GTID: the sequence number and domain of the group that follows.
+///
+/// Layout from the server's own decoder: seq_no(8), domain_id(4), flags(1).
+/// The server id is not in here at all — it is in the event header, which is
+/// why the header carries it.
+pub fn parse_maria_gtid(body: &[u8]) -> Option<(u32, u64)> {
+    if body.len() < 13 {
+        return None;
+    }
+    let seq_no = u64::from_le_bytes(body[0..8].try_into().unwrap());
+    let domain = u32::from_le_bytes(body[8..12].try_into().unwrap());
+    (seq_no > 0).then_some((domain, seq_no))
+}
+
+/// 16 bytes as `8-4-4-4-12`, lowercase to match what the server prints.
+fn format_uuid(raw: &[u8]) -> String {
+    let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 // ---- FORMAT_DESCRIPTION -----------------------------------------------------

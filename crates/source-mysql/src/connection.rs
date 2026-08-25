@@ -220,6 +220,56 @@ impl MySqlConnection {
         self.write_command(&p).await
     }
 
+    /// Start streaming from a GTID set rather than a coordinate (MySQL only).
+    ///
+    /// The layout is MySQL's own: the command byte, flags, our server id, the
+    /// file name with its length, a position, and — because the flags say
+    /// `through_gtid` — the encoded set. The file name is empty and the
+    /// position is the start of a file, since the set is what decides where the
+    /// server begins; sending a real coordinate here would only be read if the
+    /// flag were absent.
+    pub async fn send_binlog_dump_gtid(&mut self, sids: &[u8]) -> Result<()> {
+        /// From MySQL's flag enum: non_blocking = 1, through_position = 2.
+        const THROUGH_GTID: u16 = 4;
+        let mut p = vec![0x1E];
+        p.extend_from_slice(&THROUGH_GTID.to_le_bytes());
+        p.extend_from_slice(&self.server_id.to_le_bytes());
+        p.extend_from_slice(&0u32.to_le_bytes());
+        p.extend_from_slice(&4u64.to_le_bytes());
+        p.extend_from_slice(&(sids.len() as u32).to_le_bytes());
+        p.extend_from_slice(sids);
+        self.write_command(&p).await
+    }
+
+    /// Tell a MariaDB server we understand GTID events, and optionally where to
+    /// resume from.
+    ///
+    /// MariaDB has no GTID dump command: the ordinary one is used, and the
+    /// server switches on the presence of `@slave_connect_state` alone. The
+    /// capability matters even when not resuming — below it the server rewrites
+    /// GTID events into old-style `BEGIN` queries, so without announcing it
+    /// there would never be a position to record in the first place.
+    ///
+    /// Strict mode is on so a position the server cannot honour is an error
+    /// rather than a silent start somewhere else.
+    pub async fn set_maria_gtid_state(&mut self, resume_from: Option<&str>) -> Result<()> {
+        let mut stmts = vec![
+            "SET @mariadb_slave_capability = 4".to_string(),
+            "SET @slave_gtid_ignore_duplicates = 0".to_string(),
+        ];
+        if let Some(position) = resume_from {
+            // The text is rendered from a parsed position, so it holds only
+            // digits, dashes and commas — it is never a checkpoint's raw string.
+            stmts.push(format!("SET @slave_connect_state = '{position}'"));
+            stmts.push("SET @slave_gtid_strict_mode = 1".to_string());
+        }
+        for stmt in stmts {
+            self.send_query(&stmt).await?;
+            let _ = read_one(&mut self.stream).await?;
+        }
+        Ok(())
+    }
+
     async fn write_command(&mut self, payload: &[u8]) -> Result<()> {
         // every command starts a new sequence
         write_framed_at(&mut self.stream, 0, payload).await

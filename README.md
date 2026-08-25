@@ -230,6 +230,11 @@ retried in process with backoff, rebuilding from the last checkpoint. After
 `[source] reconnect_max` consecutive failures it exits so a real outage still
 surfaces. Configuration and privilege errors are never retried.
 
+**MySQL failover** — with `gtid_mode = ON` the checkpoint records which
+transactions have been consumed, not just a file and offset, so pointing the
+pipeline at a promoted replica resumes instead of reloading. `dev/failover-probe.sh`
+promotes a real replica and proves it. MariaDB needs no setting for this.
+
 **Crash safety** — restart the process; it resumes from the last checkpoint.
 Delivery is at-least-once with idempotent writes (`_id` is the primary key), so
 replays overwrite rather than duplicate. The acknowledgement sent back to the

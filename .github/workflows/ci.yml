@@ -111,6 +111,27 @@ jobs:
           docker exec mysql-test mysql -uroot -pmysqlpw -e "
             CREATE USER 'repl'@'%' IDENTIFIED WITH mysql_native_password BY 'replpw';
             GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'repl'@'%';"
+      - name: Turn GTIDs on, so the checkpoint's GTID position is exercised
+        # A service container takes no server flags, and mysql:8.0 starts with
+        # gtid_mode = OFF, which would have the suite skip that section
+        # entirely. This is MySQL's own online procedure for enabling them.
+        run: |
+          docker exec mysql-test mysql -uroot -pmysqlpw -e "
+            SET @@GLOBAL.ENFORCE_GTID_CONSISTENCY = WARN;
+            SET @@GLOBAL.ENFORCE_GTID_CONSISTENCY = ON;
+            SET @@GLOBAL.GTID_MODE = OFF_PERMISSIVE;
+            SET @@GLOBAL.GTID_MODE = ON_PERMISSIVE;"
+          # every anonymous transaction has to finish before the last step
+          for _ in $(seq 1 30); do
+            count=$(docker exec mysql-test mysql -uroot -pmysqlpw -N -B -e \
+              "SELECT COUNT(*) FROM performance_schema.global_status \
+               WHERE VARIABLE_NAME = 'ONGOING_ANONYMOUS_TRANSACTION_COUNT' \
+                 AND VARIABLE_VALUE <> '0';")
+            [ "$count" = "0" ] && break
+            sleep 1
+          done
+          docker exec mysql-test mysql -uroot -pmysqlpw -e "SET @@GLOBAL.GTID_MODE = ON;"
+          docker exec mysql-test mysql -uroot -pmysqlpw -N -B -e "SELECT @@GLOBAL.gtid_mode;"
       - run: docker exec -i mysql-test mysql -uroot -pmysqlpw sourcedb < dev/mysql-seed.sql
       - run: cargo build --release -p pg2osync
       - run: ./dev/e2e-mysql-test.sh

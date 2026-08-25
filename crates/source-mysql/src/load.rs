@@ -43,6 +43,11 @@ pub async fn run(
     mut load_done: watch::Receiver<u64>,
     scope: &LoadScope,
     children: &std::collections::HashMap<(String, String), Vec<ChildSpec>>,
+    // Added to every coordinate to make a version, so a load that runs after a
+    // failover writes in the same generation the stream does. Without it these
+    // rows would carry versions from the previous server's numbering and the
+    // target would refuse them.
+    version_base: u64,
 ) -> Result<()> {
     // No explicit transaction, and READ COMMITTED so that an implicit one
     // cannot outlive its statement either. A read view held for the length of a
@@ -132,7 +137,7 @@ pub async fn run(
             // to run beside the stream. It is a version only: these rows still
             // never advance the checkpoint.
             let (file, pos) = catalog::master_position(conn).await?;
-            let version = Some(catalog::position_token(&file, pos));
+            let version = Some(version_base.saturating_add(catalog::position_token(&file, pos)));
             let sql = chunk_statement(
                 schema,
                 table,

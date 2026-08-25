@@ -157,11 +157,51 @@ transaction's events are written to the binlog as one group at commit — so no
 position inside a group can predate a coordinate a reader saw earlier, which is
 what makes an event's own offset a sound version. A GTID could not be one: it is
 `source_uuid:N` with `N` restarting at 1 for each UUID, so a GTID set has no
-order as an integer. The cost of using the offset is that the space is per
-server and per binlog history: if that history restarts, the target holds
-versions from a numbering that no longer exists and would reject everything
-written under the new one, so a position behind the checkpoint refuses to start
-rather than reloading into silence.
+order as an integer. MariaDB is the exception that proves the rule — its
+sequence number is one monotonic 64-bit counter per replication domain — and one
+version scheme for both servers is worth more than exploiting that.
+
+**The version carries a generation, so the coordinate space can change.** The
+version is `base + ((file index << 32) | offset)`, with `base` persisted beside
+the checkpoint. That space is per server and per binlog history, and a failover
+moves to a different one: the new coordinate may be *lower* than what the target
+already holds, and `external_gte` would then refuse every write and leave the
+index quietly stale. So when the source is behind the checkpoint and there is a
+GTID position to resume the stream from, a new generation opens at
+`stored token + 2^40` instead, and every later version outranks everything
+written under the old numbering.
+
+The margin has to exceed the highest version written but not yet acknowledged.
+That gap is bounded by how much binlog one unacknowledged transaction can span —
+a few file rotations, so a few multiples of `2^32`. `2^40` is a thousand
+rotations of headroom and still leaves room for millions of generations in a
+`u64`.
+
+Without a GTID position the refusal stands: a coordinate behind the checkpoint
+then means we can neither continue the stream nor trust the numbering, and
+reloading into silence is the one outcome worth refusing.
+
+**GTID is the resume position, never the version.** Binlog file names and
+offsets are per server, which is why MySQL's own `GTID_ONLY` exists to stop
+persisting them; a checkpoint holding only a coordinate cannot resume anywhere
+but the server it came from. So the checkpoint carries a GTID position as well,
+inside the source's own position text — `core` says that text is the source's
+business and nothing else parses it.
+
+The set is accumulated from the stream, one GTID per commit, and never read from
+`@@GLOBAL.gtid_executed`: that describes what the *server* holds, including
+transactions we have not consumed, so resuming from it would skip data.
+
+The two servers share no mechanism for asking. MySQL has `COM_BINLOG_DUMP_GTID`
+carrying the set in binary; MariaDB has no such command at all and switches into
+GTID mode on the presence of `@slave_connect_state` alone. Both are implemented
+rather than one being emulated, because the difference is in the server and
+neither is a dialect of the other.
+
+Anything that would leave the set incomplete refuses to use it rather than
+checkpointing a lie: a tagged GTID event, which MySQL 8.4 gives a type of its
+own, and an anonymous transaction under `gtid_mode = ON_PERMISSIVE`, which has
+no GTID to record at all.
 
 **A write the stream has already removed is dropped, not offered.** Versioning
 alone does not make the overlap safe, and this is the one place it does not. A
