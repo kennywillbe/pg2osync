@@ -541,7 +541,7 @@ async fn attempt_postgres(
     let stored = if polling {
         None
     } else {
-        usable_checkpoint(sink.read_checkpoint().await?, &stream_id)
+        usable_checkpoint(sink.read_checkpoint(&stream_id).await?, &stream_id)
     };
     let mut resume_from = stored.map(|c| Lsn(c.token));
     if !polling {
@@ -882,7 +882,7 @@ async fn attempt_mysql(
     let source = MySqlSource::new(mysql_config(cfg, source_url)?);
     let mut admin = source.admin_connection().await?;
 
-    let stored = usable_checkpoint(sink.read_checkpoint().await?, &stream_id);
+    let stored = usable_checkpoint(sink.read_checkpoint(&stream_id).await?, &stream_id);
     let resume = stored.and_then(|c| mysql_catalog::parse_position(&c.position));
     let (file_prefix, _) = match &resume {
         Some((file, _)) => {

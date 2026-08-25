@@ -8,6 +8,7 @@ mod run;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use pg2osync_core::lsn::Lsn;
 use pg2osync_core::sink::Health;
 use std::path::{Path, PathBuf};
 
@@ -43,6 +44,21 @@ enum Command {
     Status {
         #[arg(short, long, value_name = "FILE")]
         config: PathBuf,
+        /// Exit 0 only once the checkpoint has reached the source's current
+        /// position, so a script can wait instead of comparing by eye.
+        #[arg(long)]
+        caught_up: bool,
+        /// Seconds to keep checking with --caught-up.
+        #[arg(long, default_value_t = 0)]
+        timeout: u64,
+    },
+    /// Point an alias at this config's index, atomically.
+    SwitchAlias {
+        #[arg(short, long, value_name = "FILE")]
+        config: PathBuf,
+        /// The alias to move. Applies to the single configured table.
+        #[arg(long)]
+        alias: String,
     },
     /// Compare each index against its source table and report documents whose
     /// row is gone. Reports only unless --delete is given.
@@ -58,10 +74,14 @@ enum Command {
         #[arg(short, long, value_name = "FILE")]
         config: PathBuf,
     },
-    /// Drop the replication slot and publication (PostgreSQL only).
+    /// Drop the replication slot (PostgreSQL only).
     DropSlot {
         #[arg(short, long, value_name = "FILE")]
         config: PathBuf,
+        /// Also drop the publication. Off by default: a second pipeline may be
+        /// reading the same one.
+        #[arg(long)]
+        publication: bool,
     },
 }
 
@@ -78,10 +98,24 @@ async fn main() -> Result<()> {
         Command::Run { config } => pipeline(&config, run::Mode::Run).await,
         Command::Bootstrap { config } => pipeline(&config, run::Mode::Bootstrap).await,
         Command::Validate { config } => validate(&config).await,
-        Command::Status { config } => status(&config).await,
+        Command::Status {
+            config,
+            caught_up,
+            timeout,
+        } => {
+            if caught_up {
+                wait_until_caught_up(&config, timeout).await
+            } else {
+                status(&config).await
+            }
+        }
         Command::Reconcile { config, delete } => reconcile_cmd(&config, delete).await,
+        Command::SwitchAlias { config, alias } => switch_alias(&config, &alias).await,
         Command::SetupSql { config } => setup_sql(&config),
-        Command::DropSlot { config } => drop_slot(&config).await,
+        Command::DropSlot {
+            config,
+            publication,
+        } => drop_slot(&config, publication).await,
     }
 }
 
@@ -198,6 +232,110 @@ async fn reconcile_cmd(path: &Path, delete: bool) -> Result<()> {
         println!("\nRe-run with --delete to remove them.");
     }
     Ok(())
+}
+
+
+/// Move an alias onto the index this config writes.
+///
+/// The last step of a reindex, and the one that has to be atomic: a reader
+/// resolving the alias between a remove and an add gets an error, which is
+/// exactly what the exercise was avoiding.
+async fn switch_alias(path: &Path, alias: &str) -> Result<()> {
+    let cfg = config::AppConfig::load(path)?;
+    let mut indices: Vec<String> = cfg.sync.iter().map(|(k, t)| t.index_name(k)).collect();
+    indices.sort();
+    indices.dedup();
+    let [index] = indices.as_slice() else {
+        bail!(
+            "switch-alias needs a config with exactly one table; this one has {}",
+            indices.len()
+        );
+    };
+    let secrets = cfg.resolve_secrets()?;
+    let sink = run::build_sink(&cfg, secrets.target_password)?;
+    sink.switch_alias(alias, index).await?;
+    println!("alias {alias} now points at {index}");
+    Ok(())
+}
+
+
+
+/// The stream this config identifies, which is also where its checkpoint lives.
+fn stream_id(cfg: &config::AppConfig) -> pg2osync_core::checkpoint::StreamId {
+    if cfg.source.flavor == "mysql" {
+        pg2osync_core::checkpoint::StreamId {
+            source: "mysql".into(),
+            stream: cfg.source.server_id.to_string(),
+            publication: String::new(),
+        }
+    } else {
+        pg2osync_core::checkpoint::StreamId {
+            source: "postgres".into(),
+            stream: cfg.source.slot_name.clone(),
+            publication: cfg.source.publication.clone(),
+        }
+    }
+}
+
+/// A binlog checkpoint token as the pair it orders by.
+///
+/// The file name carries a zero-padded sequence number, so files compare as
+/// text; the offset within one does not, and must be a number.
+fn binlog_coordinate(token: &str) -> Option<(String, u32)> {
+    let (file, pos) = token.rsplit_once(':')?;
+    Some((file.to_string(), pos.parse().ok()?))
+}
+
+/// Exit 0 once the checkpoint has reached the source's current position.
+///
+/// The reindex recipe says "wait for lag to reach zero", which until now meant
+/// watching a metric by eye. This is the same question with an exit code.
+async fn wait_until_caught_up(path: &Path, timeout_secs: u64) -> Result<()> {
+    let cfg = config::AppConfig::load(path)?;
+    let secrets = cfg.resolve_secrets()?;
+    let sink = run::build_sink(&cfg, secrets.target_password)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+
+    loop {
+        let checkpoint = sink.read_checkpoint(&stream_id(&cfg)).await?;
+        let position = checkpoint.map(|c| c.position);
+        let (current, reached) = if cfg.source.flavor == "mysql" {
+            let source = mysql_source(&cfg, &secrets.source_url)?;
+            let mut admin = source.admin_connection().await?;
+            let (file, pos) = pg2osync_source_mysql::catalog::master_position(&mut admin).await?;
+            let current = format!("{file}:{pos}");
+            let reached = position
+                .as_deref()
+                .and_then(binlog_coordinate)
+                .is_some_and(|have| have >= (file, pos));
+            (current, reached)
+        } else {
+            let client = connect_pg(&cfg, &secrets.source_url).await?;
+            let current: String = client
+                .query_one("SELECT pg_current_wal_lsn()::text", &[])
+                .await?
+                .get(0);
+            // parsed, not compared as text: LSN halves are unpadded hex, so
+            // "0/9ABC" sorts above "0/10000" as a string and below it in fact
+            let reached = match (
+                position.as_deref().and_then(|p| p.parse::<Lsn>().ok()),
+                current.parse::<Lsn>(),
+            ) {
+                (Some(have), Ok(want)) => have >= want,
+                _ => false,
+            };
+            (current, reached)
+        };
+        let shown = position.clone().unwrap_or_else(|| "none".into());
+        if reached {
+            println!("caught up: checkpoint {shown} has reached {current}");
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!("not caught up: checkpoint {shown}, source at {current}");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
 }
 
 async fn validate(path: &Path) -> Result<()> {
@@ -424,7 +562,7 @@ async fn status(path: &Path) -> Result<()> {
     let cfg = config::AppConfig::load(path)?;
     let secrets = cfg.resolve_secrets()?;
     let sink = run::build_sink(&cfg, secrets.target_password)?;
-    match sink.read_checkpoint().await? {
+    match sink.read_checkpoint(&stream_id(&cfg)).await? {
         Some(ckpt) => println!(
             "checkpoint: source={} stream={} position={}",
             ckpt.stream.source, ckpt.stream.stream, ckpt.position
@@ -480,7 +618,7 @@ async fn status(path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn drop_slot(path: &Path) -> Result<()> {
+async fn drop_slot(path: &Path, publication: bool) -> Result<()> {
     let cfg = config::AppConfig::load(path)?;
     if cfg.source.flavor == "mysql" {
         bail!("drop-slot is PostgreSQL-only; MySQL keeps no server-side state for us");
@@ -488,7 +626,18 @@ async fn drop_slot(path: &Path) -> Result<()> {
     let secrets = cfg.resolve_secrets()?;
     let client = connect_pg(&cfg, &secrets.source_url).await?;
     pg2osync_source::catalog::drop_slot(&client, &cfg.source.slot_name).await?;
-    pg2osync_source::catalog::drop_publication(&client, &cfg.source.publication).await
+    if publication {
+        return pg2osync_source::catalog::drop_publication(&client, &cfg.source.publication).await;
+    }
+    // A reindex runs two pipelines on one publication, so dropping the old
+    // one's slot used to take the publication out from under the new one —
+    // which then could not stream at all.
+    println!(
+        "publication {} left in place; another pipeline may be reading it.\n\
+         Drop it with --publication, or: DROP PUBLICATION {};",
+        cfg.source.publication, cfg.source.publication
+    );
+    Ok(())
 }
 
 async fn connect_pg(cfg: &config::AppConfig, source_url: &str) -> Result<tokio_postgres::Client> {

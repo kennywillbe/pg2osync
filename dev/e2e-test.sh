@@ -188,10 +188,10 @@ synced
 check "streaming continues after TRUNCATE" "$(os_count e2e_users)" "1"
 
 say "8. checkpoint and WAL safety"
-checkpoint=$(curl -s "$OS/.pg2osync_meta/_doc/default" | jqf "d['_source']")
+checkpoint=$(curl -s "$OS/.pg2osync_meta/_doc/postgres-pg2osync_e2e" | jqf "d['_source']")
 echo "    $checkpoint"
-check "checkpoint source" "$(curl -s "$OS/.pg2osync_meta/_doc/default" | jqf "d['_source']['source']")" "postgres"
-ckpt_lsn=$(curl -s "$OS/.pg2osync_meta/_doc/default" | jqf "d['_source']['position']")
+check "checkpoint source" "$(curl -s "$OS/.pg2osync_meta/_doc/postgres-pg2osync_e2e" | jqf "d['_source']['source']")" "postgres"
+ckpt_lsn=$(curl -s "$OS/.pg2osync_meta/_doc/postgres-pg2osync_e2e" | jqf "d['_source']['position']")
 # Acknowledging past the checkpoint would let PostgreSQL recycle WAL for rows
 # that are not indexed yet, which is exactly what loses data on crash-restart.
 behind=$(pg "SELECT pg_wal_lsn_diff('$ckpt_lsn'::pg_lsn, confirmed_flush_lsn) >= 0 FROM pg_replication_slots WHERE slot_name='pg2osync_e2e';")
@@ -269,7 +269,11 @@ $BIN status -c "$CONFIG" | sed 's/^/    /'
 stop_sync; sleep 1
 $BIN drop-slot -c "$CONFIG" > /dev/null
 check "slot dropped" "$(pg "SELECT count(*) FROM pg_replication_slots WHERE slot_name='pg2osync_e2e';")" "0"
-check "publication dropped" "$(pg "SELECT count(*) FROM pg_publication WHERE pubname='pg2osync_e2e_pub';")" "0"
+# a re-index runs two pipelines on one publication, so dropping it with the old
+# slot would take it out from under the new one
+check "publication left alone by default" "$(pg "SELECT count(*) FROM pg_publication WHERE pubname='pg2osync_e2e_pub';")" "1"
+$BIN drop-slot -c "$CONFIG" --publication > /dev/null
+check "publication dropped when asked" "$(pg "SELECT count(*) FROM pg_publication WHERE pubname='pg2osync_e2e_pub';")" "0"
 
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

@@ -79,7 +79,8 @@ pg2osync reconcile -c pg2osync.toml  # find index documents whose row is gone
 pg2osync validate -c pg2osync.toml   # config, connectivity, server settings
 pg2osync status   -c pg2osync.toml   # checkpoint vs the source's position
 pg2osync bootstrap -c pg2osync.toml  # create slot/publication/indices, then exit
-pg2osync drop-slot -c pg2osync.toml  # teardown when decommissioning
+pg2osync switch-alias -c pg2osync.toml --alias users   # point an alias here
+pg2osync drop-slot -c pg2osync.toml  # teardown; --publication drops that too
 ```
 
 `status` output:
@@ -189,8 +190,9 @@ documents by primary key, so they are invisible in the result.
 scratch:
 
 ```sh
-curl -XDELETE "$OS/.pg2osync_meta/_doc/default"    # OpenSearch / Elasticsearch
-rm .pg2osync-state/checkpoint.json                 # Meilisearch
+# the document is named after the stream: <source>-<slot_name|server_id>
+curl -XDELETE "$OS/.pg2osync_meta/_doc/postgres-pg2osync"   # OpenSearch / Elasticsearch
+rm .pg2osync-state/checkpoint-postgres-pg2osync.json        # Meilisearch
 ```
 
 **Source history expired** (WAL recycled, binlog purged). The next start detects
@@ -209,13 +211,42 @@ concluding anything.
 
 ## Zero-downtime re-index
 
-The index name is configuration, so a re-index is a second instance:
+The index name is configuration, so a re-index is a second instance. This
+sequence has been rehearsed end to end against the dev stack with a reader
+polling the alias throughout:
 
-1. Copy the config, change `index` to `users_v2` and `slot_name` to a new value.
-2. Run it. It performs its own initial load and then streams.
-3. When `pg2osync_position_lag` is near zero, move your search alias to
-   `users_v2`.
-4. Stop the old instance and `drop-slot` it.
+```sh
+# 1. Copy the config. Change `index` to users_v2 and `slot_name` to a new
+#    value. Keep the same publication: both instances read it.
+# 2. Start it. It runs its own initial load, then streams.
+pg2osync run -c users-v2.toml
+
+# 3. Wait for it to catch up — an exit code rather than a metric to watch.
+pg2osync status -c users-v2.toml --caught-up --timeout 300
+
+# 4. Move the alias. This is one atomic request: a reader resolving it never
+#    sees a moment where it points nowhere.
+pg2osync switch-alias -c users-v2.toml --alias users
+
+# 5. Stop the old instance, then drop its slot.
+pg2osync drop-slot -c users-v1.toml
+```
+
+Four things the rehearsal turned up, all of which are now handled:
+
+- **The two instances must not share a checkpoint.** They no longer do —
+  each stream keeps its own document in the target. Before that they overwrote
+  each other, and whichever restarted first found a checkpoint belonging to the
+  other, rejected it, and re-ran a full initial load.
+- **`drop-slot` no longer drops the publication.** Both instances read the same
+  one, so dropping it with the old slot took it out from under the *new*
+  pipeline. Pass `--publication` when you really are decommissioning.
+- **A publication dropped under a running slot is not repaired by recreating
+  it.** Logical decoding reads the catalog as it was at the position being
+  replayed, and at that position the new publication does not exist. The
+  recovery is to drop the slot and let the pipeline run a fresh initial load.
+- **Two slots mean two lots of retained WAL** until the old one is dropped, so
+  do step 5 promptly. `pg2osync status` lists every slot and what each retains.
 
 Two instances must never share a slot — each needs its own `slot_name` (or
 `server_id` for MySQL).
