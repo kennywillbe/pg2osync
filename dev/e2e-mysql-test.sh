@@ -18,7 +18,10 @@ PASSWORD=${MYSQL_PASSWORD:-replpw}
 ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:-mysqlpw}
 # MariaDB images ship the client as `mariadb`, MySQL images as `mysql`
 CLIENT=${MYSQL_CLIENT:-mysql}
-CONFIG=$(mktemp /tmp/pg2osync-mysql-XXXX.toml)
+# BSD mktemp only substitutes X's at the *end* of the template: with a
+# suffix after them it creates the literal name instead, and one killed run
+# then breaks every later one with "File exists".
+CONFIG=$(mktemp /tmp/pg2osync-mysql.XXXXXX)
 LOG=/tmp/pg2osync-mysql-e2e.log
 export PG2OSYNC_MYSQL_URL="mysql://$USER:$PASSWORD@localhost:$PORT/sourcedb"
 PASS=0; FAIL=0

@@ -20,7 +20,10 @@ OS=${OS_URL:-http://localhost:9200}
 PG_CONTAINER=${PG_CONTAINER:-dev-postgres-1}
 ROWS=${ROWS:-20000}
 WIDTH=${WIDTH:-8000}
-CONFIG=$(mktemp /tmp/pg2osync-toast-XXXX.toml)
+# BSD mktemp only substitutes X's at the *end* of the template: with a
+# suffix after them it creates the literal name instead, and one killed run
+# then breaks every later one with "File exists".
+CONFIG=$(mktemp /tmp/pg2osync-toast.XXXXXX)
 LOG=/tmp/pg2osync-toast.log
 export PG2OSYNC_SOURCE_URL="postgres://postgres:postgres@localhost:15432/sourcedb"
 
