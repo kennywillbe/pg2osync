@@ -157,8 +157,13 @@ foreign_key = "customer_id"  # column on the CHILD referencing the parent key
 - Children are fetched during the initial load and re-fetched whenever the
   parent or any of its children changes, so the array is never stale.
 - Child tables are added to the publication automatically.
-- A change to a child costs one query for the parent plus one per child
-  collection. A wide fan-out slows the initial load noticeably.
+- The initial load reads each collection once and joins it, so it costs one
+  query per table no matter how many parents there are.
+- A change to a child costs one query for the parent plus one per collection.
+  **Index the foreign key on the child table**: those lookups compare the key in
+  its own type, and without an index each one scans the whole child table.
+- The field name must not collide with a column of the parent table; the initial
+  load refuses to start rather than shadow a real column.
 - **Give child tables `REPLICA IDENTITY FULL`**
   (`ALTER TABLE public.orders REPLICA IDENTITY FULL`). Without it a DELETE
   carries no foreign key, so the parent cannot be located; pg2osync warns at

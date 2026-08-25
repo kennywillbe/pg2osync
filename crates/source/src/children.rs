@@ -45,26 +45,43 @@ impl ChildSpec {
     /// Native-typed JSON array of children for one parent key value.
     /// `pk_value` is already a JSON scalar/object rendered by pk_to_id rules.
     pub async fn fetch(&self, client: &Client, parent_pk_json: &Value) -> Result<Value> {
-        // to_jsonb on the whole row preserves native types; the fk filter uses
-        // the JSON-rendered parent key which matches PK rendering for scalars
+        // to_jsonb on the whole row preserves native types
+        let (predicate, key) = key_predicate(&pg_quote_ident(&self.foreign_key), parent_pk_json);
         let sql = format!(
             "SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb) \
-             FROM (SELECT * FROM {}.{} WHERE {}::text = $1::text) t",
-            self.schema,
-            self.table,
-            pg_quote_ident(&self.foreign_key),
+             FROM (SELECT * FROM {}.{} WHERE {predicate}) t",
+            pg_quote_ident(&self.schema),
+            pg_quote_ident(&self.table),
         );
-        // $1 is text form of the parent key; for bigint PKs text compares fine
-        let val = match parent_pk_json {
-            Value::String(s) => s.clone(),
-            other => other.to_string(),
-        };
         let row = client
-            .query_one(&sql, &[&val])
+            .query_one(&sql, &[key.as_ref()])
             .await
             .with_context(|| format!("child fetch failed for {}", self.qualified()))?;
         let v: Value = row.get(0);
         Ok(v)
+    }
+}
+
+/// Bind a key in the column's own type so the query can use an index.
+///
+/// Casting either side to text — which this did before — makes the index
+/// unusable and turns every lookup into a sequential scan: measured at 165s
+/// against 50k parents where the typed form took 74ms. Anything that is not a
+/// plain scalar falls back to the text form, which is correct if slow.
+fn key_predicate(
+    quoted_column: &str,
+    key: &Value,
+) -> (String, Box<dyn tokio_postgres::types::ToSql + Sync + Send>) {
+    match key {
+        Value::Number(n) if n.is_i64() => (
+            format!("{quoted_column} = $1"),
+            Box::new(n.as_i64().expect("checked")),
+        ),
+        Value::String(s) => (format!("{quoted_column} = $1"), Box::new(s.clone())),
+        other => (
+            format!("{quoted_column}::text = $1"),
+            Box::new(other.to_string()),
+        ),
     }
 }
 
@@ -99,24 +116,52 @@ pub fn refetch_parent<'a>(
     pk_json: &'a Value,
     pk_column: &'a str,
 ) -> impl std::future::Future<Output = Result<Option<Value>>> + 'a {
-    let val = match pk_json {
-        Value::String(s) => s.clone(),
-        other => other.to_string(),
-    };
+    let (predicate, key) = key_predicate(&pg_quote_ident(pk_column), pk_json);
     let sql = format!(
-        "SELECT to_jsonb(t) FROM (SELECT * FROM {}.{} WHERE {}::text = $1::text) t",
-        schema,
-        table,
-        pg_quote_ident(pk_column),
+        "SELECT to_jsonb(t) FROM (SELECT * FROM {}.{} WHERE {predicate}) t",
+        pg_quote_ident(schema),
+        pg_quote_ident(table),
     );
     async move {
         let row = client
-            .query_opt(&sql, &[&val])
+            .query_opt(&sql, &[key.as_ref()])
             .await
             .with_context(|| format!("parent refetch failed for {schema}.{table}"))?;
         Ok(row.map(|r| {
             let v: Value = r.get(0);
             v
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn integer_keys_compare_in_their_own_type() {
+        let (predicate, _) = key_predicate("\"customer_id\"", &json!(42));
+        assert_eq!(predicate, "\"customer_id\" = $1");
+    }
+
+    #[test]
+    fn string_keys_compare_in_their_own_type() {
+        let (predicate, _) = key_predicate("\"tenant\"", &json!("acme"));
+        assert_eq!(predicate, "\"tenant\" = $1");
+    }
+
+    #[test]
+    fn anything_else_falls_back_to_text() {
+        // composite keys arrive as an object; correctness first, speed second
+        let (predicate, _) = key_predicate("\"k\"", &json!({"a": 1}));
+        assert_eq!(predicate, "\"k\"::text = $1");
+    }
+
+    #[test]
+    fn child_tables_are_schema_qualified_and_quoted() {
+        let spec = ChildSpec::new("we\"ird.ch\"ild", "kids", "fk", "id").expect("qualified");
+        assert_eq!(spec.schema, "we\"ird");
+        assert_eq!(spec.table, "ch\"ild");
     }
 }
