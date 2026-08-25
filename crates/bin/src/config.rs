@@ -209,6 +209,15 @@ pub struct TableSync {
     /// One-to-many children embedded as JSON arrays (single level, 0.3).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<ChildJoin>,
+    /// JSON file holding the mapping to create this index with, resolved
+    /// relative to the config file. Applied only when the index does not
+    /// exist; an existing index is compared against it, never altered.
+    #[serde(default)]
+    pub mapping_file: Option<String>,
+    /// The parsed contents of `mapping_file`. Read once at load so a missing
+    /// or malformed file fails before anything connects.
+    #[serde(skip)]
+    pub mapping: Option<serde_json::Value>,
 }
 
 /// A child table joined into the parent document.
@@ -243,8 +252,27 @@ impl AppConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read config file {}", path.display()))?;
-        let cfg: AppConfig =
+        let mut cfg: AppConfig =
             toml::from_str(&raw).with_context(|| format!("invalid TOML in {}", path.display()))?;
+        let base = path.parent().unwrap_or_else(|| Path::new("."));
+        for (key, table) in cfg.sync.iter_mut() {
+            let Some(file) = &table.mapping_file else {
+                continue;
+            };
+            let full = base.join(file);
+            let text = std::fs::read_to_string(&full).with_context(|| {
+                format!("[sync.{key}] cannot read mapping_file {}", full.display())
+            })?;
+            let mapping: serde_json::Value = serde_json::from_str(&text)
+                .with_context(|| format!("[sync.{key}] {} is not valid JSON", full.display()))?;
+            if !mapping.is_object() {
+                anyhow::bail!(
+                    "[sync.{key}] {} must hold a JSON object",
+                    full.display()
+                );
+            }
+            table.mapping = Some(mapping);
+        }
         cfg.validate()?;
         Ok(cfg)
     }

@@ -51,6 +51,7 @@ pub async fn run_pipeline(
         .iter()
         .map(|(k, t)| IndexSpec {
             name: t.index_name(k),
+            mapping: t.mapping.clone(),
         })
         .collect();
 

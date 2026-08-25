@@ -1,6 +1,7 @@
 //! Sink implementations: OpenSearch (reference), Elasticsearch, Meilisearch.
 
 pub mod elasticsearch;
+pub mod mapping;
 pub mod meilisearch;
 
 use async_trait::async_trait;
@@ -268,6 +269,32 @@ fn chrono_now() -> u64 {
         .as_secs()
 }
 
+
+/// Compare a configured mapping against a live index and act on the answer.
+///
+/// A field mapped to a different type means every document carrying it will be
+/// rejected, and a rejection halts the pipeline — so it is worth finding at
+/// startup rather than mid-batch. A field the index simply lacks is not fatal:
+/// the target will map it dynamically from the first value that arrives, which
+/// may be exactly what was wanted and may not.
+fn report_mapping(index: &str, configured: &Value, live: &Value) -> Result<(), CoreError> {
+    let report = crate::mapping::compare(configured, live);
+    if !report.missing.is_empty() {
+        tracing::warn!(target: "pg2osync::sink",
+            "index {index} already exists and does not declare {}; \
+             those fields will be mapped from whatever arrives first",
+            report.missing.join(", "));
+    }
+    if !report.conflicting.is_empty() {
+        return Err(CoreError::Sink(format!(
+            "index {index} disagrees with the configured mapping: {}. \
+             A mapping is not changed in place; reindex into a new index name",
+            report.conflicting.join("; ")
+        )));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl Sink for OpenSearchSink {
     async fn ensure_ready(&self, tables: &[IndexSpec]) -> Result<(), CoreError> {
@@ -283,15 +310,35 @@ impl Sink for OpenSearchSink {
                 .await
                 .map_err(http_err)?;
             if !exists.status_code().is_success() {
-                // dynamic mapping for v0.1; explicit mappings arrive with 0.3 config work
+                // an empty body leaves the index to whatever the target infers,
+                // or to whatever index template the operator already manages
+                let body = spec
+                    .mapping
+                    .as_ref()
+                    .map_or_else(|| json!({}), crate::mapping::create_body);
                 let resp = self
                     .client
                     .indices()
                     .create(opensearch::indices::IndicesCreateParts::Index(&spec.name))
+                    .body(body)
                     .send()
                     .await
                     .map_err(http_err)?;
                 check_status(resp, &format!("create index {}", spec.name)).await?;
+                continue;
+            }
+            if let Some(mapping) = &spec.mapping {
+                let resp = self
+                    .client
+                    .indices()
+                    .get_mapping(opensearch::indices::IndicesGetMappingParts::Index(&[
+                        &spec.name,
+                    ]))
+                    .send()
+                    .await
+                    .map_err(http_err)?;
+                let body: Value = resp.json().await.map_err(http_err)?;
+                report_mapping(&spec.name, mapping, &body[&spec.name])?;
             }
         }
         Ok(())

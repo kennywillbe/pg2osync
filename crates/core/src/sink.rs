@@ -46,6 +46,11 @@ pub enum Health {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexSpec {
     pub name: String,
+    /// Mapping to create the index with, when the operator configured one.
+    /// Never applied to an index that already exists: changing a mapping in
+    /// place is refused by the target for anything that matters, and doing it
+    /// implicitly would be a reindex nobody asked for.
+    pub mapping: Option<Value>,
 }
 
 #[async_trait::async_trait]

@@ -107,6 +107,15 @@ impl MeilisearchSink {
 impl Sink for MeilisearchSink {
     async fn ensure_ready(&self, tables: &[IndexSpec]) -> Result<(), CoreError> {
         for spec in tables {
+            if spec.mapping.is_some() {
+                // Meilisearch has no field types to declare; its equivalent is
+                // the settings API, which is a different feature than this one
+                return Err(CoreError::Sink(format!(
+                    "index {} has a mapping configured, which Meilisearch has no \
+                     equivalent for; remove mapping_file for this target",
+                    spec.name
+                )));
+            }
             // "id" as primary key matches our pk_to_id rendering contract
             let (status, body) = self
                 .send(

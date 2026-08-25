@@ -14,6 +14,7 @@ BIN=./target/release/pg2osync
 OS=${OS_URL:-http://localhost:9200}
 PG_CONTAINER=${PG_CONTAINER:-dev-postgres-1}
 CONFIG=$(mktemp /tmp/pg2osync-e2e-XXXX.toml)
+MAPPING=$(dirname "$CONFIG")/pg2osync-e2e-mapping.json
 LOG=/tmp/pg2osync-e2e.log
 export PG2OSYNC_SOURCE_URL="postgres://postgres:postgres@localhost:15432/sourcedb"
 PASS=0; FAIL=0
@@ -38,7 +39,7 @@ start_sync() {
 }
 stop_sync() { pkill -f "pg2osync run" 2> /dev/null || true; }
 drop_own_slot() { pg "SELECT pg_drop_replication_slot('pg2osync_e2e') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='pg2osync_e2e');" > /dev/null 2>&1 || true; }
-cleanup()   { stop_sync; drop_own_slot; rm -f "$CONFIG"; }
+cleanup()   { stop_sync; drop_own_slot; rm -f "$CONFIG" "$MAPPING"; }
 trap cleanup EXIT
 
 cat > "$CONFIG" <<'TOML'
@@ -61,6 +62,7 @@ bind = "127.0.0.1:9131"
 table = "public.users"
 index = "e2e_users"
 exclude_columns = ["password_hash"]
+mapping_file = "pg2osync-e2e-mapping.json"
 
 [sync.users.transform]
 email = "redact"
@@ -95,6 +97,10 @@ pg "INSERT INTO tickets (id,customer_id,subject) VALUES (20,1,'late delivery');"
 curl -s -XDELETE "$OS/e2e_users,e2e_customers,.pg2osync_meta" > /dev/null
 ok "seeded 3 users, 2 customers, 3 orders; indices cleared"
 
+cat > "$MAPPING" <<'JSON'
+{ "mappings": { "properties": { "name": { "type": "keyword" } } } }
+JSON
+
 say "1. validate"
 if $BIN validate -c "$CONFIG" 2>&1 | grep -q "all checks passed"; then
   ok "validate passes"
@@ -108,6 +114,9 @@ check "slot exists" "$(pg "SELECT count(*) FROM pg_replication_slots WHERE slot_
 check "publication exists" "$(pg "SELECT count(*) FROM pg_publication WHERE pubname='pg2osync_e2e_pub';")" "1"
 refresh
 check "bootstrap indexed nothing" "$(os_count e2e_users)" "0"
+check "the index was created with the configured mapping" \
+  "$(curl -s "$OS/e2e_users/_mapping" | jqf "d['e2e_users']['mappings']['properties']['name']['type']")" \
+  "keyword"
 
 say "3. initial load"
 start_sync

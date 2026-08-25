@@ -124,6 +124,7 @@ One section per table. `<key>` is the index name when `index` is omitted.
 | `exclude_columns` | All columns except these; mutually exclusive with `columns` |
 | `transform` | Map of column to `"hash"` or `"redact"` |
 | `poll_column` | Poll mode: overrides `[source] poll_column` for this table |
+| `mapping_file` | JSON mapping to create the index with, see below |
 | `children` | Nested child collections, see below |
 
 Projection and transforms apply to every path — initial load, live streaming and
@@ -136,6 +137,60 @@ it can still be grouped on. `redact` replaces it with `***`. Null values are
 left alone in both cases.
 
 Two tables may not map to the same index: document identity would be ambiguous.
+
+### Index mappings
+
+Without `mapping_file` the index is created empty and the target infers field
+types from the first document that carries each field. That is enough to get
+started and not enough for real search: analyzers, `keyword` subfields for
+aggregation, explicit date formats and vector fields all have to exist before
+the first document lands.
+
+```toml
+[sync.users]
+table = "public.users"
+index = "users"
+mapping_file = "users-mapping.json"
+```
+
+The path is resolved relative to the config file, and the file is read at
+startup so a missing or malformed one fails before anything connects. It holds
+either a full index-creation body or just the mapping:
+
+```json
+{
+  "mappings": {
+    "properties": {
+      "id":         { "type": "long" },
+      "name":       { "type": "text", "fields": { "raw": { "type": "keyword" } } },
+      "created_at": { "type": "date" }
+    }
+  },
+  "settings": { "number_of_shards": 1 }
+}
+```
+
+Three rules, and the reasoning behind each:
+
+- **It applies only when the index does not exist.** A target refuses to change
+  an existing field's type — that is a reindex — so applying a mapping to a
+  live index would either fail or quietly do half the job.
+- **An existing index is compared against it at startup.** A field the index
+  maps to a different type is an error: every document carrying it would be
+  rejected, and a permanent rejection halts the pipeline. A field the index
+  does not declare is a warning: it will be mapped from whatever value arrives
+  first, which may be what you wanted.
+- **Only the fields you name are checked.** The target normalises what it is
+  given and dynamic mapping legitimately adds fields you never declared, so an
+  equality check would report differences on a mapping that is exactly right.
+
+If you would rather manage an index template, leave `mapping_file` unset: the
+index is then created without a body and your template applies. Configuring
+both means the creation body wins and the template is ignored for these
+indices.
+
+Meilisearch has no field types to declare; `mapping_file` is refused for that
+target rather than ignored.
 
 ### Nested children
 

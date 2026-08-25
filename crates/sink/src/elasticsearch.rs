@@ -184,8 +184,14 @@ impl Sink for ElasticsearchSink {
             return Err(CoreError::Sink(format!("ensure meta index: {status}")));
         }
         for spec in tables {
+            // without a body the index takes whatever Elasticsearch infers, or
+            // whatever index template the operator already manages
+            let create = spec
+                .mapping
+                .as_ref()
+                .map(|m| crate::mapping::create_body(m).to_string());
             let (status, body) = self
-                .send(reqwest::Method::PUT, &format!("/{}", spec.name), None)
+                .send(reqwest::Method::PUT, &format!("/{}", spec.name), create)
                 .await?;
             let already = body["error"]["type"] == json!("resource_already_exists_exception");
             if !(status == 200 || already) {
@@ -193,6 +199,16 @@ impl Sink for ElasticsearchSink {
                     "create index {}: {status}",
                     spec.name
                 )));
+            }
+            if already && let Some(mapping) = &spec.mapping {
+                let (_, live) = self
+                    .send(
+                        reqwest::Method::GET,
+                        &format!("/{}/_mapping", spec.name),
+                        None,
+                    )
+                    .await?;
+                crate::report_mapping(&spec.name, mapping, &live[&spec.name])?;
             }
         }
         Ok(())
