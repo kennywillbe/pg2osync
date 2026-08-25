@@ -375,38 +375,44 @@ fn auth_error(payload: &[u8]) -> anyhow::Error {
 }
 
 impl MySqlConnection {
-    /// Run a query and return every row of the text-protocol resultset.
+    /// Run a query and collect every row of the text-protocol resultset.
     ///
-    /// Values arrive as strings (text protocol); NULL becomes `None`.
+    /// For anything whose size is bounded by the schema — column lists, one
+    /// binlog coordinate. A table is read through [`Self::text_query`] instead.
     pub async fn query_text_rows(&mut self, sql: &str) -> Result<Vec<Vec<Option<String>>>> {
+        let mut rows = self.text_query(sql).await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(row);
+        }
+        Ok(out)
+    }
+
+    /// Open a resultset and read it row by row.
+    ///
+    /// The borrow is the guarantee: nothing else can use the connection until
+    /// the cursor is dropped, and a cursor dropped with rows still unread would
+    /// leave them in the socket for the next query to misparse.
+    pub async fn text_query(&mut self, sql: &str) -> Result<TextRows<'_>> {
         self.send_query(sql).await?;
         let head = read_one(&mut self.stream).await?;
-        match head.first() {
+        let ncols = match head.first() {
             Some(0xFF) => bail!("query failed: {}", error_message(&head)),
-            // OK packet: a statement with no resultset
-            Some(0x00) => return Ok(vec![]),
-            None => return Ok(vec![]),
-            _ => {}
-        }
-        let ncols = head.first().copied().unwrap_or(0) as usize;
+            // OK packet: a statement with no resultset at all
+            Some(0x00) | None => 0,
+            _ => lenenc_at(&head, &mut 0).context("resultset header is not a column count")?,
+        };
         // column definitions, then the EOF that closes them
-        for _ in 0..=ncols {
-            let _ = read_one(&mut self.stream).await?;
-        }
-        let mut rows = Vec::new();
-        loop {
-            let pkt = read_one(&mut self.stream).await?;
-            match pkt.first() {
-                Some(0xFF) => bail!("query failed mid-resultset: {}", error_message(&pkt)),
-                // EOF packet: 0xFE with a short payload. A longer packet
-                // starting with 0xFE is a row whose first value is 8-byte
-                // length-encoded, which cannot happen for our metadata queries.
-                Some(0xFE) if pkt.len() < 9 => break,
-                None => break,
-                _ => rows.push(parse_text_row(&pkt, ncols)?),
+        if ncols > 0 {
+            for _ in 0..=ncols {
+                let _ = read_one(&mut self.stream).await?;
             }
         }
-        Ok(rows)
+        Ok(TextRows {
+            conn: self,
+            ncols,
+            done: ncols == 0,
+        })
     }
 
     /// Convenience wrapper for single-row queries such as `SHOW MASTER STATUS`.
@@ -428,35 +434,80 @@ impl MySqlConnection {
     }
 }
 
+/// An open text-protocol resultset, read one row at a time.
+pub struct TextRows<'a> {
+    conn: &'a mut MySqlConnection,
+    ncols: usize,
+    done: bool,
+}
+
+impl TextRows<'_> {
+    /// The next row, or `None` once the resultset is exhausted.
+    pub async fn next(&mut self) -> Result<Option<Vec<Option<String>>>> {
+        if self.done {
+            return Ok(None);
+        }
+        let pkt = read_one(&mut self.conn.stream).await?;
+        match pkt.first() {
+            Some(0xFF) => bail!("query failed mid-resultset: {}", error_message(&pkt)),
+            // EOF packet: 0xFE with a short payload, and CLIENT_DEPRECATE_EOF
+            // is not negotiated so it stays five bytes. A row whose first value
+            // is 8-byte length-encoded also starts with 0xFE, but its marker
+            // and length alone are nine bytes, so the two cannot be confused.
+            Some(0xFE) if pkt.len() < 9 => {
+                self.done = true;
+                Ok(None)
+            }
+            None => {
+                self.done = true;
+                Ok(None)
+            }
+            _ => Ok(Some(parse_text_row(&pkt, self.ncols)?)),
+        }
+    }
+}
+
+/// A length-encoded integer at `pos`, advancing it past what it read.
+///
+/// Reading only the first byte works until a value — or a column count —
+/// reaches 251 and then misreads the bytes that follow it.
+fn lenenc_at(pkt: &[u8], pos: &mut usize) -> Option<usize> {
+    let first = *pkt.get(*pos)?;
+    *pos += 1;
+    let (len, width) = match first {
+        0xFC => (
+            u16::from_le_bytes(pkt.get(*pos..*pos + 2)?.try_into().ok()?) as usize,
+            2,
+        ),
+        0xFD => {
+            let b = pkt.get(*pos..*pos + 3)?;
+            (
+                b[0] as usize | (b[1] as usize) << 8 | (b[2] as usize) << 16,
+                3,
+            )
+        }
+        0xFE => (
+            u64::from_le_bytes(pkt.get(*pos..*pos + 8)?.try_into().ok()?) as usize,
+            8,
+        ),
+        n => (n as usize, 0),
+    };
+    *pos += width;
+    Some(len)
+}
+
 /// Decode one text-protocol row: length-encoded strings, 0xFB marking NULL.
 fn parse_text_row(pkt: &[u8], ncols: usize) -> Result<Vec<Option<String>>> {
     let mut vals = Vec::with_capacity(ncols);
     let mut pos = 0usize;
     for _ in 0..ncols {
         let Some(&first) = pkt.get(pos) else { break };
-        pos += 1;
-        let len = match first {
-            0xFB => {
-                vals.push(None);
-                continue;
-            }
-            0xFC => {
-                let b = pkt.get(pos..pos + 2).context("row truncated")?;
-                pos += 2;
-                u16::from_le_bytes([b[0], b[1]]) as usize
-            }
-            0xFD => {
-                let b = pkt.get(pos..pos + 3).context("row truncated")?;
-                pos += 3;
-                b[0] as usize | (b[1] as usize) << 8 | (b[2] as usize) << 16
-            }
-            0xFE => {
-                let b = pkt.get(pos..pos + 8).context("row truncated")?;
-                pos += 8;
-                u64::from_le_bytes(b.try_into().expect("8 bytes")) as usize
-            }
-            other => other as usize,
-        };
+        if first == 0xFB {
+            pos += 1;
+            vals.push(None);
+            continue;
+        }
+        let len = lenenc_at(pkt, &mut pos).context("row truncated")?;
         let raw = pkt.get(pos..pos + len).context("row value truncated")?;
         pos += len;
         vals.push(Some(String::from_utf8_lossy(raw).into_owned()));
@@ -490,5 +541,15 @@ mod tests {
     fn truncated_row_is_an_error_not_a_panic() {
         let pkt = vec![10, b'a'];
         assert!(parse_text_row(&pkt, 1).is_err());
+    }
+
+    #[test]
+    fn a_wide_resultset_reports_its_real_column_count() {
+        // one byte holds 250 at most, so a table with more columns than that
+        // announces itself length-encoded
+        let mut head = vec![0xFC];
+        head.extend_from_slice(&300u16.to_le_bytes());
+        assert_eq!(lenenc_at(&head, &mut 0), Some(300));
+        assert_eq!(lenenc_at(&[7], &mut 0), Some(7));
     }
 }
