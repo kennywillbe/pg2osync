@@ -373,5 +373,117 @@ check "a row deleted during the copy is not resurrected by it" \
   "$(os_status e2e_resume 198000)" "404"
 stop_sync
 
+say "14. a document the target refuses"
+# The rejection path is entirely source-independent — it lives in the engine and
+# the sink — so it is exercised once here rather than duplicated for MySQL.
+stop_sync
+QSLOT=pg2osync_e2e_reject
+QCONFIG=$(mktemp /tmp/pg2osync-reject.XXXXXX)
+HCONFIG=$(mktemp /tmp/pg2osync-halt.XXXXXX)
+q_body() {
+  cat <<TOML
+[source]
+url_env = "PG2OSYNC_SOURCE_URL"
+slot_name = "$QSLOT"
+publication = "${QSLOT}_pub"
+
+[target]
+url = "$OS"
+
+[metrics]
+bind = "127.0.0.1:9115"
+
+$1
+
+[sync.t]
+table = "public.reject_probe"
+index = "e2e_reject"
+TOML
+}
+q_body '[engine]
+on_permanent_rejection = "quarantine"
+max_rejects = 100' > "$QCONFIG"
+q_body '' > "$HCONFIG"
+reject_cleanup() {
+  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  pg "SELECT pg_drop_replication_slot('$QSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$QSLOT');" > /dev/null 2>&1 || true
+  pg "DROP PUBLICATION IF EXISTS ${QSLOT}_pub; DROP TABLE IF EXISTS reject_probe;" > /dev/null 2>&1 || true
+  rm -f "$QCONFIG" "$HCONFIG"
+}
+trap 'cleanup; resume_cleanup; reject_cleanup' EXIT
+
+pg "DROP TABLE IF EXISTS reject_probe; CREATE TABLE reject_probe(id bigint primary key, amount text);" > /dev/null 2>&1
+pg "DROP PUBLICATION IF EXISTS ${QSLOT}_pub; CREATE PUBLICATION ${QSLOT}_pub FOR TABLE reject_probe;" > /dev/null 2>&1
+curl -s -XDELETE "$OS/e2e_reject,.pg2osync_rejects" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/postgres-$QSLOT" > /dev/null
+# amount is declared a long, so a row holding text is refused permanently
+curl -s -XPUT "$OS/e2e_reject" -H 'Content-Type: application/json' \
+  -d '{"mappings":{"properties":{"amount":{"type":"long"}}}}' > /dev/null
+pg "INSERT INTO reject_probe VALUES (1, '100');" > /dev/null
+
+# halt is the default: no progress past the bad row, and nothing recorded. The
+# attempt dies and is retried, so the process stays up and the document is tried
+# again — which is what lets a mapping fix unblock it without a restart.
+nohup $BIN run -c "$HCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sleep 5
+halts_before=$(grep -c "halting pipeline: permanent rejection" "$LOG" || true)
+pg "INSERT INTO reject_probe VALUES (2, 'not-a-number');" > /dev/null
+for _ in $(seq 1 20); do
+  [ "$(grep -c 'halting pipeline: permanent rejection' "$LOG" || true)" -gt "$halts_before" ] && break
+  sleep 1
+done
+if [ "$(grep -c 'halting pipeline: permanent rejection' "$LOG" || true)" -gt "$halts_before" ]; then
+  ok "halt is the default: the refused document stops the pipeline, naming itself"
+else
+  bad "a refused document did not halt the pipeline with on_permanent_rejection unset"
+fi
+refresh
+check "the refused row is not indexed under halt" "$(os_status e2e_reject 2)" "404"
+check "nothing was quarantined under halt" \
+  "$(curl -s "$OS/.pg2osync_rejects/_count" | jqf "d.get('count', 0)")" "0"
+stop_sync
+
+# now quarantine: the same row is recorded and the pipeline carries on
+nohup $BIN run -c "$QCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sleep 5
+pg "INSERT INTO reject_probe VALUES (3, '300');" > /dev/null
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_status e2e_reject 3)" = "200" ] && break
+  sleep 1
+done
+check "a later row still arrives" "$(os_status e2e_reject 3)" "200"
+check "the refused row is not in the index" "$(os_status e2e_reject 2)" "404"
+curl -s -XPOST "$OS/.pg2osync_rejects/_refresh" > /dev/null
+check "it is in the quarantine store instead" \
+  "$(curl -s "$OS/.pg2osync_rejects/_count" | jqf "d.get('count', 0)")" "1"
+if curl -s http://127.0.0.1:9115/metrics | grep -q "^pg2osync_rejected_total 1"; then
+  ok "pg2osync_rejected_total reports it"
+else
+  bad "pg2osync_rejected_total did not move"
+fi
+if $BIN rejects -c "$QCONFIG" 2>&1 | grep -q "e2e_reject/2 at .*mapper_parsing_exception"; then
+  ok "rejects names the document, its position and why"
+else
+  bad "rejects did not list the refused document"
+  $BIN rejects -c "$QCONFIG" 2>&1 | tail -3 | sed 's/^/    /'
+fi
+stop_sync
+
+# fix the mapping, then replay what was held back
+curl -s -XDELETE "$OS/e2e_reject" > /dev/null
+curl -s -XPUT "$OS/e2e_reject" -H 'Content-Type: application/json' \
+  -d '{"mappings":{"properties":{"amount":{"type":"text"}}}}' > /dev/null
+if $BIN rejects -c "$QCONFIG" --replay 2>&1 | grep -q "replayed 1, still refused 0"; then
+  ok "replay indexed the document the target now accepts"
+else
+  bad "replay did not accept the document"
+fi
+refresh
+check "the once-refused row is indexed" "$(os_field e2e_reject 2 amount)" "not-a-number"
+curl -s -XPOST "$OS/.pg2osync_rejects/_refresh" > /dev/null
+check "and the quarantine store is empty" \
+  "$(curl -s "$OS/.pg2osync_rejects/_count" | jqf "d.get('count', 0)")" "0"
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

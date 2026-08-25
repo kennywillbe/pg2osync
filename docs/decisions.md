@@ -67,9 +67,39 @@ resurrect rows the source has already dropped. The target is also refreshed
 before the truncate, because `delete_by_query` only removes documents a search
 can see.
 
-**Stop on permanent rejection.** A document the target will never accept halts
-the pipeline. Skipping it would be silent data loss, and every later batch would
-widen the divergence.
+**Stop on permanent rejection, unless told to quarantine.** A document the target
+will never accept halts the pipeline by default. Skipping it would be silent data
+loss, and every later batch would widen the divergence. Halting means making no
+progress, not exiting: the attempt fails and is retried, so the position never
+passes the document and a mapping fix is picked up without a restart.
+
+The cost of that default is that one malformed row stops replication for every
+table until someone edits a mapping, so `on_permanent_rejection = "quarantine"`
+records the refused document — with its position and the operation itself, in a
+hidden `.pg2osync_rejects` index — and carries on. What it must never become is
+Airbyte's Elasticsearch destination, which dead-letters a document while the
+offset advances anyway: the rule is that a position may be acknowledged only once
+the document behind it was written *or* durably recorded as refused, which is why
+quarantining happens before the acknowledgement and a failure to quarantine halts.
+
+**Quarantining a document is a partial transaction, and that is the trade.** "No
+partial transactions" is otherwise an invariant here; skipping one row while its
+siblings land breaks it for that transaction. It is why the option is off by
+default and why it is named after what it does rather than after being resilient.
+
+**Quarantine is bounded.** `max_rejects` (default 100) counts what the store
+actually holds, read at startup rather than kept in memory, so a crash loop cannot
+hand the budget back. One bad row is worth carrying on past; a mapping that
+refuses a whole table is not, and the pipeline halts naming the limit. Nothing is
+lost either way: the batch that reaches the limit has its refusals recorded first,
+and a batch arriving once the limit is already spent is left unacknowledged, so
+the source sends it again when the mapping is fixed.
+
+**A rejected document is replayed through the ordinary write path.** `pg2osync
+rejects --replay` submits it again with its original position as its version, so a
+row the source has since changed loses to the newer value by the same rule that
+orders everything else, and the record is cleared only once the target has taken
+it.
 
 **A checkpoint is bound to its stream.** It records the source kind, the slot or
 `server_id`, and the publication. A checkpoint from another stream is rejected

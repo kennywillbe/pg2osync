@@ -17,13 +17,6 @@ pub enum CoreError {
     #[error("transient sink error: {0}")]
     SinkTransient(String),
 
-    #[error("sink rejected document {doc_id} on index {index}: {reason}")]
-    DocumentRejected {
-        index: String,
-        doc_id: String,
-        reason: String,
-    },
-
     #[error(transparent)]
     InvalidLsn(#[from] crate::lsn::InvalidLsn),
 

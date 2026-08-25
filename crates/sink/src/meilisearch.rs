@@ -240,9 +240,7 @@ impl Sink for MeilisearchSink {
                 }
             }
         }
-        Ok(SinkAck {
-            max_lsn: batch.last().expect("nonempty").lsn,
-        })
+        Ok(SinkAck::written(batch.last().expect("nonempty").lsn))
     }
 
     async fn truncate_index(

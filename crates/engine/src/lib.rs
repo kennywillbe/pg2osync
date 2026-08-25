@@ -41,6 +41,33 @@ pub struct EngineConfig {
     pub retry_max: u32,
     pub retry_backoff_ms: u64,
     pub checkpoint_interval_ms: u64,
+    /// What to do about a document the target will never accept.
+    #[serde(default)]
+    pub on_permanent_rejection: RejectionPolicy,
+    /// How many documents may be quarantined before the pipeline halts anyway.
+    ///
+    /// One malformed row should not stop replication; a mapping that refuses a
+    /// whole table should. Counted against what the target actually holds, so a
+    /// restart does not hand the budget back.
+    #[serde(default = "default_max_rejects")]
+    pub max_rejects: u64,
+}
+
+/// What to do when the target permanently refuses a document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RejectionPolicy {
+    /// Stop. Nothing is skipped and nothing is lost, at the cost of replication
+    /// for every table until someone fixes the mapping.
+    #[default]
+    Halt,
+    /// Record the document with its position and carry on. Trades the
+    /// no-partial-transactions guarantee, per document, for availability.
+    Quarantine,
+}
+
+fn default_max_rejects() -> u64 {
+    100
 }
 
 impl Default for EngineConfig {
@@ -52,6 +79,8 @@ impl Default for EngineConfig {
             retry_max: 10,
             retry_backoff_ms: 500,
             checkpoint_interval_ms: 500,
+            on_permanent_rejection: RejectionPolicy::Halt,
+            max_rejects: default_max_rejects(),
         }
     }
 }
@@ -166,6 +195,8 @@ pub async fn run(
         ckpt_done_tx.clone(),
         ctx.load_done_tx.clone(),
         ctx.metrics.clone(),
+        ctx.cfg.on_permanent_rejection,
+        ctx.cfg.max_rejects,
     ));
 
     // checkpoint loop: persist acked LSN periodically; only after a successful
@@ -585,12 +616,32 @@ async fn sink_loop(
     ckpt_done_tx: watch::Sender<Option<Lsn>>,
     load_done_tx: watch::Sender<u64>,
     metrics: Arc<crate::metrics::Metrics>,
+    policy: RejectionPolicy,
+    max_rejects: u64,
 ) {
+    // What the target already holds, so the budget survives a restart instead of
+    // being handed back every time the pipeline comes up.
+    let mut quarantined = match policy {
+        RejectionPolicy::Quarantine => match sink.list_rejects(0).await {
+            Ok((_, total)) => total,
+            Err(e) => {
+                tracing::error!(target: "pg2osync::sink",
+                    "cannot read the quarantine store, so its limit cannot be honoured: {e}");
+                return;
+            }
+        },
+        RejectionPolicy::Halt => 0,
+    };
+    if quarantined > 0 {
+        tracing::warn!(target: "pg2osync::sink",
+            "{quarantined} document(s) already quarantined of a limit of {max_rejects}; \
+             `pg2osync rejects` lists them");
+    }
     while let Some(command) = commands.recv().await {
         let wrote = matches!(command, SinkCommand::Write(_));
         let result = match command {
             SinkCommand::Write(batch) => sink.write(batch).await.map(Some),
-            SinkCommand::Position(lsn) => Ok(Some(SinkAck { max_lsn: lsn })),
+            SinkCommand::Position(lsn) => Ok(Some(SinkAck::written(lsn))),
             SinkCommand::LoadMark(mark) => {
                 // reached only after every write queued ahead of it succeeded,
                 // which is exactly what the load needs to know
@@ -613,6 +664,55 @@ async fn sink_loop(
                 if wrote {
                     metrics.batches_flushed.fetch_add(1, Ordering::Relaxed);
                 }
+                if !ack.rejected.is_empty() {
+                    let first = &ack.rejected[0];
+                    if policy == RejectionPolicy::Halt {
+                        metrics.sink_errors_total.fetch_add(1, Ordering::Relaxed);
+                        tracing::error!(target: "pg2osync::sink",
+                            "halting pipeline: permanent rejection {} for {}/{}. Set \
+                             on_permanent_rejection = \"quarantine\" to record it and carry on",
+                            first.reason, first.index, first.doc_id);
+                        return;
+                    }
+                    // Already spent: halt without recording more. The batch is
+                    // not acknowledged either, so these documents are replayed
+                    // once the mapping is fixed or the limit raised — nothing is
+                    // lost by declining to file them now.
+                    if quarantined >= max_rejects {
+                        metrics.sink_errors_total.fetch_add(1, Ordering::Relaxed);
+                        tracing::error!(target: "pg2osync::sink",
+                            "halting pipeline: {quarantined} quarantined documents are already at \
+                             the max_rejects limit of {max_rejects}; fix the mapping and replay \
+                             them with `pg2osync rejects --replay`");
+                        return;
+                    }
+                    // Recorded *before* the position is acknowledged. The
+                    // checkpoint may only pass a document that was written or
+                    // durably filed as refused; if this fails the batch goes
+                    // unacknowledged and the source replays it.
+                    if let Err(e) = sink.quarantine(&ack.rejected).await {
+                        metrics.sink_errors_total.fetch_add(1, Ordering::Relaxed);
+                        tracing::error!(target: "pg2osync::sink",
+                            "halting pipeline: {} document(s) were refused and could not be \
+                             quarantined, so their position must not be acknowledged: {e}",
+                            ack.rejected.len());
+                        return;
+                    }
+                    quarantined += ack.rejected.len() as u64;
+                    metrics
+                        .rejected_total
+                        .fetch_add(ack.rejected.len() as u64, Ordering::Relaxed);
+                    tracing::warn!(target: "pg2osync::sink",
+                        "quarantined {}/{} ({}); {quarantined} of {max_rejects} used",
+                        first.index, first.doc_id, first.reason);
+                    if quarantined >= max_rejects {
+                        tracing::error!(target: "pg2osync::sink",
+                            "halting pipeline: {quarantined} quarantined documents reached the \
+                             max_rejects limit of {max_rejects}. One bad row is worth carrying \
+                             on past; this many means something systematic");
+                        return;
+                    }
+                }
                 // zero-position acks come from initial-load batches;
                 // acknowledging them would corrupt the source position chain
                 if ack.max_lsn.0 > 0 {
@@ -621,16 +721,6 @@ async fn sink_loop(
                 }
             }
             Ok(None) => {}
-            Err(CoreError::DocumentRejected {
-                index,
-                doc_id,
-                reason,
-            }) => {
-                metrics.sink_errors_total.fetch_add(1, Ordering::Relaxed);
-                tracing::error!(target: "pg2osync::sink",
-                    "halting pipeline: permanent rejection {reason} for {index}/{doc_id}");
-                return;
-            }
             Err(e) => {
                 metrics.sink_errors_total.fetch_add(1, Ordering::Relaxed);
                 tracing::error!(target: "pg2osync::sink", "sink failed permanently: {e}");
@@ -882,6 +972,13 @@ mod pipeline_tests {
     struct RecordingSink {
         events: Mutex<Vec<String>>,
         checkpoints: Mutex<Vec<Checkpoint>>,
+        /// Document ids the target refuses permanently.
+        refuse: Mutex<Vec<String>>,
+        /// Whether recording a refusal fails, which must stop the pipeline
+        /// without acknowledging.
+        quarantine_fails: bool,
+        /// What the store already held before this run.
+        held: u64,
     }
 
     impl RecordingSink {
@@ -920,6 +1017,29 @@ mod pipeline_tests {
 
         async fn write(&self, batch: Vec<LsnOp>) -> Result<SinkAck, CoreError> {
             let max_lsn = batch.last().expect("engine never sends empty batches").lsn;
+            let refuse = self.refuse.lock().expect("not poisoned").clone();
+            let rejected: Vec<pg2osync_core::sink::Rejection> = batch
+                .iter()
+                .filter(|op| {
+                    let id = match &op.op {
+                        DocumentOp::Upsert { id, .. } | DocumentOp::Delete { id, .. } => id,
+                    };
+                    refuse.contains(id)
+                })
+                .map(|op| {
+                    let (index, doc_id) = match &op.op {
+                        DocumentOp::Upsert { index, id, .. }
+                        | DocumentOp::Delete { index, id, .. } => (index.clone(), id.clone()),
+                    };
+                    pg2osync_core::sink::Rejection {
+                        index,
+                        doc_id,
+                        reason: "refused by the test target".into(),
+                        lsn: op.lsn,
+                        op: op.op.clone(),
+                    }
+                })
+                .collect();
             let rendered: Vec<String> = batch
                 .iter()
                 .map(|op| match &op.op {
@@ -934,7 +1054,33 @@ mod pipeline_tests {
                 .lock()
                 .expect("not poisoned")
                 .push(format!("write[{}]", rendered.join(" ")));
-            Ok(SinkAck { max_lsn })
+            Ok(SinkAck { max_lsn, rejected })
+        }
+
+        fn can_quarantine(&self) -> bool {
+            true
+        }
+
+        async fn quarantine(
+            &self,
+            rejected: &[pg2osync_core::sink::Rejection],
+        ) -> Result<(), CoreError> {
+            if self.quarantine_fails {
+                return Err(CoreError::Sink("quarantine store unavailable".into()));
+            }
+            let ids: Vec<String> = rejected.iter().map(|r| r.doc_id.clone()).collect();
+            self.events
+                .lock()
+                .expect("not poisoned")
+                .push(format!("quarantine[{}]", ids.join(" ")));
+            Ok(())
+        }
+
+        async fn list_rejects(
+            &self,
+            _limit: usize,
+        ) -> Result<(Vec<pg2osync_core::sink::StoredReject>, u64), CoreError> {
+            Ok((Vec::new(), self.held))
         }
 
         async fn refresh(&self, _indices: &[String]) -> Result<(), CoreError> {
@@ -1023,7 +1169,27 @@ mod pipeline_tests {
         script: Vec<ChangeEvent>,
         copy_script: Vec<ChangeEvent>,
     ) -> (Arc<RecordingSink>, u64) {
-        let sink = Arc::new(RecordingSink::default());
+        drive_sink(
+            Arc::new(RecordingSink::default()),
+            EngineConfig {
+                batch_size,
+                checkpoint_interval_ms: 100,
+                ..EngineConfig::default()
+            },
+            script,
+            copy_script,
+        )
+        .await
+    }
+
+    /// As `drive_split`, over a sink and a configuration the caller chose — for
+    /// the tests that are about what the pipeline does when a write is refused.
+    async fn drive_sink(
+        sink: Arc<RecordingSink>,
+        cfg: EngineConfig,
+        script: Vec<ChangeEvent>,
+        copy_script: Vec<ChangeEvent>,
+    ) -> (Arc<RecordingSink>, u64) {
         let (events_tx, events_rx) = mpsc::channel(1024);
         let (copy_tx, copy_rx) = mpsc::channel(1024);
         let (ack_tx, _ack_rx) = watch::channel(None);
@@ -1037,13 +1203,7 @@ mod pipeline_tests {
             )]),
             projections: crate::mapping::Projections::default(),
             transforms: crate::mapping::Transforms::default(),
-            cfg: EngineConfig {
-                batch_size,
-                // a short interval keeps the test fast; the loop only persists
-                // when the acknowledged position actually moved
-                checkpoint_interval_ms: 100,
-                ..EngineConfig::default()
-            },
+            cfg,
             ack_tx,
             load_done_tx,
             metrics: Arc::new(crate::metrics::Metrics::default()),
@@ -1432,6 +1592,149 @@ mod pipeline_tests {
             vec!["write[delete:1]", "write[upsert:1@256]"],
             "the mark cleared the window, so the later chunk is untouched"
         );
+    }
+
+    fn refusing(ids: &[&str]) -> RecordingSink {
+        RecordingSink {
+            refuse: Mutex::new(ids.iter().map(|s| (*s).to_string()).collect()),
+            ..RecordingSink::default()
+        }
+    }
+
+    fn quarantining(max_rejects: u64) -> EngineConfig {
+        EngineConfig {
+            batch_size: 500,
+            checkpoint_interval_ms: 100,
+            on_permanent_rejection: RejectionPolicy::Quarantine,
+            max_rejects,
+            ..EngineConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_document_halts_by_default_and_acknowledges_nothing() {
+        let (sink, _) = drive_sink(
+            Arc::new(refusing(&["2"])),
+            EngineConfig {
+                batch_size: 500,
+                checkpoint_interval_ms: 100,
+                ..EngineConfig::default()
+            },
+            vec![row(1), row(2), commit(0x100)],
+            vec![],
+        )
+        .await;
+        assert_eq!(
+            sink.last_checkpoint(),
+            None,
+            "a position may never pass a document that was neither written nor recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn quarantine_records_before_it_acknowledges() {
+        // The order is the whole correctness argument: the checkpoint may only
+        // advance past a refused document once the target holds it.
+        let (sink, _) = drive_sink(
+            Arc::new(refusing(&["2"])),
+            quarantining(100),
+            vec![row(1), row(2), commit(0x100)],
+            vec![],
+        )
+        .await;
+        assert_eq!(
+            sink.events(),
+            vec!["write[upsert:1 upsert:2]", "quarantine[2]"],
+            "the write is reported, then the refusal is filed"
+        );
+        assert_eq!(
+            sink.last_checkpoint().map(|c| c.token),
+            Some(0x100),
+            "and only then does the position move"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_quarantine_that_fails_halts_without_acknowledging() {
+        let sink = RecordingSink {
+            quarantine_fails: true,
+            ..refusing(&["2"])
+        };
+        let (sink, _) = drive_sink(
+            Arc::new(sink),
+            quarantining(100),
+            vec![row(1), row(2), commit(0x100)],
+            vec![],
+        )
+        .await;
+        assert_eq!(
+            sink.last_checkpoint(),
+            None,
+            "nowhere to record it means the source has to send it again"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_limit_stops_a_mapping_that_refuses_everything() {
+        let (sink, _) = drive_sink(
+            Arc::new(refusing(&["1", "2", "3"])),
+            quarantining(2),
+            vec![
+                row(1),
+                commit(0x100),
+                row(2),
+                commit(0x200),
+                row(3),
+                commit(0x300),
+            ],
+            vec![],
+        )
+        .await;
+        // The three transactions coalesce into one batch, so all three refusals
+        // arrive together: every one is recorded first — losing them is the one
+        // thing the limit must not cause — and only then does the limit halt.
+        assert_eq!(
+            sink.events(),
+            vec!["write[upsert:1 upsert:2 upsert:3]", "quarantine[1 2 3]"]
+        );
+        assert_eq!(
+            sink.last_checkpoint(),
+            None,
+            "the batch that hit the limit is not acknowledged either"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_budget_counts_what_the_target_already_holds() {
+        // Otherwise a crash loop hands the whole budget back on every restart.
+        let sink = RecordingSink {
+            held: 2,
+            ..refusing(&["1"])
+        };
+        let (sink, _) = drive_sink(
+            Arc::new(sink),
+            quarantining(2),
+            vec![row(1), commit(0x100)],
+            vec![],
+        )
+        .await;
+        assert_eq!(
+            sink.last_checkpoint(),
+            None,
+            "already at the limit before this run started"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_delete_keeps_its_operation() {
+        let (sink, _) = drive_sink(
+            Arc::new(refusing(&["7"])),
+            quarantining(100),
+            vec![deleted_at(7, 0x100), commit(0x100)],
+            vec![],
+        )
+        .await;
+        assert_eq!(sink.events(), vec!["write[delete:7]", "quarantine[7]"]);
     }
 
     #[tokio::test]

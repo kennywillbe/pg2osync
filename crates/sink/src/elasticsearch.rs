@@ -180,10 +180,11 @@ impl ElasticsearchSink {
         Ok((status, body))
     }
 
-    async fn bulk_once(
-        &self,
-        batch: &[LsnOp],
-    ) -> Result<(Lsn, Vec<(String, String, String)>), CoreError> {
+    /// One bulk request. Returns how far it got and, for each refused document,
+    /// its position in `batch` and why — the position because there is exactly
+    /// one action per operation, in order, so it identifies the operation even
+    /// when a batch holds two writes for the same document.
+    async fn bulk_once(&self, batch: &[LsnOp]) -> Result<(Lsn, Vec<(usize, String)>), CoreError> {
         let mut ndjson = String::new();
         for op in batch {
             match &op.op {
@@ -235,7 +236,13 @@ impl ElasticsearchSink {
         }
         let mut retryable = false;
         let mut permanent = vec![];
-        for item in body["items"].as_array().cloned().unwrap_or_default() {
+        for (nth, item) in body["items"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+        {
             // first key is the action name ("index"/"create"/"delete")
             let entry = item
                 .as_object()
@@ -253,11 +260,8 @@ impl ElasticsearchSink {
                     "version conflict on {} left the newer document in place",
                     entry["_id"].as_str().unwrap_or("?"));
             } else if !(200..300).contains(&s) {
-                permanent.push((
-                    entry["_id"].as_str().unwrap_or("?").into(),
-                    entry["_index"].as_str().unwrap_or("?").into(),
-                    error_type.into(),
-                ));
+                let reason = entry["error"]["reason"].as_str().unwrap_or(error_type);
+                permanent.push((nth, format!("{error_type}: {reason}")));
             }
         }
         if retryable {
@@ -357,17 +361,10 @@ impl Sink for ElasticsearchSink {
             attempt += 1;
             match self.bulk_once(&batch).await {
                 Ok((lsn, permanent)) => {
-                    for (id, index, reason) in &permanent {
-                        tracing::error!(target: "pg2osync::sink", "PERMANENT rejection id={id} {index}: {reason}");
-                    }
-                    if let Some(first) = permanent.first() {
-                        return Err(CoreError::DocumentRejected {
-                            doc_id: first.0.clone(),
-                            index: first.1.clone(),
-                            reason: first.2.clone(),
-                        });
-                    }
-                    return Ok(SinkAck { max_lsn: lsn });
+                    return Ok(SinkAck {
+                        max_lsn: lsn,
+                        rejected: crate::rejections(&batch, permanent)?,
+                    });
                 }
                 Err(e) if attempt < self.retry.max_attempts && is_retryable(&e) => {
                     let backoff = self.retry.base_backoff_ms * 2u64.saturating_pow(attempt - 1);
@@ -490,6 +487,114 @@ impl Sink for ElasticsearchSink {
             404 => Ok(None),
             other => Err(CoreError::Sink(format!("read state {key}: {other}"))),
         }
+    }
+
+    fn can_quarantine(&self) -> bool {
+        true
+    }
+
+    async fn quarantine(
+        &self,
+        rejected: &[pg2osync_core::sink::Rejection],
+    ) -> Result<(), CoreError> {
+        // Created explicitly rather than left to auto-creation: the refused
+        // document is stored but never searched by its own fields, and indexing
+        // it would let the very mapping conflict that refused it refuse it here
+        // too.
+        let _ = self
+            .send(
+                reqwest::Method::PUT,
+                &format!("/{}", crate::REJECTS_INDEX),
+                Some(
+                    json!({
+                        "settings": {"index": {"hidden": true, "number_of_shards": 1}},
+                        "mappings": {"properties": {
+                            "document": {"type": "object", "enabled": false}
+                        }}
+                    })
+                    .to_string(),
+                ),
+            )
+            .await;
+        for r in rejected {
+            let id = crate::reject_doc_id(&r.index, &r.doc_id);
+            let (status, _) = self
+                .send(
+                    reqwest::Method::PUT,
+                    &format!("/{}/_doc/{id}", crate::REJECTS_INDEX),
+                    Some(crate::reject_doc(r).to_string()),
+                )
+                .await?;
+            if status != 200 && status != 201 {
+                return Err(CoreError::Sink(format!(
+                    "quarantine {}/{}: {status}",
+                    r.index, r.doc_id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    async fn list_rejects(
+        &self,
+        limit: usize,
+    ) -> Result<(Vec<pg2osync_core::sink::StoredReject>, u64), CoreError> {
+        // A search only sees refreshed segments, and this total is what bounds
+        // the quarantine: reading it stale would hand back budget already spent.
+        let _ = self
+            .send(
+                reqwest::Method::POST,
+                &format!("/{}/_refresh", crate::REJECTS_INDEX),
+                None,
+            )
+            .await;
+        let (status, body) = self
+            .send(
+                reqwest::Method::POST,
+                &format!("/{}/_search", crate::REJECTS_INDEX),
+                Some(
+                    json!({
+                        "size": limit,
+                        "track_total_hits": true,
+                        "sort": [{"at_epoch": {"order": "desc"}}],
+                        "query": {"match_all": {}}
+                    })
+                    .to_string(),
+                ),
+            )
+            .await?;
+        // nothing has ever been quarantined, which is not an error
+        if status == 404 {
+            return Ok((Vec::new(), 0));
+        }
+        if status != 200 {
+            return Err(CoreError::Sink(format!("list rejects: {status}")));
+        }
+        let total = body["hits"]["total"]["value"].as_u64().unwrap_or(0);
+        let stored = body["hits"]["hits"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|hit| {
+                crate::reject_from_doc(hit["_id"].as_str().unwrap_or_default(), &hit["_source"])
+            })
+            .collect();
+        Ok((stored, total))
+    }
+
+    async fn clear_reject(&self, id: &str) -> Result<(), CoreError> {
+        let (status, _) = self
+            .send(
+                reqwest::Method::DELETE,
+                &format!("/{}/_doc/{id}", crate::REJECTS_INDEX),
+                None,
+            )
+            .await?;
+        if status != 200 && status != 404 {
+            return Err(CoreError::Sink(format!("clear reject {id}: {status}")));
+        }
+        Ok(())
     }
 
     async fn write_state(&self, key: &str, doc: &Value) -> Result<(), CoreError> {

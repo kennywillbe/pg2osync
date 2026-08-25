@@ -262,6 +262,8 @@ Defaults are production-sane; tune only against measurements.
 | `retry_max` | `10` | Attempts per request before the pipeline stops |
 | `retry_backoff_ms` | `500` | Initial backoff, doubled per attempt, capped at 30 s |
 | `checkpoint_interval_ms` | `500` | How often the position is persisted |
+| `on_permanent_rejection` | `"halt"` | `"halt"` stops the pipeline on a document the target will never accept. `"quarantine"` records it in a hidden `.pg2osync_rejects` index, with its position, and carries on |
+| `max_rejects` | `100` | Quarantined documents allowed before the pipeline halts anyway. Counted against what the store holds, so a restart does not reset it |
 
 `checkpoint_interval_ms` is the ceiling on replayed work after a crash: a lower
 value means less replay and more writes to the target.
@@ -273,7 +275,12 @@ state is correct, but a reader can observe the transaction half-applied.
 Transient failures (HTTP 429, 5xx, connection resets) are retried with
 exponential backoff. A permanent rejection — a mapping conflict, for example —
 stops the pipeline instead of skipping the document, because skipping is silent
-data loss.
+data loss. `on_permanent_rejection = "quarantine"` trades that for availability:
+the document is recorded with its position before the position is acknowledged,
+so nothing is lost, but the transaction it belonged to is applied without it.
+`pg2osync rejects --replay` puts it back once the mapping is fixed. Only the
+OpenSearch and Elasticsearch targets can quarantine; configuring it against
+Meilisearch fails at startup.
 
 ## `[api]`
 
