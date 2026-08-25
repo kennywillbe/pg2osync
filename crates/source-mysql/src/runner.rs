@@ -104,6 +104,11 @@ impl MySqlSource {
             (Some(f), p) if p > 0 => (f.clone(), p),
             _ => catalog::master_position(&mut admin).await?,
         };
+        // Where the stream is in the current file, tracked rather than read off
+        // each event: MariaDB writes `end_log_pos = 0` on every event inside a
+        // transaction group and fills it in only on the GTID event that opens
+        // the group and the XID that closes it. MySQL fills all of them in.
+        let mut current_pos = start_pos;
 
         conn.send_binlog_dump(&current_file, start_pos).await?;
         tracing::info!(target: "pg2osync::source",
@@ -132,6 +137,23 @@ impl MySqlSource {
                 continue;
             };
             let body = &ev[19..ev.len().saturating_sub(checksum_len)];
+            let end_pos = match h.event_type {
+                // Reports where the stream is without being part of it, and is
+                // not in the file at all — so its size must never be counted.
+                binlog::T_HEARTBEAT => current_pos.max(h.log_pos),
+                // Sent at the head of every dump, describing a file we may have
+                // resumed into the middle of: its offset is near that file's
+                // start and says nothing about where we are.
+                binlog::T_FORMAT_DESCRIPTION | binlog::T_ROTATE => current_pos,
+                // MariaDB writes end_log_pos = 0 on every event inside a
+                // transaction group, filling it in only on the GTID event that
+                // opens the group and the XID that closes it. MySQL fills all of
+                // them in, and a filled-in one is authoritative: taking it back
+                // is what keeps a counted group from drifting past its own end.
+                _ if h.log_pos == 0 => current_pos.saturating_add(h.event_size),
+                _ => h.log_pos,
+            };
+            current_pos = end_pos;
 
             match h.event_type {
                 binlog::T_FORMAT_DESCRIPTION => {
@@ -144,10 +166,17 @@ impl MySqlSource {
                     checksum_len = clen;
                 }
                 binlog::T_ROTATE => {
-                    if let Some(rot) = binlog::parse_rotate(body) {
+                    // The server opens every dump with a rotate naming the file
+                    // being resumed, which has moved nothing: acting on it would
+                    // reset the position to that event's own and throw away
+                    // table registrations that are still valid.
+                    if let Some(rot) = binlog::parse_rotate(body)
+                        && rot.next_file != current_file
+                    {
                         tracing::info!(target: "pg2osync::source",
                             "binlog rotated to {}", rot.next_file);
                         current_file = rot.next_file;
+                        current_pos = rot.position as u32;
                         // table ids are only valid within one binlog file
                         registered.clear();
                     }
@@ -163,7 +192,7 @@ impl MySqlSource {
                                 tx.send(ChangeEvent::TableTruncated {
                                     schema,
                                     table,
-                                    version: None,
+                                    version: Some(catalog::position_token(&current_file, end_pos)),
                                 })
                                 .await
                                 .context("change channel closed")?;
@@ -206,7 +235,7 @@ impl MySqlSource {
                 binlog::T_HEARTBEAT => {
                     // carries no data; its value is the position it reports
                     tx.send(ChangeEvent::Transaction(TransactionBoundary::Commit {
-                        lsn: Lsn(catalog::position_token(&current_file, h.log_pos)),
+                        lsn: Lsn(catalog::position_token(&current_file, end_pos)),
                         commit_ts_micros: 0,
                     }))
                     .await
@@ -216,7 +245,7 @@ impl MySqlSource {
                     // XID closes a transaction: this is the only point where a
                     // position may be acknowledged
                     tx.send(ChangeEvent::Transaction(TransactionBoundary::Commit {
-                        lsn: Lsn(catalog::position_token(&current_file, h.log_pos)),
+                        lsn: Lsn(catalog::position_token(&current_file, end_pos)),
                         commit_ts_micros: i64::from(h.timestamp) * 1_000_000 - 946_684_800_000_000,
                     }))
                     .await
@@ -270,8 +299,9 @@ impl MySqlSource {
                         continue;
                     };
                     let set = binlog::parse_rows(h.event_type, body, &rt.meta)?;
+                    let version = catalog::position_token(&current_file, end_pos);
                     for row in &set.rows {
-                        let change = build_change(rt, &set.kind, row)?;
+                        let change = build_change(rt, &set.kind, row, version)?;
                         tx.send(change).await.context("change channel closed")?;
                     }
                 }
@@ -310,6 +340,7 @@ fn build_change(
     rt: &RegisteredTable,
     kind: &RowsKind,
     row: &binlog::RowsRow,
+    version: u64,
 ) -> Result<ChangeEvent> {
     // Deletes carry only the before-image; inserts and updates carry an after-
     // image whose values are the new row state.
@@ -358,8 +389,10 @@ fn build_change(
         schema: rt.schema.clone(),
         table: rt.table.clone(),
         kind,
-        // see the snapshot path: file-and-offset does not order as a version
-        version: None,
+        // The row event's own end position, which is finer than the commit's:
+        // two updates of one row inside a transaction order correctly against
+        // each other, and a later transaction is always higher.
+        version: Some(version),
     }))
 }
 
@@ -424,7 +457,8 @@ mod tests {
             before: Some(vec![Some(json!(1)), Some(json!("5.00"))]),
             after: Some(vec![Some(json!(1)), Some(json!("9.00"))]),
         };
-        let ChangeEvent::Row(change) = build_change(&table(), &RowsKind::Update, &row).unwrap()
+        let ChangeEvent::Row(change) =
+            build_change(&table(), &RowsKind::Update, &row, 900).unwrap()
         else {
             panic!("expected a row change");
         };
@@ -445,7 +479,8 @@ mod tests {
             before: Some(vec![Some(json!(1)), Some(json!("5.00"))]),
             after: Some(vec![Some(json!(2)), Some(json!("5.00"))]),
         };
-        let ChangeEvent::Row(change) = build_change(&table(), &RowsKind::Update, &row).unwrap()
+        let ChangeEvent::Row(change) =
+            build_change(&table(), &RowsKind::Update, &row, 900).unwrap()
         else {
             panic!("expected a row change");
         };
@@ -465,7 +500,8 @@ mod tests {
             before: Some(vec![Some(json!(42)), Some(json!("1.00"))]),
             after: None,
         };
-        let ChangeEvent::Row(change) = build_change(&table(), &RowsKind::Delete, &row).unwrap()
+        let ChangeEvent::Row(change) =
+            build_change(&table(), &RowsKind::Delete, &row, 900).unwrap()
         else {
             panic!("expected a row change");
         };
@@ -479,6 +515,6 @@ mod tests {
             before: None,
             after: Some(vec![None, Some(json!("1.00"))]),
         };
-        assert!(build_change(&table(), &RowsKind::Write, &row).is_err());
+        assert!(build_change(&table(), &RowsKind::Write, &row, 900).is_err());
     }
 }
