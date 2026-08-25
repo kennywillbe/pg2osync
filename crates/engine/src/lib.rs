@@ -8,6 +8,7 @@
 //! flushed in bounded batches, and acknowledged upstream only after the
 //! checkpoint is durable.
 
+pub mod api;
 pub mod mapping;
 pub mod metrics;
 
@@ -112,6 +113,13 @@ enum SinkCommand {
 /// Injected by the binary so the engine can persist a resumable checkpoint
 /// without knowing whether the token is a WAL LSN or a binlog offset.
 pub type PositionRenderer = Arc<dyn Fn(u64) -> String + Send + Sync>;
+
+/// The inverse: turns a position a caller supplies back into an ordering token.
+///
+/// Returns `None` when the text does not belong to this source's position
+/// space, so a caller pasting a MySQL coordinate at a PostgreSQL pipeline gets
+/// a clear rejection rather than a nonsensical wait.
+pub type PositionParser = Arc<dyn Fn(&str) -> Option<u64> + Send + Sync>;
 
 /// Runtime handles shared by all pipeline tasks.
 pub struct PipelineCtx {
@@ -600,6 +608,14 @@ mod pipeline_tests {
                 .expect("not poisoned")
                 .push(format!("write[{}]", rendered.join(" ")));
             Ok(SinkAck { max_lsn })
+        }
+
+        async fn refresh(&self, _indices: &[String]) -> Result<(), CoreError> {
+            self.events
+                .lock()
+                .expect("not poisoned")
+                .push("refresh".to_string());
+            Ok(())
         }
 
         async fn truncate_index(&self, index: &str) -> Result<(), CoreError> {

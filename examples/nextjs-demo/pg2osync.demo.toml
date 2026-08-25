@@ -34,3 +34,7 @@ supplier_email = "redact"
 table = "public.demo_reviews"
 field = "reviews"
 foreign_key = "product_id"
+
+[api]
+enabled = true
+bind = "127.0.0.1:9131"

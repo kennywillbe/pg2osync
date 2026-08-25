@@ -18,6 +18,8 @@ pub struct AppConfig {
     pub engine: pg2osync_engine::EngineConfig,
     #[serde(default)]
     pub metrics: MetricsConfig,
+    #[serde(default)]
+    pub api: ApiConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -150,6 +152,27 @@ pub struct MetricsConfig {
 
 fn default_bind() -> String {
     "127.0.0.1:9100".into()
+}
+
+/// The read-your-writes endpoint. Off by default: it is a surface applications
+/// call, not an operational one, so opening a port is the operator's decision.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ApiConfig {
+    pub enabled: bool,
+    pub bind: String,
+    /// Environment variable holding a bearer token required on every request.
+    pub token_env: Option<String>,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: "127.0.0.1:9101".into(),
+            token_env: None,
+        }
+    }
 }
 
 // derive(Default) would set enabled=false, silently disabling metrics

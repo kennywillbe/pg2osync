@@ -60,6 +60,7 @@ replay, and no transformation language — if you need those, you want Kafka.
 | Column transforms (`hash`, `redact`) | ✅ |
 | TRUNCATE propagation | ✅ |
 | Polling fallback for managed databases without replication | ✅ upsert-only |
+| **Read-your-writes** (`/synced`) | ✅ wait for your own commit to be searchable |
 | Prometheus metrics | ✅ built-in endpoint |
 
 ### Known limitations
@@ -207,6 +208,11 @@ Every option is documented in
 **Metrics** — `GET http://127.0.0.1:9100/metrics`: events by type, batches
 flushed, sink errors, reconnects, commit-to-indexed latency quantiles, and the
 current/confirmed source position with the lag between them.
+
+**Read-your-writes** — the pipeline is asynchronous, so a page that writes and
+then reads from search can race it. Enable `[api]` and call `GET /synced` after
+your commit: it returns once your write is searchable, and only the requests
+that need the guarantee pay for it. Measured at 5 ms median on the dev stack.
 
 **Reconnects** — a dropped connection, a failover or a terminated backend is
 retried in process with backoff, rebuilding from the last checkpoint. After

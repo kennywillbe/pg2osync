@@ -102,6 +102,9 @@ pub const T_ROTATE: u8 = 4;
 pub const T_QUERY: u8 = 2;
 pub const T_FORMAT_DESCRIPTION: u8 = 15;
 pub const T_XID: u8 = 16;
+/// Sent when the server has nothing else to send. Its header position is how a
+/// consumer learns the stream has moved on during quiet periods.
+pub const T_HEARTBEAT: u8 = 27;
 pub const T_TABLE_MAP: u8 = 19;
 pub const T_WRITE_ROWS_V1: u8 = 20;
 pub const T_UPDATE_ROWS_V1: u8 = 21;

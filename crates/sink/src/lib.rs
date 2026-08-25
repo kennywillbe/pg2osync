@@ -378,6 +378,22 @@ impl Sink for OpenSearchSink {
         check_status(resp, &format!("truncate index {index}")).await
     }
 
+    async fn refresh(&self, indices: &[String]) -> Result<(), CoreError> {
+        if self.serverless || indices.is_empty() {
+            // Serverless manages visibility itself and rejects the call
+            return Ok(());
+        }
+        let names: Vec<&str> = indices.iter().map(String::as_str).collect();
+        let resp = self
+            .client
+            .indices()
+            .refresh(opensearch::indices::IndicesRefreshParts::Index(&names))
+            .send()
+            .await
+            .map_err(http_err)?;
+        check_status(resp, "refresh").await
+    }
+
     async fn write_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), CoreError> {
         self.ensure_meta_index().await?;
         let resp = self

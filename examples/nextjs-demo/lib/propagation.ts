@@ -1,3 +1,31 @@
+const PG2OSYNC_API = process.env.PG2OSYNC_API_URL ?? "http://127.0.0.1:9131";
+
+/**
+ * Waits until everything committed before now is searchable, by asking
+ * pg2osync rather than polling OpenSearch.
+ *
+ * The endpoint reads the source position itself and returns only once the
+ * pipeline has written past it and refreshed the index, so a query made right
+ * after this resolves is guaranteed to see the write. Polling used to be the
+ * only option here, and it needed a different check for every operation —
+ * present for a create, changed for an update, gone for a delete.
+ */
+export async function waitUntilSearchable(
+  { timeoutMs = 8_000 } = {},
+): Promise<{ landed: boolean; ms: number }> {
+  const start = performance.now();
+  const url = `${PG2OSYNC_API}/synced?refresh=true&timeout=${timeoutMs}`;
+  try {
+    const res = await fetch(url);
+    const body = await res.json();
+    return { landed: res.ok && body.synced === true, ms: Math.round(performance.now() - start) };
+  } catch {
+    // the endpoint being unreachable must not fail the write that already
+    // succeeded; the caller shows a stale list rather than an error
+    return { landed: false, ms: Math.round(performance.now() - start) };
+  }
+}
+
 import { getProductDoc } from "./opensearch";
 
 /**

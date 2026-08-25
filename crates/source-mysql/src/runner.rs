@@ -163,6 +163,10 @@ impl MySqlSource {
             .await
             .context("mysql connect failed")?;
         conn.negotiate_checksum().await?;
+        // frequent enough that a caller waiting on a position is not left
+        // waiting for unrelated traffic, cheap enough to be invisible
+        conn.set_heartbeat_period(std::time::Duration::from_millis(100))
+            .await?;
 
         let (mut current_file, start_pos) = match (&self.cfg.start_file, self.cfg.start_pos) {
             (Some(f), p) if p > 0 => (f.clone(), p),
@@ -223,6 +227,15 @@ impl MySqlSource {
                             registered.clear();
                         }
                     }
+                }
+                binlog::T_HEARTBEAT => {
+                    // carries no data; its value is the position it reports
+                    tx.send(ChangeEvent::Transaction(TransactionBoundary::Commit {
+                        lsn: Lsn(catalog::position_token(&current_file, h.log_pos)),
+                        commit_ts_micros: 0,
+                    }))
+                    .await
+                    .context("change channel closed")?;
                 }
                 binlog::T_XID => {
                     // XID closes a transaction: this is the only point where a

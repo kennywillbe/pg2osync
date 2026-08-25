@@ -187,8 +187,8 @@ fn pipeline_ctx(
     cfg: &AppConfig,
     sink: Arc<dyn Sink>,
     metrics: SharedMetrics,
+    ack_tx: watch::Sender<Option<Lsn>>,
 ) -> Result<Arc<PipelineCtx>> {
-    let (ack_tx, _ack_rx) = watch::channel(None);
     Ok(Arc::new(PipelineCtx {
         sink,
         mapping: table_mapping(cfg),
@@ -198,6 +198,57 @@ fn pipeline_ctx(
         ack_tx,
         metrics,
     }))
+}
+
+/// Start the read-your-writes endpoint, if the operator asked for one.
+///
+/// Like the metrics endpoint it is started once, outside the retry loop: the
+/// acknowledged-position channel it watches has to survive a reconnect.
+fn start_api(
+    cfg: &AppConfig,
+    acked: watch::Receiver<Option<Lsn>>,
+    parse_position: pg2osync_engine::PositionParser,
+    render_position: PositionRenderer,
+    sink: Arc<dyn Sink>,
+    nudge: Option<pg2osync_engine::api::StreamNudge>,
+    current_position: Option<pg2osync_engine::api::CurrentPosition>,
+) -> Result<()> {
+    if !cfg.api.enabled {
+        return Ok(());
+    }
+    let token = match &cfg.api.token_env {
+        Some(key) => Some(std::env::var(key).map_err(|_| {
+            anyhow::anyhow!("api.token_env={key:?} is set but the variable is missing")
+        })?),
+        None => None,
+    };
+    if token.is_none() && !cfg.api.bind.starts_with("127.0.0.1") {
+        tracing::warn!(target: "pg2osync::api",
+            "the endpoint is bound to {} without a token; anything that can \
+             reach it can query the pipeline position", cfg.api.bind);
+    }
+    let api_cfg = pg2osync_engine::api::ApiConfig {
+        bind: cfg.api.bind.clone(),
+        token,
+        indices: cfg
+            .sync
+            .iter()
+            .map(|(key, tbl)| tbl.index_name(key))
+            .collect(),
+    };
+    tokio::spawn(async move {
+        pg2osync_engine::api::serve(
+            api_cfg,
+            acked,
+            parse_position,
+            render_position,
+            sink,
+            nudge,
+            current_position,
+        )
+        .await
+    });
+    Ok(())
 }
 
 /// How one streaming attempt ended.
@@ -346,7 +397,45 @@ async fn run_postgres(
         publication: cfg.source.publication.clone(),
     };
     let render: PositionRenderer = Arc::new(|token| Lsn(token).to_string());
+    let parse: pg2osync_engine::PositionParser =
+        Arc::new(|text| text.trim().parse::<Lsn>().ok().map(|lsn| lsn.0));
     let metrics = start_metrics(&cfg);
+    let (ack_tx, ack_rx) = watch::channel(None);
+    let nudge: Option<pg2osync_engine::api::StreamNudge> = if cfg.api.enabled {
+        let url = admin_url.clone();
+        let tls = tls.clone();
+        Some(Arc::new(move || {
+            let url = url.clone();
+            let tls = tls.clone();
+            Box::pin(async move {
+                if let Err(e) = emit_stream_marker(&tls, &url).await {
+                    tracing::warn!(target: "pg2osync::api", "cannot advance the stream: {e:#}");
+                }
+            })
+        }))
+    } else {
+        None
+    };
+    let current_position: Option<pg2osync_engine::api::CurrentPosition> = if cfg.api.enabled {
+        let url = admin_url.clone();
+        let tls = tls.clone();
+        Some(Arc::new(move || {
+            let url = url.clone();
+            let tls = tls.clone();
+            Box::pin(async move { read_current_lsn(&tls, &url).await })
+        }))
+    } else {
+        None
+    };
+    start_api(
+        &cfg,
+        ack_rx,
+        parse,
+        render.clone(),
+        sink.clone(),
+        nudge,
+        current_position,
+    )?;
 
     stream_with_reconnect(
         cfg.source.reconnect_policy(),
@@ -363,6 +452,7 @@ async fn run_postgres(
                 &src_cfg,
                 sink.clone(),
                 metrics.clone(),
+                ack_tx.clone(),
                 stream_id.clone(),
                 render.clone(),
                 durable.clone(),
@@ -390,6 +480,7 @@ async fn attempt_postgres(
     src_cfg: &pg2osync_source::runner::WalSourceConfig,
     sink: Arc<dyn Sink>,
     metrics: SharedMetrics,
+    ack_tx: watch::Sender<Option<Lsn>>,
     stream_id: StreamId,
     render: PositionRenderer,
     durable: DurableLsn,
@@ -428,7 +519,7 @@ async fn attempt_postgres(
     }
 
     let (events_tx, events_rx) = mpsc::channel::<ChangeEvent>(EVENT_CHANNEL_DEPTH);
-    let ctx = pipeline_ctx(cfg, sink, metrics)?;
+    let ctx = pipeline_ctx(cfg, sink, metrics, ack_tx)?;
     let engine = spawn_engine(
         events_rx,
         ctx,
@@ -462,6 +553,38 @@ async fn attempt_postgres(
             streamed_for: started.elapsed(),
         }
     })
+}
+
+/// Write a logical decoding message so the stream carries a position past the
+/// caller's.
+///
+/// PostgreSQL omits transactions that touch no published table, so on a quiet
+/// database the position a caller reads from `pg_current_wal_lsn()` is one the
+/// pipeline would never see. A message is the table-less way to produce one —
+/// no schema of ours in the user's database, no DDL privileges required.
+async fn emit_stream_marker(
+    tls: &pg2osync_source::tls::TlsSettings,
+    admin_url: &str,
+) -> Result<()> {
+    let client = pg2osync_source::tls::connect(tls, admin_url).await?;
+    client
+        .execute(
+            "SELECT pg_logical_emit_message(false, 'pg2osync', 'sync')",
+            &[],
+        )
+        .await
+        .context("emitting a logical decoding message failed")?;
+    Ok(())
+}
+
+/// The source's current WAL position, read on pg2osync's own connection.
+async fn read_current_lsn(tls: &pg2osync_source::tls::TlsSettings, admin_url: &str) -> Option<u64> {
+    let client = pg2osync_source::tls::connect(tls, admin_url).await.ok()?;
+    let row = client
+        .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        .await
+        .ok()?;
+    row.get::<_, String>(0).parse::<Lsn>().ok().map(|lsn| lsn.0)
 }
 
 fn wal_config(
@@ -615,6 +738,39 @@ async fn run_mysql(
         publication: String::new(),
     };
     let metrics = start_metrics(&cfg);
+    let (ack_tx, ack_rx) = watch::channel(None);
+    // the binlog prefix is only known once a position has been read, so the
+    // renderer and parser are built from the source's own vocabulary
+    let api_prefix = mysql_binlog_prefix(&cfg, &source_url).await?;
+    {
+        let prefix = api_prefix.clone();
+        let render: PositionRenderer =
+            Arc::new(move |token| pg2osync_source_mysql::catalog::position_text(&prefix, token));
+        let parse: pg2osync_engine::PositionParser = Arc::new(|text| {
+            let (file, pos) = pg2osync_source_mysql::catalog::parse_position(text)?;
+            Some(pg2osync_source_mysql::catalog::position_token(&file, pos))
+        });
+        let current_position: Option<pg2osync_engine::api::CurrentPosition> = if cfg.api.enabled {
+            let cfg = cfg.clone();
+            let url = source_url.clone();
+            Some(Arc::new(move || {
+                let cfg = cfg.clone();
+                let url = url.clone();
+                Box::pin(async move { read_current_binlog_position(&cfg, &url).await })
+            }))
+        } else {
+            None
+        };
+        start_api(
+            &cfg,
+            ack_rx,
+            parse,
+            render,
+            sink.clone(),
+            None,
+            current_position,
+        )?;
+    }
 
     stream_with_reconnect(
         cfg.source.reconnect_policy(),
@@ -624,11 +780,14 @@ async fn run_mysql(
             attempt_mysql(
                 &cfg,
                 &source_url,
-                sink.clone(),
-                metrics.clone(),
-                stream_id.clone(),
-                durable.clone(),
-                shutdown_rx.clone(),
+                AttemptWiring {
+                    sink: sink.clone(),
+                    metrics: metrics.clone(),
+                    ack_tx: ack_tx.clone(),
+                    stream_id: stream_id.clone(),
+                    durable: durable.clone(),
+                    shutdown_rx: shutdown_rx.clone(),
+                },
             )
         },
     )
@@ -640,18 +799,32 @@ async fn run_mysql(
 /// Each attempt opens its own administrative connection: whatever broke the
 /// binlog stream — a restart, a failover, a killed thread — usually took that
 /// connection with it.
-async fn attempt_mysql(
-    cfg: &AppConfig,
-    source_url: &str,
+/// What one attempt needs beyond the configuration.
+struct AttemptWiring {
     sink: Arc<dyn Sink>,
     metrics: SharedMetrics,
+    ack_tx: watch::Sender<Option<Lsn>>,
     stream_id: StreamId,
     durable: DurableLsn,
     shutdown_rx: watch::Receiver<bool>,
+}
+
+async fn attempt_mysql(
+    cfg: &AppConfig,
+    source_url: &str,
+    wiring: AttemptWiring,
 ) -> Result<AttemptEnd> {
     use pg2osync_source_mysql::catalog as mysql_catalog;
     use pg2osync_source_mysql::runner::MySqlSource;
 
+    let AttemptWiring {
+        sink,
+        metrics,
+        ack_tx,
+        stream_id,
+        durable,
+        shutdown_rx,
+    } = wiring;
     let source = MySqlSource::new(mysql_config(cfg, source_url)?);
     let mut admin = source.admin_connection().await?;
 
@@ -672,7 +845,7 @@ async fn attempt_mysql(
     };
 
     let (events_tx, events_rx) = mpsc::channel::<ChangeEvent>(EVENT_CHANNEL_DEPTH);
-    let ctx = pipeline_ctx(cfg, sink, metrics)?;
+    let ctx = pipeline_ctx(cfg, sink, metrics, ack_tx)?;
     let engine = spawn_engine(
         events_rx,
         ctx,
@@ -712,6 +885,30 @@ async fn attempt_mysql(
             streamed_for: started.elapsed(),
         }
     })
+}
+
+/// The source's current binlog coordinate, read on pg2osync's own connection.
+///
+/// Reading it needs `REPLICATION CLIENT`, which an application account should
+/// not hold — so pg2osync reads it instead of asking the caller to.
+async fn read_current_binlog_position(cfg: &AppConfig, source_url: &str) -> Option<u64> {
+    use pg2osync_source_mysql::catalog as mysql_catalog;
+    let source =
+        pg2osync_source_mysql::runner::MySqlSource::new(mysql_config(cfg, source_url).ok()?);
+    let mut admin = source.admin_connection().await.ok()?;
+    let (file, pos) = mysql_catalog::master_position(&mut admin).await.ok()?;
+    Some(mysql_catalog::position_token(&file, pos))
+}
+
+/// The binlog file prefix in use, so positions can be rendered and parsed.
+async fn mysql_binlog_prefix(cfg: &AppConfig, source_url: &str) -> Result<String> {
+    use pg2osync_source_mysql::catalog as mysql_catalog;
+    let source = pg2osync_source_mysql::runner::MySqlSource::new(mysql_config(cfg, source_url)?);
+    let mut admin = source.admin_connection().await?;
+    let (file, _) = mysql_catalog::master_position(&mut admin).await?;
+    Ok(mysql_catalog::split_binlog_file(&file)
+        .map(|(prefix, _)| prefix)
+        .unwrap_or_else(|| "binlog".to_string()))
 }
 
 fn mysql_config(

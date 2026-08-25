@@ -103,6 +103,10 @@ impl WalSource {
         // RELATION messages arrive after every relcache invalidation, so the
         // registry is upserted rather than built once at startup.
         let mut relations: HashMap<u32, crate::pgoutput::Relation> = HashMap::new();
+        // Keepalives may only advance the position between transactions: doing
+        // it mid-transaction would acknowledge a position the buffered rows
+        // have not reached yet.
+        let mut in_transaction = false;
         // Nested children need their own connection for the refetch queries:
         // the replication connection cannot run them. Without children there
         // is nothing to query, so no connection is opened.
@@ -133,15 +137,21 @@ impl WalSource {
             };
             tracing::trace!(target: "pg2osync::source", "raw event");
             match ev {
-                ReplicationEvent::Begin { .. } => {}
+                ReplicationEvent::Begin { .. } => {
+                    in_transaction = true;
+                }
                 ReplicationEvent::Commit {
-                    lsn,
+                    end_lsn,
                     commit_time_micros,
                     ..
                 } => {
+                    in_transaction = false;
+                    // end_lsn, not the commit record's own position: this is
+                    // what pg_current_wal_lsn() reports after the commit, so a
+                    // caller waiting for its own write compares like with like.
                     tx.send(ChangeEvent::Transaction(
                         pg2osync_core::event::TransactionBoundary::Commit {
-                            lsn: to_core_lsn(lsn),
+                            lsn: to_core_lsn(end_lsn),
                             commit_ts_micros: commit_time_micros,
                         },
                     ))
@@ -185,7 +195,38 @@ impl WalSource {
                         _ => {}
                     }
                 }
+                // A logical decoding message carries no row data; its value is
+                // its position. PostgreSQL skips transactions that touch no
+                // published table, so on a quiet database our position can sit
+                // arbitrarily far behind the server's — emitting a message is
+                // how anything (the /synced endpoint, an idle pipeline) pushes
+                // the stream forward without writing to a user table.
+                ReplicationEvent::Message { lsn, .. } if !in_transaction => {
+                    tx.send(ChangeEvent::Transaction(
+                        pg2osync_core::event::TransactionBoundary::Commit {
+                            lsn: to_core_lsn(lsn),
+                            commit_ts_micros: 0,
+                        },
+                    ))
+                    .await
+                    .context("change channel closed")?;
+                }
                 ReplicationEvent::KeepAlive { wal_end, .. } => {
+                    // A keepalive means the server has sent everything up to
+                    // wal_end. Publishing it advances the position on an idle
+                    // database, which is what lets a caller wait for its own
+                    // commit when no later traffic follows it — and stops WAL
+                    // accumulating for a pipeline that is simply caught up.
+                    if !in_transaction {
+                        tx.send(ChangeEvent::Transaction(
+                            pg2osync_core::event::TransactionBoundary::Commit {
+                                lsn: to_core_lsn(wal_end),
+                                commit_ts_micros: 0,
+                            },
+                        ))
+                        .await
+                        .context("change channel closed")?;
+                    }
                     // clamp feedback to the durable position: acknowledging
                     // ahead of it would allow PG to discard WAL we cannot
                     // recover from after a crash

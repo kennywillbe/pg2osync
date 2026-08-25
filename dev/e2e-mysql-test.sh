@@ -53,6 +53,10 @@ url = "$OS"
 [metrics]
 bind = "127.0.0.1:9112"
 
+[api]
+enabled = true
+bind = "127.0.0.1:9132"
+
 [sync.shop_users]
 table = "sourcedb.shop_users"
 index = "e2e_mysql_users"
@@ -142,7 +146,15 @@ metrics=$(curl -s http://127.0.0.1:9112/metrics)
 reconnects=$(awk '$1 == "pg2osync_reconnects_total" {print $2}' <<< "$metrics")
 if [ "${reconnects:-0}" -ge 1 ]; then ok "reconnects_total counted it ($reconnects)"; else bad "reconnects_total still zero"; fi
 
-say "7. crash recovery resumes from the binlog position"
+say "7. read-your-writes"
+my "INSERT INTO shop_users (id,name,email) VALUES (11,'ryw','r@test.io');"
+synced=$(curl -s "http://127.0.0.1:9132/synced?refresh=true&timeout=8000")
+found=$(curl -s "$OS/e2e_mysql_users/_search" -H 'Content-Type: application/json' \
+  -d '{"query":{"term":{"id":11}}}' | jqf "d['hits']['total']['value']")
+check "the row is searchable the moment /synced returns" "$found" "1"
+ok "waited $(jqf "d['waited_ms']" <<< "$synced")ms"
+
+say "8. crash recovery resumes from the binlog position"
 pkill -9 -f "pg2osync run"; sleep 1
 my "INSERT INTO shop_users (id,name,email) VALUES (5,'eve-during-downtime','eve@test.io');"
 start_sync
@@ -150,10 +162,10 @@ sleep 6; refresh
 check "row written while down is recovered" "$(os_field e2e_mysql_users 5 name)" "eve-during-downtime"
 check "no full re-snapshot needed" "$(grep -c 'snapshot of' "$LOG")" "0"
 
-say "8. final consistency"
+say "9. final consistency"
 check "row counts match" "$(my 'SELECT count(*) FROM shop_users;')" "$(os_count e2e_mysql_users)"
 
-say "9. status"
+say "10. status"
 $BIN status -c "$CONFIG" | sed 's/^/    /'
 
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
