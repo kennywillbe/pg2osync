@@ -242,6 +242,24 @@ never calls this and pays nothing.
 |---|---|---|
 | `enabled` | `true` | Serve the Prometheus endpoint |
 | `bind` | `127.0.0.1:9100` | Listen address; use `0.0.0.0:9100` in a container |
+| `token_env` | unset | Variable holding a bearer token required on `/metrics` |
+
+Only `GET /metrics` and `GET /healthz` are served; anything else is a 404.
+`/healthz` is never authenticated, because a kubelet probe has nowhere to keep
+a token and a liveness check that fails on a missing one would restart a
+healthy pipeline.
+
+With `token_env` set, Prometheus sends the same token:
+
+```yaml
+scrape_configs:
+  - job_name: pg2osync
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/pg2osync-token
+    static_configs:
+      - targets: ["pg2osync:9100"]
+```
 
 ```
 pg2osync_events_total{type="row|truncate"}

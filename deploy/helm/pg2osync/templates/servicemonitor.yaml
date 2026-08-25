@@ -15,4 +15,13 @@ spec:
   endpoints:
     - port: metrics
       interval: {{ .Values.metrics.serviceMonitor.interval }}
+      {{- with .Values.metrics.serviceMonitor.bearerTokenSecret }}
+      # matches config.metrics.token_env on the pod: Prometheus sends the same
+      # token the process expects
+      authorization:
+        type: Bearer
+        credentials:
+          name: {{ .name }}
+          key: {{ .key }}
+      {{- end }}
 {{- end }}

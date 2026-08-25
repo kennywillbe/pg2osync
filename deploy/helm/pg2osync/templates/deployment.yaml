@@ -65,7 +65,7 @@ spec:
           {{- if .Values.probes.startup.enabled }}
           startupProbe:
             httpGet:
-              path: /metrics
+              path: /healthz
               port: metrics
             periodSeconds: {{ .Values.probes.startup.periodSeconds }}
             failureThreshold: {{ .Values.probes.startup.failureThreshold }}
@@ -73,7 +73,7 @@ spec:
           {{- if .Values.probes.liveness.enabled }}
           livenessProbe:
             httpGet:
-              path: /metrics
+              path: /healthz
               port: metrics
             periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
             failureThreshold: {{ .Values.probes.liveness.failureThreshold }}

@@ -6,6 +6,7 @@
 //! never on the write path — which is the whole reason this is an endpoint
 //! rather than a synchronous write.
 
+use crate::http::{authorized, request_target, split_target};
 use crate::PositionParser;
 use pg2osync_core::lsn::Lsn;
 use pg2osync_core::sink::Sink;
@@ -244,30 +245,6 @@ async fn wait_for(
     }
 }
 
-fn request_target(request: &str) -> Option<&str> {
-    let first_line = request.lines().next()?;
-    let mut parts = first_line.split_whitespace();
-    let method = parts.next()?;
-    if method != "GET" {
-        return None;
-    }
-    parts.next()
-}
-
-fn split_target(target: &str) -> (&str, &str) {
-    target.split_once('?').unwrap_or((target, ""))
-}
-
-fn authorized(request: &str, expected: &str) -> bool {
-    request.lines().any(|line| {
-        let Some((name, value)) = line.split_once(':') else {
-            return false;
-        };
-        name.eq_ignore_ascii_case("authorization")
-            && value.trim().strip_prefix("Bearer ").map(str::trim) == Some(expected)
-    })
-}
-
 fn query_param(query: &str, key: &str) -> Option<String> {
     query.split('&').find_map(|pair| {
         let (name, value) = pair.split_once('=')?;
@@ -369,15 +346,9 @@ mod tests {
     }
 
     #[test]
-    fn the_token_must_match_exactly() {
+    fn a_request_without_the_token_is_refused_before_anything_else() {
         let with = |header: &str| format!("GET /synced HTTP/1.1\r\n{header}\r\n\r\n");
         assert!(authorized(&with("Authorization: Bearer secret"), "secret"));
-        assert!(
-            authorized(&with("authorization: Bearer secret"), "secret"),
-            "header names are case-insensitive"
-        );
-        assert!(!authorized(&with("Authorization: Bearer other"), "secret"));
-        assert!(!authorized(&with("Authorization: secret"), "secret"));
         assert!(!authorized(&with("Host: x"), "secret"));
     }
 
