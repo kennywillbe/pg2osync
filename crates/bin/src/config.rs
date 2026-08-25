@@ -60,6 +60,15 @@ pub struct SourceConfig {
     pub reconnect_max: u32,
     #[serde(default = "default_reconnect_backoff")]
     pub reconnect_backoff_ms: u64,
+    /// Rows one range of the initial load should cover.
+    ///
+    /// A range is one statement and cannot be interrupted, so this is also how
+    /// often the load can look at anything — the slot's WAL budget included.
+    /// The default is a measurement, not a convention: ~50,000 rows is under a
+    /// second of work at observed rates, which is the same granularity
+    /// pt-online-schema-change aims for with its 0.5s chunk target.
+    #[serde(default = "default_load_chunk_rows")]
+    pub load_chunk_rows: i64,
     #[serde(default = "default_slot_name")]
     pub slot_name: String,
     #[serde(default = "default_publication")]
@@ -96,6 +105,10 @@ fn default_reconnect_max() -> u32 {
 
 fn default_reconnect_backoff() -> u64 {
     1000
+}
+
+fn default_load_chunk_rows() -> i64 {
+    50_000
 }
 
 fn default_slot_name() -> String {

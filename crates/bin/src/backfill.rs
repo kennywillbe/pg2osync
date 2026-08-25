@@ -43,11 +43,6 @@ pub struct ColMeta {
 /// buffer entirely in the engine before the first flush.
 const ROWS_PER_BOUNDARY: u64 = 5_000;
 
-/// Rows a single range should cover. A range is read as one statement and
-/// cannot be interrupted, so this also bounds how long the load goes without
-/// checking anything — which is the argument for sizing chunks at all.
-const TARGET_ROWS_PER_CHUNK: i64 = 50_000;
-
 /// Enough sampled rows per boundary that an uneven key distribution produces
 /// uneven ranges rather than empty ones.
 const SAMPLE_ROWS_PER_BOUNDARY: f64 = 20.0;
@@ -213,6 +208,7 @@ async fn key_bounds(
     client: &tokio_postgres::Client,
     qualified_table: &str,
     cols: &[ColMeta],
+    rows_per_chunk: i64,
 ) -> Result<Vec<String>> {
     let whole: Vec<String> = Vec::new();
 
@@ -235,11 +231,11 @@ async fn key_bounds(
         .await
         .context("cannot estimate table size")?
         .get(0);
-    if estimate < TARGET_ROWS_PER_CHUNK as f64 {
+    if estimate < rows_per_chunk as f64 {
         return Ok(whole);
     }
 
-    let chunks = (estimate / TARGET_ROWS_PER_CHUNK as f64).ceil() as i64;
+    let chunks = (estimate / rows_per_chunk as f64).ceil() as i64;
     let boundaries = chunks - 1;
     if boundaries < 1 {
         return Ok(whole);
@@ -387,7 +383,13 @@ pub async fn run(
             }
             None => {
                 let progress = LoadProgress {
-                    boundaries: key_bounds(admin, &tbl.table, &cols).await?,
+                    boundaries: key_bounds(
+                        admin,
+                        &tbl.table,
+                        &cols,
+                        cfg.source.load_chunk_rows.max(1),
+                    )
+                    .await?,
                     done: 0,
                     finished: false,
                 };
