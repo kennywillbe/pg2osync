@@ -410,7 +410,8 @@ async fn run_postgres(
         .await
         .context("cannot connect to source PostgreSQL")?;
 
-    let children = child_specs_for(&cfg)?;
+    let mut children = child_specs_for(&cfg)?;
+    resolve_child_order(&mut children, &admin).await?;
     let mut tables: Vec<String> = cfg.sync.values().map(|t| t.table.clone()).collect();
     // child tables must join the publication or their changes never reach us
     for tbl in cfg.sync.values() {
@@ -800,6 +801,24 @@ fn poll_config(
     })
 }
 
+/// Ask the catalogue what to order each child collection by.
+///
+/// Without an order the embedded array is a set in arbitrary order, so the
+/// initial load and a streamed re-fetch can hold the same children differently
+/// and a re-snapshot changes a document for no reason. With `max_rows` it decides
+/// *which* children are kept, so two runs would otherwise keep different ones.
+pub async fn resolve_child_order(
+    children: &mut HashMap<(String, String), Vec<pg2osync_source::children::ChildSpec>>,
+    admin: &tokio_postgres::Client,
+) -> Result<()> {
+    for specs in children.values_mut() {
+        for spec in specs.iter_mut() {
+            spec.resolve_order(admin).await?;
+        }
+    }
+    Ok(())
+}
+
 pub fn child_specs_for(
     cfg: &AppConfig,
 ) -> Result<HashMap<(String, String), Vec<pg2osync_source::children::ChildSpec>>> {
@@ -807,12 +826,13 @@ pub fn child_specs_for(
     for tbl in cfg.sync.values() {
         let (schema, table) = split_qualified(&tbl.table);
         for child in &tbl.children {
-            let spec = pg2osync_source::children::ChildSpec::new(
+            let mut spec = pg2osync_source::children::ChildSpec::new(
                 &child.table,
                 &child.field,
                 &child.foreign_key,
                 &tbl.primary_key.clone().unwrap_or_else(|| "id".into()),
             )?;
+            spec.max_rows = child.max_rows;
             map.entry((schema.to_string(), table.to_string()))
                 .or_default()
                 .push(spec);

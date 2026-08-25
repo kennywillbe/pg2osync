@@ -82,8 +82,9 @@ Stated up front, because finding these out in production is expensive:
 - **Poll mode cannot see a hard delete.** It has no access to the replication
   log. A soft delete it can see (`soft_delete`), and `pg2osync reconcile`
   removes index documents whose row is gone.
-- **Nested children are one level deep**, re-fetched with a query per changed
-  parent — a wide fan-out slows the initial load.
+- **Nested children are one level deep**, re-fetched once per collection per
+  transaction rather than per changed row, ordered by the child's primary key.
+  `max_rows` bounds a collection, and a document whose array was cut says so.
 - **MySQL needs `binlog_row_image = FULL`**, and refuses
   `binlog_row_value_options = PARTIAL_JSON`.
 - **MySQL nested children are not supported yet.**

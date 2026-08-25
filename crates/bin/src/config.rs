@@ -247,6 +247,16 @@ pub struct ChildJoin {
     pub field: String,
     /// FK column on the CHILD table referencing the parent PK.
     pub foreign_key: String,
+    /// How many children to embed. Unset embeds all of them.
+    ///
+    /// Unset by default because a cap loses data and the target already has the
+    /// bound that matters: past `index.mapping.nested_objects.limit` (10,000 by
+    /// default) OpenSearch refuses a document whose field is mapped `nested`,
+    /// which is reported and quarantined rather than lost. Set this to trade a
+    /// complete array for a bounded document — a document whose array was cut
+    /// says so in `<field>_truncated` and `<field>_total`.
+    #[serde(default)]
+    pub max_rows: Option<u32>,
 }
 
 impl TableSync {
