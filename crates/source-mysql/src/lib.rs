@@ -7,5 +7,6 @@ pub mod auth;
 pub mod binlog;
 pub mod catalog;
 pub mod connection;
+pub mod json;
 pub mod packet;
 pub mod runner;

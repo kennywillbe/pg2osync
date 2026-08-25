@@ -94,7 +94,8 @@ full initial load.
 ## How it works
 
 1. **Prerequisite check** on a plain connection (`log_bin`, `binlog_format`,
-   `binlog_row_image`), plus column and primary-key resolution from
+   `binlog_row_image`, `binlog_row_value_options`), plus column and
+   primary-key resolution from
    `information_schema`.
 2. **Initial load** inside `START TRANSACTION WITH CONSISTENT SNAPSHOT`. The
    binlog coordinate is read *inside* that transaction, so streaming from it can
@@ -147,9 +148,38 @@ Handled transparently:
 | `DATE`, `DATETIME`, `TIMESTAMP`, `TIME` | string |
 | `CHAR`, `VARCHAR`, `TEXT` | string |
 | `BIT`, `BINARY`, `BLOB`, `GEOMETRY` | base64 string |
-| `JSON` | parsed JSON on the initial load; hex placeholder when streamed |
+| `JSON` | parsed JSON, whichever path wrote it |
 
 Decimals stay strings on purpose: a float round-trip loses precision on money.
+A decimal *inside* a `JSON` document is the exception: MySQL renders it as a
+bare number in the JSON text the initial load reads, so the streamed value
+matches that rather than the column rule.
+
+## JSON columns
+
+`binlog_row_value_options = PARTIAL_JSON` is refused at startup. It makes the
+server log a JSON update as a diff in an event type of its own, which is not
+decoded here; refusing says so rather than dropping those updates silently.
+
+MySQL stores `JSON` in its own binary form, which the binlog carries verbatim.
+It is decoded here, so a row keeps the same shape whether it arrived through
+the initial load or through an update. Dates, times and decimals that JSON has
+no type for are rendered exactly as the initial load renders them; anything
+else opaque is base64.
+
+Two things worth knowing before pointing this at a target:
+
+- A document that cannot be decoded is stored as `__mysql_json_hex:<hex>` and
+  logged. The bytes stay recoverable rather than being guessed at, and the log
+  names the size so the row can be found.
+- OpenSearch's dynamic mapping rejects some perfectly valid JSON — an array
+  mixing scalars and objects, or an integer larger than a `long`. That is a
+  target-side limit, not a decoding one, and it applies to the initial load
+  just as much. Define the mapping yourself, or map the field as
+  `{"type": "object", "enabled": false}` to store it without indexing.
+
+MariaDB is unaffected: it stores `JSON` as `LONGTEXT`, which already arrives as
+text.
 
 ## TRUNCATE and DROP
 
@@ -177,7 +207,6 @@ field names.
 | Limitation | Detail | Workaround |
 |---|---|---|
 | Nested children | Not implemented for MySQL | Use PostgreSQL, or denormalize in a view |
-| `JSON` while streaming | MySQL's binary JSON format is not parsed; a hex placeholder is stored | Store JSON as `TEXT`, or re-run the initial load |
 | GTID positions | Checkpoints use file and offset, not GTID sets | Fine for a single server; failover to a replica needs a fresh initial load |
 | Timezone edge cases | `DATETIME` values decode naive | Prefer `TIMESTAMP`, or verify your setup |
 

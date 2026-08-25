@@ -105,6 +105,21 @@ sleep 3; refresh
 check "UPDATE propagated" "$(os_field e2e_mysql_users 4 name)" "dave-renamed"
 check "UPDATE keeps decimals" "$(os_field e2e_mysql_users 4 balance)" "8.50"
 
+my "INSERT INTO shop_users (id,name,metadata) VALUES (7,'jane','{\"tier\":\"gold\",\"tags\":[1,2]}');"
+synced
+case "$(os_field e2e_mysql_users 7 metadata)" in
+  *__mysql_json_hex*) bad "JSON streamed as a hex placeholder" ;;
+  *) ok "JSON decoded rather than left as hex" ;;
+esac
+if [ "$CLIENT" = "mysql" ]; then
+  # MariaDB stores JSON as LONGTEXT, so only MySQL produces a nested document
+  found=$(curl -s "$OS/e2e_mysql_users/_search" -H 'Content-Type: application/json' \
+    -d '{"query":{"term":{"metadata.tier":"gold"}}}' | jqf "d['hits']['total']['value']")
+  check "a streamed JSON field is searchable by subfield" "$found" "1"
+fi
+my "DELETE FROM shop_users WHERE id=7;"
+synced
+
 my "DELETE FROM shop_users WHERE id=3;"
 sleep 3; refresh
 check "DELETE propagated" "$(os_status e2e_mysql_users 3)" "404"
