@@ -117,6 +117,48 @@ pub async fn table_schema(
     })
 }
 
+
+/// The whole script a DBA needs for a MySQL or MariaDB source.
+///
+/// The server settings are a file edit rather than SQL: `binlog_format` is
+/// settable at runtime but does not survive a restart, and `log_bin` is not
+/// settable at all, so anything but my.cnf is a trap.
+pub fn setup_script(user: &str, databases: &[String]) -> String {
+    let mut out = String::new();
+    out.push_str("-- pg2osync source setup for MySQL/MariaDB. Review before running.\n\n");
+    out.push_str("-- 1. Server settings. These belong in my.cnf and need a RESTART:\n");
+    out.push_str("--    log_bin is not settable at runtime, and a SET GLOBAL of the\n");
+    out.push_str("--    others is lost on the next one.\n");
+    out.push_str("--\n");
+    out.push_str("--    [mysqld]\n");
+    out.push_str("--    log_bin                   = mysql-bin\n");
+    out.push_str("--    binlog_format             = ROW\n");
+    out.push_str("--    binlog_row_image          = FULL\n");
+    out.push_str("--    binlog_row_value_options  =        # must be empty: PARTIAL_JSON\n");
+    out.push_str("--                                       # writes JSON updates as diffs\n");
+    out.push_str("--    server_id                 = 1\n\n");
+
+    out.push_str("-- 2. A user for the pipeline.\n");
+    out.push_str(&format!(
+        "CREATE USER '{user}'@'%' IDENTIFIED BY 'change-me';\n\n"
+    ));
+
+    out.push_str("-- 3. Replication privileges. SLAVE opens the binlog stream,\n");
+    out.push_str("--    CLIENT reads the position it should start from.\n");
+    out.push_str(&format!(
+        "GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO '{user}'@'%';\n\n"
+    ));
+
+    out.push_str("-- 4. Read access for the initial load and for column metadata.\n");
+    for db in databases {
+        out.push_str(&format!(
+            "GRANT SELECT ON `{db}`.* TO '{user}'@'%';\n"
+        ));
+    }
+    out.push_str("\nFLUSH PRIVILEGES;\n");
+    out
+}
+
 /// Verify the server is configured for row-based CDC.
 ///
 /// All three settings are required for correct updates and deletes; failing at
@@ -256,6 +298,17 @@ fn quote_str(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_setup_script_names_the_settings_that_need_a_restart() {
+        let script = setup_script("svc", &["shop".into()]);
+        assert!(script.contains("RESTART"));
+        assert!(script.contains("binlog_row_image          = FULL"));
+        assert!(script.contains("binlog_row_value_options"), "PARTIAL_JSON is refused");
+        assert!(script.contains("CREATE USER 'svc'@'%'"));
+        assert!(script.contains("GRANT REPLICATION SLAVE, REPLICATION CLIENT"));
+        assert!(script.contains("GRANT SELECT ON `shop`.*"));
+    }
+
     use super::*;
 
     #[test]

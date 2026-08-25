@@ -12,6 +12,10 @@ for real-time change capture with a consistent-snapshot backfill.
   - `SELECT` on all synced tables (used by backfill and child queries)
   - schema usage rights
 
+`pg2osync setup-sql -c pg2osync.toml` prints the whole script for your config —
+role, grants, publication, the `wal_level` change and the restart it needs — so
+it can be handed to whoever holds the privileges. By hand it is:
+
 ```sql
 CREATE USER sync_user WITH REPLICATION PASSWORD '...';
 GRANT CONNECT ON DATABASE appdb TO sync_user;
