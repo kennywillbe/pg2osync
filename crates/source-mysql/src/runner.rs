@@ -32,6 +32,18 @@ pub struct MySqlSourceConfig {
     pub children: HashMap<(String, String), Vec<pg2osync_core::children::ChildSpec>>,
     /// Reverse routing: CHILD (schema, table) -> parent (schema, table).
     pub child_parents: HashMap<(String, String), (String, String)>,
+    /// Which transactions have been consumed, so a checkpoint can resume on a
+    /// server that never had this one's binlog files. Shared with whoever
+    /// renders the checkpoint position: the stream fills it, the checkpoint
+    /// reads it as of the position being written.
+    pub gtid: Option<std::sync::Arc<std::sync::Mutex<crate::gtid::GtidTracker>>>,
+    /// The GTID position to ask the server to resume from, when there is one.
+    pub gtid_resume: Option<crate::gtid::GtidPosition>,
+    /// Added to every coordinate to make the ordering token and the document
+    /// version. A failover moves to a different, often lower, coordinate space,
+    /// and versions may only go up — so the generation lives here rather than
+    /// being applied by whoever consumes the events.
+    pub version_base: u64,
 }
 
 impl MySqlSourceConfig {
@@ -118,10 +130,52 @@ impl MySqlSource {
         // tracking the position here is the honest side of that trade. MySQL has
         // no such setting and fills every event in.
         let mut current_pos = start_pos;
+        // Every token this stream emits — a version, a commit boundary, a
+        // checkpoint position — is the coordinate plus the generation. Built in
+        // one place because a coordinate that escaped without it would be a
+        // version from the previous server's numbering, which the target
+        // silently refuses.
+        let version_base = self.cfg.version_base;
+        let token_at =
+            |file: &str, pos: u32| version_base.saturating_add(catalog::position_token(file, pos));
 
-        conn.send_binlog_dump(&current_file, start_pos).await?;
-        tracing::info!(target: "pg2osync::source",
-            "mysql binlog dump from {current_file}@{start_pos}");
+        // Which command to ask with is the server's decision, not ours: MySQL
+        // takes the set in a dump command of its own, MariaDB has no such
+        // command and switches on a session variable instead.
+        let support = catalog::gtid_support(&mut admin).await?;
+        let tracking = self.cfg.gtid.is_some();
+        // What actually decided where the stream starts, which is what the log
+        // has to say — a coordinate printed for a stream the GTID position
+        // governed would send the next reader looking in the wrong place.
+        let mut resumed_by = format!("{current_file}@{start_pos}");
+        if support.mariadb && tracking {
+            let resume = match &self.cfg.gtid_resume {
+                // rendered from the parsed position, never the stored text
+                Some(crate::gtid::GtidPosition::MariaDb(pos)) => Some(pos.to_text()),
+                _ => None,
+            };
+            conn.set_maria_gtid_state(resume.as_deref()).await?;
+            if let Some(pos) = &resume {
+                resumed_by = format!("gtid {pos}");
+            }
+        }
+        let by_gtid = match (&self.cfg.gtid_resume, support.mariadb, tracking) {
+            (Some(crate::gtid::GtidPosition::MySql(set)), false, true) => set.encode(),
+            _ => None,
+        };
+        match by_gtid {
+            Some(sids) => {
+                if let Some(position) = &self.cfg.gtid_resume {
+                    resumed_by = format!("gtid {}", position.to_text());
+                }
+                conn.send_binlog_dump_gtid(&sids).await?;
+            }
+            // The ordinary command, which MariaDB also uses in GTID mode: the
+            // coordinate goes over but the server ignores it once
+            // `@slave_connect_state` is set, exactly as its own replica does.
+            None => conn.send_binlog_dump(&current_file, start_pos).await?,
+        }
+        tracing::info!(target: "pg2osync::source", "binlog dump from {resumed_by}");
 
         let mut registered: HashMap<u64, RegisteredTable> = HashMap::new();
         let mut pending = pg2osync_core::children::Pending::default();
@@ -201,7 +255,7 @@ impl MySqlSource {
                                 tx.send(ChangeEvent::TableTruncated {
                                     schema,
                                     table,
-                                    version: Some(catalog::position_token(&current_file, end_pos)),
+                                    version: Some(token_at(&current_file, end_pos)),
                                 })
                                 .await
                                 .context("change channel closed")?;
@@ -241,10 +295,51 @@ impl MySqlSource {
                         }
                     }
                 }
+                binlog::T_GTID | binlog::T_MARIA_GTID if self.cfg.gtid.is_some() => {
+                    // Recorded against the position of the group it opens, so a
+                    // checkpoint written for an earlier position never claims
+                    // this transaction. The group's own end position is not
+                    // known yet; its opening one is enough, because a
+                    // checkpoint at or past it means the group was written.
+                    let token = token_at(&current_file, end_pos);
+                    let tracker = self.cfg.gtid.as_ref().expect("checked");
+                    let mut tracker = tracker.lock().expect("not poisoned");
+                    if h.event_type == binlog::T_GTID {
+                        match binlog::parse_mysql_gtid(body) {
+                            Some((uuid, gno)) => tracker.record_mysql(token, uuid, gno),
+                            None => tracker.mark_incomplete("a GTID event could not be read"),
+                        }
+                    } else {
+                        match binlog::parse_maria_gtid(body) {
+                            Some((domain, seq_no)) => {
+                                tracker.record_mariadb(token, domain, h.server_id, seq_no)
+                            }
+                            None => tracker.mark_incomplete("a GTID event could not be read"),
+                        }
+                    }
+                }
+                binlog::T_ANONYMOUS_GTID if self.cfg.gtid.is_some() => {
+                    self.cfg
+                        .gtid
+                        .as_ref()
+                        .expect("checked")
+                        .lock()
+                        .expect("not poisoned")
+                        .mark_incomplete("a transaction was written with no GTID");
+                }
+                binlog::T_GTID_TAGGED if self.cfg.gtid.is_some() => {
+                    self.cfg
+                        .gtid
+                        .as_ref()
+                        .expect("checked")
+                        .lock()
+                        .expect("not poisoned")
+                        .mark_incomplete("a tagged GTID arrived, which this reader cannot decode");
+                }
                 binlog::T_HEARTBEAT => {
                     // carries no data; its value is the position it reports
                     tx.send(ChangeEvent::Transaction(TransactionBoundary::Commit {
-                        lsn: Lsn(catalog::position_token(&current_file, end_pos)),
+                        lsn: Lsn(token_at(&current_file, end_pos)),
                         commit_ts_micros: 0,
                     }))
                     .await
@@ -259,13 +354,13 @@ impl MySqlSource {
                         &mut pending,
                         &mut admin,
                         &tx,
-                        Some(catalog::position_token(&current_file, end_pos)),
+                        Some(token_at(&current_file, end_pos)),
                     )
                     .await?;
                     // XID closes a transaction: this is the only point where a
                     // position may be acknowledged
                     tx.send(ChangeEvent::Transaction(TransactionBoundary::Commit {
-                        lsn: Lsn(catalog::position_token(&current_file, end_pos)),
+                        lsn: Lsn(token_at(&current_file, end_pos)),
                         commit_ts_micros: i64::from(h.timestamp) * 1_000_000 - 946_684_800_000_000,
                     }))
                     .await
@@ -327,7 +422,7 @@ impl MySqlSource {
                         continue;
                     };
                     let set = binlog::parse_rows(h.event_type, body, &rt.meta)?;
-                    let version = catalog::position_token(&current_file, end_pos);
+                    let version = token_at(&current_file, end_pos);
                     let table = (rt.schema.clone(), rt.table.clone());
                     // A child row is not a document: it names a parent to re-read.
                     // Naming it rather than emitting it is what lets a thousand

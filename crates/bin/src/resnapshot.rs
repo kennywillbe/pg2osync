@@ -194,6 +194,15 @@ async fn mysql(
     let source = pg2osync_source_mysql::runner::MySqlSource::new(src_cfg);
     let mut conn = source.admin_connection().await?;
     run::resolve_mysql_child_order(&mut children, &mut conn).await?;
+    // The generation the pipeline is versioning in. A re-snapshot writing under
+    // an older one would have every document refused by the target and repair
+    // nothing, which is the one outcome worse than doing nothing at all.
+    let version_base = sink
+        .read_checkpoint(stream_id)
+        .await?
+        .and_then(|c| pg2osync_source_mysql::catalog::parse_stored_position(&c.position))
+        .map(|p| p.base)
+        .unwrap_or(0);
     pg2osync_source_mysql::load::run(
         &mut conn,
         &tables,
@@ -204,6 +213,7 @@ async fn mysql(
         load_done,
         scope,
         &children,
+        version_base,
     )
     .await
 }

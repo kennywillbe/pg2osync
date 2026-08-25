@@ -790,6 +790,11 @@ fn mysql_source(
             start_pos: 0,
             children: Default::default(),
             child_parents: Default::default(),
+            // this source is built for one-off catalog work, not for streaming,
+            // so it records nothing and resumes from nowhere
+            gtid: None,
+            gtid_resume: None,
+            version_base: 0,
             tls: cfg.tls_settings(source_url)?,
         },
     ))

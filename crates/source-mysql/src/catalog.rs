@@ -220,6 +220,92 @@ pub async fn master_position(conn: &mut MySqlConnection) -> Result<(String, u32)
     bail!("cannot read binlog position; the replication user needs REPLICATION CLIENT")
 }
 
+/// Which server this is, and whether its GTIDs can be used to resume.
+///
+/// The two answers travel together because neither is useful alone: the
+/// mechanism for asking differs by server, and MySQL can have GTIDs turned off
+/// while MariaDB cannot have them at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GtidSupport {
+    pub mariadb: bool,
+    pub usable: bool,
+}
+
+/// Ask the server what it is and whether GTIDs are on.
+///
+/// MariaDB always has them, and has no `gtid_mode` to ask about. MySQL does,
+/// and only `ON` is usable: under `ON_PERMISSIVE` a transaction may be written
+/// with no GTID at all, so a set built from the stream would silently omit it.
+pub async fn gtid_support(conn: &mut MySqlConnection) -> Result<GtidSupport> {
+    let version = conn
+        .query_text_row("SELECT VERSION()")
+        .await
+        .ok()
+        .and_then(|row| row.first().cloned().flatten())
+        .unwrap_or_default();
+    let mariadb = version.to_lowercase().contains("mariadb");
+    if mariadb {
+        return Ok(GtidSupport {
+            mariadb: true,
+            usable: true,
+        });
+    }
+    let mode = conn
+        .query_text_row("SELECT @@GLOBAL.gtid_mode")
+        .await
+        .ok()
+        .and_then(|row| row.first().cloned().flatten())
+        .unwrap_or_default()
+        .to_uppercase();
+    if mode == "ON_PERMISSIVE" || mode == "OFF_PERMISSIVE" {
+        tracing::warn!(target: "pg2osync::source",
+            "gtid_mode is {mode}, which still allows transactions with no GTID, so \
+             checkpoints keep using the binlog coordinate and cannot survive a failover. \
+             Set gtid_mode = ON to change that");
+    }
+    Ok(GtidSupport {
+        mariadb: false,
+        usable: mode == "ON",
+    })
+}
+
+/// Everything the server has already written, as a GTID position.
+///
+/// Read only when starting without a checkpoint, and read *before* the
+/// coordinate the stream will start from. It is the baseline a later resume
+/// needs: `COM_BINLOG_DUMP_GTID` sends every transaction *not* in the set it is
+/// given, so a set holding only what this run streamed would have the server
+/// replay the whole history before it. Taking it before the coordinate means it
+/// can only under-claim, and an under-claim costs a replay onto an idempotent
+/// write rather than a gap.
+///
+/// It is not a substitute for tracking: from here on, only what the stream
+/// actually delivers is added, because this says what the *server* holds and
+/// not what we have consumed.
+pub async fn gtid_baseline(
+    conn: &mut MySqlConnection,
+    support: GtidSupport,
+) -> Option<crate::gtid::GtidPosition> {
+    if !support.usable {
+        return None;
+    }
+    let variable = if support.mariadb {
+        "@@GLOBAL.gtid_binlog_pos"
+    } else {
+        "@@GLOBAL.gtid_executed"
+    };
+    let text = conn
+        .query_text_row(&format!("SELECT {variable}"))
+        .await
+        .ok()?
+        .first()
+        .cloned()
+        .flatten()?;
+    // A server with nothing in its binlog has an empty position, which is not a
+    // failure: there is simply nothing to have consumed yet.
+    crate::gtid::GtidPosition::parse(&text.replace('\n', ""))
+}
+
 /// Split `binlog.000004` into its prefix and numeric index.
 pub fn split_binlog_file(file: &str) -> Option<(String, u32)> {
     let (prefix, idx) = file.rsplit_once('.')?;
@@ -242,8 +328,74 @@ pub fn position_text(prefix: &str, token: u64) -> String {
 
 /// Parse the textual form produced by [`position_text`].
 pub fn parse_position(text: &str) -> Option<(String, u32)> {
-    let (file, pos) = text.rsplit_once(':')?;
-    Some((file.to_string(), pos.parse().ok()?))
+    let stored = parse_stored_position(text)?;
+    Some((stored.file, stored.pos))
+}
+
+/// Everything a MySQL checkpoint's position text says.
+///
+/// `core` treats that text as the source's own business, so the GTID position
+/// and the version generation ride inside it rather than widening the
+/// checkpoint document for one source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredPosition {
+    pub file: String,
+    pub pos: u32,
+    /// Where to resume regardless of which server this is now.
+    pub gtid: Option<crate::gtid::GtidPosition>,
+    /// Added to every coordinate to make the version. Zero for a checkpoint
+    /// written before generations existed, which is exactly what it means: the
+    /// first generation.
+    pub base: u64,
+}
+
+impl StoredPosition {
+    /// The version the coordinate in this position maps to.
+    pub fn token(&self) -> u64 {
+        self.base
+            .saturating_add(position_token(&self.file, self.pos))
+    }
+}
+
+/// Render a checkpoint position, carrying what it takes to resume elsewhere.
+///
+/// The bare `file:pos` form is kept when there is nothing to add, so a
+/// checkpoint only grows the extra fields once they mean something.
+pub fn position_text_full(prefix: &str, token: u64, base: u64, gtid: Option<&str>) -> String {
+    let mut out = position_text(prefix, token.saturating_sub(base));
+    if let Some(gtid) = gtid {
+        out.push_str(";gtid=");
+        out.push_str(gtid);
+    }
+    if base > 0 {
+        out.push_str(&format!(";base={base}"));
+    }
+    out
+}
+
+/// Parse either the bare coordinate or the full form.
+///
+/// A field this version does not know is ignored rather than fatal: the
+/// coordinate is the part every version has understood, and refusing the whole
+/// checkpoint over an unrecognised suffix would force a reload for nothing.
+pub fn parse_stored_position(text: &str) -> Option<StoredPosition> {
+    let mut parts = text.split(';');
+    let coordinate = parts.next()?;
+    let (file, pos) = coordinate.rsplit_once(':')?;
+    let mut stored = StoredPosition {
+        file: file.to_string(),
+        pos: pos.trim().parse().ok()?,
+        gtid: None,
+        base: 0,
+    };
+    for field in parts {
+        match field.split_once('=') {
+            Some(("gtid", value)) => stored.gtid = crate::gtid::GtidPosition::parse(value),
+            Some(("base", value)) => stored.base = value.trim().parse().unwrap_or(0),
+            _ => {}
+        }
+    }
+    Some(stored)
 }
 
 /// Build one backfill document plus its primary key.
@@ -304,6 +456,52 @@ mod tests {
             parse_position("binlog.000004:900"),
             Some(("binlog.000004".into(), 900))
         );
+    }
+
+    #[test]
+    fn a_position_written_before_generations_still_reads() {
+        let stored = parse_stored_position("binlog.000004:900").expect("parses");
+        assert_eq!(stored.file, "binlog.000004");
+        assert_eq!(stored.pos, 900);
+        assert_eq!(stored.base, 0, "no generation means the first one");
+        assert!(stored.gtid.is_none());
+        assert_eq!(stored.token(), position_token("binlog.000004", 900));
+    }
+
+    #[test]
+    fn a_full_position_survives_its_own_text() {
+        let token = position_token("binlog.000004", 900) + 4096;
+        let text = position_text_full("binlog", token, 4096, Some("0-3307-1431"));
+        assert_eq!(text, "binlog.000004:900;gtid=0-3307-1431;base=4096");
+        let stored = parse_stored_position(&text).expect("parses");
+        assert_eq!(stored.pos, 900);
+        assert_eq!(stored.base, 4096);
+        assert_eq!(
+            stored.gtid.as_ref().map(|g| g.to_text()).as_deref(),
+            Some("0-3307-1431")
+        );
+        assert_eq!(
+            stored.token(),
+            token,
+            "the token round trips through the text"
+        );
+    }
+
+    #[test]
+    fn nothing_extra_is_written_when_there_is_nothing_extra_to_say() {
+        let token = position_token("binlog.000004", 900);
+        assert_eq!(
+            position_text_full("binlog", token, 0, None),
+            "binlog.000004:900",
+            "a checkpoint only grows the extra fields once they mean something"
+        );
+    }
+
+    #[test]
+    fn an_unknown_field_costs_the_extras_and_not_the_checkpoint() {
+        let stored = parse_stored_position("binlog.000004:900;whatever=1;base=8").expect("parses");
+        assert_eq!(stored.base, 8);
+        assert_eq!(stored.pos, 900);
     }
 
     #[test]

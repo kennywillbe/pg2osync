@@ -265,11 +265,51 @@ builds a parent document means a value inside an array is the same JSON as the
 same value on its own. The cost is unchanged: one query per collection per batch,
 with the server still doing the ordering, the cap and the count.
 
+## Surviving a failover
+
+A binlog file name and offset only mean anything on the server they were read
+from, so a checkpoint also records which transactions have been consumed:
+
+```
+mysql-bin.000003:2278;gtid=3c63db20-a0cd-11f1-bc85-32cf1c33a72f:1-14
+```
+
+With that, pointing the pipeline at a promoted replica resumes rather than
+reloading. Two things make it work, and both need the server's cooperation:
+
+- **GTIDs have to be on.** MySQL needs `gtid_mode = ON`; `ON_PERMISSIVE` is not
+  enough, because a transaction may then be written with no GTID at all and a
+  position built from the stream would silently omit it. MariaDB always has
+  them, and needs nothing.
+- **The replica has to write its own binlog** — `log_replica_updates = ON` — or
+  there is nothing to stream from it once it is promoted.
+
+The new primary's coordinates are a different, usually lower, numbering than the
+one the target already holds versions from. Rather than refuse to continue,
+pg2osync opens a new *generation*: the version becomes `base + coordinate` with
+a base past everything already written, and the log says so —
+`versioning documents from a new generation at …`. Documents written after the
+promotion therefore outrank what came before them, which is what stops a
+failover from leaving the index quietly stale.
+
+`dev/failover-probe.sh` builds a primary and a replica, promotes the replica and
+asserts both halves: that the stream resumes without an initial load, and that a
+row only the new primary ever had actually lands in the index.
+
+If the GTID position has been purged from the new primary's binlogs, the server
+refuses the request rather than starting somewhere else, and the pipeline stops
+with what the server said. A fresh initial load is then the only honest repair.
+
+Without GTIDs, a checkpoint still resumes exactly — but only against the server
+it was written on. A coordinate behind the checkpoint stops the pipeline instead
+of reloading into silence, because the target's versions come from a numbering
+that no longer exists.
+
 ## Known limitations
 
 | Limitation | Detail | Workaround |
 |---|---|---|
-| GTID positions | Checkpoints use file and offset, not GTID sets | Fine for a single server; failover to a replica needs a fresh initial load |
+| Tagged GTIDs | MySQL 8.4's tagged GTID events are not decoded | Checkpoints fall back to the coordinate and say so; untagged GTIDs are unaffected |
 | Timezone edge cases | `DATETIME` values decode naive | Prefer `TIMESTAMP`, or verify your setup |
 
 ## Verifying your setup
@@ -285,3 +325,16 @@ MYSQL_CONTAINER=mysql-test MYSQL_PORT=13306 \
 The suite covers the snapshot, live CRUD, decimal fidelity, projections,
 transforms, the checkpoint format and crash recovery. For MariaDB add
 `MYSQL_CLIENT=mariadb`.
+
+The GTID section needs a server that has them. MySQL's image starts with them
+off, so a run that exercises it wants the flags:
+
+```sh
+docker run -d --name mysql-gtid -p 13308:3306 \
+  -e MYSQL_ROOT_PASSWORD=secret -e MYSQL_DATABASE=sourcedb mysql:8.0 \
+  --log-bin=mysql-bin --binlog-format=ROW --binlog-row-image=FULL \
+  --server-id=77 --gtid-mode=ON --enforce-gtid-consistency=ON
+```
+
+Against a server without them the section says it skipped and why, rather than
+passing without having tested anything. MariaDB needs none of this.

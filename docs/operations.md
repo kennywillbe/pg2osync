@@ -214,6 +214,13 @@ once a connection has lasted longer than that cap. After
 `[source] reconnect_max` consecutive failures (10 by default, roughly five
 minutes) the process exits and hands over.
 
+A MySQL **failover** is the case where reconnecting is not enough by itself: the
+address may now point at a server whose binlog file names and offsets mean
+nothing here. With GTIDs on, the checkpoint carries a position that any member of
+the topology can honour, and the pipeline resumes rather than reloading —
+see [surviving a failover](sources/mysql.md#surviving-a-failover) for what the
+server needs and what the log says when it happens.
+
 Configuration and privilege problems are **not** retried: `wal_level`,
 publication drift, a missing table, insufficient privileges and target setup all
 fail at startup and stay fatal. Retrying those is a crash loop wearing a
