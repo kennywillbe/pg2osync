@@ -57,12 +57,6 @@ pub struct MySqlSource {
     cfg: MySqlSourceConfig,
 }
 
-/// Result of the pre-stream snapshot: where to start streaming from.
-pub struct SnapshotStart {
-    pub file: String,
-    pub pos: u32,
-}
-
 impl MySqlSource {
     pub fn new(cfg: MySqlSourceConfig) -> Self {
         Self { cfg }
@@ -86,72 +80,6 @@ impl MySqlSource {
                 resolved.columns.len(), resolved.pk_columns);
         }
         Ok(())
-    }
-
-    /// Read every configured table inside one repeatable-read snapshot and
-    /// report the binlog coordinate the snapshot corresponds to.
-    ///
-    /// The position is taken *inside* the transaction: InnoDB establishes the
-    /// read view at `START TRANSACTION WITH CONSISTENT SNAPSHOT`, so streaming
-    /// from that coordinate can only re-deliver rows, never skip them.
-    pub async fn snapshot(
-        &self,
-        admin: &mut MySqlConnection,
-        tx: &tokio::sync::mpsc::Sender<ChangeEvent>,
-    ) -> Result<SnapshotStart> {
-        admin
-            .query_text_rows("SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-            .await?;
-        admin
-            .query_text_rows("START TRANSACTION WITH CONSISTENT SNAPSHOT")
-            .await?;
-        let (file, pos) = catalog::master_position(admin).await?;
-
-        for (schema, table) in &self.cfg.tables {
-            let resolved = catalog::table_schema(admin, schema, table).await?;
-            let sql = format!(
-                "SELECT {} FROM {}.{}",
-                resolved
-                    .columns
-                    .iter()
-                    .map(|c| catalog::quote_ident(&c.name))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                catalog::quote_ident(schema),
-                catalog::quote_ident(table)
-            );
-            let rows = admin
-                .query_text_rows(&sql)
-                .await
-                .with_context(|| format!("snapshot read failed for {schema}.{table}"))?;
-            let count = rows.len();
-            for row in rows {
-                let (doc, pk) = catalog::build_document(&resolved, &row);
-                tx.send(ChangeEvent::Row(RowChange {
-                    schema: schema.clone(),
-                    table: table.clone(),
-                    kind: RowKind::Insert { pk, doc },
-                    // a binlog coordinate is a file and an offset, not one
-                    // monotonic number, so there is nothing to version by until
-                    // checkpoints move to GTIDs
-                    version: None,
-                }))
-                .await
-                .context("change channel closed during snapshot")?;
-            }
-            // positionless boundary: flushes the batch without advancing any
-            // checkpoint, since snapshot rows have no binlog coordinate
-            tx.send(ChangeEvent::Transaction(TransactionBoundary::Commit {
-                lsn: Lsn(0),
-                commit_ts_micros: 0,
-            }))
-            .await
-            .context("change channel closed during snapshot")?;
-            tracing::info!(target: "pg2osync::source",
-                "snapshot of {schema}.{table}: {count} rows");
-        }
-        admin.query_text_rows("COMMIT").await?;
-        Ok(SnapshotStart { file, pos })
     }
 
     /// Stream committed row changes until error or shutdown signal fires.

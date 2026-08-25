@@ -567,7 +567,12 @@ async fn attempt_postgres(
     // A checkpoint is not proof that the load finished: it says where streaming
     // got to, and with a load recording its own progress the two are separate
     // facts. Trusting the checkpoint alone is what silently skips a load.
-    let load_pending = crate::backfill::unfinished(sink.as_ref(), cfg, &stream_id).await?;
+    let load_pending = pg2osync_core::load::unfinished(
+        sink.as_ref(),
+        &stream_id,
+        cfg.sync.values().map(|t| t.table.as_str()),
+    )
+    .await?;
     match (&resume_from, load_pending) {
         (Some(lsn), false) => {
             tracing::info!(target: "pg2osync::run", "resuming from checkpoint {lsn}")
@@ -930,26 +935,49 @@ async fn attempt_mysql(
 
     let stored = usable_checkpoint(sink.read_checkpoint(&stream_id).await?, &stream_id);
     let resume = stored.and_then(|c| mysql_catalog::parse_position(&c.position));
-    let (file_prefix, _) = match &resume {
-        Some((file, _)) => {
-            mysql_catalog::split_binlog_file(file).unwrap_or_else(|| ("binlog".to_string(), 0))
+    // A checkpoint says where streaming got to; a load records its own progress.
+    // Trusting the checkpoint alone is what silently skips an unfinished load.
+    let load_pending = pg2osync_core::load::unfinished(
+        sink.as_ref(),
+        &stream_id,
+        cfg.sync.values().map(|t| t.table.as_str()),
+    )
+    .await?;
+    // The coordinate is read *before* the first chunk, so streaming from it
+    // replays anything a chunk missed or read stale onto an idempotent write.
+    // That, not a snapshot, is what makes chunked reads correct.
+    let (start_file, start_pos) = match &resume {
+        Some((file, pos)) => {
+            tracing::info!(target: "pg2osync::run",
+            "resuming binlog from {file}@{pos}{}", if load_pending {
+                ", with an initial load still to finish"
+            } else {
+                ""
+            });
+            (file.clone(), *pos)
         }
         None => {
-            let (file, _) = mysql_catalog::master_position(&mut admin).await?;
-            mysql_catalog::split_binlog_file(&file).unwrap_or_else(|| ("binlog".to_string(), 0))
+            tracing::info!(target: "pg2osync::run", "no usable checkpoint; initial load");
+            mysql_catalog::master_position(&mut admin).await?
         }
     };
     let render: PositionRenderer = {
-        let prefix = file_prefix.clone();
+        let (prefix, _) = mysql_catalog::split_binlog_file(&start_file)
+            .unwrap_or_else(|| ("binlog".to_string(), 0));
         Arc::new(move |token| mysql_catalog::position_text(&prefix, token))
     };
 
+    let mut src_cfg = mysql_config(cfg, source_url)?;
+    src_cfg.start_file = Some(start_file);
+    src_cfg.start_pos = start_pos;
+
     let (events_tx, events_rx) = mpsc::channel::<ChangeEvent>(EVENT_CHANNEL_DEPTH);
-    // MySQL's snapshot is neither chunked nor concurrent with the stream yet, so
-    // nothing waits on load marks and the copy channel is closed immediately.
-    let (load_done_tx, _load_done_rx) = watch::channel(0u64);
+    // MySQL's load does not run beside the stream yet, so the copy channel is
+    // closed immediately.
     let (_, copy_rx) = mpsc::channel::<ChangeEvent>(1);
+    let (load_done_tx, load_done_rx) = watch::channel(0u64);
     let load_sink = sink.clone();
+    let load_stream_id = stream_id.clone();
     let ctx = pipeline_ctx(cfg, sink, metrics, ack_tx, load_done_tx)?;
     let engine = spawn_engine(
         events_rx,
@@ -961,24 +989,21 @@ async fn attempt_mysql(
         shutdown_rx.clone(),
     );
 
-    let mut src_cfg = mysql_config(cfg, source_url)?;
-    match resume {
-        Some((file, pos)) => {
-            tracing::info!(target: "pg2osync::run", "resuming binlog from {file}@{pos}");
-            src_cfg.start_file = Some(file);
-            src_cfg.start_pos = pos;
-        }
-        None => {
-            tracing::info!(target: "pg2osync::run", "no usable checkpoint; initial load");
-            let start = with_bulk_load_settings(&load_sink, cfg, async {
-                source.snapshot(&mut admin, &events_tx).await
-            })
-            .await?;
-            tracing::info!(target: "pg2osync::run",
-                "snapshot complete; streaming from {}@{}", start.file, start.pos);
-            src_cfg.start_file = Some(start.file);
-            src_cfg.start_pos = start.pos;
-        }
+    if resume.is_none() || load_pending {
+        let tables = src_cfg.tables.clone();
+        with_bulk_load_settings(&load_sink, cfg, async {
+            pg2osync_source_mysql::load::run(
+                &mut admin,
+                &tables,
+                cfg.source.load_chunk_rows.max(1) as u64,
+                &events_tx,
+                load_sink.as_ref(),
+                &load_stream_id,
+                load_done_rx,
+            )
+            .await
+        })
+        .await?;
     }
 
     let started = std::time::Instant::now();

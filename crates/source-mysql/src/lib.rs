@@ -8,5 +8,6 @@ pub mod binlog;
 pub mod catalog;
 pub mod connection;
 pub mod json;
+pub mod load;
 pub mod packet;
 pub mod runner;
