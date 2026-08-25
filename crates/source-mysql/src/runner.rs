@@ -221,9 +221,43 @@ impl MySqlSource {
                     }
                 }
                 binlog::T_QUERY => {
-                    // DDL changes column layout; drop cached schemas so the
-                    // next TABLE_MAP resolves fresh names from the catalog
                     if let Some(q) = binlog::parse_query(body) {
+                        // TRUNCATE is logged as a statement rather than as row
+                        // events, so without reading it here the target would
+                        // keep every document of a table the source emptied
+                        if let Some((schema, table)) = binlog::truncated_table(&q.sql, &q.database)
+                        {
+                            if self.is_configured(&schema, &table) {
+                                tx.send(ChangeEvent::TableTruncated { schema, table })
+                                    .await
+                                    .context("change channel closed")?;
+                                continue;
+                            }
+                            // a truncate we decline to act on is worth naming:
+                            // silence here reads exactly like a decoding fault
+                            tracing::debug!(target: "pg2osync::source",
+                                "TRUNCATE of unconfigured table {schema}.{table} ignored");
+                        }
+                        if let Some((schema, table)) = binlog::dropped_table(&q.sql, &q.database)
+                            && self.is_configured(&schema, &table)
+                        {
+                            // clearing the index would be presumptuous — the
+                            // table may be about to be recreated — but leaving
+                            // it stale without saying so would be worse
+                            tracing::warn!(target: "pg2osync::source",
+                                "{schema}.{table} was dropped; its index still holds \
+                                 the documents it had and will not be updated again");
+                            continue;
+                        }
+                        // a statement that reached here changed something we
+                        // did not act on; naming it is what makes an
+                        // unrecognised form diagnosable instead of silent
+                        tracing::debug!(target: "pg2osync::source",
+                            "statement not acted on, db={:?}: {:?}",
+                            q.database,
+                            q.sql.chars().take(60).collect::<String>());
+                        // DDL changes column layout; drop cached schemas so the
+                        // next TABLE_MAP resolves fresh names from the catalog
                         let sql = q.sql.trim_start().to_uppercase();
                         if sql.starts_with("ALTER") || sql.starts_with("RENAME") {
                             tracing::info!(target: "pg2osync::source",

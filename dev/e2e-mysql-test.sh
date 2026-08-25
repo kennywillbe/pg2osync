@@ -35,6 +35,7 @@ os_has()    { curl -s "$OS/$1/_doc/$2" | jqf "'$3' in d.get('_source',{})"; }
 os_status() { curl -s -o /dev/null -w "%{http_code}" "$OS/$1/_doc/$2"; }
 my()        { docker exec "$CONTAINER" "$CLIENT" -uroot -p"$ROOT_PASSWORD" -N -B sourcedb -e "$1" 2>/dev/null; }
 refresh()   { curl -s -XPOST "$OS/_refresh" > /dev/null; }
+synced()    { curl -s "http://127.0.0.1:9132/synced?refresh=true&timeout=10000" > /dev/null; refresh; }
 
 start_sync() { nohup $BIN run -c "$CONFIG" >> "$LOG" 2>&1 < /dev/null & disown; }
 stop_sync()  { pkill -f "pg2osync run" 2> /dev/null || true; }
@@ -117,7 +118,17 @@ my "DELETE FROM shop_users WHERE id = 40;"
 sleep 3; refresh
 check "deleting the moved row leaves nothing" "$(os_status e2e_mysql_users 40)" "404"
 
-say "5. checkpoint format"
+say "5. TRUNCATE clears the index"
+my "TRUNCATE TABLE shop_users;"
+# wait on the pipeline rather than on a guess: /synced returns once everything
+# committed before it has been applied, which keeps this step deterministic
+synced
+check "index cleared after TRUNCATE" "$(os_count e2e_mysql_users)" "0"
+my "INSERT INTO shop_users (id,name,email) VALUES (7,'after-truncate','g@test.io');"
+synced
+check "streaming continues after TRUNCATE" "$(os_count e2e_mysql_users)" "1"
+
+say "6. checkpoint format"
 source_kind=$(curl -s "$OS/.pg2osync_meta/_doc/default" | jqf "d['_source']['source']")
 position=$(curl -s "$OS/.pg2osync_meta/_doc/default" | jqf "d['_source']['position']")
 check "checkpoint source" "$source_kind" "mysql"
@@ -127,7 +138,7 @@ else
   bad "binlog position malformed ($position)"
 fi
 
-say "6. reconnects after the server kills the dump thread"
+say "7. reconnects after the server kills the dump thread"
 before_pid=$(pgrep -f "pg2osync run" | head -1)
 # information_schema.PROCESSLIST rather than performance_schema.threads:
 # MariaDB ships with performance_schema disabled, so the latter finds nothing
@@ -146,7 +157,7 @@ metrics=$(curl -s http://127.0.0.1:9112/metrics)
 reconnects=$(awk '$1 == "pg2osync_reconnects_total" {print $2}' <<< "$metrics")
 if [ "${reconnects:-0}" -ge 1 ]; then ok "reconnects_total counted it ($reconnects)"; else bad "reconnects_total still zero"; fi
 
-say "7. read-your-writes"
+say "8. read-your-writes"
 my "INSERT INTO shop_users (id,name,email) VALUES (11,'ryw','r@test.io');"
 synced=$(curl -s "http://127.0.0.1:9132/synced?refresh=true&timeout=8000")
 found=$(curl -s "$OS/e2e_mysql_users/_search" -H 'Content-Type: application/json' \
@@ -154,7 +165,7 @@ found=$(curl -s "$OS/e2e_mysql_users/_search" -H 'Content-Type: application/json
 check "the row is searchable the moment /synced returns" "$found" "1"
 ok "waited $(jqf "d['waited_ms']" <<< "$synced")ms"
 
-say "8. crash recovery resumes from the binlog position"
+say "9. crash recovery resumes from the binlog position"
 snapshots_before=$(grep -c 'snapshot of' "$LOG")
 pkill -9 -f "pg2osync run"; sleep 1
 my "INSERT INTO shop_users (id,name,email) VALUES (5,'eve-during-downtime','eve@test.io');"
@@ -163,10 +174,10 @@ sleep 6; refresh
 check "row written while down is recovered" "$(os_field e2e_mysql_users 5 name)" "eve-during-downtime"
 check "no full re-snapshot needed" "$(( $(grep -c 'snapshot of' "$LOG") - snapshots_before ))" "0"
 
-say "9. final consistency"
+say "10. final consistency"
 check "row counts match" "$(my 'SELECT count(*) FROM shop_users;')" "$(os_count e2e_mysql_users)"
 
-say "10. status"
+say "11. status"
 $BIN status -c "$CONFIG" | sed 's/^/    /'
 
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"

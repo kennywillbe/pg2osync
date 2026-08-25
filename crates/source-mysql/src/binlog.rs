@@ -193,8 +193,81 @@ pub fn parse_query(payload: &[u8]) -> Option<QueryInfo> {
     let status_len = r.u16v().ok()? as usize;
     r.take(status_len).ok()?;
     let db = String::from_utf8_lossy(r.take(db_len).ok()?).into_owned();
+    // the database name is NUL-terminated; without consuming that byte every
+    // statement would begin with it and no keyword would ever match
+    r.u8v().ok()?;
     let sql = String::from_utf8_lossy(r.rest()).into_owned();
     Some(QueryInfo { database: db, sql })
+}
+
+/// The table a `TRUNCATE` statement clears, if that is what this statement is.
+///
+/// InnoDB logs `TRUNCATE` as a statement rather than as row events, so reading
+/// it out of the SQL is the only way to see it at all. Only the table-name
+/// token is read; whatever follows it — a semicolon, a comment, padding — says
+/// nothing about which table was cleared.
+pub fn truncated_table(sql: &str, default_db: &str) -> Option<(String, String)> {
+    let mut words = sql.split_whitespace();
+    if !words.next()?.eq_ignore_ascii_case("TRUNCATE") {
+        return None;
+    }
+    let mut name = words.next()?;
+    // "TABLE" is optional: both TRUNCATE TABLE t and TRUNCATE t are logged
+    if name.eq_ignore_ascii_case("TABLE") {
+        name = words.next()?;
+    }
+    split_qualified_name(name, default_db)
+}
+
+/// The table a `DROP TABLE` names, for warning that its index is now stale.
+pub fn dropped_table(sql: &str, default_db: &str) -> Option<(String, String)> {
+    let mut words = sql.split_whitespace();
+    if !words.next()?.eq_ignore_ascii_case("DROP") {
+        return None;
+    }
+    if !words.next()?.eq_ignore_ascii_case("TABLE") {
+        return None;
+    }
+    let mut name = words.next()?;
+    for optional in ["IF", "EXISTS"] {
+        if name.eq_ignore_ascii_case(optional) {
+            name = words.next()?;
+        }
+    }
+    split_qualified_name(name, default_db)
+}
+
+/// Split `db.table`, `` `db`.`table` `` or a bare name into its two parts.
+fn split_qualified_name(raw: &str, default_db: &str) -> Option<(String, String)> {
+    let (first, rest) = read_identifier(raw)?;
+    match rest.strip_prefix('.') {
+        Some(after_dot) => {
+            let (table, _) = read_identifier(after_dot)?;
+            (!first.is_empty() && !table.is_empty()).then_some((first, table))
+        }
+        None => {
+            let schema = default_db.trim().to_string();
+            (!schema.is_empty() && !first.is_empty()).then_some((schema, first))
+        }
+    }
+}
+
+/// Read one identifier and report what follows it.
+///
+/// Stopping at the end of the identifier is not fastidiousness: statements
+/// arrive with whatever trails them, and MariaDB pads a replaced event out to
+/// the length of the one it stands in for. Treating any of that as part of the
+/// name silently breaks the match, and a name that fails to match looks exactly
+/// like a table nobody configured.
+fn read_identifier(raw: &str) -> Option<(String, &str)> {
+    if let Some(quoted) = raw.strip_prefix('`') {
+        let end = quoted.find('`')?;
+        return Some((quoted[..end].to_string(), &quoted[end + 1..]));
+    }
+    let end = raw
+        .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+        .unwrap_or(raw.len());
+    (end > 0).then(|| (raw[..end].to_string(), &raw[end..]))
 }
 
 // ---- TABLE_MAP --------------------------------------------------------------
@@ -870,6 +943,105 @@ mod tests {
             4,
             "a pre-stripped body cannot report CRC32; runner must pass the whole event"
         );
+    }
+
+    #[test]
+    fn a_query_event_yields_the_statement_without_its_separator() {
+        // db_len(1) err(2) status_len(2) status db NUL sql, after the
+        // thread id and exec time
+        let mut body = Vec::new();
+        body.extend_from_slice(&7u32.to_le_bytes()); // thread id
+        body.extend_from_slice(&0u32.to_le_bytes()); // exec time
+        body.push(8); // length of "sourcedb"
+        body.extend_from_slice(&0u16.to_le_bytes()); // error code
+        body.extend_from_slice(&0u16.to_le_bytes()); // status block length
+        body.extend_from_slice(b"sourcedb");
+        body.push(0);
+        body.extend_from_slice(b"TRUNCATE TABLE t");
+
+        let q = parse_query(&body).expect("parsed");
+        assert_eq!(q.database, "sourcedb");
+        assert_eq!(q.sql, "TRUNCATE TABLE t", "the NUL must not survive");
+        assert_eq!(
+            truncated_table(&q.sql, &q.database),
+            Some(("sourcedb".into(), "t".into()))
+        );
+    }
+
+    #[test]
+    fn truncate_is_recognised_in_the_forms_the_server_logs() {
+        // both observed against MySQL 8.0.46; TABLE is optional
+        assert_eq!(
+            truncated_table("TRUNCATE TABLE trunc_probe", "sourcedb"),
+            Some(("sourcedb".into(), "trunc_probe".into()))
+        );
+        assert_eq!(
+            truncated_table("TRUNCATE trunc_probe", "sourcedb"),
+            Some(("sourcedb".into(), "trunc_probe".into()))
+        );
+        assert_eq!(
+            truncated_table("truncate TaBLe `shop`.`users`", ""),
+            Some(("shop".into(), "users".into())),
+            "a qualified name needs no default database"
+        );
+        assert_eq!(
+            truncated_table("TRUNCATE TABLE shop.users", "other"),
+            Some(("shop".into(), "users".into())),
+            "the statement's own qualification wins"
+        );
+    }
+
+    #[test]
+    fn the_name_ends_where_the_identifier_ends() {
+        // the statement text is not guaranteed to end cleanly: a checksum can
+        // follow it, and reading to the end would corrupt the table name
+        assert_eq!(
+            truncated_table("TRUNCATE trunc_probe;", "db"),
+            Some(("db".into(), "trunc_probe".into()))
+        );
+        assert_eq!(
+            truncated_table("TRUNCATE TABLE `t` /* generated by server */", "db"),
+            Some(("db".into(), "t".into()))
+        );
+        // exactly what MySQL 8.0.46 sends: the CRC32 follows the name with no
+        // separator at all
+        assert_eq!(
+            truncated_table("TRUNCATE TABLE shop_users\u{feff}\u{7f}p{", "sourcedb"),
+            Some(("sourcedb".into(), "shop_users".into()))
+        );
+        assert_eq!(
+            truncated_table("TRUNCATE TABLE `shop`.`users`\u{7f}\u{1}", "db"),
+            Some(("shop".into(), "users".into()))
+        );
+    }
+
+    #[test]
+    fn other_statements_are_not_truncates() {
+        assert_eq!(truncated_table("DELETE FROM t", "db"), None);
+        assert_eq!(truncated_table("BEGIN", "db"), None);
+        assert_eq!(truncated_table("TRUNCATE", "db"), None, "no table named");
+        assert_eq!(
+            truncated_table("TRUNCATE t", ""),
+            None,
+            "unqualified with no default database cannot be resolved"
+        );
+    }
+
+    #[test]
+    fn drops_are_recognised_including_the_optional_clause() {
+        assert_eq!(
+            dropped_table(
+                "DROP TABLE `trunc_probe` /* generated by server */",
+                "sourcedb"
+            ),
+            Some(("sourcedb".into(), "trunc_probe".into()))
+        );
+        assert_eq!(
+            dropped_table("DROP TABLE IF EXISTS shop.users", "db"),
+            Some(("shop".into(), "users".into()))
+        );
+        assert_eq!(dropped_table("DROP DATABASE shop", "db"), None);
+        assert_eq!(dropped_table("TRUNCATE t", "db"), None);
     }
 
     #[test]
