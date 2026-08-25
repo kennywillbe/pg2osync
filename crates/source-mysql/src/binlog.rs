@@ -149,11 +149,6 @@ pub fn parse_fde(body_after_header: &[u8]) -> (usize, usize) {
     (header_len.max(19), checksum_len)
 }
 
-/// Strip trailing checksum bytes from a non-FDE event.
-fn strip_checksum(ev_body: &[u8], checksum_len: usize) -> &[u8] {
-    &ev_body[..ev_body.len().saturating_sub(checksum_len)]
-}
-
 // ---- ROTATE -----------------------------------------------------------------
 
 pub struct RotateInfo {
@@ -374,10 +369,12 @@ pub struct RowsRowSet {
     pub rows: Vec<RowsRow>,
 }
 
+/// `payload` is the event body with any checksum already removed: stripping
+/// belongs to the reader that knows the stream's checksum length, and doing it
+/// in two places once cost four bytes off the end of every row event.
 pub fn parse_rows(
     ev_type: u8,
     payload: &[u8],
-    checksum_len: usize,
     meta: &TableMeta,
 ) -> Result<RowsRowSet, DecodeError> {
     let (kind, _is_v2) = match ev_type {
@@ -390,8 +387,7 @@ pub fn parse_rows(
         other => return Err(DecodeError::UnknownType(other)),
     };
 
-    let body = strip_checksum(payload, checksum_len);
-    let mut r = R::new(body);
+    let mut r = R::new(payload);
     let table_id = r.u48()?;
     let _flags = r.u16v()?;
     // MySQL v2 row events carry a 2-byte extra-data length + payload;
@@ -846,6 +842,36 @@ fn format_unix_ts(secs: u32, micros: u32) -> String {
 mod tests {
     use super::*;
 
+    /// A realistic FDE body: 2 + 50 + 4 header fields, the common-header
+    /// length at [56], then the post-header array, the checksum algorithm
+    /// byte, and the CRC32 itself.
+    fn fde_body(alg: u8, len: usize) -> Vec<u8> {
+        let mut b = vec![0u8; len];
+        b[56] = 19;
+        b[len - 5] = alg;
+        b
+    }
+
+    #[test]
+    fn the_checksum_algorithm_is_read_from_the_unstripped_body() {
+        assert_eq!(parse_fde(&fde_body(1, 100)), (19, 4));
+        assert_eq!(parse_fde(&fde_body(0, 100)), (19, 0), "checksums disabled");
+    }
+
+    #[test]
+    fn a_body_that_already_lost_its_checksum_reads_the_wrong_byte() {
+        // the guarantee this pins down is the caller's: parse_fde must see the
+        // event whole. Stripping first moves the algorithm byte out of reach
+        // and the answer stops depending on what the server actually sends.
+        let whole = fde_body(1, 100);
+        let stripped = &whole[..whole.len() - 4];
+        assert_ne!(
+            parse_fde(stripped).1,
+            4,
+            "a pre-stripped body cannot report CRC32; runner must pass the whole event"
+        );
+    }
+
     #[test]
     fn header_parses() {
         let mut ev = vec![0u8; 19];
@@ -947,7 +973,7 @@ mod tests {
         })
         .unwrap();
 
-        let set = parse_rows(T_WRITE_ROWS_V2, &p, 0, &meta).unwrap();
+        let set = parse_rows(T_WRITE_ROWS_V2, &p, &meta).unwrap();
         assert_eq!(set.kind, RowsKind::Write);
         assert_eq!(set.rows.len(), 1);
         let img = set.rows[0].after.as_ref().unwrap();

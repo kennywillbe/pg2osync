@@ -33,7 +33,7 @@ pg()         { docker exec "$PG_CONTAINER" psql -U postgres -d sourcedb -qtAc "$
 refresh()    { curl -s -XPOST "$OS/_refresh" > /dev/null; }
 
 start_sync() {
-  nohup $BIN run -c "$CONFIG" &> "$LOG" < /dev/null & disown
+  nohup $BIN run -c "$CONFIG" >> "$LOG" 2>&1 < /dev/null & disown
 }
 stop_sync() { pkill -f "pg2osync run" 2> /dev/null || true; }
 cleanup()   { stop_sync; rm -f "$CONFIG"; }

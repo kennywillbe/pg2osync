@@ -69,7 +69,7 @@ async fn main() -> Result<()> {
 
         match h.event_type {
             binlog::T_FORMAT_DESCRIPTION => {
-                let (header_len, clen) = parse_fde(body);
+                let (header_len, clen) = parse_fde(&ev[19..]);
                 checksum_len = clen;
                 println!("[FDE] header_len={header_len} checksum_len={clen}");
             }
@@ -112,7 +112,7 @@ async fn main() -> Result<()> {
                     println!("[ROWS] unknown table id {table_id}");
                     continue;
                 };
-                let set = parse_rows(h.event_type, body, checksum_len, meta)?;
+                let set = parse_rows(h.event_type, body, meta)?;
                 for row in &set.rows {
                     if let Some(before) = &row.before {
                         println!(

@@ -203,7 +203,12 @@ impl MySqlSource {
 
             match h.event_type {
                 binlog::T_FORMAT_DESCRIPTION => {
-                    let (_, clen) = binlog::parse_fde(body);
+                    // the FDE carries the checksum algorithm in its own last
+                    // five bytes, so it has to be read before any stripping:
+                    // handing it the stripped body reads a padding byte
+                    // instead and settles on a length that then mangles the
+                    // tail of every later event
+                    let (_, clen) = binlog::parse_fde(&ev[19..]);
                     checksum_len = clen;
                 }
                 binlog::T_ROTATE => {
@@ -294,7 +299,7 @@ impl MySqlSource {
                     let Some(rt) = registered.get(&table_id) else {
                         continue;
                     };
-                    let set = binlog::parse_rows(h.event_type, body, checksum_len, &rt.meta)?;
+                    let set = binlog::parse_rows(h.event_type, body, &rt.meta)?;
                     for row in &set.rows {
                         let change = build_change(rt, &set.kind, row)?;
                         tx.send(change).await.context("change channel closed")?;
