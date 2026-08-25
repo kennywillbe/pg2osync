@@ -92,10 +92,7 @@ pub trait Sink: Send + Sync {
     /// of rows land is doing work nobody is waiting for: nothing searches an
     /// index that is still being filled. Targets with no such settings do
     /// nothing here.
-    async fn begin_bulk_load(
-        &self,
-        _indices: &[String],
-    ) -> Result<BulkLoadSettings, CoreError> {
+    async fn begin_bulk_load(&self, _indices: &[String]) -> Result<BulkLoadSettings, CoreError> {
         Ok(BulkLoadSettings::default())
     }
 

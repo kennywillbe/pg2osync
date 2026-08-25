@@ -6,8 +6,8 @@
 //! never on the write path — which is the whole reason this is an endpoint
 //! rather than a synchronous write.
 
-use crate::http::{authorized, request_target, split_target};
 use crate::PositionParser;
+use crate::http::{authorized, request_target, split_target};
 use pg2osync_core::lsn::Lsn;
 use pg2osync_core::sink::Sink;
 use std::future::Future;

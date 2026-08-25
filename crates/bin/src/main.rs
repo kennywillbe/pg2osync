@@ -137,7 +137,6 @@ async fn pipeline(path: &Path, mode: run::Mode) -> Result<()> {
     .await
 }
 
-
 /// Print the source-side setup script for this config.
 ///
 /// Offline on purpose: the point is to hand something to whoever holds the
@@ -187,7 +186,6 @@ fn setup_sql(path: &Path) -> Result<()> {
     Ok(())
 }
 
-
 /// Compare every configured index against its table.
 ///
 /// Run it when the pipeline is caught up: a document whose row was inserted
@@ -234,7 +232,6 @@ async fn reconcile_cmd(path: &Path, delete: bool) -> Result<()> {
     Ok(())
 }
 
-
 /// Move an alias onto the index this config writes.
 ///
 /// The last step of a reindex, and the one that has to be atomic: a reader
@@ -257,8 +254,6 @@ async fn switch_alias(path: &Path, alias: &str) -> Result<()> {
     println!("alias {alias} now points at {index}");
     Ok(())
 }
-
-
 
 /// The stream this config identifies, which is also where its checkpoint lives.
 fn stream_id(cfg: &config::AppConfig) -> pg2osync_core::checkpoint::StreamId {
@@ -365,7 +360,6 @@ async fn validate(path: &Path) -> Result<()> {
     Ok(())
 }
 
-
 /// Check a table's configuration against the columns it actually has.
 ///
 /// A `columns` list naming something that no longer exists is silently ignored
@@ -394,7 +388,10 @@ fn check_configured_columns(table: &config::TableSync, live: &[String]) -> Resul
     if let Some(pk) = &table.primary_key
         && !missing(std::slice::from_ref(pk)).is_empty()
     {
-        bail!("table {} has no column {pk} to use as primary_key", table.table);
+        bail!(
+            "table {} has no column {pk} to use as primary_key",
+            table.table
+        );
     }
     // an exclusion or a transform for a column that is gone changes nothing,
     // so it is stale configuration rather than a fault

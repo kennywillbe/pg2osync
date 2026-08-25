@@ -13,7 +13,6 @@ pub mod http;
 pub mod mapping;
 pub mod metrics;
 
-use std::collections::HashMap;
 use crate::mapping::TableMapping;
 use pg2osync_core::checkpoint::{Checkpoint, StreamId};
 use pg2osync_core::error::CoreError;
@@ -22,6 +21,7 @@ use pg2osync_core::lsn::Lsn;
 use pg2osync_core::sink::{DocumentOp, LsnOp, Sink, SinkAck};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::sync::{mpsc, watch};
@@ -271,8 +271,9 @@ pub async fn run(
                         }
                         Err(_) => false,
                     };
-                    let overdue = coalescing_since
-                        .is_some_and(|since: std::time::Instant| since.elapsed() >= COALESCE_WINDOW);
+                    let overdue = coalescing_since.is_some_and(|since: std::time::Instant| {
+                        since.elapsed() >= COALESCE_WINDOW
+                    });
                     if waiting && !overdue {
                         coalescing_since.get_or_insert_with(std::time::Instant::now);
                     } else {

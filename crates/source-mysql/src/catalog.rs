@@ -117,7 +117,6 @@ pub async fn table_schema(
     })
 }
 
-
 /// The whole script a DBA needs for a MySQL or MariaDB source.
 ///
 /// The server settings are a file edit rather than SQL: `binlog_format` is
@@ -151,9 +150,7 @@ pub fn setup_script(user: &str, databases: &[String]) -> String {
 
     out.push_str("-- 4. Read access for the initial load and for column metadata.\n");
     for db in databases {
-        out.push_str(&format!(
-            "GRANT SELECT ON `{db}`.* TO '{user}'@'%';\n"
-        ));
+        out.push_str(&format!("GRANT SELECT ON `{db}`.* TO '{user}'@'%';\n"));
     }
     out.push_str("\nFLUSH PRIVILEGES;\n");
     out
@@ -303,7 +300,10 @@ mod tests {
         let script = setup_script("svc", &["shop".into()]);
         assert!(script.contains("RESTART"));
         assert!(script.contains("binlog_row_image          = FULL"));
-        assert!(script.contains("binlog_row_value_options"), "PARTIAL_JSON is refused");
+        assert!(
+            script.contains("binlog_row_value_options"),
+            "PARTIAL_JSON is refused"
+        );
         assert!(script.contains("CREATE USER 'svc'@'%'"));
         assert!(script.contains("GRANT REPLICATION SLAVE, REPLICATION CLIENT"));
         assert!(script.contains("GRANT SELECT ON `shop`.*"));

@@ -124,8 +124,7 @@ fn decode_object(body: &[u8], large: bool) -> Option<Value> {
         let key_at = width * 2 + i * key_entry;
         let key_offset = field(body, key_at, large)?;
         let key_len = u16::from_le_bytes(head(body.get(key_at + width..)?)?) as usize;
-        let key =
-            String::from_utf8_lossy(body.get(key_offset..key_offset + key_len)?).into_owned();
+        let key = String::from_utf8_lossy(body.get(key_offset..key_offset + key_len)?).into_owned();
 
         let value_at = width * 2 + count * key_entry + i * value_entry;
         map.insert(key, entry_value(body, value_at, large)?);
@@ -319,7 +318,10 @@ mod tests {
             ],
             &[],
         );
-        assert_eq!(decode(&doc), Some(json!({"t": true, "f": false, "n": null})));
+        assert_eq!(
+            decode(&doc),
+            Some(json!({"t": true, "f": false, "n": null}))
+        );
     }
 
     #[test]
@@ -386,7 +388,10 @@ mod tests {
             Some(json!("2024-03-05"))
         );
         let time: i64 = (10i64 << 12 | 20i64 << 6 | 30) << 24;
-        assert_eq!(decode(&opaque(11, &time.to_le_bytes())), Some(json!("10:20:30")));
+        assert_eq!(
+            decode(&opaque(11, &time.to_le_bytes())),
+            Some(json!("10:20:30"))
+        );
     }
 
     #[test]

@@ -190,9 +190,9 @@ fn start_metrics(cfg: &AppConfig) -> Result<SharedMetrics> {
 /// has to live in a file that gets committed or mounted as a ConfigMap.
 fn read_token(var: Option<&str>, endpoint: &str) -> Result<Option<String>> {
     match var {
-        Some(key) => std::env::var(key)
-            .map(Some)
-            .map_err(|_| anyhow::anyhow!("{endpoint}.token_env={key:?} is set but the variable is missing")),
+        Some(key) => std::env::var(key).map(Some).map_err(|_| {
+            anyhow::anyhow!("{endpoint}.token_env={key:?} is set but the variable is missing")
+        }),
         None => Ok(None),
     }
 }
@@ -482,11 +482,7 @@ async fn run_postgres(
 /// Restoring is not optional and not conditional on success: an index left with
 /// refresh suspended looks empty to every search against it, and nothing would
 /// ever put it back.
-async fn with_bulk_load_settings<F, T>(
-    sink: &Arc<dyn Sink>,
-    cfg: &AppConfig,
-    load: F,
-) -> Result<T>
+async fn with_bulk_load_settings<F, T>(sink: &Arc<dyn Sink>, cfg: &AppConfig, load: F) -> Result<T>
 where
     F: std::future::Future<Output = Result<T>>,
 {

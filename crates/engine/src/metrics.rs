@@ -101,7 +101,9 @@ impl Metrics {
             "pg2osync_toast_readbacks_total",
             "Reads of the target to complete unchanged TOASTed columns",
             "counter",
-            self.toast_readbacks_total.load(Ordering::Relaxed).to_string(),
+            self.toast_readbacks_total
+                .load(Ordering::Relaxed)
+                .to_string(),
         );
         push(
             &mut out,
@@ -263,7 +265,9 @@ pub async fn serve(bind: &str, metrics: SharedMetrics, token: Option<String>) {
                 return;
             };
             let request = String::from_utf8_lossy(&buf[..read]);
-            let response = respond(&request, token.as_deref().map(String::as_str), || m.render());
+            let response = respond(&request, token.as_deref().map(String::as_str), || {
+                m.render()
+            });
             let _ = sock.write_all(response.render().as_bytes()).await;
         });
     }
@@ -320,5 +324,4 @@ mod tests {
         let post = "POST /metrics HTTP/1.1\r\nHost: h\r\n\r\n";
         assert_eq!(body(post, None).0, "405 Method Not Allowed");
     }
-
 }

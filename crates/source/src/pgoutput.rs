@@ -86,7 +86,8 @@ pub fn column_drift(before: &Relation, after: &Relation) -> Option<String> {
         .iter()
         .filter_map(|b| {
             let a = after.columns.iter().find(|a| a.name == b.name)?;
-            (a.type_oid != b.type_oid).then(|| format!("{} ({} -> {})", b.name, b.type_oid, a.type_oid))
+            (a.type_oid != b.type_oid)
+                .then(|| format!("{} ({} -> {})", b.name, b.type_oid, a.type_oid))
         })
         .collect();
 
@@ -438,7 +439,10 @@ mod tests {
         let before = relation_with(&[("email", 25)]);
         let after = relation_with(&[("mail", 25)]);
         let drift = column_drift(&before, &after).expect("changed");
-        assert!(drift.contains("added mail") && drift.contains("removed email"), "{drift}");
+        assert!(
+            drift.contains("added mail") && drift.contains("removed email"),
+            "{drift}"
+        );
     }
 
     use super::*;
