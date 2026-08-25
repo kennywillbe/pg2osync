@@ -4,7 +4,6 @@
 //! ROTATE, TABLE_MAP, WRITE/UPDATE/DELETE_ROWS (v1+v2), XID, QUERY.
 //!
 //! Known limitations:
-//! - JSON columns decode as `__mysql_json_hex:<hex>` placeholders
 //! - GEOMETRY decodes as base64 blob
 //! - MariaDB-specific event types (Annotate_rows etc.) are tolerated, ignored
 
@@ -105,6 +104,9 @@ pub const T_XID: u8 = 16;
 /// Sent when the server has nothing else to send. Its header position is how a
 /// consumer learns the stream has moved on during quiet periods.
 pub const T_HEARTBEAT: u8 = 27;
+/// A JSON update logged as a diff rather than as a whole row image. Only ever
+/// produced when the server sets `binlog_row_value_options = PARTIAL_JSON`.
+pub const T_PARTIAL_UPDATE_ROWS: u8 = 39;
 pub const T_TABLE_MAP: u8 = 19;
 pub const T_WRITE_ROWS_V1: u8 = 20;
 pub const T_UPDATE_ROWS_V1: u8 = 21;
@@ -327,7 +329,7 @@ pub fn parse_table_map(payload: &[u8]) -> Result<(u64, TableMeta, OptionalMeta),
             246 => 2,       // NEWDECIMAL precision+scale
             16 => 2,        // BIT
             17..=19 => 1,   // TIMESTAMP2/DATETIME2/TIME2 fsp
-            245 => 4,       // JSON
+            245 => 1,       // JSON: one byte holding the length field's width
             250..=252 => 1, // blobs
             _ => 0,
         }
@@ -740,11 +742,23 @@ fn decode_value_inner(
             }
         }
         245 => {
-            // JSON binary format decoding deferred (documented limitation)
-            let len = r.u32v()? as usize;
+            // the metadata byte says how wide the length field is; it is 4 in
+            // every build seen so far, but reading it is what keeps the column
+            // aligned with the next one
+            let width = meta.first().copied().unwrap_or(4) as usize;
+            let len = read_uint_n(r, width)? as usize;
             let bytes = r.take(len)?;
-            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-            Ok(str_val(format!("__mysql_json_hex:{hex}")))
+            match crate::json::decode(bytes) {
+                Some(value) => Ok(value),
+                None => {
+                    // keeping the bytes beats inventing a value: the document
+                    // stays recoverable and the log says which row to look at
+                    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                    tracing::warn!(target: "pg2osync::source",
+                        "could not decode a JSON value; storing it as hex ({} bytes)", len);
+                    Ok(str_val(format!("__mysql_json_hex:{hex}")))
+                }
+            }
         }
         249..=252 => {
             let size = *meta.first().unwrap_or(&1) as usize;
@@ -802,6 +816,19 @@ fn read_uint_n(r: &mut R, n: usize) -> Result<u64, DecodeError> {
     let mut buf = [0u8; 8];
     buf[..n].copy_from_slice(s);
     Ok(u64::from_le_bytes(buf))
+}
+
+/// Decode a packed decimal that is not part of a row event.
+///
+/// A DECIMAL inside a JSON document is packed identically; sharing the reader
+/// is what keeps the same number from rendering two ways depending on where it
+/// was found.
+pub(crate) fn decode_packed_decimal(bytes: &[u8], precision: usize, scale: usize) -> Option<String> {
+    let mut r = R::new(bytes);
+    match decode_decimal(&mut r, precision, scale) {
+        Ok(Value::String(s)) => Some(s),
+        _ => None,
+    }
 }
 
 fn decode_decimal(r: &mut R, precision: usize, scale: usize) -> Result<Value, DecodeError> {

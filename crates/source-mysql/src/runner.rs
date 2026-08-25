@@ -339,6 +339,14 @@ impl MySqlSource {
                         tx.send(change).await.context("change channel closed")?;
                     }
                 }
+                binlog::T_PARTIAL_UPDATE_ROWS => {
+                    // the setting that produces these is refused at startup, so
+                    // reaching one means it was turned on underneath us
+                    anyhow::bail!(
+                        "the server sent a partial JSON update, which is not decoded here; \
+                         set binlog_row_value_options to the empty string"
+                    );
+                }
                 _ => {}
             }
         }

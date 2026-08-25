@@ -145,6 +145,16 @@ pub async fn check_prerequisites(conn: &mut MySqlConnection) -> Result<()> {
         ),
         _ => {}
     }
+    // PARTIAL_JSON logs a JSON update as a diff in an event type of its own,
+    // and changes the shape of every row image that follows it. Refusing is
+    // honest; the alternative is dropping those updates without saying so.
+    match conn.global_var("binlog_row_value_options").await {
+        Ok(Some(options)) if !options.trim().is_empty() => bail!(
+            "binlog_row_value_options is {options:?} but must be empty; \
+             PARTIAL_JSON writes JSON updates as diffs, which are not decoded here"
+        ),
+        _ => {}
+    }
     Ok(())
 }
 
