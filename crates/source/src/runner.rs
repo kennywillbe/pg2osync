@@ -28,7 +28,8 @@ pub struct WalSourceConfig {
     /// confirmed_flush_lsn. Callers should resolve this from the catalog
     /// instead of passing zero — the zero path stalls on some servers.
     pub start_lsn: Option<Lsn>,
-    /// Admin connection string for child-collection queries (nested docs).
+    /// Kept for the error message when children are configured without a SQL
+    /// connection; the connection itself is the caller's.
     pub admin_url: Option<String>,
     /// Applies to the replication transport and to the child-query connection
     /// alike: one source must not be half encrypted.
@@ -75,10 +76,14 @@ impl WalSource {
     /// protocol read risks losing frames. Shutdown is cooperative: the loop
     /// checks the watch flag between messages and the transport wakes the idle
     /// read periodically.
+    /// `admin` is an ordinary SQL connection for the child re-fetch queries.
+    /// The replication connection cannot run them, which is unavoidable; a
+    /// third connection of our own was not, since the caller already holds one.
     pub async fn stream(
         &mut self,
         tx: tokio::sync::mpsc::Sender<ChangeEvent>,
         shutdown: tokio::sync::watch::Receiver<bool>,
+        admin: Option<&tokio_postgres::Client>,
     ) -> Result<()> {
         use pgwire_replication::client::ReplicationEvent;
         use pgwire_replication::{ReplicationClient, ReplicationConfig};
@@ -108,18 +113,13 @@ impl WalSource {
         // it mid-transaction would acknowledge a position the buffered rows
         // have not reached yet.
         let mut in_transaction = false;
-        // Nested children need their own connection for the refetch queries:
-        // the replication connection cannot run them. Without children there
-        // is nothing to query, so no connection is opened.
+        // Only child re-fetch needs SQL, so without children the connection the
+        // caller passed is left alone.
         let needs_admin = !self.cfg.children.is_empty() || !self.cfg.child_parents.is_empty();
-        let admin_client = match (&self.cfg.admin_url, needs_admin) {
-            (Some(url), true) => Some(
-                crate::tls::connect(&self.cfg.tls, url)
-                    .await
-                    .context("nested-docs admin connection failed")?,
-            ),
-            _ => None,
-        };
+        let admin_client = needs_admin.then_some(admin).flatten();
+        if needs_admin && admin_client.is_none() {
+            anyhow::bail!("nested children are configured but no SQL connection was provided");
+        }
         tracing::info!(target: "pg2osync::source", "stream loop starting");
 
         loop {
@@ -198,7 +198,7 @@ impl WalSource {
                         | crate::pgoutput::Message::Update(_)
                         | crate::pgoutput::Message::Delete(_)) => {
                             if let Some(ChangeEvent::Row(row_change)) = self
-                                .build_change_from_message(&msg, &relations, admin_client.as_ref())
+                                .build_change_from_message(&msg, &relations, admin_client)
                                 .await?
                             {
                                 send_change(&tx, row_change).await?;
@@ -306,7 +306,7 @@ impl WalSource {
         if let Some(parent_key) = self.cfg.child_parents.get(&parent_key) {
             let Some(admin) = admin else {
                 return Err(anyhow::anyhow!(
-                    "child table configured but no admin_url for parent refetch"
+                    "child table configured but no SQL connection for parent refetch"
                 ));
             };
             let child_specs = self

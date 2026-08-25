@@ -447,6 +447,10 @@ async fn run_postgres(
         current_position,
     )?;
 
+    // setup is done; each attempt opens the SQL connection it needs, so holding
+    // this one open would be a third connection doing nothing
+    drop(admin);
+
     stream_with_reconnect(
         cfg.source.reconnect_policy(),
         metrics.clone(),
@@ -456,7 +460,6 @@ async fn run_postgres(
                 &cfg,
                 &source_url,
                 &admin_url,
-                &admin,
                 &tls,
                 &children,
                 &src_cfg,
@@ -484,7 +487,6 @@ async fn attempt_postgres(
     cfg: &AppConfig,
     source_url: &str,
     admin_url: &str,
-    admin: &tokio_postgres::Client,
     tls: &pg2osync_source::tls::TlsSettings,
     children: &HashMap<(String, String), Vec<pg2osync_source::children::ChildSpec>>,
     src_cfg: &pg2osync_source::runner::WalSourceConfig,
@@ -498,6 +500,15 @@ async fn attempt_postgres(
     polling: bool,
 ) -> Result<AttemptEnd> {
     use pg2osync_source::runner::WalSource;
+
+    // One SQL connection per attempt, shared by the checkpoint check, the
+    // initial load and child re-fetch. Opening it here rather than once at
+    // startup means a connection lost during an outage is replaced by the
+    // reconnect instead of staying dead for the life of the process.
+    let admin = pg2osync_source::tls::connect(tls, admin_url)
+        .await
+        .context("cannot connect to source PostgreSQL")?;
+    let admin = &admin;
 
     // Poll mode has no source position to resume from, so a leftover WAL
     // checkpoint would skip rows changed while the process was down.
@@ -550,7 +561,9 @@ async fn attempt_postgres(
         poll.stream(events_tx, shutdown_rx.clone()).await
     } else {
         let mut source = WalSource::new(src_cfg.clone());
-        source.stream(events_tx, shutdown_rx.clone()).await
+        source
+            .stream(events_tx, shutdown_rx.clone(), Some(admin))
+            .await
     };
     // dropping the sender above is what lets the engine drain and exit
     let _ = engine.await;

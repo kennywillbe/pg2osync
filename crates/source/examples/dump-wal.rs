@@ -116,7 +116,7 @@ async fn main() -> Result<()> {
     });
 
     let mut source = WalSource::new(cfg);
-    let result = source.stream(tx, shutdown_rx).await;
+    let result = source.stream(tx, shutdown_rx, None).await;
     // surface source termination loudly: silent exits here cost hours of debugging
     if let Err(e) = &result {
         eprintln!("source terminated with error: {e:#}");
