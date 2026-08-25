@@ -46,7 +46,11 @@ nothing else. It:
    handed to a sink;
 2. splits a transaction that exceeds `batch_size` or `batch_max_bytes` across
    requests (safe because every write is idempotent, and the commit position
-   lands on the final piece);
+   lands on the final piece), and conversely lets whole transactions accumulate
+   for up to 10 ms when more events are already waiting — a commit is what
+   forces a batch, so without it a stream of single-row transactions costs one
+   request each. The batch's highest position stays the last commit in it, so
+   an ack can never run past a transaction that was not fully written;
 3. applies column projection and transforms;
 4. completes unchanged-TOAST columns by reading the previously indexed
    documents — for a whole group of rows in one request, not one round-trip
