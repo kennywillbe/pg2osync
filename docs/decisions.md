@@ -100,6 +100,16 @@ separate from the checkpoint token: a copied row needs a version and must never
 advance a position. Sources with no monotonic position — poll mode, and MySQL's
 file-and-offset coordinate — write no version and rely on ordering alone.
 
+**The load runs beside the stream, not before it.** Loading first means nothing
+acknowledges a position for the load's whole duration, so retained WAL grows
+monotonically and a large enough table invalidates the slot — which forces the
+full reload the load was trying to finish. Alternating copy and catch-up phases
+does not fix it either: on PostgreSQL a paused consumer freezes `restart_lsn`
+whether it detaches or merely stops reading, so the only thing that releases WAL
+is continuing to consume it. Document versioning is what makes the overlap safe;
+change events take strict priority over copy rows, and the copy pauses between
+ranges while the slot's `wal_status` is anything but `reserved`.
+
 **Load progress is recorded per range, in the target, behind a durability
 barrier.** The order is strict: rows, then a mark the sink reports once they are
 written, then the progress document. A crash can therefore lose forward

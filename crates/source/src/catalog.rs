@@ -444,6 +444,61 @@ pub async fn drop_publication(client: &Client, publication: &str) -> Result<()> 
     Ok(())
 }
 
+/// How much room a slot has before the server starts discarding WAL it still
+/// needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotPressure {
+    /// `reserved`, `extended`, `unreserved` or `lost`. Anything past
+    /// `extended` means the slot is living on borrowed WAL.
+    pub wal_status: String,
+    /// Bytes that may still be written before this slot risks invalidation.
+    /// `None` when `max_slot_wal_keep_size = -1`, where there is no limit to
+    /// approach — and no protection either.
+    pub safe_wal_size: Option<i64>,
+    /// WAL the slot is holding back, which is the number to watch when there is
+    /// no limit to measure against.
+    pub retained_bytes: Option<i64>,
+}
+
+impl SlotPressure {
+    /// The slot has been invalidated: it can no longer be used to stream, and
+    /// nothing recovers it.
+    pub fn lost(&self) -> bool {
+        self.wal_status == "lost"
+    }
+
+    /// The slot is past the WAL the server promised to keep, so every further
+    /// byte written brings invalidation closer.
+    ///
+    /// This is PostgreSQL's own answer rather than a threshold of ours:
+    /// `reserved` means inside `max_slot_wal_keep_size`, anything else means
+    /// beyond it. With no limit configured the status stays `reserved`, which
+    /// is honest — there is no line to stay behind, and no protection either.
+    pub fn straining(&self) -> bool {
+        self.wal_status != "reserved"
+    }
+}
+
+/// Read one slot's pressure. Cheap on purpose: `pg_get_replication_slots` is a
+/// shared-memory read under one LWLock, not a catalog scan, so it can be polled
+/// as often as a load needs to.
+pub async fn slot_pressure(client: &Client, slot_name: &str) -> Result<Option<SlotPressure>> {
+    let row = client
+        .query_opt(
+            "SELECT wal_status, safe_wal_size::bigint,                     pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint              FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot_name],
+        )
+        .await
+        .context("cannot read replication slot pressure")?;
+    Ok(row.map(|r| SlotPressure {
+        // restart_lsn, not confirmed_flush_lsn: the former is what actually
+        // pins WAL, and the two can be far apart during a load
+        wal_status: r.get::<_, Option<String>>(0).unwrap_or_default(),
+        safe_wal_size: r.get(1),
+        retained_bytes: r.get(2),
+    }))
+}
+
 /// Current confirmed_flush_lsn of a slot, if it exists.
 pub async fn confirmed_flush_lsn(client: &Client, slot_name: &str) -> Result<Option<Lsn>> {
     let row = client

@@ -52,6 +52,11 @@ const TARGET_ROWS_PER_CHUNK: i64 = 50_000;
 /// uneven ranges rather than empty ones.
 const SAMPLE_ROWS_PER_BOUNDARY: f64 = 20.0;
 
+/// How long to wait before looking at the slot again while it is under
+/// pressure. The stream is draining WAL the whole time, so this resolves on its
+/// own; the wait only has to be short enough not to waste the room it frees.
+const SLOT_RECHECK: std::time::Duration = std::time::Duration::from_millis(500);
+
 pub async fn columns_of(
     client: &tokio_postgres::Client,
     qualified_table: &str,
@@ -395,6 +400,12 @@ pub async fn run(
         let started = std::time::Instant::now();
         let mut count: u64 = 0;
         for (nth, range) in ranges.iter().enumerate().skip(progress.done) {
+            // Between ranges, never inside one. A `COPY` paused mid-stream would
+            // hold its snapshot open for as long as the pause lasts, which is
+            // the long transaction this design exists to avoid — and a range is
+            // under a second's work at measured rates, so waiting for one to
+            // finish costs nothing worth having.
+            wait_for_slot_room(admin, &cfg.source.slot_name).await?;
             // The position read before the range becomes the version of every
             // document the range produces. A change committed after this point
             // necessarily has a higher position, so it wins at the target
@@ -480,6 +491,48 @@ pub async fn run(
         }
     }
     Ok(())
+}
+
+/// Hold the copy back while the replication slot is beyond the WAL the server
+/// promised to keep.
+///
+/// The copy competes with the stream for the same target, and the stream is
+/// what releases WAL: if the copy takes all the throughput, retention grows
+/// until PostgreSQL invalidates the slot, which forces exactly the full reload
+/// this is all built to avoid. So the copy yields, and the source's own
+/// `wal_status` decides when — no threshold of ours to tune or get wrong.
+async fn wait_for_slot_room(client: &tokio_postgres::Client, slot_name: &str) -> Result<()> {
+    let mut waited = std::time::Duration::ZERO;
+    loop {
+        let Some(pressure) = pg2osync_source::catalog::slot_pressure(client, slot_name).await?
+        else {
+            // no slot: poll mode, where there is no WAL to retain
+            return Ok(());
+        };
+        if pressure.lost() {
+            bail!(
+                "replication slot {slot_name:?} has been invalidated (wal_status = lost);                  the load cannot continue and streaming cannot resume from it. Raise                  max_slot_wal_keep_size, then start again"
+            );
+        }
+        if !pressure.straining() {
+            if !waited.is_zero() {
+                tracing::info!(target: "pg2osync::backfill",
+                    "slot {slot_name} back within its WAL budget after {:.1}s", waited.as_secs_f64());
+            }
+            return Ok(());
+        }
+        if waited.is_zero() {
+            tracing::warn!(target: "pg2osync::backfill",
+                "pausing the load: slot {slot_name} is at wal_status = {} with {} retained; the stream gets the throughput until it recovers",
+                pressure.wal_status,
+                pressure
+                    .retained_bytes
+                    .map(|b| format!("{b} bytes"))
+                    .unwrap_or_else(|| "an unknown amount".into()));
+        }
+        tokio::time::sleep(SLOT_RECHECK).await;
+        waited += SLOT_RECHECK;
+    }
 }
 
 /// The source's current position, for versioning the rows a range is about to

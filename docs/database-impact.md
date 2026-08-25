@@ -13,7 +13,7 @@ holds them for the life of the process; there is no pool and no reconnect storm.
 |---|---|---|
 | replication (`walsender`) | always, for the whole run | `START_REPLICATION SLOT … LOGICAL` — the change stream |
 | client | always | catalog lookups, publication and slot management, column metadata |
-| client | during the initial load only | runs one `COPY` per key range |
+| client | during the initial load only | runs one `COPY` per key range, concurrently with the stream |
 | client | only when nested children are configured | re-fetches parent and child rows |
 
 Measured: **2 connections** in steady state, **3** with nested children
@@ -155,6 +155,12 @@ What it costs the source:
 Measured: 20,000 rows loaded in under a second; a 200,000-row table read in six
 ranges at ~55,000 rows/s, no single transaction lasting longer than a range.
 
+The load also runs *beside* the stream rather than before it, which is what keeps
+retained WAL bounded on a long one — see
+[architecture](architecture.md#why-the-load-and-the-stream-overlap). The cost to
+the source is that the copy and the change stream compete for the same target,
+so a load under WAL pressure deliberately pauses and takes longer.
+
 A table smaller than one range, or one with a composite primary key, is still
 read in a single `COPY`, so the common case has none of the extra round trips.
 
@@ -175,9 +181,12 @@ FROM pg_replication_slots;
 - Alert when `retained` grows over hours, or when `active` is false for a slot
   you expect to be running.
 - Run `pg2osync drop-slot` when you decommission an instance for good.
-- Consider `max_slot_wal_keep_size` (PostgreSQL 13+) as a backstop: the slot is
-  invalidated instead of filling the disk, and pg2osync then falls back to a
-  full initial load, which is safe.
+- Set `max_slot_wal_keep_size` (PostgreSQL 13+) as a backstop: a full disk
+  becomes a recoverable incident instead, and the initial load now watches the
+  same signal — while the slot is past its budget the copy pauses and gives the
+  stream the throughput, so the load is what slows down rather than the slot
+  being invalidated. Without the setting there is nothing to watch and nothing
+  to protect: `wal_status` stays `reserved` however much WAL piles up.
 
 MySQL has no equivalent: it keeps binlogs on its own schedule
 (`binlog_expire_logs_seconds`). The trade-off is reversed — nothing accumulates
