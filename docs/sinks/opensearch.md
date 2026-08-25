@@ -14,9 +14,9 @@ url = "http://localhost:9200"
 
 - Writes batches via `_bulk` with `index`/`delete` operations; document `_id`
   is the row's primary key → idempotent replay-safe writes.
-- The checkpoint is one document in a hidden **`.pg2osync_meta`** index.
-  Deleting it forces a full initial load on the next start, which is safe but
-  expensive.
+- The checkpoint is one document per stream in a hidden **`.pg2osync_meta`**
+  index, named `<source>-<slot_name>` or `<source>-<server_id>`. Deleting it
+  forces a full initial load on the next start, which is safe but expensive.
 - TRUNCATE runs as `_delete_by_query` with a refresh first, so a write that has
   not been refreshed yet cannot survive the truncate.
 - Unmodified TOASTed columns are completed before the write — from the old
