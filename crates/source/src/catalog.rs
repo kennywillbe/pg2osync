@@ -104,7 +104,6 @@ impl Preflight {
     }
 }
 
-
 /// The whole script a DBA needs, derived from the config rather than copied
 /// out of documentation.
 ///
@@ -292,7 +291,6 @@ pub async fn ensure_publication(
     }
     Ok(())
 }
-
 
 /// One replication slot as the server sees it.
 #[derive(Debug, Clone)]
@@ -487,7 +485,10 @@ mod tests {
             "p",
             "s",
         );
-        assert_eq!(script.matches("GRANT USAGE ON SCHEMA \"public\"").count(), 1);
+        assert_eq!(
+            script.matches("GRANT USAGE ON SCHEMA \"public\"").count(),
+            1
+        );
         assert_eq!(script.matches("GRANT USAGE ON SCHEMA \"shop\"").count(), 1);
     }
 

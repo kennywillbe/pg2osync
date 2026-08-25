@@ -270,10 +270,7 @@ impl AppConfig {
             let mapping: serde_json::Value = serde_json::from_str(&text)
                 .with_context(|| format!("[sync.{key}] {} is not valid JSON", full.display()))?;
             if !mapping.is_object() {
-                anyhow::bail!(
-                    "[sync.{key}] {} must hold a JSON object",
-                    full.display()
-                );
+                anyhow::bail!("[sync.{key}] {} must hold a JSON object", full.display());
             }
             table.mapping = Some(mapping);
         }

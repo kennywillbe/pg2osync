@@ -33,7 +33,13 @@ pub const CHECKPOINT_DOC_ID: &str = "default";
 pub fn checkpoint_doc_id(stream: &pg2osync_core::checkpoint::StreamId) -> String {
     let tame: String = format!("{}-{}", stream.source, stream.stream)
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     tame
 }
@@ -182,7 +188,9 @@ impl OpenSearchSink {
         let resp = self
             .client
             .indices()
-            .put_settings(opensearch::indices::IndicesPutSettingsParts::Index(&[index]))
+            .put_settings(opensearch::indices::IndicesPutSettingsParts::Index(&[
+                index,
+            ]))
             .body(body)
             .send()
             .await
@@ -332,7 +340,6 @@ fn chrono_now() -> u64 {
         .as_secs()
 }
 
-
 /// Compare a configured mapping against a live index and act on the answer.
 ///
 /// A field mapped to a different type means every document carrying it will be
@@ -395,7 +402,7 @@ impl Sink for OpenSearchSink {
                     .client
                     .indices()
                     .get_mapping(opensearch::indices::IndicesGetMappingParts::Index(&[
-                        &spec.name,
+                        &spec.name
                     ]))
                     .send()
                     .await
@@ -505,7 +512,6 @@ impl Sink for OpenSearchSink {
         check_status(resp, "refresh").await
     }
 
-
     async fn begin_bulk_load(&self, indices: &[String]) -> Result<BulkLoadSettings, CoreError> {
         if self.serverless || indices.is_empty() {
             // Serverless manages refresh and replication itself and rejects
@@ -568,7 +574,6 @@ impl Sink for OpenSearchSink {
         Ok(())
     }
 
-
     async fn scan_keys(
         &self,
         index: &str,
@@ -610,7 +615,6 @@ impl Sink for OpenSearchSink {
             })
             .unwrap_or_default())
     }
-
 
     async fn switch_alias(&self, alias: &str, index: &str) -> Result<(), CoreError> {
         // where it points now, so the remove names real indices: a remove
@@ -690,7 +694,10 @@ impl Sink for OpenSearchSink {
             if !legacy.status_code().is_success() {
                 return Ok(None);
             }
-            let body: Value = legacy.json().await.map_err(|e| CoreError::Sink(e.to_string()))?;
+            let body: Value = legacy
+                .json()
+                .await
+                .map_err(|e| CoreError::Sink(e.to_string()))?;
             return Ok(checkpoint_from_doc(&body["_source"]));
         }
         if !resp.status_code().is_success() {

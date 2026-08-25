@@ -70,11 +70,16 @@ fn walk(want: &Map<String, Value>, have: &Map<String, Value>, path: &str, out: &
         } else {
             format!("{path}.{name}")
         };
-        let Some(live) = live_properties.and_then(|p| p.get(name)).and_then(Value::as_object) else {
+        let Some(live) = live_properties
+            .and_then(|p| p.get(name))
+            .and_then(Value::as_object)
+        else {
             out.missing.push(field);
             continue;
         };
-        let Some(spec) = spec.as_object() else { continue };
+        let Some(spec) = spec.as_object() else {
+            continue;
+        };
         // an object with properties and no type of its own is a container:
         // what matters about it is the leaves underneath
         match (spec.get("type"), live.get("type")) {
@@ -98,7 +103,9 @@ fn walk(want: &Map<String, Value>, have: &Map<String, Value>, path: &str, out: &
 }
 
 fn render(v: &Value) -> String {
-    v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())
+    v.as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| v.to_string())
 }
 
 #[cfg(test)]
@@ -136,7 +143,10 @@ mod tests {
         let want = json!({"properties": {"price": {"type": "double"}}});
         let live = json!({"mappings": {"properties": {"price": {"type": "text"}}}});
         let report = compare(&want, &live);
-        assert!(report.conflicting[0].contains("price is double"), "{report:?}");
+        assert!(
+            report.conflicting[0].contains("price is double"),
+            "{report:?}"
+        );
         assert!(report.missing.is_empty());
     }
 
@@ -156,7 +166,10 @@ mod tests {
             "order": {"properties": {"total": {"type": "keyword"}}}
         }}});
         let report = compare(&want, &live);
-        assert!(report.conflicting[0].starts_with("order.total is double"), "{report:?}");
+        assert!(
+            report.conflicting[0].starts_with("order.total is double"),
+            "{report:?}"
+        );
     }
 
     #[test]

@@ -823,7 +823,11 @@ fn read_uint_n(r: &mut R, n: usize) -> Result<u64, DecodeError> {
 /// A DECIMAL inside a JSON document is packed identically; sharing the reader
 /// is what keeps the same number from rendering two ways depending on where it
 /// was found.
-pub(crate) fn decode_packed_decimal(bytes: &[u8], precision: usize, scale: usize) -> Option<String> {
+pub(crate) fn decode_packed_decimal(
+    bytes: &[u8],
+    precision: usize,
+    scale: usize,
+) -> Option<String> {
     let mut r = R::new(bytes);
     match decode_decimal(&mut r, precision, scale) {
         Ok(Value::String(s)) => Some(s),

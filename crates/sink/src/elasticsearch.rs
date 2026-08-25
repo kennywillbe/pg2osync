@@ -41,7 +41,9 @@ impl ElasticsearchSink {
             )
             .await?;
         if status != 200 {
-            return Err(CoreError::Sink(format!("settings for {index}: {status} {body}")));
+            return Err(CoreError::Sink(format!(
+                "settings for {index}: {status} {body}"
+            )));
         }
         Ok(())
     }
