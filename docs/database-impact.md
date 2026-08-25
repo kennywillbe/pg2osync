@@ -192,13 +192,50 @@ An active pipeline retains only what it has not yet confirmed — measured at
 **176 kB** while streaming.
 
 A slot with nothing consuming it retains WAL **forever**, and that fills the
-database's disk. This is the failure mode to alert on:
+database's disk. This is the failure mode to alert on.
+
+### What it costs, measured
+
+A row of about 110 bytes retains **238 bytes** of WAL — the row plus its
+overhead, and the same figure whether the writes arrive as one transaction of
+100,000 rows or as 20,000 separate ones. So for a workload of that shape, with
+nothing reading the slot:
+
+| write rate | retained after 1 hour | after a day |
+|---|---|---|
+| 100 rows/s | ~82 MB | ~2 GB |
+| 1,000 rows/s | ~820 MB | ~19 GB |
+| 10,000 rows/s | ~8 GB | ~192 GB |
+
+Wider rows cost proportionally more, and `REPLICA IDENTITY FULL` multiplies the
+update half by about 1.5. The point of the table is the shape: retention is
+linear in write volume and unbounded in time, so the question is never *whether*
+a stopped pipeline fills the disk but *when*.
+
+### Alerting on it
+
+pg2osync reports this itself, for every slot on the server and not only its own:
+
+```
+pg2osync_slot_retained_bytes{slot="pg2osync"}      4096
+pg2osync_slot_wal_status{slot="pg2osync",status="lost"} 0
+pg2osync_slot_active{slot="pg2osync"}              1
+```
+
+`pg2osync_slot_safe_wal_size_bytes` appears only when `max_slot_wal_keep_size`
+is set: the server leaves it null when nothing bounds the slot, so its absence
+says the retention is unbounded. The same numbers by hand:
 
 ```sql
-SELECT slot_name, active,
+SELECT slot_name, active, wal_status,
        pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained
 FROM pg_replication_slots;
 ```
+
+The awkward case is a pipeline that has been *down* for a week, because nothing
+is running to report anything. For that, `pg2osync status --max-retained-mb`
+exits non-zero when any slot is over the limit, which makes it something a cron
+job or a Kubernetes `CronJob` can check without the pipeline being up.
 
 - Alert when `retained` grows over hours, or when `active` is false for a slot
   you expect to be running.

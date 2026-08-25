@@ -31,6 +31,10 @@ Probes use `/healthz`, which is never authenticated.
 | `pg2osync_position_current` | gauge | Highest source position received |
 | `pg2osync_position_confirmed` | gauge | Highest position durably checkpointed |
 | `pg2osync_position_lag` | gauge | Difference between the two |
+| `pg2osync_slot_retained_bytes{slot}` | gauge | WAL a slot forbids the source from recycling — the number that fills a disk |
+| `pg2osync_slot_safe_wal_size_bytes{slot}` | gauge | WAL that may still be written before the slot is lost; **absent** when `max_slot_wal_keep_size` is unlimited |
+| `pg2osync_slot_wal_status{slot,status}` | gauge | 1 for the server's own verdict: `reserved`, `extended`, `unreserved`, `lost` |
+| `pg2osync_slot_active{slot}` | gauge | 1 while something is streaming that slot |
 
 ### What to alert on
 
@@ -44,6 +48,15 @@ deriv(pg2osync_position_lag[10m]) > 0
 
 # a permanent rejection stops the pipeline
 increase(pg2osync_sink_errors_total[5m]) > 0
+
+# a slot is pinning WAL and growing: this is what fills the source's disk
+deriv(pg2osync_slot_retained_bytes[30m]) > 0 and pg2osync_slot_retained_bytes > 5e9
+
+# the source has already given up on a slot, so resuming it means a full reload
+pg2osync_slot_wal_status{status="lost"} == 1
+
+# nothing is reading a slot that exists
+pg2osync_slot_active == 0
 
 # the process is gone
 up{job="pg2osync"} == 0
@@ -87,6 +100,7 @@ pg2osync setup-sql -c pg2osync.toml  # the SQL a DBA needs, from your config
 pg2osync reconcile -c pg2osync.toml  # find index documents whose row is gone
 pg2osync validate -c pg2osync.toml   # config, connectivity, server settings
 pg2osync status   -c pg2osync.toml   # checkpoint vs the source's position
+pg2osync status   -c pg2osync.toml --max-retained-mb 10240   # exit 1 over 10 GB
 pg2osync bootstrap -c pg2osync.toml  # create slot/publication/indices, then exit
 pg2osync switch-alias -c pg2osync.toml --alias users   # point an alias here
 pg2osync drop-slot -c pg2osync.toml  # teardown; --publication drops that too
@@ -105,7 +119,21 @@ pipeline: SELECT pg_drop_replication_slot('pg2osync_old');
 ```
 
 `retained_wal` growing over hours means the target is not keeping up, or the
-process is not running while the slot still exists.
+process is not running while the slot still exists. A slot the server has given
+up on says so — `wal_status=lost` — and cannot be resumed from at all: a
+pipeline using it starts with a full initial load.
+
+The metrics above cover this while the pipeline runs. While it does *not* —
+which is the dangerous case, since nobody is reading logs for a process that is
+not there — `--max-retained-mb` makes the same check something a scheduler can
+run:
+
+```sh
+pg2osync status -c pg2osync.toml --max-retained-mb 10240   # exits 1 over 10 GB
+```
+
+It looks at every slot on the server, not only the configured one, because an
+orphan fills the same disk.
 
 Every logical slot on the server is listed, not only the configured one.
 Changing `slot_name` leaves the old slot behind, still pinning WAL with nothing

@@ -52,6 +52,11 @@ enum Command {
         /// Seconds to keep checking with --caught-up.
         #[arg(long, default_value_t = 0)]
         timeout: u64,
+        /// Exit non-zero when any slot is holding more than this many MB of
+        /// WAL, so a scheduled check catches a pipeline that has been down
+        /// long enough to threaten the source's disk.
+        #[arg(long, value_name = "MB")]
+        max_retained_mb: Option<u64>,
     },
     /// Point an alias at this config's index, atomically.
     SwitchAlias {
@@ -130,11 +135,12 @@ async fn main() -> Result<()> {
             config,
             caught_up,
             timeout,
+            max_retained_mb,
         } => {
             if caught_up {
                 wait_until_caught_up(&config, timeout).await
             } else {
-                status(&config).await
+                status(&config, max_retained_mb).await
             }
         }
         Command::Reconcile { config, delete } => reconcile_cmd(&config, delete).await,
@@ -678,7 +684,7 @@ fn shutdown_signal() -> tokio::sync::watch::Receiver<bool> {
     rx
 }
 
-async fn status(path: &Path) -> Result<()> {
+async fn status(path: &Path, max_retained_mb: Option<u64>) -> Result<()> {
     let cfg = config::AppConfig::load(path)?;
     let secrets = cfg.resolve_secrets()?;
     let sink = run::build_sink(&cfg, secrets.target_password)?;
@@ -711,12 +717,25 @@ async fn status(path: &Path) -> Result<()> {
         } else {
             ""
         };
+        // A slot past `reserved` is on its way to being unusable, and `lost`
+        // already is: printing a big number without the server's own verdict
+        // leaves the reader to guess which.
+        let verdict = match slot.wal_status.as_str() {
+            "" | "reserved" => String::new(),
+            other => format!(" wal_status={other}"),
+        };
         println!(
-            "slot {}{mine}: active={} retained_wal={}",
+            "slot {}{mine}: active={} retained_wal={}{verdict}",
             slot.name,
             slot.active,
             slot.retained_pretty(),
         );
+        if slot.wal_status == "lost" {
+            println!(
+                "  this slot can no longer be resumed from: the WAL it needed is gone, \
+                 so a pipeline using it starts with a full initial load"
+            );
+        }
     }
     let idle: Vec<&str> = slots
         .iter()
@@ -734,6 +753,30 @@ async fn status(path: &Path) -> Result<()> {
              this pipeline: SELECT pg_drop_replication_slot('{}');",
             idle[0]
         );
+    }
+    // Checked over every slot, not only the configured one: an orphan fills the
+    // same disk, and the whole point of a scheduled check is that it runs when
+    // no pipeline is running to notice.
+    if let Some(limit_mb) = max_retained_mb {
+        let limit = limit_mb.saturating_mul(1024 * 1024) as i64;
+        let over: Vec<&pg2osync_source::catalog::SlotInfo> = slots
+            .iter()
+            .filter(|s| s.retained_bytes.unwrap_or(0) > limit)
+            .collect();
+        if !over.is_empty() {
+            for slot in &over {
+                println!(
+                    "\nslot {} is holding {}, over the {limit_mb} MB limit",
+                    slot.name,
+                    slot.retained_pretty()
+                );
+            }
+            bail!(
+                "{} slot(s) over the retention limit; the source keeps this WAL until \
+                 the pipeline catches up or the slot is dropped",
+                over.len()
+            );
+        }
     }
     Ok(())
 }
