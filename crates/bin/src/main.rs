@@ -4,6 +4,7 @@
 mod backfill;
 mod config;
 mod reconcile;
+mod resnapshot;
 mod run;
 
 use anyhow::{Context, Result, bail};
@@ -74,6 +75,21 @@ enum Command {
         #[arg(short, long, value_name = "FILE")]
         config: PathBuf,
     },
+    /// Read one table again into its index, without reloading everything else.
+    ///
+    /// Adds and updates; never deletes — `reconcile` is the other half. Safe to
+    /// run while the pipeline is streaming: its rows carry the position they were
+    /// read at, so a concurrent change wins.
+    Resnapshot {
+        #[arg(short, long, value_name = "FILE")]
+        config: PathBuf,
+        /// Qualified table name, as it appears in the config.
+        #[arg(long, value_name = "SCHEMA.TABLE")]
+        table: String,
+        /// SQL predicate narrowing what is re-read, e.g. "tenant_id = 42".
+        #[arg(long = "where", value_name = "PREDICATE")]
+        filter: Option<String>,
+    },
     /// List the documents the target refused and, with --replay, submit them
     /// again once the mapping that refused them is fixed.
     Rejects {
@@ -124,6 +140,11 @@ async fn main() -> Result<()> {
         Command::Reconcile { config, delete } => reconcile_cmd(&config, delete).await,
         Command::SwitchAlias { config, alias } => switch_alias(&config, &alias).await,
         Command::SetupSql { config } => setup_sql(&config),
+        Command::Resnapshot {
+            config,
+            table,
+            filter,
+        } => resnapshot_cmd(&config, &table, filter).await,
         Command::Rejects {
             config,
             replay,
@@ -348,6 +369,23 @@ async fn wait_until_caught_up(path: &Path, timeout_secs: u64) -> Result<()> {
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
+}
+
+async fn resnapshot_cmd(path: &Path, table: &str, filter: Option<String>) -> Result<()> {
+    let cfg = config::AppConfig::load(path)?;
+    let secrets = cfg.resolve_secrets()?;
+    for warning in &secrets.warnings {
+        tracing::warn!(target: "pg2osync::config", "{warning}");
+    }
+    resnapshot::run_for(
+        &cfg,
+        &secrets.source_url,
+        &secrets.admin_url,
+        secrets.target_password,
+        table,
+        filter,
+    )
+    .await
 }
 
 /// Show what the target refused, and optionally offer it again.

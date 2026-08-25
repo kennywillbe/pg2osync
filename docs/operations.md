@@ -256,11 +256,52 @@ curl -s "$OS/users/_count"
 Counts can differ transiently while a batch is in flight; check twice before
 concluding anything.
 
+**One table is wrong.** Read it again, without reloading everything else:
+
+```sh
+pg2osync resnapshot -c pg2osync.toml --table public.users
+pg2osync resnapshot -c pg2osync.toml --table public.users --where "tenant_id = 42"
+```
+
+Safe to run while the pipeline is streaming, and it never moves the checkpoint —
+its rows carry the position they were read at, so a change committed after that
+wins as it always does. Use it after a mapping change, or after fixing something
+that wrote a wrong value.
+
+Three things it does not do:
+
+- **It does not delete.** A row gone from the source keeps its document; deciding
+  that is `reconcile`'s job, and keeping the two apart keeps each explainable.
+- **It does not resume.** An interruption means running it again, which costs the
+  read and nothing else. Recording progress would leave bookkeeping the next
+  pipeline start would read as an unfinished initial load.
+- **It does not overwrite a document whose version is above the position it read
+  at.** That is the same rule that lets it run beside the stream. Documents the
+  pipeline wrote are always at or below the current position, so this only bites
+  if you have edited the index by hand: a plain `PUT` or `DELETE` through the
+  target's own API uses internal versioning, which leaves a version one past the
+  source's current position, and the re-snapshot declines it until the source
+  moves on. One write to the table is enough — or reach for the zero-downtime
+  re-index below, which builds a fresh index and has nothing to argue with.
+
 ## Zero-downtime re-index
 
 The index name is configuration, so a re-index is a second instance. This
 sequence has been rehearsed end to end against the dev stack with a reader
 polling the alias throughout:
+
+There are two ways in. A second instance, which is what the rehearsal below
+covers, or — when the mapping is the only thing changing and a gap in freshness is
+acceptable — a re-snapshot into the new index name, which needs no second slot:
+
+```sh
+# point a copy of the config at users_v2, then fill it from the source
+pg2osync resnapshot -c users-v2.toml --table public.users
+pg2osync switch-alias -c users-v2.toml --alias users
+```
+
+That leaves the new index static from the moment the re-snapshot finished, so it
+suits a one-off rebuild rather than a live cutover. For a live cutover:
 
 ```sh
 # 1. Copy the config. Change `index` to users_v2 and `slot_name` to a new

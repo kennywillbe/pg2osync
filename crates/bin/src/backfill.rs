@@ -23,7 +23,7 @@
 use anyhow::{Context as _, Result, bail};
 use pg2osync_core::checkpoint::StreamId;
 use pg2osync_core::event::{ChangeEvent, RowKind, TransactionBoundary};
-use pg2osync_core::load::{LoadCursor, LoadProgress, load_progress_key};
+use pg2osync_core::load::{LoadCursor, LoadProgress, LoadScope, load_progress_key};
 use pg2osync_core::lsn::Lsn;
 use pg2osync_source::children::ChildSpec;
 use std::collections::HashMap;
@@ -93,6 +93,7 @@ pub async fn columns_of(
 /// by orders of magnitude, and unlike a correlated lateral it does not depend
 /// on the child's foreign key being indexed — which a general-purpose tool
 /// cannot assume.
+#[allow(clippy::too_many_arguments)]
 fn copy_statement(
     qualified_table: &str,
     cols: &[ColMeta],
@@ -100,6 +101,7 @@ fn copy_statement(
     soft_delete: Option<&str>,
     range: &KeyRange,
     pk_column: Option<&str>,
+    filter: Option<&str>,
 ) -> String {
     let mut selected: Vec<String> = cols
         .iter()
@@ -132,6 +134,11 @@ fn copy_statement(
     // deleted again on the first poll cycle
     if let Some(predicate) = soft_delete {
         conditions.push(format!("NOT ({predicate})"));
+    }
+    // an operator's own predicate, parenthesised so it cannot rearrange the
+    // conditions it is joined to
+    if let Some(predicate) = filter {
+        conditions.push(format!("({predicate})"));
     }
     let filter = if conditions.is_empty() {
         String::new()
@@ -292,6 +299,7 @@ pub async fn run(
     sink: &dyn pg2osync_core::sink::Sink,
     stream: &StreamId,
     mut load_done: tokio::sync::watch::Receiver<u64>,
+    scope: &LoadScope,
 ) -> Result<()> {
     // A dedicated connection, but no transaction spanning the load: each range
     // is its own statement and its own snapshot. Holding one open for the whole
@@ -306,6 +314,9 @@ pub async fn run(
     let mut progress_keys: Vec<String> = Vec::new();
 
     for tbl in cfg.sync.values() {
+        if !scope.covers(&tbl.table) {
+            continue;
+        }
         let (schema, table) = split_qualified(&tbl.table);
         let mut cols = columns_of(admin, &tbl.table).await?;
         let child_specs: &[ChildSpec] = children
@@ -339,12 +350,15 @@ pub async fn run(
         let pk_column = (pk_column.len() == 1).then(|| pk_column[0].clone());
 
         let progress_key = load_progress_key(stream, &tbl.table);
-        progress_keys.push(progress_key.clone());
-        let stored = sink
-            .read_state(&progress_key)
-            .await?
-            .as_ref()
-            .and_then(LoadProgress::from_doc);
+        let stored = if scope.resumable {
+            progress_keys.push(progress_key.clone());
+            sink.read_state(&progress_key)
+                .await?
+                .as_ref()
+                .and_then(LoadProgress::from_doc)
+        } else {
+            None
+        };
         let mut progress = match stored {
             Some(p) if p.finished => {
                 tracing::info!(target: "pg2osync::backfill",
@@ -366,7 +380,9 @@ pub async fn run(
                     },
                     finished: false,
                 };
-                sink.write_state(&progress_key, &progress.to_doc()).await?;
+                if scope.resumable {
+                    sink.write_state(&progress_key, &progress.to_doc()).await?;
+                }
                 progress
             }
         };
@@ -407,6 +423,7 @@ pub async fn run(
                 tbl.soft_delete.as_deref(),
                 range,
                 pk_column.as_deref(),
+                scope.filter.as_deref(),
             );
             let copy_stream = reader.copy_out(&sql).await?;
             use futures::StreamExt;
@@ -462,13 +479,17 @@ pub async fn run(
             if let LoadCursor::Ranges { done, .. } = &mut progress.cursor {
                 *done = nth + 1;
             }
-            sink.write_state(&progress_key, &progress.to_doc()).await?;
+            if scope.resumable {
+                sink.write_state(&progress_key, &progress.to_doc()).await?;
+            }
         }
         progress.finished = true;
-        sink.write_state(&progress_key, &progress.to_doc()).await?;
+        if scope.resumable {
+            sink.write_state(&progress_key, &progress.to_doc()).await?;
+        }
         let secs = started.elapsed().as_secs_f64();
         tracing::info!(target: "pg2osync::backfill",
-            "backfilled {} rows from {} in {:.1}s (~{:.0} rows/s) over {} range(s)",
+            "read {} rows from {} in {:.1}s (~{:.0} rows/s) over {} range(s)",
             count, tbl.table, secs, count as f64 / secs.max(f64::EPSILON), ranges.len());
     }
     // Nothing left to resume, so nothing should claim otherwise on the next
@@ -735,6 +756,7 @@ mod tests {
                 to: Some("'9'".into()),
             },
             Some("id"),
+            None,
         );
         assert!(sql.contains("p.\"id\" >= '1' AND p.\"id\" < '9'"), "{sql}");
         assert!(sql.contains("NOT (deleted_at IS NOT NULL)"), "{sql}");
@@ -749,7 +771,7 @@ mod tests {
         let mut b = col("b");
         a.is_pk = true;
         b.is_pk = true;
-        let sql = copy_statement("public.t", &[a, b], &[], None, &whole(), None);
+        let sql = copy_statement("public.t", &[a, b], &[], None, &whole(), None, None);
         assert!(!sql.contains("WHERE"), "{sql}");
     }
 
@@ -770,8 +792,26 @@ mod tests {
             Some("deleted_at IS NOT NULL"),
             &whole(),
             None,
+            None,
         );
         assert!(sql.contains("WHERE NOT (deleted_at IS NOT NULL)"), "{sql}");
+    }
+
+    #[test]
+    fn a_resnapshot_filter_joins_the_conditions_already_there() {
+        let sql = copy_statement(
+            "public.users",
+            &[col("id")],
+            &[],
+            Some("deleted_at IS NOT NULL"),
+            &whole(),
+            None,
+            Some("tenant_id = 42"),
+        );
+        assert!(
+            sql.contains("WHERE NOT (deleted_at IS NOT NULL) AND (tenant_id = 42)"),
+            "{sql}"
+        );
     }
 
     use super::*;
@@ -805,6 +845,7 @@ mod tests {
             None,
             &whole(),
             None,
+            None,
         );
         assert_eq!(
             sql,
@@ -823,6 +864,7 @@ mod tests {
             &[child("orders", "public.orders", "customer_id", "id")],
             None,
             &whole(),
+            None,
             None,
         );
         assert!(
@@ -852,6 +894,7 @@ mod tests {
             None,
             &whole(),
             None,
+            None,
         );
         assert!(sql.contains("c0.k = p.\"id\""), "{sql}");
         assert!(sql.contains("c1.k = p.\"id\""), "{sql}");
@@ -867,6 +910,7 @@ mod tests {
             &[child("kids", "public.ch\"ild", "fk\"y", "pk\"y")],
             None,
             &whole(),
+            None,
             None,
         );
         assert!(sql.contains("\"we\"\"ird\""), "{sql}");

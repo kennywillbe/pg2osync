@@ -20,7 +20,7 @@ use crate::typemap::ValueShape;
 use anyhow::{Context as _, Result};
 use pg2osync_core::checkpoint::StreamId;
 use pg2osync_core::event::{ChangeEvent, RowChange, RowKind, TransactionBoundary};
-use pg2osync_core::load::{LoadCursor, LoadProgress, load_progress_key};
+use pg2osync_core::load::{LoadCursor, LoadProgress, LoadScope, load_progress_key};
 use pg2osync_core::lsn::Lsn;
 use pg2osync_core::sink::Sink;
 use tokio::sync::mpsc::Sender;
@@ -40,6 +40,7 @@ pub async fn run(
     sink: &dyn Sink,
     stream: &StreamId,
     mut load_done: watch::Receiver<u64>,
+    scope: &LoadScope,
 ) -> Result<()> {
     // No explicit transaction, and READ COMMITTED so that an implicit one
     // cannot outlive its statement either. A read view held for the length of a
@@ -57,15 +58,21 @@ pub async fn run(
 
     for (schema, table) in tables {
         let qualified = format!("{schema}.{table}");
+        if !scope.covers(&qualified) {
+            continue;
+        }
         let progress_key = load_progress_key(stream, &qualified);
-        progress_keys.push(progress_key.clone());
         let resolved = catalog::table_schema(conn, schema, table).await?;
 
-        let stored = sink
-            .read_state(&progress_key)
-            .await?
-            .as_ref()
-            .and_then(LoadProgress::from_doc);
+        let stored = if scope.resumable {
+            progress_keys.push(progress_key.clone());
+            sink.read_state(&progress_key)
+                .await?
+                .as_ref()
+                .and_then(LoadProgress::from_doc)
+        } else {
+            None
+        };
         let mut cursor: Option<Vec<String>> = match stored {
             Some(p) if p.finished => {
                 tracing::info!(target: "pg2osync::load",
@@ -126,6 +133,7 @@ pub async fn run(
                 &resolved,
                 cursor.as_deref(),
                 chunked.then_some(chunk_rows),
+                scope.filter.as_deref(),
             );
 
             let mut rows = conn
@@ -181,11 +189,13 @@ pub async fn run(
                 );
             }
             cursor = last;
-            let progress = LoadProgress {
-                cursor: LoadCursor::After(cursor.clone().unwrap_or_default()),
-                finished,
-            };
-            sink.write_state(&progress_key, &progress.to_doc()).await?;
+            if scope.resumable {
+                let progress = LoadProgress {
+                    cursor: LoadCursor::After(cursor.clone().unwrap_or_default()),
+                    finished,
+                };
+                sink.write_state(&progress_key, &progress.to_doc()).await?;
+            }
             if finished {
                 break;
             }
@@ -226,6 +236,7 @@ fn chunk_statement(
     resolved: &TableSchema,
     cursor: Option<&[String]>,
     limit: Option<u64>,
+    filter: Option<&str>,
 ) -> String {
     let columns = resolved
         .columns
@@ -243,9 +254,19 @@ fn chunk_statement(
         catalog::quote_ident(schema),
         catalog::quote_ident(table)
     );
+    // The cursor comparison is an OR chain, so it is wrapped wherever anything
+    // else joins it: `a OR b AND c` is `a OR (b AND c)`, which would read a
+    // different set of rows without saying so.
+    let mut conditions: Vec<String> = Vec::new();
     if let Some(values) = cursor.filter(|v| v.len() == key.len()) {
+        conditions.push(format!("({})", after_predicate(&key, values)));
+    }
+    if let Some(predicate) = filter {
+        conditions.push(format!("({predicate})"));
+    }
+    if !conditions.is_empty() {
         sql.push_str(" WHERE ");
-        sql.push_str(&after_predicate(&key, values));
+        sql.push_str(&conditions.join(" AND "));
     }
     if limit.is_some() {
         sql.push_str(&format!(" ORDER BY {}", key.join(", ")));
@@ -368,6 +389,7 @@ mod tests {
             &schema(&["id", "tenant"]),
             Some(&["5".into(), "'acme'".into()]),
             Some(1000),
+            None,
         );
         assert!(
             !sql.contains("(`id`, `tenant`) >"),
@@ -378,15 +400,51 @@ mod tests {
     }
 
     #[test]
+    fn a_filter_cannot_rearrange_the_cursor_comparison() {
+        // The cursor is an OR chain. Joined unwrapped, `a OR b AND c` parses as
+        // `a OR (b AND c)` and the chunk quietly reads a different set of rows.
+        let sql = chunk_statement(
+            "shop",
+            "orders",
+            &schema(&["id", "tenant"]),
+            Some(&["5".into(), "'acme'".into()]),
+            Some(1000),
+            Some("tenant = 'acme'"),
+        );
+        assert!(
+            sql.contains(
+                "WHERE ((`id` > 5) OR (`id` = 5 AND `tenant` > 'acme')) AND (tenant = 'acme')"
+            ),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn a_filter_stands_alone_on_the_first_chunk() {
+        let sql = chunk_statement(
+            "shop",
+            "orders",
+            &schema(&["id"]),
+            None,
+            Some(10),
+            Some("id > 100"),
+        );
+        assert!(
+            sql.contains("WHERE (id > 100) ORDER BY `id` LIMIT 10"),
+            "{sql}"
+        );
+    }
+
+    #[test]
     fn the_first_chunk_has_no_cursor() {
-        let sql = chunk_statement("shop", "orders", &schema(&["id"]), None, Some(10));
+        let sql = chunk_statement("shop", "orders", &schema(&["id"]), None, Some(10), None);
         assert!(!sql.contains("WHERE"));
         assert!(sql.contains("FROM `shop`.`orders` ORDER BY `id` LIMIT 10"));
     }
 
     #[test]
     fn an_unchunkable_table_is_one_plain_statement() {
-        let sql = chunk_statement("shop", "orders", &schema(&["id"]), None, None);
+        let sql = chunk_statement("shop", "orders", &schema(&["id"]), None, None, None);
         assert!(!sql.contains("LIMIT"), "{sql}");
         assert!(!sql.contains("ORDER BY"), "ordering it would buy nothing");
     }

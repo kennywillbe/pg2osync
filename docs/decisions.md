@@ -222,6 +222,30 @@ which needs nothing else to be exact. A checkpoint alone is not proof the
 load finished — the two are separate facts, and conflating them is what
 silently skips a load.
 
+**A re-snapshot is a subcommand, not a signal table.** Debezium triggers an
+ad-hoc snapshot by writing to a table in the user's database. pg2osync will not
+write to the source, and the CLI is already where operator actions live, so
+`pg2osync resnapshot --table` reads one table again into the index it is mapped
+to. It is the initial load's chunked reader with a scope, going through the whole
+ordinary write path — mapping, projections, transforms, children, id derivation —
+because a document it writes has to be indistinguishable from one the load wrote,
+and a second write path would drift immediately.
+
+It cannot move the checkpoint by construction rather than by care: its rows carry
+position `0`, so nothing acknowledges a position and the checkpoint task has
+nothing to persist. That is what makes it safe beside a running pipeline, together
+with the versioning that already orders a copied row against a streamed change.
+
+It records no progress. An interruption means running it again; the alternative is
+bookkeeping under the key the initial load uses, which the next pipeline start
+would read as an unfinished load — the silent skip the load's own progress
+documents exist to prevent. It also leaves `refresh_interval` alone, unlike the
+initial load: it repairs an index that is in use, so hiding new writes for its
+duration would be the wrong trade.
+
+It adds and updates but never deletes. `reconcile` is the other half, and keeping
+them apart is what keeps each one explainable.
+
 ## Checkpoints
 
 **State lives in the target.** A hidden `.pg2osync_meta` index holds one

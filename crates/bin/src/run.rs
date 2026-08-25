@@ -41,7 +41,7 @@ const EVENT_CHANNEL_DEPTH: usize = 10_000;
 /// the target can absorb rather than piling up ahead of it, deep enough that a
 /// bulk batch still fills from one pull instead of one row at a time. Change
 /// events jump this queue regardless, so its depth costs the stream nothing.
-const COPY_CHANNEL_DEPTH: usize = 2_000;
+pub const COPY_CHANNEL_DEPTH: usize = 2_000;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_pipeline(
@@ -226,7 +226,25 @@ fn read_token(var: Option<&str>, endpoint: &str) -> Result<Option<String>> {
 }
 
 /// Build the engine context for one attempt.
-fn pipeline_ctx(
+/// Which stream this configuration is, as the checkpoint and the load's progress
+/// documents key themselves.
+pub fn stream_id_for(cfg: &AppConfig) -> StreamId {
+    if cfg.source.flavor == "mysql" {
+        StreamId {
+            source: SOURCE_MYSQL.into(),
+            stream: cfg.source.server_id.to_string(),
+            publication: String::new(),
+        }
+    } else {
+        StreamId {
+            source: SOURCE_POSTGRES.into(),
+            stream: cfg.source.slot_name.clone(),
+            publication: cfg.source.publication.clone(),
+        }
+    }
+}
+
+pub fn pipeline_ctx(
     cfg: &AppConfig,
     sink: Arc<dyn Sink>,
     metrics: SharedMetrics,
@@ -392,7 +410,7 @@ async fn run_postgres(
         .await
         .context("cannot connect to source PostgreSQL")?;
 
-    let children = child_specs(&cfg)?;
+    let children = child_specs_for(&cfg)?;
     let mut tables: Vec<String> = cfg.sync.values().map(|t| t.table.clone()).collect();
     // child tables must join the publication or their changes never reach us
     for tbl in cfg.sync.values() {
@@ -431,11 +449,7 @@ async fn run_postgres(
         return Ok(());
     }
 
-    let stream_id = StreamId {
-        source: SOURCE_POSTGRES.into(),
-        stream: cfg.source.slot_name.clone(),
-        publication: cfg.source.publication.clone(),
-    };
+    let stream_id = stream_id_for(&cfg);
     let render: PositionRenderer = Arc::new(|token| Lsn(token).to_string());
     let parse: pg2osync_engine::PositionParser =
         Arc::new(|text| text.trim().parse::<Lsn>().ok().map(|lsn| lsn.0));
@@ -641,6 +655,7 @@ async fn attempt_postgres(
                     load_sink.as_ref(),
                     &load_stream_id,
                     load_done_rx,
+                    &pg2osync_core::load::LoadScope::initial_load(),
                 )
                 .await
             })
@@ -785,7 +800,7 @@ fn poll_config(
     })
 }
 
-fn child_specs(
+pub fn child_specs_for(
     cfg: &AppConfig,
 ) -> Result<HashMap<(String, String), Vec<pg2osync_source::children::ChildSpec>>> {
     let mut map: HashMap<_, Vec<_>> = HashMap::new();
@@ -846,7 +861,7 @@ async fn run_mysql(
     if cfg.sync.values().any(|t| !t.children.is_empty()) {
         bail!("nested children are not supported for the MySQL source yet");
     }
-    let src_cfg = mysql_config(&cfg, &source_url)?;
+    let src_cfg = mysql_config_for(&cfg, &source_url)?;
     let source = MySqlSource::new(src_cfg);
     let mut admin = source.admin_connection().await?;
     source.bootstrap(&mut admin).await?;
@@ -857,11 +872,7 @@ async fn run_mysql(
         return Ok(());
     }
 
-    let stream_id = StreamId {
-        source: SOURCE_MYSQL.into(),
-        stream: cfg.source.server_id.to_string(),
-        publication: String::new(),
-    };
+    let stream_id = stream_id_for(&cfg);
     let metrics = start_metrics(&cfg)?;
     let (ack_tx, ack_rx) = watch::channel(None);
     // the binlog prefix is only known once a position has been read, so the
@@ -950,7 +961,7 @@ async fn attempt_mysql(
         durable,
         shutdown_rx,
     } = wiring;
-    let source = MySqlSource::new(mysql_config(cfg, source_url)?);
+    let source = MySqlSource::new(mysql_config_for(cfg, source_url)?);
     let mut admin = source.admin_connection().await?;
 
     let stored = usable_checkpoint(sink.read_checkpoint(&stream_id).await?, &stream_id);
@@ -1035,7 +1046,7 @@ async fn attempt_mysql(
         Arc::new(move |token| mysql_catalog::position_text(&prefix, token))
     };
 
-    let mut src_cfg = mysql_config(cfg, source_url)?;
+    let mut src_cfg = mysql_config_for(cfg, source_url)?;
     src_cfg.start_file = Some(start_file);
     src_cfg.start_pos = start_pos;
 
@@ -1081,6 +1092,7 @@ async fn attempt_mysql(
                     load_sink.as_ref(),
                     &load_stream_id,
                     load_done_rx,
+                    &pg2osync_core::load::LoadScope::initial_load(),
                 )
                 .await
             })
@@ -1118,7 +1130,7 @@ async fn attempt_mysql(
 async fn read_current_binlog_position(cfg: &AppConfig, source_url: &str) -> Option<u64> {
     use pg2osync_source_mysql::catalog as mysql_catalog;
     let source =
-        pg2osync_source_mysql::runner::MySqlSource::new(mysql_config(cfg, source_url).ok()?);
+        pg2osync_source_mysql::runner::MySqlSource::new(mysql_config_for(cfg, source_url).ok()?);
     let mut admin = source.admin_connection().await.ok()?;
     let (file, pos) = mysql_catalog::master_position(&mut admin).await.ok()?;
     Some(mysql_catalog::position_token(&file, pos))
@@ -1127,7 +1139,8 @@ async fn read_current_binlog_position(cfg: &AppConfig, source_url: &str) -> Opti
 /// The binlog file prefix in use, so positions can be rendered and parsed.
 async fn mysql_binlog_prefix(cfg: &AppConfig, source_url: &str) -> Result<String> {
     use pg2osync_source_mysql::catalog as mysql_catalog;
-    let source = pg2osync_source_mysql::runner::MySqlSource::new(mysql_config(cfg, source_url)?);
+    let source =
+        pg2osync_source_mysql::runner::MySqlSource::new(mysql_config_for(cfg, source_url)?);
     let mut admin = source.admin_connection().await?;
     let (file, _) = mysql_catalog::master_position(&mut admin).await?;
     Ok(mysql_catalog::split_binlog_file(&file)
@@ -1135,7 +1148,7 @@ async fn mysql_binlog_prefix(cfg: &AppConfig, source_url: &str) -> Result<String
         .unwrap_or_else(|| "binlog".to_string()))
 }
 
-fn mysql_config(
+pub fn mysql_config_for(
     cfg: &AppConfig,
     source_url: &str,
 ) -> Result<pg2osync_source_mysql::runner::MySqlSourceConfig> {
@@ -1182,7 +1195,7 @@ fn percent_decode(value: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn spawn_engine(
+pub fn spawn_engine(
     events_rx: mpsc::Receiver<ChangeEvent>,
     copy_rx: mpsc::Receiver<ChangeEvent>,
     ctx: Arc<PipelineCtx>,
