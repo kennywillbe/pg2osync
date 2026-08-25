@@ -93,7 +93,7 @@ pg "INSERT INTO child_bench SELECT g, 'parent-' || g FROM generate_series(1, $PA
 pg "INSERT INTO child_bench_items
       SELECT (p - 1) * $CHILDREN + c, p, 0, 'item'
       FROM generate_series(1, $PARENTS) p, generate_series(1, $CHILDREN) c;" > /dev/null
-curl -s -XDELETE "$OS/child_bench,.pg2osync_meta" > /dev/null
+curl -s -XDELETE "$OS/child_bench,.pg2osync_meta?ignore_unavailable=true" > /dev/null
 
 nohup $BIN run -c "$CONFIG" &> "$LOG" < /dev/null & disown
 while :; do refresh; [ "$(count)" -ge "$PARENTS" ] && break; sleep 1; done

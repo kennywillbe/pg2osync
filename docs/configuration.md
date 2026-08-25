@@ -294,6 +294,7 @@ Defaults are production-sane; tune only against measurements.
 |---|---|---|
 | `batch_size` | `500` | Rows per sink request |
 | `batch_max_bytes` | `10485760` | Approximate byte ceiling per request; whichever limit hits first splits the batch |
+| `write_concurrency` | `1` | Write requests open against the target at once. One at a time is what the initial load is limited by, not the source read; raising it multiplies the load on the target, and it needs a target that orders by document version, so Meilisearch refuses anything above 1 |
 | `txn_buffer_cap_mb` | `256` | Warning threshold for one open transaction |
 | `retry_max` | `10` | Attempts per request before the pipeline stops |
 | `retry_backoff_ms` | `500` | Initial backoff, doubled per attempt, capped at 30 s |
@@ -424,6 +425,7 @@ tls_verify = true
 [engine]
 batch_size = 500
 batch_max_bytes = 10485760
+write_concurrency = 1
 checkpoint_interval_ms = 500
 
 [metrics]

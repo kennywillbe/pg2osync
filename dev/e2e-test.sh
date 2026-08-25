@@ -100,7 +100,10 @@ pg "INSERT INTO users (id,name,email,password_hash,metadata) VALUES
 pg "INSERT INTO customers (id,name) VALUES (1,'acme'),(2,'globex'),(3,'no-children');" > /dev/null
 pg "INSERT INTO orders (id,customer_id,total) VALUES (10,1,99.90),(11,1,5.00),(12,2,42.00);" > /dev/null
 pg "INSERT INTO tickets (id,customer_id,subject) VALUES (20,1,'late delivery');" > /dev/null
-curl -s -XDELETE "$OS/e2e_users,e2e_customers,.pg2osync_meta" > /dev/null
+# ignore_unavailable, because a multi-index delete where one index is absent
+# returns 404 and deletes *none* of them — which silently leaves the previous
+# run's documents behind and fails the counts below by however many there were
+curl -s -XDELETE "$OS/e2e_users,e2e_customers,.pg2osync_meta?ignore_unavailable=true" > /dev/null
 ok "seeded 3 users, 2 customers, 3 orders; indices cleared"
 
 cat > "$MAPPING" <<'JSON'
@@ -440,7 +443,7 @@ trap 'cleanup; resume_cleanup; reject_cleanup' EXIT
 
 pg "DROP TABLE IF EXISTS reject_probe; CREATE TABLE reject_probe(id bigint primary key, amount text);" > /dev/null 2>&1
 pg "DROP PUBLICATION IF EXISTS ${QSLOT}_pub; CREATE PUBLICATION ${QSLOT}_pub FOR TABLE reject_probe;" > /dev/null 2>&1
-curl -s -XDELETE "$OS/e2e_reject,.pg2osync_rejects" > /dev/null
+curl -s -XDELETE "$OS/e2e_reject,.pg2osync_rejects?ignore_unavailable=true" > /dev/null
 curl -s -XDELETE "$OS/.pg2osync_meta/_doc/postgres-$QSLOT" > /dev/null
 # amount is declared a long, so a row holding text is refused permanently
 curl -s -XPUT "$OS/e2e_reject" -H 'Content-Type: application/json' \
@@ -483,7 +486,10 @@ check "the refused row is not in the index" "$(os_status e2e_reject 2)" "404"
 curl -s -XPOST "$OS/.pg2osync_rejects/_refresh" > /dev/null
 check "it is in the quarantine store instead" \
   "$(curl -s "$OS/.pg2osync_rejects/_count" | jqf "d.get('count', 0)")" "1"
-if curl -s http://127.0.0.1:9115/metrics | grep -q "^pg2osync_rejected_total 1"; then
+# at least one, not exactly one: the store is keyed by document id, while the
+# counter counts arrivals — and a restart replays the row, so the same refusal
+# is legitimately filed again under at-least-once
+if curl -s http://127.0.0.1:9115/metrics | grep -qE "^pg2osync_rejected_total [1-9]"; then
   ok "pg2osync_rejected_total reports it"
 else
   bad "pg2osync_rejected_total did not move"
@@ -581,6 +587,60 @@ before=$($BIN status -c "$RCONFIG" | grep -o 'position=[^ ]*' | head -1)
 $BIN resnapshot -c "$RCONFIG" --table public.resume_probe >> "$LOG" 2>&1
 check "a re-snapshot does not move the checkpoint" \
   "$($BIN status -c "$RCONFIG" | grep -o 'position=[^ ]*' | head -1)" "$before"
+
+echo -e "\n\033[1m== 16. concurrent write requests ==\033[0m"
+# The write window is what the initial load is actually limited by, so the load
+# has to stay correct with several requests open at once — including the two
+# things concurrency could plausibly break: a streamed change landing while the
+# copy is still running, and a delete the copy must not undo.
+WCONFIG=$(mktemp /tmp/pg2osync-e2e-conc.XXXXXX)
+WSLOT=pg2osync_e2e_conc
+sed -e "s/^slot_name = .*/slot_name = \"$WSLOT\"/" \
+    -e "s/^publication = .*/publication = \"${WSLOT}_pub\"/" \
+    -e "s/^index = .*/index = \"e2e_conc\"/" \
+    -e "s#^bind = .*#bind = \"127.0.0.1:9118\"#" \
+    -e "s/^\[target\]/[engine]\nwrite_concurrency = 4\n\n[target]/" \
+    "$RCONFIG" > "$WCONFIG"
+conc_cleanup() {
+  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  pg "SELECT pg_drop_replication_slot('$WSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$WSLOT');" > /dev/null 2>&1 || true
+  pg "DROP PUBLICATION IF EXISTS ${WSLOT}_pub;" > /dev/null 2>&1 || true
+  rm -f "$WCONFIG"
+}
+trap 'cleanup; resume_cleanup; conc_cleanup' EXIT
+pg "DROP PUBLICATION IF EXISTS ${WSLOT}_pub; CREATE PUBLICATION ${WSLOT}_pub FOR TABLE resume_probe;" > /dev/null 2>&1
+curl -s -XDELETE "$OS/e2e_conc" > /dev/null
+src_rows=$(pg "SELECT count(*) FROM resume_probe;")
+nohup $BIN run -c "$WCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sleep 1
+pg "UPDATE resume_probe SET v='changed-under-concurrency' WHERE id = 150000;" > /dev/null
+pg "DELETE FROM resume_probe WHERE id = 150001;" > /dev/null
+src_rows=$((src_rows - 1))
+for _ in $(seq 1 180); do
+  refresh
+  [ "$(os_count e2e_conc)" = "$src_rows" ] && break
+  sleep 1
+done
+check "every row is indexed with four requests open" "$(os_count e2e_conc)" "$src_rows"
+sleep 3; refresh
+check "a streamed change still outranks the copy" \
+  "$(os_field e2e_conc 150000 v)" "changed-under-concurrency"
+check "a deleted row is not resurrected by a concurrent write" \
+  "$(os_status e2e_conc 150001)" "404"
+# The checkpoint may only pass what is durable, and with several requests open
+# that is the property most at risk. A restart that loses nothing proves it.
+stop_sync
+sleep 1
+pg "INSERT INTO resume_probe VALUES (900001,'after-the-restart');" > /dev/null
+nohup $BIN run -c "$WCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_status e2e_conc 900001)" = "200" ] && break
+  sleep 1
+done
+check "streaming resumes from a position written under concurrency" \
+  "$(os_field e2e_conc 900001 v)" "after-the-restart"
+stop_sync
 
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

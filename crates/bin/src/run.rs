@@ -112,6 +112,14 @@ pub fn check_rejection_policy(cfg: &AppConfig, sink: &dyn Sink) -> Result<()> {
             cfg.target.flavor
         );
     }
+    if cfg.engine.write_concurrency > 1 && !sink.orders_by_version() {
+        bail!(
+            "[engine] write_concurrency = {} needs a target that decides between two writes of \
+             one document by their version, and {} keeps whichever landed last. Leave it at 1",
+            cfg.engine.write_concurrency,
+            cfg.target.flavor
+        );
+    }
     Ok(())
 }
 

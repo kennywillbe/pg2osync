@@ -62,7 +62,7 @@ pg "CREATE TABLE impact_child (id bigint PRIMARY KEY, parent_id bigint NOT NULL,
 pg "ALTER TABLE impact_child REPLICA IDENTITY FULL;" > /dev/null
 pg "INSERT INTO impact_parent SELECT g, 'p'||g, repeat('x', 200) FROM generate_series(1,$ROWS) g;" > /dev/null
 pg "INSERT INTO impact_child SELECT g, g, 1.00 FROM generate_series(1,$ROWS) g;" > /dev/null
-curl -s -XDELETE "$OS/impact_parent,.pg2osync_meta" > /dev/null
+curl -s -XDELETE "$OS/impact_parent,.pg2osync_meta?ignore_unavailable=true" > /dev/null
 
 echo
 echo "== 1. WAL written by the source, with and without REPLICA IDENTITY FULL =="

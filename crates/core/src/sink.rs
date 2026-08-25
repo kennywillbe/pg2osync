@@ -185,6 +185,19 @@ pub trait Sink: Send + Sync {
         ))
     }
 
+    /// Whether this target decides between two writes of one document by the
+    /// version they carry rather than by which arrived last.
+    ///
+    /// This is what makes more than one write request safe to have open at
+    /// once: two in-flight requests can land in either order, and only a target
+    /// that compares versions still ends up holding the later document. A
+    /// target without versions would keep whichever request happened to finish
+    /// second, so concurrency is refused there at startup instead of quietly
+    /// reordering writes.
+    fn orders_by_version(&self) -> bool {
+        true
+    }
+
     /// Whether this target can durably record a rejected document.
     ///
     /// Checked at startup so a pipeline configured to quarantine against a

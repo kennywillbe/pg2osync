@@ -76,7 +76,7 @@ run_case() {
   toasted=$(pg "SELECT count(*) FROM pg_toast.pg_toast_$(pg "SELECT 'toast_bench'::regclass::oid;");" 2>/dev/null || echo 0)
   echo "   ($toasted toast chunks stored out of line)"
   pg "ALTER TABLE toast_bench REPLICA IDENTITY $identity;" > /dev/null
-  curl -s -XDELETE "$OS/toast_bench,.pg2osync_meta" > /dev/null
+  curl -s -XDELETE "$OS/toast_bench,.pg2osync_meta?ignore_unavailable=true" > /dev/null
 
   nohup $BIN run -c "$CONFIG" &> "$LOG" < /dev/null & disown
   while :; do refresh; [ "$(count)" -ge "$ROWS" ] && break; sleep 1; done

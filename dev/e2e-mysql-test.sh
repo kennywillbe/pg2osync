@@ -81,7 +81,7 @@ my "INSERT INTO shop_users (id,name,email,password_hash,balance,metadata) VALUES
       (1,'alice','alice@test.io','secret-1',10.25,'{\"role\":\"admin\"}'),
       (2,'bob','bob@test.io','secret-2',0.00,'{\"role\":\"user\"}'),
       (3,'carol','carol@test.io','secret-3',99.99,NULL);"
-curl -s -XDELETE "$OS/e2e_mysql_users,.pg2osync_meta" > /dev/null
+curl -s -XDELETE "$OS/e2e_mysql_users,.pg2osync_meta?ignore_unavailable=true" > /dev/null
 ok "seeded 3 rows, indices cleared"
 
 say "1. validate"
@@ -257,7 +257,7 @@ my "DROP TABLE IF EXISTS composite_probe;
                                  primary key (tenant, id));"
 my "INSERT INTO composite_probe SELECT IF(id%2=0,'acme','globex'), id, CONCAT('c-', id)
       FROM resume_probe WHERE id <= 5000;"
-curl -s -XDELETE "$OS/e2e_mysql_resume,e2e_mysql_composite" > /dev/null
+curl -s -XDELETE "$OS/e2e_mysql_resume,e2e_mysql_composite?ignore_unavailable=true" > /dev/null
 PROG=load-mysql-$RSID-sourcedb_resume_probe
 curl -s -XDELETE "$OS/.pg2osync_meta/_doc/$PROG" > /dev/null
 big_rows=$(my 'SELECT count(*) FROM resume_probe;')
@@ -502,7 +502,7 @@ my "CREATE TABLE kid_item(id bigint PRIMARY KEY, parent_id bigint,
 my "INSERT INTO kid_parent VALUES (1,'one'),(2,'two');"
 my "INSERT INTO kid_item VALUES (10,1,0x00FF10,12.34,b'0000000011111111','a,c','i10'),
                                 (11,1,0x01,0.10,b'1','','i11');"
-curl -s -XDELETE "$OS/e2e_mysql_kid,e2e_mysql_kid_item" > /dev/null
+curl -s -XDELETE "$OS/e2e_mysql_kid,e2e_mysql_kid_item?ignore_unavailable=true" > /dev/null
 curl -s -XDELETE "$OS/.pg2osync_meta/_doc/mysql-$CSID" > /dev/null
 
 nohup $BIN run -c "$CCONFIG" >> "$LOG" 2>&1 < /dev/null & disown

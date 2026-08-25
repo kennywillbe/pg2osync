@@ -222,6 +222,45 @@ which needs nothing else to be exact. A checkpoint alone is not proof the
 load finished — the two are separate facts, and conflating them is what
 silently skips a load.
 
+**The load is made faster on the write side, because that is where the limit
+is.** The obvious move is parallel readers, and it would have bought nothing.
+Measured on an 8-core laptop against the dev stack, 2M rows: one `COPY` hands
+over rows at ~1,050,000 a second, while the whole pipeline ran at 43,000 and
+spent 63% of its wall clock idle. The target was the reason — one bulk request
+open at a time tops out near 52,000 documents a second, and its size makes no
+difference at all (50,500 at 500 documents a request, 52,100 at 20,000), while
+four requests open at once reach 114,000. Refresh and replicas are already
+suspended for the load, so concurrency was the only variable left.
+
+Opening more requests is therefore the whole change, and it delivers: 43,000
+rows a second at one, 67,000 at two, 87,000 at four, 96,000 at eight. The
+process's CPU share over the same runs went from 37% of wall clock to 102%,
+which says plainly what happened — it stopped waiting and started working. At
+10M rows the same shape holds and the numbers barely move — 42,700 at one,
+90,100 at four — so this is not an artefact of a table that fits in cache.
+
+Wide rows do not change the answer. A TOAST-heavy table reads at 11,200 rows a
+second through a client and gets *slower* with parallel readers, because what
+saturates is transporting the data, not the backend producing it; server-side the
+same read scales to 141,000 with four readers, so PostgreSQL is not the problem
+and neither is our connection count.
+
+**Write requests are open concurrently and completed in order.** Concurrency
+that reordered completions would break three things at once, so it does not: a
+position is acknowledged only after every batch sent before it is durable, a
+refused document is filed before the position covering it passes, and a failure
+acknowledges nothing behind it. Load marks, truncates and bare positions are
+barriers that wait for the open writes to finish — for a load mark that is
+required rather than tidy, because the engine forgets its record of
+stream-removed keys on one, and that is only safe while the mark still means
+every copy row before it is durable.
+
+It stays at one request by default. Raising it multiplies the load placed on
+someone's production target, which is not a default anyone should inherit
+unmeasured, and it needs a target that decides between two writes by their
+version: Meilisearch keeps whichever landed last, so it refuses the setting
+outright rather than reordering writes quietly.
+
 **A re-snapshot is a subcommand, not a signal table.** Debezium triggers an
 ad-hoc snapshot by writing to a table in the user's database. pg2osync will not
 write to the source, and the CLI is already where operator actions live, so

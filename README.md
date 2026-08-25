@@ -252,6 +252,8 @@ read this as an order of magnitude, not a capacity plan:
 | Metric | Value |
 |---|---|
 | Initial load | 200K docs in ~5.8 s (**~35,000 docs/s**) |
+| Initial load, 2M rows | ~43,000 rows/s with one write request open, **~87,000 with four** (`[engine] write_concurrency`) |
+| Initial load, 10M rows | ~43,000 rows/s at one, **~90,000 at four** — the ratio holds at scale |
 | Pipeline latency, commit to indexed | **p50 2 ms**, p99 3 ms |
 | Commit to searchable, single row | ~80 ms including the client round-trip and a forced index refresh |
 | One 50K-row transaction | propagated in ~1.4 s |
@@ -271,6 +273,12 @@ A commit is what forces a batch, so a stream of single-row transactions used to
 cost one request each and topped out near 1,100 rows/s. Whole transactions now
 accumulate for up to 10 ms before the batch is written, which is where the rest
 of that number comes from; end-to-end latency moved from p50 1 ms to 2 ms.
+
+The initial load is bounded by the target, not by the source: one `COPY` produces
+rows more than twenty times faster than the pipeline can index them, and the
+figure above is what a single open write request buys. `write_concurrency` opens
+more of them, which is why it roughly doubles the load and does almost nothing
+past four.
 
 The two latency rows measure different things on purpose. "Commit to indexed" is
 what pg2osync controls, taken from its own `pg2osync_latency_ms`. "Commit to

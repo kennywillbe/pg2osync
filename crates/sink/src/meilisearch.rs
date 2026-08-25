@@ -122,6 +122,12 @@ impl MeilisearchSink {
 
 #[async_trait]
 impl Sink for MeilisearchSink {
+    /// Meilisearch keeps whichever write it applied last, so two requests open
+    /// at once could settle a document either way round.
+    fn orders_by_version(&self) -> bool {
+        false
+    }
+
     async fn ensure_ready(&self, tables: &[IndexSpec]) -> Result<(), CoreError> {
         for spec in tables {
             if spec.mapping.is_some() {
