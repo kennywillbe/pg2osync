@@ -813,7 +813,24 @@ pub async fn resolve_child_order(
 ) -> Result<()> {
     for specs in children.values_mut() {
         for spec in specs.iter_mut() {
-            spec.resolve_order(admin).await?;
+            pg2osync_source::children::resolve_order(spec, admin).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Ask MySQL's catalogue what to order each child collection by.
+///
+/// The same reasoning as the PostgreSQL counterpart: without an order the array
+/// is a set, so the load and a re-fetch can embed it differently, and with
+/// `max_rows` they would keep different rows.
+pub async fn resolve_mysql_child_order(
+    children: &mut HashMap<(String, String), Vec<pg2osync_core::children::ChildSpec>>,
+    conn: &mut pg2osync_source_mysql::connection::MySqlConnection,
+) -> Result<()> {
+    for specs in children.values_mut() {
+        for spec in specs.iter_mut() {
+            pg2osync_source_mysql::children::resolve_order(spec, conn).await?;
         }
     }
     Ok(())
@@ -878,9 +895,6 @@ async fn run_mysql(
 ) -> Result<()> {
     use pg2osync_source_mysql::runner::MySqlSource;
 
-    if cfg.sync.values().any(|t| !t.children.is_empty()) {
-        bail!("nested children are not supported for the MySQL source yet");
-    }
     let src_cfg = mysql_config_for(&cfg, &source_url)?;
     let source = MySqlSource::new(src_cfg);
     let mut admin = source.admin_connection().await?;
@@ -1067,6 +1081,8 @@ async fn attempt_mysql(
     };
 
     let mut src_cfg = mysql_config_for(cfg, source_url)?;
+    resolve_mysql_child_order(&mut src_cfg.children, &mut admin).await?;
+    let load_children = src_cfg.children.clone();
     src_cfg.start_file = Some(start_file);
     src_cfg.start_pos = start_pos;
 
@@ -1113,6 +1129,7 @@ async fn attempt_mysql(
                     &load_stream_id,
                     load_done_rx,
                     &pg2osync_core::load::LoadScope::initial_load(),
+                    &load_children,
                 )
                 .await
             })
@@ -1173,7 +1190,9 @@ pub fn mysql_config_for(
     source_url: &str,
 ) -> Result<pg2osync_source_mysql::runner::MySqlSourceConfig> {
     let url = url::Url::parse(source_url).context("source url is not a valid URL")?;
-    let tables = cfg
+    let children = child_specs_for(cfg)?;
+    let mut child_parents = HashMap::new();
+    let mut tables: Vec<(String, String)> = cfg
         .sync
         .values()
         .map(|t| {
@@ -1181,6 +1200,18 @@ pub fn mysql_config_for(
             (schema.to_string(), table.to_string())
         })
         .collect();
+    // A child table has to be streamed or its changes never reach us, which is
+    // the counterpart of adding it to the publication on PostgreSQL. Its rows
+    // resolve to a parent instead of becoming documents.
+    for (parent, specs) in &children {
+        for spec in specs {
+            let child = (spec.schema.clone(), spec.table.clone());
+            if !tables.contains(&child) {
+                tables.push(child.clone());
+            }
+            child_parents.insert(child, parent.clone());
+        }
+    }
     Ok(pg2osync_source_mysql::runner::MySqlSourceConfig {
         host: url.host_str().unwrap_or("localhost").into(),
         port: url.port().unwrap_or(3306),
@@ -1191,6 +1222,8 @@ pub fn mysql_config_for(
         start_file: None,
         start_pos: 0,
         tls: cfg.tls_settings(source_url)?,
+        children,
+        child_parents,
     })
 }
 

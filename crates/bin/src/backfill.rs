@@ -126,7 +126,7 @@ fn copy_statement(
         // makes the index unusable and turns this into a sequential scan
         joins.push_str(&format!(
             " LEFT JOIN ({agg}) {alias} ON {alias}.k = p.{parent_key}",
-            agg = child.agg_subquery(None),
+            agg = pg2osync_source::children::agg_subquery(child, None),
             parent_key = quote_ident(&child.parent_column),
         ));
     }
@@ -938,7 +938,7 @@ mod tests {
             None,
         );
         assert!(
-            sql.contains(&spec.agg_subquery(None)),
+            sql.contains(&pg2osync_source::children::agg_subquery(&spec, None)),
             "the load embeds the source crate's own aggregation verbatim: {sql}"
         );
         assert!(sql.contains("ORDER BY \"id\""), "ordered: {sql}");

@@ -239,11 +239,36 @@ resynchronize.
 Column renames and drops need a re-index: existing documents keep the old
 field names.
 
+## Nested children
+
+`[[sync.x.children]]` works here as it does for PostgreSQL: the parent document
+embeds the collection as an array, refreshed whenever the parent or any of its
+children changes. Child tables are added to the streamed set automatically, and
+their row events resolve to a parent instead of becoming documents of their own.
+
+Two things are easier here than on PostgreSQL:
+
+- **A deleted child is always locatable.** `binlog_row_image = FULL` is already a
+  requirement, so a delete carries its whole before-image and the foreign key is
+  always present. PostgreSQL needs `REPLICA IDENTITY FULL` on the child for the
+  same guarantee and warns when it is missing.
+- **There is no TOAST equivalent**, so no value ever arrives as a marker that has
+  to be completed from the target.
+
+The array is built from ordinary rows rather than by `JSON_ARRAYAGG(JSON_OBJECT(…))`,
+which would not agree with the rest of the pipeline. `JSON_OBJECT` renders a
+`varbinary` as `base64:type15:…` on MySQL and as raw escaped bytes on MariaDB, a
+`set` as `"a,b"` rather than an array, a `decimal` as a number rather than a
+precision-preserving string, and a `bit` as *invalid JSON* on MariaDB — its own
+`JSON_VALID` says so. Reading the rows and converting them with the same code that
+builds a parent document means a value inside an array is the same JSON as the
+same value on its own. The cost is unchanged: one query per collection per batch,
+with the server still doing the ordering, the cap and the count.
+
 ## Known limitations
 
 | Limitation | Detail | Workaround |
 |---|---|---|
-| Nested children | Not implemented for MySQL | Use PostgreSQL, or denormalize in a view |
 | GTID positions | Checkpoints use file and offset, not GTID sets | Fine for a single server; failover to a replica needs a fresh initial load |
 | Timezone edge cases | `DATETIME` values decode naive | Prefer `TIMESTAMP`, or verify your setup |
 

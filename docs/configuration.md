@@ -234,6 +234,7 @@ foreign_key = "customer_id"  # column on the CHILD referencing the parent key
 # max_rows = 1000            # optional: embed at most this many, see below
 ```
 
+- PostgreSQL and MySQL/MariaDB alike.
 - One level deep only.
 - Children are fetched during the initial load and re-fetched whenever the
   parent or any of its children changes, so the array is never stale.

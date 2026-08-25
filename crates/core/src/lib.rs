@@ -4,6 +4,7 @@
 //! The `Sink` trait lives here so the engine never imports the sink crate.
 
 pub mod checkpoint;
+pub mod children;
 pub mod error;
 pub mod event;
 pub mod load;

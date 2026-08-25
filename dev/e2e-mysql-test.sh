@@ -38,6 +38,7 @@ jqf()       { python3 -c "import sys,json;d=json.load(sys.stdin);print($1)"; }
 os_count()  { curl -s "$OS/$1/_count" | jqf "d.get('count', 0)"; }
 os_field()  { curl -s "$OS/$1/_doc/$2" | jqf "d.get('_source',{}).get('$3','<missing>')"; }
 os_has()    { curl -s "$OS/$1/_doc/$2" | jqf "'$3' in d.get('_source',{})"; }
+os_len()    { curl -s "$OS/$1/_doc/$2" | jqf "len(d.get('_source',{}).get('$3') or [])"; }
 os_status() { curl -s -o /dev/null -w "%{http_code}" "$OS/$1/_doc/$2"; }
 my()        { docker exec "$CONTAINER" "$CLIENT" -uroot -p"$ROOT_PASSWORD" -N -B sourcedb -e "$1" 2>/dev/null; }
 refresh()   { curl -s -XPOST "$OS/_refresh" > /dev/null; }
@@ -450,6 +451,101 @@ before=$($BIN status -c "$RCONFIG" | grep -o 'position=[^ ]*' | head -1)
 $BIN resnapshot -c "$RCONFIG" --table sourcedb.resume_probe >> "$LOG" 2>&1
 check "a re-snapshot does not move the checkpoint" \
   "$($BIN status -c "$RCONFIG" | grep -o 'position=[^ ]*' | head -1)" "$before"
+
+say "15. nested children"
+stop_sync
+CCONFIG=$(mktemp /tmp/pg2osync-mysql-child.XXXXXX)
+CSID=990004
+cat > "$CCONFIG" <<TOML
+[source]
+flavor = "mysql"
+url_env = "PG2OSYNC_MYSQL_URL"
+server_id = $CSID
+
+[target]
+url = "$OS"
+
+[metrics]
+bind = "127.0.0.1:9116"
+
+[sync.kid_parent]
+table = "sourcedb.kid_parent"
+index = "e2e_mysql_kid"
+primary_key = "id"
+
+[[sync.kid_parent.children]]
+table = "sourcedb.kid_item"
+field = "items"
+foreign_key = "parent_id"
+
+# the same child table as its own index, so an embedded object can be compared
+# against the very row it came from
+[sync.kid_item]
+table = "sourcedb.kid_item"
+index = "e2e_mysql_kid_item"
+TOML
+child_cleanup() {
+  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  my "DROP TABLE IF EXISTS kid_item; DROP TABLE IF EXISTS kid_parent;" > /dev/null 2>&1 || true
+  rm -f "$CCONFIG"
+}
+trap 'cleanup; resume_cleanup; types_cleanup; child_cleanup' EXIT
+
+my "DROP TABLE IF EXISTS kid_item; DROP TABLE IF EXISTS kid_parent;"
+my "CREATE TABLE kid_parent(id bigint PRIMARY KEY, name varchar(32));"
+# the types MySQL's own JSON functions render differently from this pipeline:
+# varbinary, bit, set and decimal. Embedding them is the case that would break
+# silently if the array were built by JSON_ARRAYAGG(JSON_OBJECT(...)).
+my "CREATE TABLE kid_item(id bigint PRIMARY KEY, parent_id bigint,
+                          b varbinary(8), d decimal(10,2), bt bit(16),
+                          s set('a','b','c'), label varchar(32), INDEX(parent_id));"
+my "INSERT INTO kid_parent VALUES (1,'one'),(2,'two');"
+my "INSERT INTO kid_item VALUES (10,1,0x00FF10,12.34,b'0000000011111111','a,c','i10'),
+                                (11,1,0x01,0.10,b'1','','i11');"
+curl -s -XDELETE "$OS/e2e_mysql_kid,e2e_mysql_kid_item" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/mysql-$CSID" > /dev/null
+
+nohup $BIN run -c "$CCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_count e2e_mysql_kid)" = "2" ] && break
+  sleep 0.5
+done
+check "children attached during the load" "$(os_len e2e_mysql_kid 1 items)" "2"
+check "a childless parent gets an empty array" "$(os_len e2e_mysql_kid 2 items)" "0"
+check "and has the field at all" "$(os_has e2e_mysql_kid 2 items)" "True"
+
+my "INSERT INTO kid_item VALUES (12,1,0x02,1.00,b'10','b','i12');"
+sleep 3; refresh
+check "child INSERT refreshes the parent" "$(os_len e2e_mysql_kid 1 items)" "3"
+my "DELETE FROM kid_item WHERE id = 12;"
+sleep 3; refresh
+# binlog_row_image = FULL is what carries the foreign key on a delete, so the
+# parent is always locatable — no REPLICA IDENTITY caveat as on PostgreSQL
+check "child DELETE refreshes the parent" "$(os_len e2e_mysql_kid 1 items)" "2"
+
+# many children of one parent in one statement: deduplicated to one document
+my "INSERT INTO kid_item SELECT 1000+seq, 2, 0x03, 2.00, b'11', 'c', CONCAT('m',seq)
+      FROM (SELECT 1 seq UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5
+            UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9
+            UNION SELECT 10) t;"
+sleep 4; refresh
+check "one statement of 10 children lands whole" "$(os_len e2e_mysql_kid 2 items)" "10"
+
+# The assertion the Rust-side aggregation exists for: an embedded child object
+# must be the same JSON as the row it came from indexed on its own.
+in_array=$(curl -s "$OS/e2e_mysql_kid/_doc/1" \
+  | jqf "[{k:v for k,v in i.items() if k in ('b','d','bt','s')} for i in ((d.get('_source') or {}).get('items') or []) if i.get('id')==10]")
+as_doc=$(curl -s "$OS/e2e_mysql_kid_item/_doc/10" \
+  | jqf "[{k:v for k,v in (d.get('_source') or {}).items() if k in ('b','d','bt','s')}]")
+if [ "$in_array" = "$as_doc" ]; then
+  ok "an embedded child is the same JSON as the row itself ($in_array)"
+else
+  bad "an embedded child differs from the row itself (array $in_array, doc $as_doc)"
+fi
+check "and it is the pipeline's own binary form, not MySQL's" \
+  "$(curl -s "$OS/e2e_mysql_kid_item/_doc/10" | jqf "(d.get('_source') or {}).get('b')")" "AP8Q"
+stop_sync
 
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

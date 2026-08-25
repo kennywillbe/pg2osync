@@ -6,6 +6,7 @@
 pub mod auth;
 pub mod binlog;
 pub mod catalog;
+pub mod children;
 pub mod connection;
 pub mod json;
 pub mod load;
