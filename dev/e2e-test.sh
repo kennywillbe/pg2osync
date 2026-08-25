@@ -340,6 +340,14 @@ nohup $BIN run -c "$RCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
 # the stale copied row from landing on top of it.
 sleep 1
 pg "UPDATE resume_probe SET v='changed-during-the-copy' WHERE id = 199000;" > /dev/null
+# And a row deleted while the copy is still running. The version cannot protect
+# this one on its own: a delete leaves a tombstone that lives for gc_deletes, and
+# a copy row starved past that would be accepted back. The engine drops such a
+# row instead of offering it. This case only pins the ordering — the starvation
+# that breaks it cannot be staged from a shell script.
+pg "DELETE FROM resume_probe WHERE id = 198000;" > /dev/null
+# one row fewer to wait for, now that the load itself is racing a delete
+src_rows=$((src_rows - 1))
 for _ in $(seq 1 180); do
   refresh
   [ "$(os_count e2e_resume)" = "$src_rows" ] && break
@@ -358,6 +366,8 @@ check "a row updated while down is current" "$(os_field e2e_resume 77 v)" "updat
 sleep 3; refresh
 check "a row changed during the copy is not overwritten by it" \
   "$(os_field e2e_resume 199000 v)" "changed-during-the-copy"
+check "a row deleted during the copy is not resurrected by it" \
+  "$(os_status e2e_resume 198000)" "404"
 stop_sync
 
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"

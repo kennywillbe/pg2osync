@@ -196,7 +196,7 @@ arrives first. Without that, a chunk read at position 100 and written after a
 streamed event at position 150 for the same key leaves the row silently stale
 until something touches it again.
 
-Three rules keep the overlap from turning into a different problem:
+Four rules keep the overlap from turning into a different problem:
 
 - **Change events have strict priority over copy rows.** They arrive on separate
   channels and the engine drains the stream first. WAL is retained until it is
@@ -208,6 +208,14 @@ Three rules keep the overlap from turning into a different problem:
   configured the status stays `reserved`, which is honest: there is no line to
   stay behind, and no protection either. `wal_status = lost` fails the load with
   an explanation instead of continuing into a gap.
+- **A write the stream has already removed is dropped, not offered.** This is
+  where versioning alone is not enough. A versioned delete leaves a tombstone
+  rather than nothing, the target keeps it for `index.gc_deletes` (60s by
+  default), and once it is gone `external_gte` accepts any version at all — so a
+  copy row starved past that would put the document back. The engine remembers
+  what the stream removed for the length of one chunk and drops such a row
+  itself. The window closes at each load mark, which is sound because the load
+  waits for its mark before reading the next chunk.
 - **Pausing happens between ranges, never inside one.** A `COPY` held mid-stream
   would keep its snapshot open for the length of the pause, which is the long
   transaction this design exists to avoid. A range is under a second of work at

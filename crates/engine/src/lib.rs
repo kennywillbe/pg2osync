@@ -232,6 +232,15 @@ pub async fn run(
     // flag disables its branch instead. The loop ends when both are closed.
     let mut events_open = true;
     let mut copy_open = true;
+    // What the stream has removed while a copy row for the same key may still be
+    // in flight behind it. A versioned delete leaves a tombstone rather than
+    // nothing, and the target keeps that tombstone only for `index.gc_deletes`
+    // (60s by default); once it is gone `external_gte` accepts *any* version,
+    // including one below the delete's. So a copy row starved behind a busy
+    // stream for longer than that would resurrect the document. These say no
+    // without asking the target to make a comparison it cannot make.
+    let mut superseded: HashMap<(String, String), u64> = HashMap::new();
+    let mut cleared: HashMap<String, u64> = HashMap::new();
 
     let result = loop {
         let ev = match deferred.take().or_else(|| try_next(&mut events, &mut copy)) {
@@ -256,7 +265,11 @@ pub async fn run(
                         ev = copy.recv(), if copy_open => match ev {
                             Some(ev) => got = Some(ev),
                             None => {
+                                // the load is over, so there is nothing left for
+                                // the window to protect
                                 copy_open = false;
+                                superseded.clear();
+                                cleared.clear();
                                 if !events_open {
                                     break;
                                 }
@@ -351,6 +364,17 @@ pub async fn run(
                 }
             }
             ChangeEvent::LoadMark(mark) => {
+                // The window closes here. The load sends a chunk's rows, then
+                // this mark, then *waits* for the sink to report it before
+                // reading the next chunk — so by the time the mark arrives every
+                // row of that chunk has been materialised and none of the next
+                // one can exist yet. Nothing is in flight for a remembered
+                // delete to outrank, which is what keeps this bounded by one
+                // chunk rather than by the whole load. A loader that sent the
+                // next chunk before its mark was confirmed would silently
+                // reopen the window.
+                superseded.clear();
+                cleared.clear();
                 if stream_txn_open {
                     pending_mark = Some(mark);
                     continue;
@@ -415,6 +439,60 @@ pub async fn run(
                             break;
                         }
                     };
+                    // A write the stream has already superseded is dropped
+                    // here rather than sent for the target to refuse: by the
+                    // time it lands the tombstone that would refuse it may be
+                    // gone. Strictly greater, because on PostgreSQL a delete and
+                    // a re-insert of one key inside one transaction share the
+                    // commit position, and the re-insert has to survive.
+                    //
+                    // Applied to every row, not only copied ones, because it
+                    // cannot fire on a streamed row: within a stream a later
+                    // event always carries a higher position.
+                    let ops: Vec<LsnOp> = ops
+                        .into_iter()
+                        .filter(|op| match &op.op {
+                            DocumentOp::Upsert {
+                                index,
+                                id,
+                                version: Some(version),
+                                ..
+                            } => {
+                                // the empty check comes first so an ordinary row
+                                // never pays for building a lookup key
+                                let dead = (!superseded.is_empty()
+                                    && superseded
+                                        .get(&(index.clone(), id.clone()))
+                                        .is_some_and(|removed| removed > version))
+                                    || cleared.get(index.as_str()).is_some_and(|at| at > version);
+                                if dead {
+                                    ctx.metrics.incr_event("superseded");
+                                    tracing::debug!(target: "pg2osync::engine",
+                                    "dropping {index}/{id} at {version}: the stream \
+                                     removed it at a later position");
+                                }
+                                !dead
+                            }
+                            _ => true,
+                        })
+                        .collect();
+                    // Remembered only while a load is running: with no copy
+                    // row to outrank there is nothing for this to protect.
+                    if copy_open {
+                        for op in &ops {
+                            if let DocumentOp::Delete {
+                                index,
+                                id,
+                                version: Some(version),
+                            } = &op.op
+                            {
+                                let entry = superseded
+                                    .entry((index.clone(), id.clone()))
+                                    .or_insert(*version);
+                                *entry = (*entry).max(*version);
+                            }
+                        }
+                    }
                     txn_bytes += ops.iter().map(op_size).sum::<usize>();
                     txn_buffer.extend(ops);
                     if txn_bytes > txn_cap_bytes && !cap_warned {
@@ -464,6 +542,13 @@ pub async fn run(
                     break Err(CoreError::Other("batch channel closed".into()));
                 }
                 txn_bytes = 0;
+                // A truncate removes every key at once, so one floor per index
+                // says what a per-key entry would: anything copied from before
+                // it is gone. Its tombstones expire like any other delete's.
+                if copy_open && let Some(version) = version {
+                    let at = cleared.entry(index.clone()).or_insert(version);
+                    *at = (*at).max(version);
+                }
                 if batch_tx
                     .send(SinkCommand::Truncate(index, version))
                     .await
@@ -930,8 +1015,9 @@ mod pipeline_tests {
     }
 
     /// As `drive`, with a second script on the copy channel. Both are queued
-    /// before the engine starts, so the order it drains them in is the
-    /// engine's choice and not a race.
+    /// before the engine starts, so the order it drains them in is the engine's
+    /// choice and not a race — which is what makes a test about precedence, or
+    /// about one channel outranking the other, mean anything.
     async fn drive_split(
         batch_size: usize,
         script: Vec<ChangeEvent>,
@@ -972,6 +1058,12 @@ mod pipeline_tests {
             copy_tx.send(event).await.expect("copy channel open");
         }
         drop(copy_tx);
+        // Queued, not sent after the engine starts: the sender is still held, so
+        // the engine cannot finish early, and it sees both channels already
+        // populated on its first turn.
+        for event in script {
+            events_tx.send(event).await.expect("channel has room");
+        }
         let engine = tokio::spawn(run(
             events_rx,
             copy_rx,
@@ -981,9 +1073,6 @@ mod pipeline_tests {
             crate::mapping::DurableLsn::default(),
             shutdown_rx,
         ));
-        for event in script {
-            events_tx.send(event).await.expect("engine alive");
-        }
         // let the checkpoint loop observe the final acknowledged position
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         drop(events_tx);
@@ -1217,6 +1306,131 @@ mod pipeline_tests {
             sink.events(),
             vec!["read(1)", "write[upsert:2 delete:1]"],
             "completion must read where the document actually is"
+        );
+    }
+
+    fn deleted_at(id: i64, version: u64) -> ChangeEvent {
+        ChangeEvent::Row(RowChange {
+            schema: "public".into(),
+            table: "users".into(),
+            kind: RowKind::Delete { pk: json!(id) },
+            version: Some(version),
+        })
+    }
+
+    fn truncated_at(version: u64) -> ChangeEvent {
+        ChangeEvent::TableTruncated {
+            schema: "public".into(),
+            table: "users".into(),
+            version: Some(version),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_copy_row_the_stream_has_already_deleted_is_never_written() {
+        // The target cannot be trusted to refuse this. A versioned delete leaves
+        // a tombstone, the tombstone lives for index.gc_deletes (60s), and once
+        // it is gone external_gte accepts any version at all — so a copy row
+        // starved behind a busy stream for longer than that would put the
+        // document back. Verified against a real target: at gc_deletes = 1s the
+        // same write is a 409 immediately and a `created` two seconds later.
+        let (sink, _) = drive_split(
+            500,
+            vec![deleted_at(1, 0x200), commit(0x200)],
+            vec![row_at(1, Some(0x100)), ChangeEvent::LoadMark(1)],
+        )
+        .await;
+        assert_eq!(
+            sink.events(),
+            vec!["write[delete:1]"],
+            "the delete stands and the stale copy row is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_copy_row_read_after_the_delete_still_lands() {
+        // The rule is a comparison, not a blocklist: a chunk that read the key
+        // after it was deleted and found it there again is telling the truth.
+        let (sink, _) = drive_split(
+            500,
+            vec![deleted_at(1, 0x100), commit(0x100)],
+            vec![row_at(1, Some(0x200)), ChangeEvent::LoadMark(1)],
+        )
+        .await;
+        assert_eq!(sink.events(), vec!["write[delete:1 upsert:1@512]"]);
+    }
+
+    #[tokio::test]
+    async fn a_streamed_reinsert_after_a_delete_survives() {
+        // Why the rule needs no idea which channel a row came from: within a
+        // stream a later event always carries a higher position, so it can never
+        // fire on one.
+        let sink = run_script(
+            500,
+            vec![deleted_at(1, 0x100), row_at(1, Some(0x200)), commit(0x200)],
+        )
+        .await;
+        assert_eq!(sink.events(), vec!["write[delete:1 upsert:1@512]"]);
+    }
+
+    #[tokio::test]
+    async fn a_delete_and_a_reinsert_sharing_one_commit_both_stand() {
+        // PostgreSQL versions every row of a transaction with its commit
+        // position, so these two are equal. Comparing with >= instead of >
+        // would drop the re-insert and lose the row.
+        let sink = run_script(
+            500,
+            vec![
+                begin(0x300),
+                deleted_at(1, 0x300),
+                row_at(1, Some(0x300)),
+                commit(0x300),
+            ],
+        )
+        .await;
+        assert_eq!(sink.events(), vec!["write[delete:1 upsert:1@768]"]);
+    }
+
+    #[tokio::test]
+    async fn a_copy_row_from_before_a_truncate_is_dropped() {
+        // A truncate removes every key at once, and clears the index with
+        // versioned deletes whose tombstones expire like any other.
+        let (sink, _) = drive_split(
+            500,
+            vec![truncated_at(0x200)],
+            vec![
+                row_at(1, Some(0x100)),
+                row_at(2, Some(0x300)),
+                ChangeEvent::LoadMark(1),
+            ],
+        )
+        .await;
+        assert_eq!(
+            sink.events(),
+            vec!["truncate(users)", "write[upsert:2@768]"],
+            "the row read before the truncate goes, the one read after stays"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_load_mark_ends_the_window_it_closed() {
+        // The load waits for each mark before reading the next chunk, so once a
+        // mark arrives nothing from the chunk it belongs to is still in flight
+        // and the next chunk's rows must not be judged against it.
+        let (sink, _) = drive_split(
+            500,
+            vec![deleted_at(1, 0x200), commit(0x200)],
+            vec![
+                ChangeEvent::LoadMark(1),
+                row_at(1, Some(0x100)),
+                ChangeEvent::LoadMark(2),
+            ],
+        )
+        .await;
+        assert_eq!(
+            sink.events(),
+            vec!["write[delete:1]", "write[upsert:1@256]"],
+            "the mark cleared the window, so the later chunk is untouched"
         );
     }
 
