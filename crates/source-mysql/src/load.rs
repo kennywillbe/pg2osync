@@ -163,8 +163,16 @@ pub async fn run(
                 .map_err(|_| anyhow::anyhow!("engine stopped before the chunk was written"))?;
 
             // A short chunk is the last one: there is nothing past its final
-            // key that this statement could have left behind.
-            let finished = !chunked || in_chunk < chunk_rows || last.is_none();
+            // key that this statement could have left behind. A full chunk that
+            // yielded no cursor cannot be continued, and treating that as the
+            // end would silently load part of a table.
+            let finished = !chunked || in_chunk < chunk_rows;
+            if !finished && last.is_none() {
+                anyhow::bail!(
+                    "{qualified}: a full chunk produced no key to continue from, \
+                     so the rest of the table cannot be read"
+                );
+            }
             cursor = last;
             let progress = LoadProgress {
                 cursor: LoadCursor::After(cursor.clone().unwrap_or_default()),

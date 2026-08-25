@@ -105,9 +105,14 @@ impl MySqlSource {
             _ => catalog::master_position(&mut admin).await?,
         };
         // Where the stream is in the current file, tracked rather than read off
-        // each event: MariaDB writes `end_log_pos = 0` on every event inside a
-        // transaction group and fills it in only on the GTID event that opens
-        // the group and the XID that closes it. MySQL fills all of them in.
+        // each event. MariaDB leaves `end_log_pos` at 0 on every event inside a
+        // transaction group, filling it in only on the GTID event that opens the
+        // group and the XID that closes it: a group's final position is not
+        // known until the group is written, and not needing it is what lets the
+        // checksums be computed in advance. `binlog_legacy_event_pos` restores
+        // the old behaviour and is documented as costing binlog scalability, so
+        // tracking the position here is the honest side of that trade. MySQL has
+        // no such setting and fills every event in.
         let mut current_pos = start_pos;
 
         conn.send_binlog_dump(&current_file, start_pos).await?;
@@ -145,11 +150,10 @@ impl MySqlSource {
                 // resumed into the middle of: its offset is near that file's
                 // start and says nothing about where we are.
                 binlog::T_FORMAT_DESCRIPTION | binlog::T_ROTATE => current_pos,
-                // MariaDB writes end_log_pos = 0 on every event inside a
-                // transaction group, filling it in only on the GTID event that
-                // opens the group and the XID that closes it. MySQL fills all of
-                // them in, and a filled-in one is authoritative: taking it back
-                // is what keeps a counted group from drifting past its own end.
+                // Inside a MariaDB transaction group, where nothing states a
+                // position. A stated one is authoritative wherever it appears:
+                // taking it back is what keeps a counted group from drifting
+                // past its own end.
                 _ if h.log_pos == 0 => current_pos.saturating_add(h.event_size),
                 _ => h.log_pos,
             };

@@ -198,5 +198,119 @@ check "row counts match" "$(my 'SELECT count(*) FROM shop_users;')" "$(os_count 
 say "11. status"
 $BIN status -c "$CONFIG" | sed 's/^/    /'
 
+say "12. chunked load: resumed mid-load, and running beside the stream"
+stop_sync
+RCONFIG=$(mktemp /tmp/pg2osync-mysql-resume.XXXXXX)
+RSID=990002
+cat > "$RCONFIG" <<TOML
+[source]
+flavor = "mysql"
+url_env = "PG2OSYNC_MYSQL_URL"
+server_id = $RSID
+load_chunk_rows = 5000
+
+[target]
+url = "$OS"
+
+[metrics]
+bind = "127.0.0.1:9113"
+
+[sync.big]
+table = "sourcedb.resume_probe"
+index = "e2e_mysql_resume"
+
+[sync.composite]
+table = "sourcedb.composite_probe"
+index = "e2e_mysql_composite"
+TOML
+resume_cleanup() {
+  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  my "DROP TABLE IF EXISTS resume_probe; DROP TABLE IF EXISTS composite_probe;" > /dev/null 2>&1 || true
+  rm -f "$RCONFIG"
+}
+trap 'cleanup; resume_cleanup' EXIT
+
+# Doubling rather than a recursive CTE: MySQL caps recursion at
+# cte_max_recursion_depth and MariaDB spells that setting differently.
+#
+# The keys are computed rather than left to auto_increment, whose default lock
+# mode in MySQL 8.0 is interleaved and which is documented to leave gaps for
+# bulk inserts — that would leave the very rows this section names absent. The
+# offset is a shell literal because a subquery on the table being inserted into
+# is error 1093; selecting from the target table itself is allowed.
+my "DROP TABLE IF EXISTS resume_probe;
+    CREATE TABLE resume_probe(id bigint primary key, v varchar(255));"
+my "INSERT INTO resume_probe VALUES (1, REPEAT('x',200));"
+grown=1
+for _ in $(seq 1 17); do
+  my "INSERT INTO resume_probe SELECT id + $grown, v FROM resume_probe;"
+  grown=$((grown * 2))
+done
+# a composite key is what forces the expanded cursor predicate rather than a
+# row constructor, which MySQL plans as type: index
+my "DROP TABLE IF EXISTS composite_probe;
+    CREATE TABLE composite_probe(tenant varchar(16), id bigint, v varchar(64),
+                                 primary key (tenant, id));"
+my "INSERT INTO composite_probe SELECT IF(id%2=0,'acme','globex'), id, CONCAT('c-', id)
+      FROM resume_probe WHERE id <= 5000;"
+curl -s -XDELETE "$OS/e2e_mysql_resume,e2e_mysql_composite" > /dev/null
+PROG=load-mysql-$RSID-sourcedb_resume_probe
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/$PROG" > /dev/null
+big_rows=$(my 'SELECT count(*) FROM resume_probe;')
+composite_rows=$(my 'SELECT count(*) FROM composite_probe;')
+
+cursor_len() { curl -s "$OS/.pg2osync_meta/_doc/$PROG" | jqf "len((d.get('_source') or {}).get('after') or [])"; }
+nohup $BIN run -c "$RCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+for _ in $(seq 1 120); do
+  [ "$(cursor_len)" -ge 1 ] 2> /dev/null && break
+  sleep 0.2
+done
+cursor_at_kill=$(cursor_len)
+pkill -9 -f "pg2osync run"; sleep 1
+if [ "$cursor_at_kill" -ge 1 ]; then
+  ok "progress recorded per chunk, as a key"
+else
+  bad "no per-chunk progress recorded (cursor length '$cursor_at_kill')"
+fi
+
+# the interesting part: the source moves while nothing is watching it, so the
+# replay argument the chunked load rests on is what has to repair the result
+my "DELETE FROM resume_probe WHERE id IN (5, 100000);"
+my "INSERT INTO resume_probe(id,v) VALUES (400001,'added-while-down');"
+my "UPDATE resume_probe SET v='updated-while-down' WHERE id = 77;"
+src_rows=$(my 'SELECT count(*) FROM resume_probe;')
+
+nohup $BIN run -c "$RCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+# The load now runs beside the stream, so a row can change while the chunk
+# holding it is still being read. The streamed change carries a higher binlog
+# position than the chunk did, so it has to win — the version is the only thing
+# stopping the stale copied row from landing on top of it.
+sleep 1
+my "UPDATE resume_probe SET v='changed-during-the-load' WHERE id = 131000;"
+for _ in $(seq 1 180); do
+  refresh
+  [ "$(os_count e2e_mysql_resume)" = "$src_rows" ] && break
+  sleep 1
+done
+check "every row is indexed after the restart" "$(os_count e2e_mysql_resume)" "$src_rows"
+if grep -q "resuming the load of sourcedb.resume_probe after key" "$LOG"; then
+  ok "the load resumed from its cursor instead of starting over"
+else
+  bad "the load restarted from the beginning"
+fi
+check "a composite key loads completely" "$(os_count e2e_mysql_composite)" "$composite_rows"
+# no /synced endpoint on this config, and the row count matching only proves the
+# changes it counts have landed — the rest of the stream needs a moment
+sleep 3; refresh
+check "a row deleted while down is gone" "$(os_status e2e_mysql_resume 100000)" "404"
+check "a row added while down arrived" "$(os_field e2e_mysql_resume 400001 v)" "added-while-down"
+check "a row updated while down is current" "$(os_field e2e_mysql_resume 77 v)" "updated-while-down"
+check "a row changed during the load is not overwritten by it" \
+  "$(os_field e2e_mysql_resume 131000 v)" "changed-during-the-load"
+# the load holding one read view for its whole duration is what this replaced
+open_trx=$(my "SELECT count(*) FROM information_schema.innodb_trx;")
+check "no transaction outlives the load" "$open_trx" "0"
+stop_sync
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

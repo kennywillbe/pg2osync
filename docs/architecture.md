@@ -166,17 +166,20 @@ miss degrades to a sort per range, and index order costs random heap access on
 any key that is not physically correlated. A table below the range size, or one
 with a composite key, is read in one piece as before.
 
-**MySQL:** `START TRANSACTION WITH CONSISTENT SNAPSHOT`, then the binlog
-coordinate is read *inside* that transaction and every table is selected. InnoDB
-establishes the read view at the start of the transaction, so streaming from
-that coordinate can only re-deliver rows. This is the one place a load still
-holds a long read view.
+**MySQL:** the binlog coordinate is read *before* the first chunk, then each
+table is read in primary-key chunks — `WHERE key > cursor ORDER BY key LIMIT n`,
+one statement each, no transaction spanning them. InnoDB's clustered index is
+the table, so that walks the rows in key order and each chunk's last key is the
+next chunk's cursor; the comparison is expanded rather than written as a row
+constructor, which MySQL plans without a usable key. A key column whose text
+form is not a faithful literal — binary, blob, bit, geometry, float — is read in
+one statement instead.
 
 Rows produced by an initial load carry position token `0`, which flushes batches
 without ever advancing the checkpoint — they have no position of their own. They
-do carry a document *version*: the WAL position read before their range, so a
-row that was already stale when it was copied cannot overwrite the streamed
-change that superseded it.
+do carry a document *version*: the source position read before their range or
+chunk, so a row that was already stale when it was copied cannot overwrite the
+streamed change that superseded it.
 
 ### Why the load and the stream overlap
 
@@ -218,29 +221,49 @@ design. With `max_slot_wal_keep_size` deliberately cut to 48 MB the slot went
 `reserved`, and the load then finished: 1,000,000 rows indexed, every streamed
 update intact. The incident stayed recoverable, which is the whole point.
 
+**MySQL overlaps too, and deliberately never pauses.** The middle rule has no
+analogue there because the hazard is reversed: a slot retains WAL until it is
+consumed, so a slow consumer is what invalidates it, while MySQL purges binlogs
+on its own time and space policy and ignores consumers entirely. Nothing
+accumulates because of pg2osync, and the thing that can go wrong — the file we
+still need being purged — is made likelier by holding the load back. There is
+also nothing to keep open between chunks: each chunk is one statement, and the
+session runs `READ COMMITTED` so no read view outlives it.
+
+Measured on the dev stack, 1,048,576 rows in 53 chunks while a writer churned a
+second table throughout: 17.2 s at ~61,000 rows/s, no transaction older than
+0 s at any sample, and `History list length` oscillating between 11 and 49
+rather than climbing — the purge keeps up, which is the whole claim. The old
+snapshot held one read view for the entire load, and a blocked purge is what
+Percona measured filling 382,969 of ~391,000 buffer-pool pages with undo on a
+1B-row table.
+
 For the duration of the load `refresh_interval` is suspended on every
 configured index, so ordinary searches see nothing new while it runs even though
 the stream is live. `/synced` forces a refresh, so read-your-writes still works.
 
 ### Resuming an interrupted load
 
-Progress is recorded per range in the target, one document per stream and table
-in `.pg2osync_meta`, holding the boundaries the table was cut at, how many
-leading ranges are durably written, and whether the table finished. The order is
+Progress is recorded per chunk in the target, one document per stream and table
+in `.pg2osync_meta`. PostgreSQL stores the boundaries the table was cut at and
+how many leading ranges are durably written; MySQL stores the last key written,
+which is all a keyset cursor needs. Both carry whether the table finished. The order is
 strict — rows, then a mark the sink reports once they are written, then the
 progress document — so a crash can lose forward progress and redo a range, but
 can never claim a range that was not written.
 
-The boundaries are stored rather than recomputed because they come from a random
-sample: a second run would cut the table elsewhere, and "two ranges done" would
-then name a different span of rows.
+PostgreSQL's boundaries are stored rather than recomputed because they come from
+a random sample: a second run would cut the table elsewhere, and "two ranges
+done" would then name a different span of rows. A keyset cursor has no such
+problem — the key it names is the key it names — which is why MySQL stores
+nothing else.
 
 A checkpoint is not proof that the load finished. Startup checks both, and an
 unfinished table is carried on even when a checkpoint exists — trusting the
 checkpoint alone is how a pipeline silently skips its load and reports success.
-`dev/e2e-test.sh` kills a load mid-range, changes the source while nothing is
-watching, restarts, and asserts both that the load resumed and that the index
-matches the source exactly.
+`dev/e2e-test.sh` and `dev/e2e-mysql-test.sh` each kill a load mid-chunk, change
+the source while nothing is watching, restart, and assert both that the load
+resumed and that the index matches the source exactly.
 
 ### Target-side cost
 

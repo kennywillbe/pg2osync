@@ -36,7 +36,7 @@ startup. Secrets never appear in logs or error messages.
 | `admin_url_env` | falls back to the source URL | Separate connection for catalog and nested-child queries |
 | `reconnect_max` | `10` | Consecutive stream failures tolerated before exiting; `0` exits on the first |
 | `reconnect_backoff_ms` | `1000` | Initial reconnect delay, doubled per failure, capped at 30 s |
-| `load_chunk_rows` | `50000` | PostgreSQL: rows one initial-load range covers. Also how often the load can react to WAL pressure, since a range cannot be interrupted |
+| `load_chunk_rows` | `50000` | Rows one initial-load piece covers: a sampled range on PostgreSQL, a keyset chunk on MySQL. On PostgreSQL it is also how often the load can react to WAL pressure, since a range cannot be interrupted |
 | `slot_name` | `"pg2osync"` | PostgreSQL replication slot |
 | `publication` | `"pg2osync_pub"` | PostgreSQL publication |
 | `server_id` | `424242` | MySQL: replica id, unique across the server's replicas |

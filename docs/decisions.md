@@ -81,15 +81,36 @@ rather than used to resume into an unrelated position space.
 design exports one transaction snapshot and reads every chunk from it, which
 keeps a read view open for the whole load: `VACUUM` cannot then clean anything
 that died after it started, and on MySQL a long read view makes purge block
-rather than lag. What makes our load safe is not snapshot consistency but that
-the slot exists *before* the first range and nothing advances it during the
-load, so streaming afterwards resumes from a position that predates every
-range. Anything a range missed or read stale is still in the log and replays
-onto an idempotent write. Two conditions that argument rests on: writes are
+rather than lag. What makes our load safe is not snapshot
+consistency but that streaming resumes from a position that predates every
+chunk: on PostgreSQL because the slot exists before the first range and nothing
+advances it during the load, on MySQL because the binlog coordinate is read
+before the first chunk. Anything a chunk missed or read stale is still in the
+log and replays onto an idempotent write. Two conditions that argument rests on: writes are
 whole-document upserts keyed by the row's primary key, and an update whose
 unchanged TOASTed columns arrive as markers is completed from the stored
 document — without that, a replayed update would erase a value a range read
 correctly.
+
+**The table is cut the way the storage engine reads it.** PostgreSQL's heap
+order says nothing about the key, so ranges are sampled in advance and read
+unordered: `ORDER BY key LIMIT n` forbids a bitmap heap scan, and index order
+costs random heap access on any key that is not physically correlated. InnoDB's
+clustered index *is* the table, so MySQL does the opposite — `WHERE key > cursor
+ORDER BY key LIMIT n` walks the rows themselves, nothing is sampled, and each
+chunk's last key is the next chunk's cursor. That also makes the MySQL resume
+point exact, where PostgreSQL has to store its boundaries because a second
+sample would cut the table elsewhere.
+
+**The cursor comparison is never a row constructor.** `(a, b) > (x, y)` says
+exactly what the expanded `(a > x) OR (a = x AND b > y)` says, and MySQL plans
+it as `type: index` with no usable key while the expansion plans as
+`type: range`. Measured on a composite key, for 1000 rows returned: 1000 rows
+read expanded, 2000 read as a row constructor, restarting at the head of the
+index every chunk — so the multiplier grows with how far the cursor has
+travelled. MySQL bug #111952, closed as not-a-bug with a worklog in its place.
+No `IS NOT NULL` guard accompanies the comparison even though MySQL sorts NULLs
+first: a `PRIMARY KEY` column is `NOT NULL` whether it was declared so or not.
 
 **Every document carries the position it became visible at, as a target
 document version.** Streamed rows carry their commit position, copied rows the
@@ -97,8 +118,20 @@ position read before their range. A copied row that is already stale therefore
 loses to the streamed change at the target, whichever order the two arrive in,
 and a version conflict is success rather than a rejection. It is deliberately
 separate from the checkpoint token: a copied row needs a version and must never
-advance a position. Sources with no monotonic position — poll mode, and MySQL's
-file-and-offset coordinate — write no version and rely on ordering alone.
+advance a position. Poll mode, which has no position at all, writes no version
+and relies on ordering alone.
+
+**MySQL versions by its binlog coordinate, not by a GTID.** `(file index << 32)
+| offset` is monotonic across rotation and was already the ordering token, and a
+transaction's events are written to the binlog as one group at commit — so no
+position inside a group can predate a coordinate a reader saw earlier, which is
+what makes an event's own offset a sound version. A GTID could not be one: it is
+`source_uuid:N` with `N` restarting at 1 for each UUID, so a GTID set has no
+order as an integer. The cost of using the offset is that the space is per
+server and per binlog history: if that history restarts, the target holds
+versions from a numbering that no longer exists and would reject everything
+written under the new one, so a position behind the checkpoint refuses to start
+rather than reloading into silence.
 
 **The load runs beside the stream, not before it.** Loading first means nothing
 acknowledges a position for the load's whole duration, so retained WAL grows
@@ -110,13 +143,23 @@ is continuing to consume it. Document versioning is what makes the overlap safe;
 change events take strict priority over copy rows, and the copy pauses between
 ranges while the slot's `wal_status` is anything but `reserved`.
 
+**On MySQL the load overlaps the stream but never pauses for it.** The hazard
+runs the other way there: a slot retains WAL until it is consumed, so a slow
+consumer is what invalidates it, while MySQL purges binlogs on its own time and
+space policy and ignores consumers entirely. Nothing accumulates because of us,
+and what can go wrong — the file we still need being purged — is made likelier
+by holding the load back, not less. So there is no `wal_status` analogue to
+watch and deliberately no pause.
+
 **Load progress is recorded per range, in the target, behind a durability
 barrier.** The order is strict: rows, then a mark the sink reports once they are
 written, then the progress document. A crash can therefore lose forward
 progress and redo a range, which idempotent writes make free, but can never
-claim a range that was not written. The range boundaries are stored with the
-progress rather than recomputed, because they come from a random sample and a
-second run would cut the table elsewhere. A checkpoint alone is not proof the
+claim a range that was not written. What the progress says depends on how the
+table was cut: PostgreSQL stores its sampled boundaries alongside a count of
+finished ranges, because recomputing them would cut the table elsewhere and the
+count would name a different span of rows; MySQL stores the last key written,
+which needs nothing else to be exact. A checkpoint alone is not proof the
 load finished — the two are separate facts, and conflating them is what
 silently skips a load.
 

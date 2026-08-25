@@ -138,19 +138,30 @@ database-wide.
 
 ## Initial load impact
 
-The load reads a table in primary-key ranges, each range one `COPY` in its own
-short transaction, so the longest transaction it holds is one range rather than
-the whole load. That matters for exactly one reason: a read view open across a
-long load stops `VACUUM` cleaning anything that died after it started, and the
-load is the operation that takes an hour.
+The load reads a table in primary-key pieces, each its own short statement, so
+the longest read view it holds is one piece rather than the whole load — one
+`COPY` per range on PostgreSQL, one keyset `SELECT` per chunk on MySQL. That
+matters for exactly one reason: a read view open across a long load stops the
+engine reclaiming anything that died after it started, and the load is the
+operation that takes an hour.
+
+The cost is worse on MySQL than on PostgreSQL, which is why the MySQL load was
+changed too. A pinned `xmin` horizon delays `VACUUM`; a long InnoDB read view
+makes purge *block*, and the undo it cannot discard accumulates in the buffer
+pool — Percona measured 382,969 of ~391,000 buffer-pool pages given over to undo
+on a 1B-row table, with foreground throughput down to single-digit TPS for as
+long as the view lived. MySQL's own manual warns about this for read-only
+transactions unprompted.
 
 What it costs the source:
 
 - One `max_connections` slot for the duration.
 - Sequential reads that compete for I/O with your workload, taking no locks
   that block writers.
-- One cheap `pg_class` lookup and one `TABLESAMPLE` read per table to decide
-  where to cut the ranges, plus one `pg_current_wal_lsn()` per range.
+- PostgreSQL: one cheap `pg_class` lookup and one `TABLESAMPLE` read per table
+  to decide where to cut the ranges, plus one `pg_current_wal_lsn()` per range.
+- MySQL: nothing to decide — the cursor comes out of the rows already read —
+  plus one `SHOW BINARY LOG STATUS` per chunk.
 
 Measured: 20,000 rows loaded in under a second; a 200,000-row table read in six
 ranges at ~55,000 rows/s, no single transaction lasting longer than a range.
@@ -159,10 +170,15 @@ The load also runs *beside* the stream rather than before it, which is what keep
 retained WAL bounded on a long one — see
 [architecture](architecture.md#why-the-load-and-the-stream-overlap). The cost to
 the source is that the copy and the change stream compete for the same target,
-so a load under WAL pressure deliberately pauses and takes longer.
+so a PostgreSQL load under WAL pressure deliberately pauses and takes longer.
+The MySQL load never pauses, because there is no retention of ours to protect
+and waiting would only widen the window for a purge.
 
-A table smaller than one range, or one with a composite primary key, is still
-read in a single `COPY`, so the common case has none of the extra round trips.
+A PostgreSQL table smaller than one range, or one with a composite primary key,
+is still read in a single `COPY`, so the common case has none of the extra round
+trips. On MySQL a composite key is chunked like any other — that is what the
+expanded cursor comparison is for — and only a key whose text is not a faithful
+literal (binary, blob, bit, geometry, float) falls back to one statement.
 
 ## The one real risk: retained WAL
 
@@ -189,9 +205,13 @@ FROM pg_replication_slots;
   to protect: `wal_status` stays `reserved` however much WAL piles up.
 
 MySQL has no equivalent: it keeps binlogs on its own schedule
-(`binlog_expire_logs_seconds`). The trade-off is reversed — nothing accumulates
-because of pg2osync, but if it is down longer than the retention window the
-position is gone and the next start re-runs the initial load.
+(`binlog_expire_logs_seconds`), and its automatic purge does not spare a file a
+consumer still needs. The trade-off is reversed — nothing accumulates because of
+pg2osync, but if it is down longer than the retention window the position is
+gone and the next start re-runs the initial load. That is also why the MySQL
+load does not pause the way the PostgreSQL one does: holding the load back
+cannot protect a position MySQL was never keeping for us, and it lengthens the
+window in which the file we still need can be purged.
 
 ## Reproducing these numbers
 
