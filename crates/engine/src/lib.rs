@@ -35,6 +35,14 @@ pub struct EngineConfig {
     /// Approximate byte ceiling per sink request; whichever limit is reached
     /// first splits the batch.
     pub batch_max_bytes: usize,
+    /// How many write requests may be open against the target at once.
+    ///
+    /// One request at a time is what the initial load is actually limited by:
+    /// measured on a laptop stack, a single open request tops out around 52,000
+    /// documents a second whatever its size, while four reach 114,000. Raising
+    /// this multiplies the load placed on the target, so it stays at one until
+    /// an operator measures their own.
+    pub write_concurrency: usize,
     /// Warning threshold for a single open transaction. Exceeding it means the
     /// transaction is split, so the sink briefly holds a partial transaction.
     pub txn_buffer_cap_mb: usize,
@@ -75,6 +83,7 @@ impl Default for EngineConfig {
         Self {
             batch_size: 500,
             batch_max_bytes: 10 * 1024 * 1024,
+            write_concurrency: 1,
             txn_buffer_cap_mb: 256,
             retry_max: 10,
             retry_backoff_ms: 500,
@@ -197,6 +206,7 @@ pub async fn run(
         ctx.metrics.clone(),
         ctx.cfg.on_permanent_rejection,
         ctx.cfg.max_rejects,
+        ctx.cfg.write_concurrency,
     ));
 
     // checkpoint loop: persist acked LSN periodically; only after a successful
@@ -618,10 +628,11 @@ async fn sink_loop(
     metrics: Arc<crate::metrics::Metrics>,
     policy: RejectionPolicy,
     max_rejects: u64,
+    write_concurrency: usize,
 ) {
     // What the target already holds, so the budget survives a restart instead of
     // being handed back every time the pipeline comes up.
-    let mut quarantined = match policy {
+    let quarantined = match policy {
         RejectionPolicy::Quarantine => match sink.list_rejects(0).await {
             Ok((_, total)) => total,
             Err(e) => {
@@ -637,18 +648,98 @@ async fn sink_loop(
             "{quarantined} document(s) already quarantined of a limit of {max_rejects}; \
              `pg2osync rejects` lists them");
     }
-    while let Some(command) = commands.recv().await {
-        let wrote = matches!(command, SinkCommand::Write(_));
+    let mut acks = Acks {
+        sink: sink.as_ref(),
+        ack_tx: &ack_tx,
+        ckpt_done_tx: &ckpt_done_tx,
+        metrics: metrics.as_ref(),
+        policy,
+        max_rejects,
+        quarantined,
+    };
+    // Write requests are the only command that may be open concurrently, and
+    // they are still completed in submission order: a position is acknowledged
+    // only once every batch before it is durable, and nothing after a failure
+    // is acknowledged at all. Everything else is a barrier, so the order a
+    // truncate or a load mark has against the writes around it is unchanged.
+    let concurrency = write_concurrency.max(1);
+    let mut inflight: std::collections::VecDeque<tokio::task::JoinHandle<_>> =
+        std::collections::VecDeque::new();
+    let mut halted = false;
+    loop {
+        // Nothing more can start while the window is full, so waiting on the
+        // oldest write is the only thing left to do.
+        let full = inflight.len() >= concurrency;
+        let command = if full || inflight.is_empty() {
+            if full {
+                if !take_one(&mut inflight, &mut acks).await {
+                    halted = true;
+                    break;
+                }
+                continue;
+            }
+            match commands.recv().await {
+                Some(command) => command,
+                None => break,
+            }
+        } else {
+            tokio::select! {
+                biased;
+                // A finished write first: it frees a slot and releases the
+                // position it carries without waiting for whatever the engine
+                // sends next. Taking the outcome here rather than dropping the
+                // branch and reading the handle again is what makes this sound:
+                // a handle that has already yielded its result panics if it is
+                // awaited a second time, and because this branch is biased
+                // first it can only be dropped while it is *not* ready, which
+                // leaves the handle in the queue untouched.
+                joined = async { inflight.front_mut().expect("not empty").await } => {
+                    inflight.pop_front();
+                    if !finish(joined, &mut acks).await {
+                        halted = true;
+                        break;
+                    }
+                    continue;
+                }
+                command = commands.recv() => match command {
+                    Some(command) => command,
+                    None => break,
+                },
+            }
+        };
         let result = match command {
-            SinkCommand::Write(batch) => sink.write(batch).await.map(Some),
-            SinkCommand::Position(lsn) => Ok(Some(SinkAck::written(lsn))),
+            SinkCommand::Write(batch) => {
+                let sink = sink.clone();
+                // Spawned rather than merely awaited concurrently, so building
+                // one request's body does not hold up sending another: past the
+                // target's own limit that serialization is the next cost.
+                inflight.push_back(tokio::spawn(
+                    async move { sink.write(batch).await.map(Some) },
+                ));
+                continue;
+            }
+            SinkCommand::Position(lsn) => {
+                if !drain(&mut inflight, &mut acks).await {
+                    halted = true;
+                    break;
+                }
+                Ok(Some(SinkAck::written(lsn)))
+            }
             SinkCommand::LoadMark(mark) => {
                 // reached only after every write queued ahead of it succeeded,
                 // which is exactly what the load needs to know
+                if !drain(&mut inflight, &mut acks).await {
+                    halted = true;
+                    break;
+                }
                 load_done_tx.send_replace(mark);
                 Ok(None)
             }
             SinkCommand::Truncate(index, version) => {
+                if !drain(&mut inflight, &mut acks).await {
+                    halted = true;
+                    break;
+                }
                 match sink.truncate_index(&index, version).await {
                     Ok(()) => {
                         tracing::info!(target: "pg2osync::sink",
@@ -659,6 +750,89 @@ async fn sink_loop(
                 }
             }
         };
+        if !acks.apply(result, false).await {
+            halted = true;
+            break;
+        }
+    }
+    if halted {
+        // The requests still open were already sent, so nothing is lost by
+        // dropping them — but leaving them running would let a write land after
+        // the pipeline decided to stop.
+        for handle in &inflight {
+            handle.abort();
+        }
+        return;
+    }
+    // The engine is done sending, so what is still open is the last of the
+    // work: dropping it here would discard writes that have already happened.
+    drain(&mut inflight, &mut acks).await;
+}
+
+/// Requests open against the target, oldest first.
+type Inflight =
+    std::collections::VecDeque<tokio::task::JoinHandle<Result<Option<SinkAck>, CoreError>>>;
+
+/// Wait for the oldest open write and account for it.
+///
+/// Returns whether the pipeline may carry on.
+async fn take_one(inflight: &mut Inflight, acks: &mut Acks<'_>) -> bool {
+    let Some(handle) = inflight.pop_front() else {
+        return true;
+    };
+    finish(handle.await, acks).await
+}
+
+/// Account for one write that has finished, however it finished.
+///
+/// Returns whether the pipeline may carry on.
+async fn finish(
+    joined: Result<Result<Option<SinkAck>, CoreError>, tokio::task::JoinError>,
+    acks: &mut Acks<'_>,
+) -> bool {
+    match joined {
+        Ok(result) => acks.apply(result, true).await,
+        Err(e) => {
+            acks.metrics
+                .sink_errors_total
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::error!(target: "pg2osync::sink", "the sink task did not finish: {e}");
+            false
+        }
+    }
+}
+
+/// Wait for every open write, in the order they were sent.
+async fn drain(inflight: &mut Inflight, acks: &mut Acks<'_>) -> bool {
+    while !inflight.is_empty() {
+        if !take_one(inflight, acks).await {
+            return false;
+        }
+    }
+    true
+}
+
+/// What one finished sink command means for the position, the quarantine budget
+/// and whether the pipeline carries on.
+///
+/// Held together rather than passed apart because the order of its steps is the
+/// contract: a refused document is filed before the position covering it is
+/// acknowledged, and a failure acknowledges nothing.
+struct Acks<'a> {
+    sink: &'a dyn Sink,
+    ack_tx: &'a watch::Sender<Option<Lsn>>,
+    ckpt_done_tx: &'a watch::Sender<Option<Lsn>>,
+    metrics: &'a crate::metrics::Metrics,
+    policy: RejectionPolicy,
+    max_rejects: u64,
+    quarantined: u64,
+}
+
+impl Acks<'_> {
+    /// Returns whether the pipeline may carry on.
+    async fn apply(&mut self, result: Result<Option<SinkAck>, CoreError>, wrote: bool) -> bool {
+        let (metrics, sink, policy, max_rejects) =
+            (self.metrics, self.sink, self.policy, self.max_rejects);
         match result {
             Ok(Some(ack)) => {
                 if wrote {
@@ -672,19 +846,20 @@ async fn sink_loop(
                             "halting pipeline: permanent rejection {} for {}/{}. Set \
                              on_permanent_rejection = \"quarantine\" to record it and carry on",
                             first.reason, first.index, first.doc_id);
-                        return;
+                        return false;
                     }
                     // Already spent: halt without recording more. The batch is
                     // not acknowledged either, so these documents are replayed
                     // once the mapping is fixed or the limit raised — nothing is
                     // lost by declining to file them now.
-                    if quarantined >= max_rejects {
+                    if self.quarantined >= max_rejects {
                         metrics.sink_errors_total.fetch_add(1, Ordering::Relaxed);
                         tracing::error!(target: "pg2osync::sink",
-                            "halting pipeline: {quarantined} quarantined documents are already at \
+                            "halting pipeline: {} quarantined documents are already at \
                              the max_rejects limit of {max_rejects}; fix the mapping and replay \
-                             them with `pg2osync rejects --replay`");
-                        return;
+                             them with `pg2osync rejects --replay`",
+                            self.quarantined);
+                        return false;
                     }
                     // Recorded *before* the position is acknowledged. The
                     // checkpoint may only pass a document that was written or
@@ -696,35 +871,37 @@ async fn sink_loop(
                             "halting pipeline: {} document(s) were refused and could not be \
                              quarantined, so their position must not be acknowledged: {e}",
                             ack.rejected.len());
-                        return;
+                        return false;
                     }
-                    quarantined += ack.rejected.len() as u64;
+                    self.quarantined += ack.rejected.len() as u64;
                     metrics
                         .rejected_total
                         .fetch_add(ack.rejected.len() as u64, Ordering::Relaxed);
                     tracing::warn!(target: "pg2osync::sink",
-                        "quarantined {}/{} ({}); {quarantined} of {max_rejects} used",
-                        first.index, first.doc_id, first.reason);
-                    if quarantined >= max_rejects {
+                        "quarantined {}/{} ({}); {} of {max_rejects} used",
+                        first.index, first.doc_id, first.reason, self.quarantined);
+                    if self.quarantined >= max_rejects {
                         tracing::error!(target: "pg2osync::sink",
-                            "halting pipeline: {quarantined} quarantined documents reached the \
+                            "halting pipeline: {} quarantined documents reached the \
                              max_rejects limit of {max_rejects}. One bad row is worth carrying \
-                             on past; this many means something systematic");
-                        return;
+                             on past; this many means something systematic",
+                            self.quarantined);
+                        return false;
                     }
                 }
                 // zero-position acks come from initial-load batches;
                 // acknowledging them would corrupt the source position chain
                 if ack.max_lsn.0 > 0 {
-                    ack_tx.send_replace(Some(ack.max_lsn));
-                    ckpt_done_tx.send_replace(Some(ack.max_lsn));
+                    self.ack_tx.send_replace(Some(ack.max_lsn));
+                    self.ckpt_done_tx.send_replace(Some(ack.max_lsn));
                 }
+                true
             }
-            Ok(None) => {}
+            Ok(None) => true,
             Err(e) => {
                 metrics.sink_errors_total.fetch_add(1, Ordering::Relaxed);
                 tracing::error!(target: "pg2osync::sink", "sink failed permanently: {e}");
-                return;
+                false
             }
         }
     }
@@ -1749,5 +1926,301 @@ mod pipeline_tests {
         )
         .await;
         assert!(sink.events().is_empty());
+    }
+
+    /// A sink that holds every write open until the test lets it finish, which
+    /// is the only way to observe how many the writer keeps open at once.
+    struct GatedSink {
+        /// Writes whose position is at or below this may return.
+        release: watch::Sender<u64>,
+        open: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+        /// Positions in the order the writes finished.
+        finished: Mutex<Vec<u64>>,
+        /// A position the target refuses, to test what is acknowledged after it.
+        fail_at: Option<u64>,
+    }
+
+    impl GatedSink {
+        fn new(fail_at: Option<u64>) -> Arc<Self> {
+            Arc::new(Self {
+                release: watch::channel(0).0,
+                open: std::sync::atomic::AtomicUsize::new(0),
+                peak: std::sync::atomic::AtomicUsize::new(0),
+                finished: Mutex::new(Vec::new()),
+                fail_at,
+            })
+        }
+
+        fn peak(&self) -> usize {
+            self.peak.load(Ordering::SeqCst)
+        }
+
+        fn finished(&self) -> Vec<u64> {
+            self.finished.lock().expect("not poisoned").clone()
+        }
+
+        /// Wait until `n` writes are open at once, so an assertion about
+        /// concurrency does not race the tasks it is about.
+        async fn await_open(&self, n: usize) {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while self.open.load(Ordering::SeqCst) < n {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("writes opened");
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Sink for GatedSink {
+        async fn ensure_ready(&self, _tables: &[IndexSpec]) -> Result<(), CoreError> {
+            Ok(())
+        }
+
+        async fn get_documents(
+            &self,
+            _index: &str,
+            ids: &[String],
+        ) -> Result<Vec<Option<Value>>, CoreError> {
+            Ok(ids.iter().map(|_| None).collect())
+        }
+
+        async fn write(&self, batch: Vec<LsnOp>) -> Result<SinkAck, CoreError> {
+            let lsn = batch.last().expect("nonempty").lsn;
+            let open = self.open.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(open, Ordering::SeqCst);
+            let mut release = self.release.subscribe();
+            loop {
+                if *release.borrow_and_update() >= lsn.0 {
+                    break;
+                }
+                release.changed().await.expect("gate open");
+            }
+            self.open.fetch_sub(1, Ordering::SeqCst);
+            self.finished.lock().expect("not poisoned").push(lsn.0);
+            if self.fail_at == Some(lsn.0) {
+                return Err(CoreError::Sink("refused".into()));
+            }
+            Ok(SinkAck::written(lsn))
+        }
+
+        async fn refresh(&self, _indices: &[String]) -> Result<(), CoreError> {
+            Ok(())
+        }
+
+        async fn truncate_index(
+            &self,
+            _index: &str,
+            _version: Option<u64>,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+
+        async fn write_checkpoint(&self, _checkpoint: &Checkpoint) -> Result<(), CoreError> {
+            Ok(())
+        }
+
+        async fn read_checkpoint(
+            &self,
+            _stream: &pg2osync_core::checkpoint::StreamId,
+        ) -> Result<Option<Checkpoint>, CoreError> {
+            Ok(None)
+        }
+
+        async fn health(&self) -> Result<Health, CoreError> {
+            Ok(Health::Up)
+        }
+    }
+
+    /// One batch carrying a single upsert at `lsn`, which is what the writer
+    /// acknowledges the position from.
+    fn batch_at(lsn: u64) -> Vec<LsnOp> {
+        vec![LsnOp {
+            lsn: Lsn(lsn),
+            op: DocumentOp::Upsert {
+                index: "users".into(),
+                id: lsn.to_string(),
+                doc: json!({"id": lsn}),
+                version: Some(lsn),
+            },
+        }]
+    }
+
+    /// The writer on its own, so the tests are about the write window and not
+    /// about how the engine happens to batch.
+    struct Writer {
+        commands: mpsc::Sender<SinkCommand>,
+        acked: watch::Receiver<Option<Lsn>>,
+        load_done: watch::Receiver<u64>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    fn writer(sink: Arc<GatedSink>, concurrency: usize) -> Writer {
+        let (commands, commands_rx) = mpsc::channel(64);
+        let (ack_tx, acked) = watch::channel(None);
+        let (ckpt_done_tx, _ckpt_done_rx) = watch::channel(None);
+        let (load_done_tx, load_done) = watch::channel(0u64);
+        let task = tokio::spawn(sink_loop(
+            commands_rx,
+            sink,
+            ack_tx,
+            ckpt_done_tx,
+            load_done_tx,
+            Arc::new(crate::metrics::Metrics::default()),
+            RejectionPolicy::Halt,
+            100,
+            concurrency,
+        ));
+        Writer {
+            commands,
+            acked,
+            load_done,
+            task,
+        }
+    }
+
+    #[tokio::test]
+    async fn write_concurrency_is_how_many_requests_stay_open() {
+        let sink = GatedSink::new(None);
+        let writer = writer(sink.clone(), 3);
+        for lsn in [100, 200, 300] {
+            writer
+                .commands
+                .send(SinkCommand::Write(batch_at(lsn)))
+                .await
+                .expect("writer running");
+        }
+        sink.await_open(3).await;
+        assert_eq!(sink.peak(), 3, "three requests open against the target");
+        sink.release.send_replace(300);
+        drop(writer.commands);
+        writer.task.await.ok();
+    }
+
+    #[tokio::test]
+    async fn one_request_at_a_time_is_still_one_request_at_a_time() {
+        let sink = GatedSink::new(None);
+        let writer = writer(sink.clone(), 1);
+        for lsn in [100, 200] {
+            writer
+                .commands
+                .send(SinkCommand::Write(batch_at(lsn)))
+                .await
+                .expect("writer running");
+        }
+        sink.await_open(1).await;
+        // Nothing may follow the first while it is unfinished, which is the
+        // default the whole change leaves untouched.
+        assert_eq!(sink.peak(), 1);
+        sink.release.send_replace(200);
+        drop(writer.commands);
+        writer.task.await.ok();
+    }
+
+    #[tokio::test]
+    async fn a_slow_write_holds_back_the_position_of_the_ones_behind_it() {
+        let sink = GatedSink::new(None);
+        let writer = writer(sink.clone(), 3);
+        for lsn in [100, 200, 300] {
+            writer
+                .commands
+                .send(SinkCommand::Write(batch_at(lsn)))
+                .await
+                .expect("writer running");
+        }
+        sink.await_open(3).await;
+        // Every position that is ever acknowledged, so the assertion is about
+        // the sequence rather than about whichever value happened to be last.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let collector = {
+            let seen = seen.clone();
+            let mut acked = writer.acked.clone();
+            tokio::spawn(async move {
+                while acked.changed().await.is_ok() {
+                    if let Some(lsn) = *acked.borrow_and_update() {
+                        seen.lock().expect("not poisoned").push(lsn.0);
+                    }
+                }
+            })
+        };
+        // The gate opens for all three at once, so the writes finish as the
+        // runtime pleases; the positions must not.
+        sink.release.send_replace(300);
+        drop(writer.commands);
+        writer.task.await.ok();
+        collector.abort();
+        let seen = seen.lock().expect("not poisoned").clone();
+        assert_eq!(
+            seen.last(),
+            Some(&300),
+            "the whole window is durable, so the newest position is safe"
+        );
+        assert!(
+            seen.windows(2).all(|pair| pair[0] < pair[1]),
+            "a position may never go backwards: {seen:?}"
+        );
+        assert_eq!(
+            sink.finished().len(),
+            3,
+            "all three writes ran, concurrently"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_load_mark_waits_for_every_write_before_it() {
+        let sink = GatedSink::new(None);
+        let mut writer = writer(sink.clone(), 3);
+        for lsn in [100, 200] {
+            writer
+                .commands
+                .send(SinkCommand::Write(batch_at(lsn)))
+                .await
+                .expect("writer running");
+        }
+        writer
+            .commands
+            .send(SinkCommand::LoadMark(7))
+            .await
+            .expect("writer running");
+        sink.await_open(2).await;
+        assert_eq!(
+            *writer.load_done.borrow_and_update(),
+            0,
+            "the mark is what says the chunk is durable, so it cannot pass the writes"
+        );
+        sink.release.send_replace(200);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            writer.load_done.changed(),
+        )
+        .await
+        .expect("the mark arrives")
+        .expect("channel open");
+        assert_eq!(*writer.load_done.borrow_and_update(), 7);
+        drop(writer.commands);
+        writer.task.await.ok();
+    }
+
+    #[tokio::test]
+    async fn nothing_behind_a_refused_write_is_acknowledged() {
+        let sink = GatedSink::new(Some(200));
+        let mut writer = writer(sink.clone(), 3);
+        for lsn in [100, 200, 300] {
+            writer
+                .commands
+                .send(SinkCommand::Write(batch_at(lsn)))
+                .await
+                .expect("writer running");
+        }
+        sink.await_open(3).await;
+        sink.release.send_replace(300);
+        writer.task.await.ok();
+        assert_eq!(
+            *writer.acked.borrow_and_update(),
+            Some(Lsn(100)),
+            "300 was written but sits behind a failure, so its position must not pass"
+        );
     }
 }

@@ -354,6 +354,14 @@ checkpoint and re-run the initial load, which is safe but expensive.
 - The initial load's cost is dominated by the target's indexing throughput, not
   by pg2osync. `dev/benchmark.sh` reproduces the numbers in the README against a
   local stack.
+- **That ceiling is what `[engine] write_concurrency` moves.** One request open
+  at a time is the default and is what the figures above are measured at; the
+  source is not the constraint, since a single `COPY` hands over rows more than
+  twenty times faster than the pipeline consumes them. On the dev stack a 2M-row
+  load went 43,000 → 87,000 rows/s from one open request to four, with little
+  left past that. Raise it against your own target and watch its indexing load,
+  not ours: the setting multiplies concurrent requests to a cluster that may be
+  serving queries at the same time.
 - **Sustained writes**: `dev/load-test.sh` drives concurrent writers and reports
   where the pipeline stops keeping up, what happens while the target is
   unavailable, and whether a `kill -9` at load loses anything. On an 8-core

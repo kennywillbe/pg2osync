@@ -98,7 +98,7 @@ drop_own_slot
 pg "DROP PUBLICATION IF EXISTS pg2osync_load_test_pub;" > /dev/null
 pg "DROP TABLE IF EXISTS load_test;" > /dev/null
 pg "CREATE TABLE load_test (id bigint PRIMARY KEY, payload text NOT NULL, n int NOT NULL);" > /dev/null
-curl -s -XDELETE "$OS/load_test,.pg2osync_meta" > /dev/null
+curl -s -XDELETE "$OS/load_test,.pg2osync_meta?ignore_unavailable=true" > /dev/null
 docker cp /tmp/pg2osync-load-small.sql "$PG_CONTAINER":/tmp/pg2osync-load-small.sql > /dev/null
 docker cp /tmp/pg2osync-load-big.sql "$PG_CONTAINER":/tmp/pg2osync-load-big.sql > /dev/null
 nohup $BIN run -c "$CONFIG" &> "$LOG" < /dev/null & disown

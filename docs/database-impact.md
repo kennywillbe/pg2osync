@@ -174,6 +174,12 @@ so a PostgreSQL load under WAL pressure deliberately pauses and takes longer.
 The MySQL load never pauses, because there is no retention of ours to protect
 and waiting would only widen the window for a purge.
 
+`[engine] write_concurrency` costs the source nothing and the *target*
+proportionally: it is how many write requests stay open at once, so raising it to
+four means four concurrent bulk requests against a cluster that may be serving
+queries as well. The source read is untouched — it was never the limit, and one
+`COPY` already outruns the pipeline by more than twenty times.
+
 A PostgreSQL table smaller than one range, or one with a composite primary key,
 is still read in a single `COPY`, so the common case has none of the extra round
 trips. On MySQL a composite key is chunked like any other — that is what the

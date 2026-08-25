@@ -71,7 +71,7 @@ pg "INSERT INTO bench_docs (id,name,email,city,score,payload)
            (g % 10000)::numeric / 100,
            jsonb_build_object('tier', g % 5, 'tags', ARRAY['a','b'])
     FROM generate_series(1, $ROWS) g;" > /dev/null
-curl -s -XDELETE "$OS/bench_docs,.pg2osync_meta" > /dev/null
+curl -s -XDELETE "$OS/bench_docs,.pg2osync_meta?ignore_unavailable=true" > /dev/null
 echo "   $(pg 'SELECT count(*) FROM bench_docs;') rows ready"
 
 echo "== 1. initial load =="
