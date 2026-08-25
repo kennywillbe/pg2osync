@@ -161,7 +161,8 @@ async fn postgres(
     let admin = pg2osync_source::tls::connect(&tls, admin_url)
         .await
         .context("cannot connect to source PostgreSQL")?;
-    let children = run::child_specs_for(cfg)?;
+    let mut children = run::child_specs_for(cfg)?;
+    run::resolve_child_order(&mut children, &admin).await?;
     crate::backfill::run(
         cfg,
         source_url,

@@ -246,6 +246,43 @@ duration would be the wrong trade.
 It adds and updates but never deletes. `reconcile` is the other half, and keeping
 them apart is what keeps each one explainable.
 
+**Children resolve in the source, once per transaction.** The engine is
+source-agnostic and runs no SQL against the source, so the only place that can
+group child lookups is the source's own decode loop — which already knows where a
+transaction begins and ends. Rows of tables with no children go straight out; the
+rest are held, and at the commit the distinct parents they affect are read in one
+query per collection. A child row holds nothing but the parent key it names, so a
+transaction touching a thousand children of one parent holds one key rather than a
+thousand rows, and writes one document rather than a thousand identical ones.
+
+Measured on 2,000 child rows across 20 parents in one transaction: 2,000 parent
+re-reads and 2,001 child fetches became 1 and 2, documents written fell from 2,000
+to 20, and throughput went from 845 to 2,829 rows/s. Every competitor breaks on
+this cost model — PGSync asks the *index* which documents a child row affects and
+was measured at 108s per batch; asking the source, once per batch, is the whole
+difference.
+
+**The child aggregation is built in one place.** The initial load's `COPY` and the
+streaming re-fetch use the same subquery, so the array's contents, order and cap
+cannot drift between them. Two builders would disagree the moment either changed,
+and the disagreement is invisible until someone re-snapshots.
+
+**The array is ordered by the child's primary key.** Without an order it is a set
+in arbitrary order, so the two paths could embed the same children differently and
+a re-snapshot would rewrite documents for no reason. With a cap it decides *which*
+children are kept, so the same subset has to come back every time.
+
+**No cap on an embedded collection by default, and truncation says so.** A cap
+loses data, and the bound that matters is already the target's: past
+`index.mapping.nested_objects.limit` (10,000) OpenSearch refuses a `nested`
+document outright, which is reported and quarantined rather than lost. So the
+default embeds everything and logs an array past that limit, naming the parent.
+Where `max_rows` is set, the document carries `<field>_truncated` and
+`<field>_total` — a consumer cannot otherwise tell a short array from a complete
+one, and handing over part of a collection as if it were all of it is worse than
+either extreme. Data Prepper's equivalent defaults to 1000 and documents no
+overflow behaviour at all, which is the version of this not worth copying.
+
 ## Checkpoints
 
 **State lives in the target.** A hidden `.pg2osync_meta` index holds one

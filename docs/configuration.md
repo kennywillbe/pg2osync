@@ -231,6 +231,7 @@ primary_key = "id"
 table = "public.orders"      # child table
 field = "orders"             # array field on the parent document
 foreign_key = "customer_id"  # column on the CHILD referencing the parent key
+# max_rows = 1000            # optional: embed at most this many, see below
 ```
 
 - One level deep only.
@@ -239,9 +240,43 @@ foreign_key = "customer_id"  # column on the CHILD referencing the parent key
 - Child tables are added to the publication automatically.
 - The initial load reads each collection once and joins it, so it costs one
   query per table no matter how many parents there are.
-- A change to a child costs one query for the parent plus one per collection.
+- **Streamed changes cost one query per collection per transaction**, not per
+  row. Rows are held until the transaction commits, the distinct parents they
+  affect are collected, and each collection is read once for the whole group — so
+  a transaction touching 2,000 children of 20 parents issues 3 queries and writes
+  20 documents, where per-row resolution issued 4,001 and wrote 2,000.
   **Index the foreign key on the child table**: those lookups compare the key in
   its own type, and without an index each one scans the whole child table.
+- The array is ordered by the child table's primary key, so the initial load and
+  a later re-fetch embed it identically and a re-snapshot does not rewrite
+  documents for no reason. A child table with no primary key has no such order,
+  and says so at startup.
+#### How many children to embed
+
+`max_rows` is unset by default, so the whole collection is embedded however large
+it is. That is deliberate: a cap loses data, and the bound that matters is already
+the target's. Past `index.mapping.nested_objects.limit` — 10,000 by default —
+OpenSearch **refuses** a document whose field is mapped `nested`, because every
+element becomes a hidden Lucene sub-document; that refusal names the parent and is
+quarantined rather than lost (see `on_permanent_rejection`). Below the limit the
+cost is gradual. An array past 10,000 is logged, naming the parent, so the
+decision is visible rather than a surprise later.
+
+Setting `max_rows` trades a complete array for a bounded document. A document
+whose array was cut says so, in two extra fields:
+
+```json
+{ "id": 42, "orders": [ /* max_rows of them */ ],
+  "orders_truncated": true, "orders_total": 100000 }
+```
+
+They appear only when something was left out, so `orders_truncated: true` finds
+every affected parent in one query. Which rows are kept is decided by the child
+table's primary key, so the same ones are kept every time and the initial load and
+a streamed re-fetch agree — a cap without that order would keep a different subset
+on each run. `max_rows` on a child table with no primary key is refused at
+startup for the same reason.
+
 - The field name must not collide with a column of the parent table; the initial
   load refuses to start rather than shadow a real column.
 - **Give child tables `REPLICA IDENTITY FULL`**

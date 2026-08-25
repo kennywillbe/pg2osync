@@ -185,6 +185,32 @@ pg "DELETE FROM orders WHERE id=13;" > /dev/null
 sleep 2; refresh
 check "child DELETE refreshes parent" "$(os_len e2e_customers 2 orders)" "1"
 
+# Many children of one parent in one transaction: the parent is re-read once for
+# the group, not once per row, and the array that lands is the whole collection.
+before_reads=$(pg "SELECT COALESCE(sum(calls),0) FROM pg_stat_statements
+                   WHERE query LIKE '%FROM \"public\".\"orders\"%'
+                     AND query NOT LIKE '%pg_stat_statements%';" 2>/dev/null || echo 0)
+pg "INSERT INTO orders (id,customer_id,total)
+      SELECT 1000 + g, 2, g FROM generate_series(1, 40) g;" > /dev/null
+sleep 3; refresh
+check "one transaction of 40 children lands whole" "$(os_len e2e_customers 2 orders)" "41"
+after_reads=$(pg "SELECT COALESCE(sum(calls),0) FROM pg_stat_statements
+                  WHERE query LIKE '%FROM \"public\".\"orders\"%'
+                    AND query NOT LIKE '%pg_stat_statements%';" 2>/dev/null || echo 0)
+# 40 rows resolved per row would be 40 fetches; per batch it is a small constant.
+# Asserting "fewer than half" rather than an exact number keeps this about the
+# cost model rather than about how the engine happened to split the batch.
+if [ "$before_reads" = "0" ] && [ "$after_reads" = "0" ]; then
+  echo "    (pg_stat_statements unavailable; query count not asserted)"
+elif [ "$((after_reads - before_reads))" -lt 20 ]; then
+  ok "children resolved per batch, not per row ($((after_reads - before_reads)) fetches for 40 rows)"
+else
+  bad "children still resolved per row ($((after_reads - before_reads)) fetches for 40 rows)"
+fi
+pg "DELETE FROM orders WHERE id > 1000;" > /dev/null
+sleep 3; refresh
+check "the parent is back to its own children" "$(os_len e2e_customers 2 orders)" "1"
+
 say "7. TRUNCATE clears the index"
 pg "TRUNCATE users;" > /dev/null
 synced

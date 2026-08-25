@@ -108,17 +108,25 @@ fn copy_statement(
         .map(|c| format!("p.{}::text", quote_ident(&c.name)))
         .collect();
     let mut joins = String::new();
+    let mut totals: Vec<String> = Vec::new();
 
     for (i, child) in children.iter().enumerate() {
         let alias = format!("c{i}");
         selected.push(format!("COALESCE({alias}.agg, '[]'::jsonb)::text"));
+        // The total the source holds, so a capped array can say what it left
+        // out. Without it the load embeds a short array that claims to be the
+        // whole collection while a streamed re-fetch of the same parent says
+        // otherwise — the two paths disagreeing where nobody looks.
+        totals.push(format!("COALESCE({alias}.total, 0)::text"));
+        // the aggregation itself comes from the source crate, so the array this
+        // embeds is the same one a streamed re-fetch embeds — order, cap and all.
+        // Two builders would disagree the moment either changed.
+        //
         // the key is compared in its own type: a ::text cast on either side
         // makes the index unusable and turns this into a sequential scan
         joins.push_str(&format!(
-            " LEFT JOIN (SELECT {fk} AS k, jsonb_agg(to_jsonb(t)) AS agg \
-             FROM {child_table} t GROUP BY {fk}) {alias} ON {alias}.k = p.{parent_key}",
-            fk = quote_ident(&child.foreign_key),
-            child_table = qualify(&child.qualified()),
+            " LEFT JOIN ({agg}) {alias} ON {alias}.k = p.{parent_key}",
+            agg = child.agg_subquery(None),
             parent_key = quote_ident(&child.parent_column),
         ));
     }
@@ -145,6 +153,7 @@ fn copy_statement(
     } else {
         format!(" WHERE {}", conditions.join(" AND "))
     };
+    selected.extend(totals);
     format!(
         "COPY (SELECT {} FROM {} p{}{}) TO STDOUT (FORMAT text)",
         selected.join(", "),
@@ -327,13 +336,20 @@ pub async fn run(
         for child in child_specs {
             // shadowing a real column would produce a document that quietly
             // disagrees with the row it came from
-            if cols.iter().any(|c| c.name == child.field) {
-                bail!(
-                    "[sync] child field {:?} collides with a column of {}; \
-                     choose another field name",
-                    child.field,
-                    tbl.table
-                );
+            let mut claimed = vec![child.field.clone()];
+            if child.max_rows.is_some() {
+                // a capped collection also writes what it left out
+                claimed.push(child.truncated_field());
+                claimed.push(child.total_field());
+            }
+            for name in claimed {
+                if cols.iter().any(|c| c.name == name) {
+                    bail!(
+                        "[sync] child field {name:?} collides with a column of {}; \
+                         choose another field name",
+                        tbl.table
+                    );
+                }
             }
             cols.push(child_column(child));
         }
@@ -452,7 +468,7 @@ pub async fn run(
                         let text = String::from_utf8_lossy(line);
                         let fields: Vec<Option<Vec<u8>>> =
                             split_copy_line(&text).iter().map(unescape_copy).collect();
-                        build_change(schema, table, &cols, &fields, chunk_lsn)?
+                        build_change(schema, table, &cols, &fields, chunk_lsn, child_specs)?
                     };
                     if tx.send(ChangeEvent::Row(change)).await.is_err() {
                         bail!("engine closed during backfill");
@@ -582,6 +598,7 @@ fn build_change(
     cols: &[ColMeta],
     fields: &[Option<Vec<u8>>],
     version: Option<u64>,
+    children: &[ChildSpec],
 ) -> Result<pg2osync_core::event::RowChange> {
     let mut doc = serde_json::Map::new();
     let mut pk_map = serde_json::Map::new();
@@ -607,6 +624,24 @@ fn build_change(
     } else {
         serde_json::Value::Object(pk_map)
     };
+    // The collection totals ride at the end of the row, one per child in
+    // configuration order. A collection cut short says so, in the same two
+    // fields the streaming path writes.
+    for (nth, child) in children.iter().enumerate() {
+        let Some(raw) = fields.get(cols.len() + nth).and_then(|f| f.as_deref()) else {
+            continue;
+        };
+        let total: i64 = String::from_utf8_lossy(raw).parse().unwrap_or(0);
+        let embedded = doc
+            .get(&child.field)
+            .and_then(|v| v.as_array())
+            .map(Vec::len)
+            .unwrap_or(0) as i64;
+        if total > embedded {
+            doc.insert(child.truncated_field(), serde_json::Value::Bool(true));
+            doc.insert(child.total_field(), serde_json::Value::from(total));
+        }
+    }
     Ok(pg2osync_core::event::RowChange {
         schema: schema.to_string(),
         table: table.to_string(),
@@ -871,7 +906,10 @@ mod tests {
             sql.contains("COALESCE(c0.agg, '[]'::jsonb)::text"),
             "a parent with no children must still get an empty array: {sql}"
         );
-        assert!(sql.contains("GROUP BY \"customer_id\""), "{sql}");
+        assert!(
+            sql.contains("PARTITION BY \"customer_id\""),
+            "grouped by the foreign key: {sql}"
+        );
         assert!(
             sql.contains("c0.k = p.\"id\""),
             "the key is compared in its own type, or the index goes unused: {sql}"
@@ -880,6 +918,31 @@ mod tests {
             !sql.contains("::text = "),
             "no cast may appear on either side of the join: {sql}"
         );
+    }
+
+    #[test]
+    fn the_load_and_the_stream_embed_the_same_array() {
+        // The one thing that must not drift: if these two ever build the
+        // aggregation separately, a re-snapshot changes documents for no reason
+        // and nothing says so.
+        let mut spec = child("orders", "public.orders", "customer_id", "id");
+        spec.order_by = vec!["id".into()];
+        spec.max_rows = Some(500);
+        let sql = copy_statement(
+            "public.customers",
+            &[col("id")],
+            std::slice::from_ref(&spec),
+            None,
+            &whole(),
+            None,
+            None,
+        );
+        assert!(
+            sql.contains(&spec.agg_subquery(None)),
+            "the load embeds the source crate's own aggregation verbatim: {sql}"
+        );
+        assert!(sql.contains("ORDER BY \"id\""), "ordered: {sql}");
+        assert!(sql.contains("rn <= 500"), "capped: {sql}");
     }
 
     #[test]
