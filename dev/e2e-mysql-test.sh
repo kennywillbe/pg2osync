@@ -36,7 +36,7 @@ os_status() { curl -s -o /dev/null -w "%{http_code}" "$OS/$1/_doc/$2"; }
 my()        { docker exec "$CONTAINER" "$CLIENT" -uroot -p"$ROOT_PASSWORD" -N -B sourcedb -e "$1" 2>/dev/null; }
 refresh()   { curl -s -XPOST "$OS/_refresh" > /dev/null; }
 
-start_sync() { nohup $BIN run -c "$CONFIG" &> "$LOG" < /dev/null & disown; }
+start_sync() { nohup $BIN run -c "$CONFIG" >> "$LOG" 2>&1 < /dev/null & disown; }
 stop_sync()  { pkill -f "pg2osync run" 2> /dev/null || true; }
 cleanup()    { stop_sync; rm -f "$CONFIG"; }
 trap cleanup EXIT
@@ -155,12 +155,13 @@ check "the row is searchable the moment /synced returns" "$found" "1"
 ok "waited $(jqf "d['waited_ms']" <<< "$synced")ms"
 
 say "8. crash recovery resumes from the binlog position"
+snapshots_before=$(grep -c 'snapshot of' "$LOG")
 pkill -9 -f "pg2osync run"; sleep 1
 my "INSERT INTO shop_users (id,name,email) VALUES (5,'eve-during-downtime','eve@test.io');"
 start_sync
 sleep 6; refresh
 check "row written while down is recovered" "$(os_field e2e_mysql_users 5 name)" "eve-during-downtime"
-check "no full re-snapshot needed" "$(grep -c 'snapshot of' "$LOG")" "0"
+check "no full re-snapshot needed" "$(( $(grep -c 'snapshot of' "$LOG") - snapshots_before ))" "0"
 
 say "9. final consistency"
 check "row counts match" "$(my 'SELECT count(*) FROM shop_users;')" "$(os_count e2e_mysql_users)"
