@@ -181,6 +181,9 @@ if grep -q "pg2osync_position_confirmed" <<< "$metrics" && grep -q "pg2osync_eve
 else
   bad "metrics missing expected series"
 fi
+check "health answers for probes" "$(curl -s http://127.0.0.1:9111/healthz)" "ok"
+check "an unknown path is not the exposition" \
+  "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9111/)" "404"
 
 say "10. reconnects after the server drops the stream"
 before_pid=$(pgrep -f "pg2osync run" | head -1)

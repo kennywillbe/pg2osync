@@ -9,6 +9,7 @@
 //! checkpoint is durable.
 
 pub mod api;
+pub mod http;
 pub mod mapping;
 pub mod metrics;
 

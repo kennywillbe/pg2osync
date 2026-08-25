@@ -148,6 +148,9 @@ pub struct MetricsConfig {
     pub enabled: bool,
     #[serde(default = "default_bind")]
     pub bind: String,
+    /// Environment variable holding a bearer token required on /metrics.
+    /// Unset serves the exposition to anything that can reach the port.
+    pub token_env: Option<String>,
 }
 
 fn default_bind() -> String {
@@ -181,6 +184,7 @@ impl Default for MetricsConfig {
         Self {
             enabled: true,
             bind: default_bind(),
+            token_env: None,
         }
     }
 }

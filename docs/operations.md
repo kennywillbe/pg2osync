@@ -5,6 +5,20 @@
 `GET http://<bind>/metrics` returns Prometheus text exposition. Defaults to
 `127.0.0.1:9100`; set `[metrics] bind = "0.0.0.0:9100"` in a container.
 
+Moving off loopback is what containers and Kubernetes need, and it is also the
+moment the endpoint becomes reachable by anything that can route to the pod.
+The exposition holds no credentials and no row data, but it does name every
+table being synced and how far behind the pipeline is. Two ways to close that,
+and they compose:
+
+- `[metrics] token_env = "PG2OSYNC_METRICS_TOKEN"` requires a bearer token on
+  `/metrics`. The process warns at startup when it is bound off loopback
+  without one.
+- A `NetworkPolicy` that admits only the Prometheus namespace to port 9100.
+  This is the baseline Kubernetes pattern and is worth having either way.
+
+Probes use `/healthz`, which is never authenticated.
+
 | Series | Type | Meaning |
 |---|---|---|
 | `pg2osync_events_total{type}` | counter | Change events received from the source |

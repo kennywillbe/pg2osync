@@ -172,14 +172,28 @@ fn transforms(cfg: &AppConfig) -> Result<Transforms> {
 
 /// Metrics outlive any one attempt: they are created once and the endpoint is
 /// served once, so a reconnect does not reset every counter or re-bind the port.
-fn start_metrics(cfg: &AppConfig) -> SharedMetrics {
+fn start_metrics(cfg: &AppConfig) -> Result<SharedMetrics> {
     let metrics = Arc::new(pg2osync_engine::metrics::Metrics::default());
     if cfg.metrics.enabled {
         let bind = cfg.metrics.bind.clone();
+        let token = read_token(cfg.metrics.token_env.as_deref(), "metrics")?;
         let m = metrics.clone();
-        tokio::spawn(async move { pg2osync_engine::metrics::serve(&bind, m).await });
+        tokio::spawn(async move { pg2osync_engine::metrics::serve(&bind, m, token).await });
     }
-    metrics
+    Ok(metrics)
+}
+
+/// Resolve a bearer token from the environment.
+///
+/// The token is named by variable rather than written in the config so it never
+/// has to live in a file that gets committed or mounted as a ConfigMap.
+fn read_token(var: Option<&str>, endpoint: &str) -> Result<Option<String>> {
+    match var {
+        Some(key) => std::env::var(key)
+            .map(Some)
+            .map_err(|_| anyhow::anyhow!("{endpoint}.token_env={key:?} is set but the variable is missing")),
+        None => Ok(None),
+    }
 }
 
 /// Build the engine context for one attempt.
@@ -216,13 +230,8 @@ fn start_api(
     if !cfg.api.enabled {
         return Ok(());
     }
-    let token = match &cfg.api.token_env {
-        Some(key) => Some(std::env::var(key).map_err(|_| {
-            anyhow::anyhow!("api.token_env={key:?} is set but the variable is missing")
-        })?),
-        None => None,
-    };
-    if token.is_none() && !cfg.api.bind.starts_with("127.0.0.1") {
+    let token = read_token(cfg.api.token_env.as_deref(), "api")?;
+    if token.is_none() && !pg2osync_engine::http::is_loopback(&cfg.api.bind) {
         tracing::warn!(target: "pg2osync::api",
             "the endpoint is bound to {} without a token; anything that can \
              reach it can query the pipeline position", cfg.api.bind);
@@ -399,7 +408,7 @@ async fn run_postgres(
     let render: PositionRenderer = Arc::new(|token| Lsn(token).to_string());
     let parse: pg2osync_engine::PositionParser =
         Arc::new(|text| text.trim().parse::<Lsn>().ok().map(|lsn| lsn.0));
-    let metrics = start_metrics(&cfg);
+    let metrics = start_metrics(&cfg)?;
     let (ack_tx, ack_rx) = watch::channel(None);
     let nudge: Option<pg2osync_engine::api::StreamNudge> = if cfg.api.enabled {
         let url = admin_url.clone();
@@ -737,7 +746,7 @@ async fn run_mysql(
         stream: cfg.source.server_id.to_string(),
         publication: String::new(),
     };
-    let metrics = start_metrics(&cfg);
+    let metrics = start_metrics(&cfg)?;
     let (ack_tx, ack_rx) = watch::channel(None);
     // the binlog prefix is only known once a position has been read, so the
     // renderer and parser are built from the source's own vocabulary

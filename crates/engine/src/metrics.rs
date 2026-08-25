@@ -156,9 +156,67 @@ impl Metrics {
     }
 }
 
+/// What the metrics port answers, and with what.
+///
+/// Pure so the routing can be tested without a socket: the endpoint is the one
+/// piece of the process an operator points the outside world at.
+fn respond(request: &str, token: Option<&str>, render: impl FnOnce() -> String) -> Response {
+    let Some(target) = crate::http::request_target(request) else {
+        return Response::text("405 Method Not Allowed", "only GET is served here");
+    };
+    let (path, _) = crate::http::split_target(target);
+    // probes have to reach the process before it can prove who is asking, and a
+    // liveness check that fails closed on a missing token would restart a
+    // perfectly healthy pipeline
+    if path == "/healthz" {
+        return Response::text("200 OK", "ok");
+    }
+    if path != "/metrics" {
+        return Response::text("404 Not Found", "only /metrics is served here");
+    }
+    if let Some(expected) = token
+        && !crate::http::authorized(request, expected)
+    {
+        return Response::text("401 Unauthorized", "missing or invalid token");
+    }
+    Response {
+        status: "200 OK",
+        content_type: "text/plain; version=0.0.4",
+        body: render(),
+    }
+}
+
+struct Response {
+    status: &'static str,
+    content_type: &'static str,
+    body: String,
+}
+
+impl Response {
+    fn text(status: &'static str, body: &str) -> Self {
+        Self {
+            status,
+            content_type: "text/plain; charset=utf-8",
+            body: format!("{body}\n"),
+        }
+    }
+
+    fn render(&self) -> String {
+        format!(
+            "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            self.status,
+            self.content_type,
+            self.body.len(),
+            self.body
+        )
+    }
+}
+
 /// Serve /metrics until the process exits. Errors are logged, never fatal:
 /// losing a metrics scrape must not take down replication.
-pub async fn serve(bind: &str, metrics: SharedMetrics) {
+///
+/// `token`, when set, is required on /metrics. /healthz is never authenticated.
+pub async fn serve(bind: &str, metrics: SharedMetrics, token: Option<String>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = match tokio::net::TcpListener::bind(bind).await {
         Ok(l) => l,
@@ -167,21 +225,85 @@ pub async fn serve(bind: &str, metrics: SharedMetrics) {
             return;
         }
     };
+    if token.is_none() && !crate::http::is_loopback(bind) {
+        // the exposition names every table being synced and how far behind the
+        // pipeline is; that is operational detail, and reaching this port
+        // should be a decision rather than a consequence of the bind address
+        tracing::warn!(target: "pg2osync::metrics",
+            "metrics are served on {bind} without a token: anything that can \
+             route to this port can read them. Set [metrics] token_env, or \
+             keep the port on an internal network.");
+    }
     tracing::info!(target: "pg2osync::metrics", "metrics listening on http://{bind}/metrics");
+    let token = token.map(std::sync::Arc::new);
     loop {
         let Ok((mut sock, _)) = listener.accept().await else {
             continue;
         };
         let m = metrics.clone();
+        let token = token.clone();
         tokio::spawn(async move {
-            let mut buf = [0u8; 1024];
-            let _ = sock.read(&mut buf).await;
-            let body = m.render();
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = sock.write_all(resp.as_bytes()).await;
+            let mut buf = [0u8; 2048];
+            let Ok(read) = sock.read(&mut buf).await else {
+                return;
+            };
+            let request = String::from_utf8_lossy(&buf[..read]);
+            let response = respond(&request, token.as_deref().map(String::as_str), || m.render());
+            let _ = sock.write_all(response.render().as_bytes()).await;
         });
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn get(path: &str, headers: &str) -> String {
+        format!("GET {path} HTTP/1.1\r\nHost: h\r\n{headers}\r\n\r\n")
+    }
+
+    fn body(request: &str, token: Option<&str>) -> (&'static str, String) {
+        let r = respond(request, token, || "metric 1\n".into());
+        (r.status, r.body)
+    }
+
+    #[test]
+    fn metrics_are_served_when_no_token_is_configured() {
+        let (status, body) = body(&get("/metrics", ""), None);
+        assert_eq!(status, "200 OK");
+        assert_eq!(body, "metric 1\n");
+    }
+
+    #[test]
+    fn a_token_is_required_once_one_is_configured() {
+        assert_eq!(body(&get("/metrics", ""), Some("s")).0, "401 Unauthorized");
+        assert_eq!(
+            body(&get("/metrics", "Authorization: Bearer s"), Some("s")).0,
+            "200 OK"
+        );
+    }
+
+    #[test]
+    fn the_exposition_is_not_returned_for_every_path() {
+        // the endpoint used to answer any path with the full exposition
+        let (status, body) = body(&get("/", ""), None);
+        assert_eq!(status, "404 Not Found");
+        assert!(!body.contains("metric 1"));
+    }
+
+    #[test]
+    fn probes_reach_health_without_a_token() {
+        // a liveness probe cannot carry one, and failing it would restart a
+        // pipeline that is working
+        let (status, body) = body(&get("/healthz", ""), Some("s"));
+        assert_eq!(status, "200 OK");
+        assert_eq!(body, "ok\n");
+    }
+
+    #[test]
+    fn only_get_is_answered() {
+        let post = "POST /metrics HTTP/1.1\r\nHost: h\r\n\r\n";
+        assert_eq!(body(post, None).0, "405 Method Not Allowed");
+    }
+
 }

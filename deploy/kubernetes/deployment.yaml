@@ -51,13 +51,13 @@ spec:
             # the initial load of a large table can take minutes; a liveness
             # probe alone would kill the pod before it ever streams
             httpGet:
-              path: /metrics
+              path: /healthz
               port: metrics
             periodSeconds: 10
             failureThreshold: 60
           livenessProbe:
             httpGet:
-              path: /metrics
+              path: /healthz
               port: metrics
             periodSeconds: 30
             failureThreshold: 3

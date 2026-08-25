@@ -20,8 +20,10 @@ config:
     # username: pg2osync
     # password_env: PG2OSYNC_TARGET_PASSWORD
   metrics:
-    # not 127.0.0.1: kubelet probes and Prometheus reach the pod from outside
+    # not 127.0.0.1: kubelet probes and Prometheus reach the pod from outside,
+    # which is also why /metrics is worth a token here
     bind: 0.0.0.0:9100
+    # token_env: PG2OSYNC_METRICS_TOKEN
   # One entry per table. Left empty on purpose: Helm merges maps, so a default
   # table here would survive your override and sync something you never asked
   # for.
@@ -68,6 +70,12 @@ metrics:
     enabled: false
     interval: 30s
     labels: {}
+    # Set together with config.metrics.token_env to require a token on
+    # /metrics. The named secret key must hold the same value the pod reads
+    # from that environment variable.
+    # bearerTokenSecret:
+    #   name: pg2osync-credentials
+    #   key: PG2OSYNC_METRICS_TOKEN
 
 # The initial load of a large table happens before the endpoint answers, so the
 # startup probe must outlast it; liveness alone would restart the pod forever.
