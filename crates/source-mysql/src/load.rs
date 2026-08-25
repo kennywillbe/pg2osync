@@ -16,6 +16,7 @@
 
 use crate::catalog::{self, TableSchema};
 use crate::connection::MySqlConnection;
+use crate::typemap::ValueShape;
 use anyhow::{Context as _, Result};
 use pg2osync_core::checkpoint::StreamId;
 use pg2osync_core::event::{ChangeEvent, RowChange, RowKind, TransactionBoundary};
@@ -82,22 +83,28 @@ pub async fn run(
             _ => None,
         };
 
-        // A key we cannot turn back into a literal that means the same thing
-        // cannot be a cursor, so such a table is read in one statement as
-        // before. One statement is still one read view, which is the whole
-        // difference from a snapshot spanning every table.
-        let unsafe_key: Vec<&str> = resolved
+        // A key we cannot carry from one chunk to the next cannot be a cursor,
+        // so such a table is read in one statement. One statement is still one
+        // read view, which is the whole difference from a snapshot spanning
+        // every table.
+        let unusable_key: Vec<&str> = resolved
             .pk_columns
             .iter()
-            .filter(|name| !cursor_safe(data_type_of(&resolved, name)))
+            .filter(|name| {
+                !resolved
+                    .columns
+                    .iter()
+                    .find(|c| &c.name == *name)
+                    .is_some_and(|c| cursor_safe(&c.shape))
+            })
             .map(String::as_str)
             .collect();
-        let chunked = unsafe_key.is_empty();
+        let chunked = unusable_key.is_empty();
         if !chunked {
             tracing::warn!(target: "pg2osync::load",
-                "{qualified} is read in one statement: its key column(s) {} have a type \
-                 whose text form is not a faithful literal, so it cannot be chunked",
-                unsafe_key.join(", "));
+                "{qualified} is read in one statement: its key column(s) {} cannot carry \
+                 a cursor from one chunk to the next",
+                unusable_key.join(", "));
             cursor = None;
         }
 
@@ -271,77 +278,63 @@ fn after_predicate(key: &[String], values: &[String]) -> String {
 }
 
 /// The primary key of one row as SQL literals, in key order.
-fn key_literals(resolved: &TableSchema, row: &[Option<String>]) -> Option<Vec<String>> {
+fn key_literals(resolved: &TableSchema, row: &[Option<Vec<u8>>]) -> Option<Vec<String>> {
     resolved
         .pk_columns
         .iter()
         .map(|name| {
             let idx = resolved.columns.iter().position(|c| &c.name == name)?;
             let raw = row.get(idx)?.as_deref()?;
-            Some(literal(raw))
+            Some(literal(&resolved.columns[idx].shape, raw))
         })
         .collect()
 }
 
-/// A value as a literal: bare when it is unambiguously a number, quoted
-/// otherwise.
+/// A key value as a SQL literal that means exactly what the value means.
 ///
-/// The number is emitted bare so the plan is not left depending on MySQL
-/// converting a string constant back — and it is validated rather than trusted,
-/// because unquoted text from the database is otherwise interpolated straight
-/// into a statement.
-fn literal(raw: &str) -> String {
-    let digits = raw.strip_prefix('-').unwrap_or(raw);
+/// Bytes go in hexadecimal rather than quoted: a `varbinary` column compares
+/// under the binary collation, which is what `x'…'` gets compared as, and its
+/// bytes are not text to quote in the first place. A number is emitted bare so
+/// the plan is not left depending on MySQL converting a string constant back —
+/// and it is validated rather than trusted, because a value from the database is
+/// otherwise interpolated straight into a statement.
+fn literal(shape: &ValueShape, raw: &[u8]) -> String {
+    if matches!(shape, ValueShape::Bytes) {
+        let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+        return format!("x'{hex}'");
+    }
+    let text = String::from_utf8_lossy(raw);
+    let digits = text.strip_prefix('-').unwrap_or(&text);
     let (int, frac) = digits.split_once('.').unwrap_or((digits, "0"));
-    let numeric = !int.is_empty()
+    let numeric = matches!(
+        shape,
+        ValueShape::Int | ValueShape::Decimal | ValueShape::Bits
+    ) && !int.is_empty()
         && !frac.is_empty()
         && int.bytes().all(|b| b.is_ascii_digit())
         && frac.bytes().all(|b| b.is_ascii_digit());
     if numeric {
-        raw.to_string()
+        text.into_owned()
     } else {
-        catalog::quote_str(raw)
+        catalog::quote_str(&text)
     }
 }
 
-fn data_type_of<'a>(resolved: &'a TableSchema, name: &str) -> &'a str {
-    resolved
-        .columns
-        .iter()
-        .find(|c| c.name == name)
-        .map(|c| c.data_type.as_str())
-        .unwrap_or_default()
-}
-
-/// Whether a key column's text form is a faithful literal.
+/// Whether a key column can carry the cursor from one chunk to the next.
 ///
-/// Binary, blob, bit and geometry values reach us through
-/// `String::from_utf8_lossy`, so their text is not the value and a cursor built
-/// from it would resume in the wrong place. `float` and `double` are excluded
-/// for the same reason one step removed: their decimal text is a rounding of
-/// the stored value.
-fn cursor_safe(data_type: &str) -> bool {
+/// It has to survive the round trip through a SQL literal and order the same way
+/// the chunk's `ORDER BY` does. A `float` cannot: its decimal text is a rounding
+/// of the stored value. A `json` column cannot be indexed by MySQL at all, and a
+/// `set` orders by its bitmask rather than by anything a caller would recognise.
+fn cursor_safe(shape: &ValueShape) -> bool {
     matches!(
-        data_type,
-        "tinyint"
-            | "smallint"
-            | "mediumint"
-            | "int"
-            | "integer"
-            | "bigint"
-            | "year"
-            | "decimal"
-            | "date"
-            | "datetime"
-            | "timestamp"
-            | "time"
-            | "char"
-            | "varchar"
-            | "enum"
-            | "tinytext"
-            | "text"
-            | "mediumtext"
-            | "longtext"
+        shape,
+        ValueShape::Int
+            | ValueShape::Decimal
+            | ValueShape::Bits
+            | ValueShape::Text
+            | ValueShape::Bytes
+            | ValueShape::Enum(_)
     )
 }
 
@@ -356,7 +349,11 @@ mod tests {
                 .iter()
                 .map(|n| Column {
                     name: (*n).into(),
-                    data_type: if *n == "id" { "bigint" } else { "varchar" }.into(),
+                    shape: if *n == "id" {
+                        ValueShape::Int
+                    } else {
+                        ValueShape::Text
+                    },
                 })
                 .collect(),
             pk_columns: pk.iter().map(|s| (*s).to_string()).collect(),
@@ -396,25 +393,37 @@ mod tests {
 
     #[test]
     fn cursor_literals_are_bare_only_when_they_are_numbers() {
-        assert_eq!(literal("42"), "42");
-        assert_eq!(literal("-1.75"), "-1.75");
-        assert_eq!(literal("2024-01-01"), "'2024-01-01'");
-        assert_eq!(literal("O'Hara"), "'O''Hara'");
+        assert_eq!(literal(&ValueShape::Int, b"42"), "42");
+        assert_eq!(literal(&ValueShape::Decimal, b"-1.75"), "-1.75");
+        assert_eq!(literal(&ValueShape::Text, b"2024-01-01"), "'2024-01-01'");
+        assert_eq!(literal(&ValueShape::Text, b"O'Hara"), "'O''Hara'");
         // never bare, whatever it looks like
-        assert_eq!(literal("1; DROP TABLE t"), "'1; DROP TABLE t'");
-        assert_eq!(literal("inf"), "'inf'");
+        assert_eq!(
+            literal(&ValueShape::Text, b"1; DROP TABLE t"),
+            "'1; DROP TABLE t'"
+        );
+        assert_eq!(literal(&ValueShape::Int, b"inf"), "'inf'");
     }
 
     #[test]
-    fn a_key_type_whose_text_is_not_the_value_is_not_a_cursor() {
-        assert!(cursor_safe("bigint") && cursor_safe("varchar"));
-        assert!(!cursor_safe("varbinary"), "arrives through from_utf8_lossy");
-        assert!(!cursor_safe("double"), "its text is a rounding");
+    fn a_binary_key_travels_as_hex_not_as_quoted_text() {
+        // its bytes are not text to quote, and x'..' compares under the binary
+        // collation, which is the one the column orders by
+        assert_eq!(
+            literal(&ValueShape::Bytes, &[0x00, 0xFF, 0x10]),
+            "x'00ff10'"
+        );
+        assert_eq!(literal(&ValueShape::Bytes, b""), "x''");
+        assert!(cursor_safe(&ValueShape::Bytes), "so it can be chunked");
     }
 
     #[test]
     fn the_cursor_is_the_last_row_of_the_chunk() {
-        let row = [Some("7".into()), Some("acme".into()), Some("x".into())];
+        let row = [
+            Some(b"7".to_vec()),
+            Some(b"acme".to_vec()),
+            Some(b"x".to_vec()),
+        ];
         assert_eq!(
             key_literals(&schema(&["id", "tenant"]), &row),
             Some(vec!["7".to_string(), "'acme'".to_string()])

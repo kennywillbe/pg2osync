@@ -168,9 +168,24 @@ and the format description of a file resumed into the middle of) move nothing.
 | `DECIMAL`/`NUMERIC` | **string**, with the declared scale preserved (`8.50` stays `8.50`) |
 | `FLOAT`, `DOUBLE` | number |
 | `DATE`, `DATETIME`, `TIMESTAMP`, `TIME` | string |
-| `CHAR`, `VARCHAR`, `TEXT` | string |
-| `BIT`, `BINARY`, `BLOB`, `GEOMETRY` | base64 string |
+| `CHAR`, `VARCHAR`, `TEXT` family | string |
+| `BINARY`, `VARBINARY`, `BLOB` family, `GEOMETRY` and the spatial subtypes | base64 string |
+| `BIT` | number (MySQL caps it at 64 bits) |
+| `ENUM` | its label, e.g. `"medium"` |
+| `SET` | an array of its labels, e.g. `["a","c"]` |
 | `JSON` | parsed JSON, whichever path wrote it |
+
+Both readers decide from the declared type rather than from what the wire
+carries, because neither wire format says enough. A binlog row image gives a
+string column no charset — `char` and `binary` share a type code, as do `text`
+and `blob` — and gives an enum an ordinal with its labels nowhere; the text
+protocol the initial load reads gives every value as bytes and nothing else. The
+shape is resolved from `information_schema` once and consulted by both.
+
+An index built before this holds the older shapes for `TEXT` (base64 when it came
+from the stream), `BIT`, `ENUM` and `SET`, and for `BINARY`/`VARBINARY` a base64
+of mangled text. There was no consistent value to preserve, so those columns are
+only correct after a rebuild.
 
 Decimals stay strings on purpose: a float round-trip loses precision on money.
 A decimal *inside* a `JSON` document is the exception: MySQL renders it as a

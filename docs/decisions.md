@@ -215,11 +215,28 @@ re-index on upgrade.
 precision, and these columns are usually money. MySQL decimals keep their
 declared scale so a streamed value matches what the initial load read.
 
-**Unknown types become strings.** Enums, domains, ranges and composites are
-passed through as text rather than guessed at.
+**Unknown types become strings.** Domains, ranges and composites are passed
+through as text rather than guessed at.
 
-**`bytea`, blobs and geometry become base64.** Binary cannot go into JSON any
-other way.
+**`bytea`, blobs, binary and geometry become base64.** Binary cannot go into JSON
+any other way.
+
+**On MySQL both readers decide from the declared type, not from the wire.**
+Neither format is self-describing where it matters. A binlog row image gives a
+string column no charset, so `char` and `binary` share a type code and so do
+`text` and `blob`; it gives an enum an ordinal and a set a bitmask with the
+labels nowhere. The text protocol has the opposite gap: every value is bytes and
+only the declared type says whether they are characters. So the shape is resolved
+from `information_schema` once — `column_type` alongside `data_type`, because
+that is where the labels live — and both decoders consult it. Deciding per format
+instead is what made `text` arrive as base64 from the stream and as a string from
+the load, and `varbinary` arrive as mangled text from both.
+
+**A MySQL `enum` is its label, a `set` is an array of its labels, and a `bit` is
+a number.** The alternatives are what the wire happens to carry — an ordinal, a
+bitmask, a byte string — and none of them is searchable, which is the only reason
+the document exists. A `set` is an array rather than a joined string so each
+label matches on its own. `bit` fits a number because MySQL caps it at 64 bits.
 
 ## Scope
 

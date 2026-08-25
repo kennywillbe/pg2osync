@@ -375,15 +375,21 @@ fn auth_error(payload: &[u8]) -> anyhow::Error {
 }
 
 impl MySqlConnection {
-    /// Run a query and collect every row of the text-protocol resultset.
+    /// Run a query and collect every row of the text-protocol resultset as
+    /// text.
     ///
-    /// For anything whose size is bounded by the schema — column lists, one
-    /// binlog coordinate. A table is read through [`Self::text_query`] instead.
+    /// For anything whose size is bounded by the schema and whose values are
+    /// known to be text — column lists, one binlog coordinate. Table data is
+    /// read through [`Self::text_query`] instead, which keeps the bytes.
     pub async fn query_text_rows(&mut self, sql: &str) -> Result<Vec<Vec<Option<String>>>> {
         let mut rows = self.text_query(sql).await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
-            out.push(row);
+            out.push(
+                row.into_iter()
+                    .map(|v| v.map(|b| String::from_utf8_lossy(&b).into_owned()))
+                    .collect(),
+            );
         }
         Ok(out)
     }
@@ -442,8 +448,15 @@ pub struct TextRows<'a> {
 }
 
 impl TextRows<'_> {
-    /// The next row, or `None` once the resultset is exhausted.
-    pub async fn next(&mut self) -> Result<Option<Vec<Option<String>>>> {
+    /// The next row as raw column bytes, or `None` once the resultset is
+    /// exhausted.
+    ///
+    /// Bytes rather than `String`: a `binary`, `varbinary`, `blob` or `bit`
+    /// column is not text, and running it through `from_utf8_lossy` replaces
+    /// every byte that is not valid UTF-8 before anything downstream can encode
+    /// it. Character columns are safe to decode later — the connection
+    /// negotiates utf8mb4, so the server transcodes them for us.
+    pub async fn next(&mut self) -> Result<Option<Vec<Option<Vec<u8>>>>> {
         if self.done {
             return Ok(None);
         }
@@ -496,8 +509,8 @@ fn lenenc_at(pkt: &[u8], pos: &mut usize) -> Option<usize> {
     Some(len)
 }
 
-/// Decode one text-protocol row: length-encoded strings, 0xFB marking NULL.
-fn parse_text_row(pkt: &[u8], ncols: usize) -> Result<Vec<Option<String>>> {
+/// Decode one text-protocol row: length-encoded byte strings, 0xFB marking NULL.
+fn parse_text_row(pkt: &[u8], ncols: usize) -> Result<Vec<Option<Vec<u8>>>> {
     let mut vals = Vec::with_capacity(ncols);
     let mut pos = 0usize;
     for _ in 0..ncols {
@@ -510,7 +523,7 @@ fn parse_text_row(pkt: &[u8], ncols: usize) -> Result<Vec<Option<String>>> {
         let len = lenenc_at(pkt, &mut pos).context("row truncated")?;
         let raw = pkt.get(pos..pos + len).context("row value truncated")?;
         pos += len;
-        vals.push(Some(String::from_utf8_lossy(raw).into_owned()));
+        vals.push(Some(raw.to_vec()));
     }
     Ok(vals)
 }
@@ -532,9 +545,9 @@ mod tests {
         pkt.extend_from_slice(&300u16.to_le_bytes());
         pkt.extend(std::iter::repeat_n(b'x', 300));
         let row = parse_text_row(&pkt, 3).expect("parse");
-        assert_eq!(row[0].as_deref(), Some("row"));
+        assert_eq!(row[0].as_deref(), Some(&b"row"[..]));
         assert_eq!(row[1], None);
-        assert_eq!(row[2].as_deref().map(str::len), Some(300));
+        assert_eq!(row[2].as_deref().map(<[u8]>::len), Some(300));
     }
 
     #[test]

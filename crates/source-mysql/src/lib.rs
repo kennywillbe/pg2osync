@@ -11,3 +11,4 @@ pub mod json;
 pub mod load;
 pub mod packet;
 pub mod runner;
+pub mod typemap;
