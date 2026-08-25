@@ -16,6 +16,9 @@ pub struct Metrics {
     /// the pipeline, so it is worth being able to see how many there are.
     pub toast_readbacks_total: AtomicU64,
     pub sink_errors_total: AtomicU64,
+    /// Documents the target refused and that were recorded rather than written.
+    /// Non-zero means data is in the quarantine store and not in the index.
+    pub rejected_total: AtomicU64,
     pub reconnects_total: AtomicU64,
     /// 1 while the source is streaming, 0 while it is being retried. The
     /// counter says how often it broke; this says whether it is broken now.
@@ -111,6 +114,13 @@ impl Metrics {
             "Sink write failures",
             "counter",
             self.sink_errors_total.load(Ordering::Relaxed).to_string(),
+        );
+        push(
+            &mut out,
+            "pg2osync_rejected_total",
+            "Documents the target refused that were quarantined instead of written",
+            "counter",
+            self.rejected_total.load(Ordering::Relaxed).to_string(),
         );
         push(
             &mut out,

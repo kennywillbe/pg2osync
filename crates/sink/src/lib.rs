@@ -13,10 +13,18 @@ use opensearch::{BulkOperation, BulkParts, GetParts, IndexParts, OpenSearch};
 use pg2osync_core::checkpoint::Checkpoint;
 use pg2osync_core::error::CoreError;
 use pg2osync_core::lsn::Lsn;
-use pg2osync_core::sink::{BulkLoadSettings, Health, IndexSpec, LsnOp, Sink, SinkAck};
+use pg2osync_core::sink::{
+    BulkLoadSettings, Health, IndexSpec, LsnOp, Rejection, Sink, SinkAck, StoredReject,
+};
 use serde_json::{Value, json};
 
 pub const META_INDEX: &str = ".pg2osync_meta";
+/// Where documents the target refused are kept.
+///
+/// Separate from the meta index on purpose: an operator can read, count or drop
+/// this without going anywhere near a checkpoint, and its contents are bounded
+/// by `max_rejects` rather than by one small document per stream.
+pub const REJECTS_INDEX: &str = ".pg2osync_rejects";
 /// Single checkpoint document per pipeline; per-document atomicity is what
 /// makes the write crash-safe without any compare-and-swap.
 /// The document every pipeline used to write its checkpoint to, whatever
@@ -295,10 +303,45 @@ impl OpenSearchSink {
         check_status(resp, "create meta index").await
     }
 
-    async fn bulk_once(
-        &self,
-        batch: &[LsnOp],
-    ) -> Result<(Lsn, Vec<(String, String, String)>), CoreError> {
+    async fn ensure_rejects_index(&self) -> Result<(), CoreError> {
+        let exists = self
+            .client
+            .indices()
+            .exists(opensearch::indices::IndicesExistsParts::Index(&[
+                REJECTS_INDEX,
+            ]))
+            .send()
+            .await
+            .map_err(http_err)?;
+        if exists.status_code().is_success() {
+            return Ok(());
+        }
+        let resp = self
+            .client
+            .indices()
+            .create(opensearch::indices::IndicesCreateParts::Index(
+                REJECTS_INDEX,
+            ))
+            .body(json!({
+                "settings": {"index": {"hidden": true, "number_of_shards": 1}},
+                // The refused document is stored but never searched by its own
+                // fields, and indexing it is what would refuse it a second time
+                // — the mapping that rejected it applies here too.
+                "mappings": {"properties": {"document": {"type": "object", "enabled": false}}}
+            }))
+            .send()
+            .await
+            .map_err(http_err)?;
+        check_status(resp, "create rejects index").await
+    }
+
+    /// One bulk request. Returns how far it got and, for each document the
+    /// target refused permanently, its position in `batch` and why.
+    ///
+    /// The position rather than the id: there is exactly one bulk action per
+    /// operation, in order, so the position identifies the operation even when a
+    /// batch holds two writes for the same document.
+    async fn bulk_once(&self, batch: &[LsnOp]) -> Result<(Lsn, Vec<(usize, String)>), CoreError> {
         // Build operations; upserts use index (last-write-wins by _id)
         // every operation carries its own _index header, so no URL-level index
         let ops: Vec<BulkOperation<Value>> = batch
@@ -354,7 +397,13 @@ impl OpenSearchSink {
         // item-level triage: retryable statuses re-queue, permanent ones surface
         let mut retryable_http = false;
         let mut permanent = vec![];
-        for item in body["items"].as_array().cloned().unwrap_or_default() {
+        for (nth, item) in body["items"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+        {
             // the action name keys the result, so a delete's outcome lives
             // under "delete" — reading only "index" hid every failed delete
             let entry = item
@@ -375,11 +424,10 @@ impl OpenSearchSink {
                     entry["_id"].as_str().unwrap_or("?"),
                     entry["error"]["reason"].as_str().unwrap_or("?"));
             } else if !(200..300).contains(&item_status) {
-                permanent.push((
-                    entry["_id"].as_str().unwrap_or("?").to_string(),
-                    entry["_index"].as_str().unwrap_or("?").to_string(),
-                    error_type.to_string(),
-                ));
+                // the reason, not only the type: a mapping error's detail is
+                // what tells an operator which field to fix
+                let reason = entry["error"]["reason"].as_str().unwrap_or(error_type);
+                permanent.push((nth, format!("{error_type}: {reason}")));
             }
         }
         if retryable_http {
@@ -395,7 +443,7 @@ impl OpenSearchSink {
         &self,
         batch: &[LsnOp],
         retry: &RetryPolicy,
-    ) -> Result<(Lsn, Vec<(String, String, String)>), CoreError> {
+    ) -> Result<(Lsn, Vec<(usize, String)>), CoreError> {
         let mut attempt = 0u32;
         loop {
             attempt += 1;
@@ -434,6 +482,117 @@ fn chrono_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Where one refused document is filed.
+///
+/// Keyed by document rather than by attempt: if the source changes a broken row
+/// and the target refuses it again, the newer refusal replaces the older one, so
+/// a replay submits the current value and the count means "how many documents
+/// are broken" rather than "how many times we tried".
+pub fn reject_doc_id(index: &str, doc_id: &str) -> String {
+    let tame: String = format!("{index}-{doc_id}")
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    tame
+}
+
+/// Serialize a rejection into its stored document form.
+pub fn reject_doc(r: &Rejection) -> Value {
+    let (action, document, version) = match &r.op {
+        pg2osync_core::sink::DocumentOp::Upsert { doc, version, .. } => {
+            ("upsert", doc.clone(), *version)
+        }
+        pg2osync_core::sink::DocumentOp::Delete { version, .. } => {
+            ("delete", Value::Null, *version)
+        }
+    };
+    json!({
+        "index": r.index,
+        "doc_id": r.doc_id,
+        "reason": r.reason,
+        "position": r.lsn.0,
+        "action": action,
+        "document": document,
+        "version": version,
+        "at_epoch": chrono_now(),
+    })
+}
+
+/// Read a stored rejection back, or `None` if the document is not one.
+pub fn reject_from_doc(id: &str, src: &Value) -> Option<StoredReject> {
+    let index = src["index"].as_str()?.to_string();
+    let doc_id = src["doc_id"].as_str()?.to_string();
+    let version = src["version"].as_u64();
+    let op = match src["action"].as_str()? {
+        "upsert" => pg2osync_core::sink::DocumentOp::Upsert {
+            index: index.clone(),
+            id: doc_id.clone(),
+            doc: src["document"].clone(),
+            version,
+        },
+        "delete" => pg2osync_core::sink::DocumentOp::Delete {
+            index: index.clone(),
+            id: doc_id.clone(),
+            version,
+        },
+        _ => return None,
+    };
+    Some(StoredReject {
+        id: id.to_string(),
+        rejection: Rejection {
+            index,
+            doc_id,
+            reason: src["reason"].as_str().unwrap_or_default().to_string(),
+            lsn: Lsn(src["position"].as_u64()?),
+            op,
+        },
+        at_epoch: src["at_epoch"].as_u64().unwrap_or_default(),
+    })
+}
+
+/// Pair each refused bulk item with the operation that produced it.
+///
+/// Shared by both Elasticsearch-family sinks: the rule that a response item with
+/// no operation behind it is an error rather than a guess is the same for both,
+/// and guessing which document was refused is how one gets lost.
+pub fn rejections(
+    batch: &[LsnOp],
+    permanent: Vec<(usize, String)>,
+) -> Result<Vec<Rejection>, CoreError> {
+    let mut out = Vec::with_capacity(permanent.len());
+    for (nth, reason) in permanent {
+        let op = batch.get(nth).ok_or_else(|| {
+            CoreError::Sink(format!(
+                "bulk response has {} items for a batch of {}",
+                nth + 1,
+                batch.len()
+            ))
+        })?;
+        let (index, doc_id) = match &op.op {
+            pg2osync_core::sink::DocumentOp::Upsert { index, id, .. }
+            | pg2osync_core::sink::DocumentOp::Delete { index, id, .. } => {
+                (index.clone(), id.clone())
+            }
+        };
+        tracing::error!(target: "pg2osync::sink",
+            "PERMANENT rejection {index}/{doc_id} at {}: {reason}", op.lsn);
+        out.push(Rejection {
+            index,
+            doc_id,
+            reason,
+            lsn: op.lsn,
+            op: op.op.clone(),
+        });
+    }
+    Ok(out)
 }
 
 /// A source position as the target's external document version.
@@ -567,19 +726,8 @@ impl Sink for OpenSearchSink {
             ));
         }
         let (max_lsn, permanent) = self.bulk_with_retry(&batch, &self.retry).await?;
-        for (id, index, reason) in &permanent {
-            tracing::error!(target: "pg2osync::sink", "PERMANENT rejection id={id} {index}: {reason}");
-        }
-        if !permanent.is_empty() {
-            // correctness-first failure policy: a document the sink will never
-            // accept must stop the pipeline instead of being skipped silently
-            return Err(CoreError::DocumentRejected {
-                index: permanent[0].1.clone(),
-                doc_id: permanent[0].0.clone(),
-                reason: permanent[0].2.clone(),
-            });
-        }
-        Ok(SinkAck { max_lsn })
+        let rejected = rejections(&batch, permanent)?;
+        Ok(SinkAck { max_lsn, rejected })
     }
 
     async fn truncate_index(&self, index: &str, version: Option<u64>) -> Result<(), CoreError> {
@@ -780,6 +928,110 @@ impl Sink for OpenSearchSink {
             .await
             .map_err(http_err)?;
         check_status(resp, &format!("point alias {alias} at {index}")).await
+    }
+
+    fn can_quarantine(&self) -> bool {
+        true
+    }
+
+    async fn quarantine(&self, rejected: &[Rejection]) -> Result<(), CoreError> {
+        if rejected.is_empty() {
+            return Ok(());
+        }
+        self.ensure_rejects_index().await?;
+        // One request per rejection rather than a bulk: a partial bulk failure
+        // here would leave the caller unable to say which documents are safe to
+        // acknowledge, and rejections are rare enough that the round trips cost
+        // nothing worth having.
+        for r in rejected {
+            let resp = self
+                .client
+                .index(IndexParts::IndexId(
+                    REJECTS_INDEX,
+                    &reject_doc_id(&r.index, &r.doc_id),
+                ))
+                .body(reject_doc(r))
+                .send()
+                .await
+                .map_err(http_err)?;
+            check_status(resp, &format!("quarantine {}/{}", r.index, r.doc_id)).await?;
+        }
+        Ok(())
+    }
+
+    async fn list_rejects(&self, limit: usize) -> Result<(Vec<StoredReject>, u64), CoreError> {
+        let exists = self
+            .client
+            .indices()
+            .exists(opensearch::indices::IndicesExistsParts::Index(&[
+                REJECTS_INDEX,
+            ]))
+            .send()
+            .await
+            .map_err(http_err)?;
+        // Nothing has ever been quarantined, which is not the same as an error
+        if !exists.status_code().is_success() {
+            return Ok((Vec::new(), 0));
+        }
+        // A search only sees refreshed segments, and this total is what bounds
+        // the quarantine: reading it stale would hand back budget that has
+        // already been spent, and would hide a document from `rejects`.
+        if !self.serverless {
+            let resp = self
+                .client
+                .indices()
+                .refresh(opensearch::indices::IndicesRefreshParts::Index(&[
+                    REJECTS_INDEX,
+                ]))
+                .send()
+                .await
+                .map_err(http_err)?;
+            check_status(resp, "refresh rejects index").await?;
+        }
+        let resp = self
+            .client
+            .search(opensearch::SearchParts::Index(&[REJECTS_INDEX]))
+            .body(json!({
+                "size": limit,
+                "track_total_hits": true,
+                "sort": [{"at_epoch": {"order": "desc"}}],
+                "query": {"match_all": {}}
+            }))
+            .send()
+            .await
+            .map_err(http_err)?;
+        if !resp.status_code().is_success() {
+            return Err(CoreError::Sink(format!(
+                "list rejects: {}",
+                resp.status_code()
+            )));
+        }
+        let body: Value = resp.json().await.map_err(http_err)?;
+        let total = body["hits"]["total"]["value"].as_u64().unwrap_or(0);
+        let stored = body["hits"]["hits"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|hit| {
+                reject_from_doc(hit["_id"].as_str().unwrap_or_default(), &hit["_source"])
+            })
+            .collect();
+        Ok((stored, total))
+    }
+
+    async fn clear_reject(&self, id: &str) -> Result<(), CoreError> {
+        let resp = self
+            .client
+            .delete(opensearch::DeleteParts::IndexId(REJECTS_INDEX, id))
+            .send()
+            .await
+            .map_err(http_err)?;
+        // already gone is success
+        if resp.status_code().as_u16() == 404 {
+            return Ok(());
+        }
+        check_status(resp, &format!("clear reject {id}")).await
     }
 
     async fn read_state(&self, key: &str) -> Result<Option<Value>, CoreError> {
@@ -984,10 +1236,50 @@ mod tests {
     fn only_transient_errors_are_retried() {
         assert!(is_retryable(&CoreError::SinkTransient("429".into())));
         assert!(!is_retryable(&CoreError::Sink("bad mapping".into())));
-        assert!(!is_retryable(&CoreError::DocumentRejected {
-            index: "i".into(),
-            doc_id: "1".into(),
-            reason: "mapper_parsing_exception".into(),
-        }));
+    }
+
+    #[test]
+    fn a_refused_item_is_paired_with_the_operation_that_caused_it() {
+        // By position, not by id: a batch may hold two writes for one document,
+        // and a replay needs the operation that was actually refused.
+        let op = |id: &str, doc: Value| LsnOp {
+            lsn: Lsn(0x100),
+            op: pg2osync_core::sink::DocumentOp::Upsert {
+                index: "i".into(),
+                id: id.into(),
+                doc,
+                version: Some(0x100),
+            },
+        };
+        let batch = vec![op("1", json!({"v": 1})), op("2", json!({"v": 2}))];
+        let out =
+            rejections(&batch, vec![(1, "mapper_parsing_exception: nope".into())]).expect("paired");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].doc_id, "2");
+        assert_eq!(
+            out[0].op, batch[1].op,
+            "the refused write, not its neighbour"
+        );
+
+        // a response that does not line up with what was sent is an error
+        assert!(rejections(&batch, vec![(9, "?".into())]).is_err());
+    }
+
+    #[test]
+    fn a_quarantined_document_round_trips() {
+        let r = Rejection {
+            index: "orders".into(),
+            doc_id: "7".into(),
+            reason: "mapper_parsing_exception: amount".into(),
+            lsn: Lsn(0x2A),
+            op: pg2osync_core::sink::DocumentOp::Delete {
+                index: "orders".into(),
+                id: "7".into(),
+                version: Some(0x2A),
+            },
+        };
+        let stored = reject_from_doc("orders-7", &reject_doc(&r)).expect("readable");
+        assert_eq!(stored.rejection, r, "a delete keeps being a delete");
+        assert_eq!(stored.id, "orders-7");
     }
 }

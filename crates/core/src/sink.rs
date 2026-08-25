@@ -40,10 +40,49 @@ pub enum DocumentOp {
     },
 }
 
-/// Highest LSN known to be durably written after a successful `write`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What came back from a `write`: how far it got, and what the target refused.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SinkAck {
+    /// Highest LSN known to be durably written.
     pub max_lsn: Lsn,
+    /// Documents the target will never accept. Reported rather than raised so
+    /// the caller can decide between halting and quarantining — and so that
+    /// *every* rejection in a batch is visible, not just the first.
+    pub rejected: Vec<Rejection>,
+}
+
+impl SinkAck {
+    /// The ordinary outcome: everything in the batch was accepted.
+    pub fn written(max_lsn: Lsn) -> Self {
+        Self {
+            max_lsn,
+            rejected: Vec::new(),
+        }
+    }
+}
+
+/// One document the target refused permanently, with everything needed to
+/// record it and to submit it again later.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rejection {
+    pub index: String,
+    pub doc_id: String,
+    pub reason: String,
+    /// Where in the source this document came from. Recorded so a quarantined
+    /// document can still be accounted for against a position.
+    pub lsn: Lsn,
+    /// The operation itself, which is what makes a replay possible at all.
+    pub op: DocumentOp,
+}
+
+/// A rejection read back out of the target's store, with the id it is filed
+/// under so it can be cleared once replayed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredReject {
+    pub id: String,
+    pub rejection: Rejection,
+    /// When it was quarantined, epoch seconds, as the target recorded it.
+    pub at_epoch: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +182,46 @@ pub trait Sink: Send + Sync {
     async fn switch_alias(&self, _alias: &str, _index: &str) -> Result<(), CoreError> {
         Err(CoreError::Sink(
             "this target has no aliases to switch".into(),
+        ))
+    }
+
+    /// Whether this target can durably record a rejected document.
+    ///
+    /// Checked at startup so a pipeline configured to quarantine against a
+    /// target that cannot fails immediately rather than at the first bad
+    /// document.
+    fn can_quarantine(&self) -> bool {
+        false
+    }
+
+    /// Record documents the target refused, durably, before their position is
+    /// acknowledged.
+    ///
+    /// The default is an error and not success on purpose: a silent no-op here
+    /// is indistinguishable from losing the document, which is the whole failure
+    /// this exists to prevent.
+    async fn quarantine(&self, _rejected: &[Rejection]) -> Result<(), CoreError> {
+        Err(CoreError::Sink(
+            "this target cannot record a rejected document; \
+             set on_permanent_rejection = \"halt\""
+                .into(),
+        ))
+    }
+
+    /// Quarantined documents, newest first, with the total held.
+    ///
+    /// The total comes back with the page so a caller can bound itself against
+    /// the whole store without asking twice.
+    async fn list_rejects(&self, _limit: usize) -> Result<(Vec<StoredReject>, u64), CoreError> {
+        Err(CoreError::Sink(
+            "this target holds no quarantined documents".into(),
+        ))
+    }
+
+    /// Forget one quarantined document, once it has been dealt with.
+    async fn clear_reject(&self, _id: &str) -> Result<(), CoreError> {
+        Err(CoreError::Sink(
+            "this target holds no quarantined documents".into(),
         ))
     }
 

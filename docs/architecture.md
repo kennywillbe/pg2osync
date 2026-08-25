@@ -94,6 +94,13 @@ which is what a restart parses to resume.
   the durable checkpoint. Acknowledging further would let the database recycle
   history for rows that are not indexed yet — the classic way CDC pipelines
   lose data on crash-restart.
+- **Written or recorded, before acknowledged.** A document the target refuses
+  permanently stops the pipeline by default. Where `on_permanent_rejection =
+  "quarantine"` is set it is written to a hidden `.pg2osync_rejects` index
+  *before* its batch's position is acknowledged, and a failure to record it halts
+  instead — so the position can never sit past a document that was neither
+  written nor kept. Dead-lettering while the offset advances regardless is how
+  other pipelines lose the document.
 - **Ordering** is guaranteed per row. Across tables there is none, as with any
   CDC system without global serialization.
 - **TRUNCATE** clears the target index, ordered against pending writes.

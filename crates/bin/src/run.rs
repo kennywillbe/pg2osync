@@ -54,6 +54,7 @@ pub async fn run_pipeline(
     mode: Mode,
 ) -> Result<()> {
     let sink = build_sink(&cfg, target_password)?;
+    check_rejection_policy(&cfg, sink.as_ref())?;
     let index_specs: Vec<IndexSpec> = cfg
         .sync
         .iter()
@@ -94,6 +95,25 @@ pub async fn run_pipeline(
 }
 
 // ---------------------------------------------------------------- shared wiring
+
+/// Refuse a quarantine policy the target cannot honour, before the pipeline
+/// runs rather than at the first bad document.
+///
+/// Silently falling back to halting would be defensible; silently dropping the
+/// document would not, and the difference between the two is exactly what a
+/// permissive default here would blur.
+pub fn check_rejection_policy(cfg: &AppConfig, sink: &dyn Sink) -> Result<()> {
+    if cfg.engine.on_permanent_rejection == pg2osync_engine::RejectionPolicy::Quarantine
+        && !sink.can_quarantine()
+    {
+        bail!(
+            "[engine] on_permanent_rejection = \"quarantine\" needs a target that can record a \
+             refused document, and {} cannot. Use \"halt\"",
+            cfg.target.flavor
+        );
+    }
+    Ok(())
+}
 
 pub fn build_sink(cfg: &AppConfig, target_password: Option<String>) -> Result<Arc<dyn Sink>> {
     let api_key = cfg

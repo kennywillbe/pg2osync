@@ -158,14 +158,52 @@ Targets: `pg2osync::source`, `::engine`, `::sink`, `::checkpoint`, `::backfill`,
 | `… changed shape: added/removed/retyped …` | A column changed under the running pipeline | Nothing breaks, but documents written earlier keep the old shape. Re-index when you want them to agree |
 | `table … has REPLICA IDENTITY NOTHING` | Updates/deletes cannot be replicated | Run the `ALTER TABLE … REPLICA IDENTITY FULL` from the message |
 | `child row carries NULL <fk>` | Child table lacks `REPLICA IDENTITY FULL` | Set it; a delete without the key cannot find its parent |
-| `halting pipeline: permanent rejection …` | The target refuses the document (usually a mapping conflict) | Fix the mapping or exclude the column, then restart |
+| `halting pipeline: permanent rejection …` | The target refuses the document (usually a mapping conflict) | Fix the mapping or exclude the column; the retry then gets through. Or quarantine it — see below |
+| `halting pipeline: … reached the max_rejects limit` | Enough documents were refused that it is systematic | Fix the mapping, then `pg2osync rejects --replay` |
+| `… were refused and could not be quarantined` | The quarantine store is unwritable | The batch is unacknowledged, so nothing is lost. Fix target access and restart |
 | `binlog_format is "STATEMENT"` | MySQL not row-based | `binlog_format = ROW` in `my.cnf`, restart |
 | `server switched to 'caching_sha2_password'` | MySQL user's auth plugin | Recreate the user with `mysql_native_password` |
 | `bogus data in log event` | Resuming at an invalid binlog offset | Delete the checkpoint document to force a fresh initial load |
 | Checkpoint ignored, full load runs | Checkpoint belongs to another slot/`server_id`/source | Expected. Restore the original identifier or accept the reload |
 
 A permanent rejection stops the pipeline on purpose: skipping the document would
-be silent data loss, and every batch after it would widen the divergence.
+be silent data loss, and every batch after it would widen the divergence. It stops
+by making no progress rather than by exiting — the attempt fails and is retried
+like any other, so the position never passes the document and fixing the mapping
+lets the next attempt through without a restart.
+
+### Carrying on past one refused document
+
+One malformed row otherwise stops replication for every table. With
+
+```toml
+[engine]
+on_permanent_rejection = "quarantine"
+max_rejects = 100
+```
+
+the refused document is recorded in a hidden `.pg2osync_rejects` index — with its
+position and the write itself — and the pipeline continues. `pg2osync_rejected_total`
+moving is the signal to alert on: it means data is in the quarantine store and not
+in the index.
+
+```sh
+pg2osync rejects -c pg2osync.toml            # what was refused, where, and why
+pg2osync rejects -c pg2osync.toml --replay   # after fixing the mapping
+```
+
+A replay submits each document again with its original position as its version, so
+a row the source has changed since loses to the newer value, and a record is
+cleared only once the target has accepted it. Anything still refused is reported
+and left in place.
+
+Two things this deliberately does not do. It does not acknowledge a position
+before the document behind it is either written or recorded — if the quarantine
+store cannot be written, the pipeline halts and the source replays the batch. And
+it does not carry on for ever: past `max_rejects` it halts anyway, because that
+many refusals is a mapping problem rather than a bad row. Nothing is lost when it
+does — whatever is not recorded is also not acknowledged, so the source sends it
+again once you have fixed the mapping.
 
 ## What retries and what does not
 

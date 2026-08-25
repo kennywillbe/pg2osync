@@ -74,6 +74,18 @@ enum Command {
         #[arg(short, long, value_name = "FILE")]
         config: PathBuf,
     },
+    /// List the documents the target refused and, with --replay, submit them
+    /// again once the mapping that refused them is fixed.
+    Rejects {
+        #[arg(short, long, value_name = "FILE")]
+        config: PathBuf,
+        /// Submit each one again, clearing the ones the target now accepts.
+        #[arg(long)]
+        replay: bool,
+        /// How many to show.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
     /// Drop the replication slot (PostgreSQL only).
     DropSlot {
         #[arg(short, long, value_name = "FILE")]
@@ -112,6 +124,11 @@ async fn main() -> Result<()> {
         Command::Reconcile { config, delete } => reconcile_cmd(&config, delete).await,
         Command::SwitchAlias { config, alias } => switch_alias(&config, &alias).await,
         Command::SetupSql { config } => setup_sql(&config),
+        Command::Rejects {
+            config,
+            replay,
+            limit,
+        } => rejects_cmd(&config, replay, limit).await,
         Command::DropSlot {
             config,
             publication,
@@ -333,6 +350,66 @@ async fn wait_until_caught_up(path: &Path, timeout_secs: u64) -> Result<()> {
     }
 }
 
+/// Show what the target refused, and optionally offer it again.
+///
+/// A replay reuses the ordinary write path with the document's original
+/// position as its version, so anything the source has since superseded is
+/// refused by the version rule and the newer value stands — which is what
+/// should happen, and costs no special handling here.
+async fn rejects_cmd(path: &Path, replay: bool, limit: usize) -> Result<()> {
+    let cfg = config::AppConfig::load(path)?;
+    let secrets = cfg.resolve_secrets()?;
+    let sink = run::build_sink(&cfg, secrets.target_password)?;
+    let (stored, total) = sink.list_rejects(limit).await?;
+    if total == 0 {
+        println!("no quarantined documents");
+        return Ok(());
+    }
+    println!(
+        "{total} quarantined document(s){}",
+        if stored.len() as u64 == total {
+            String::new()
+        } else {
+            format!(", showing {}", stored.len())
+        }
+    );
+    let mut replayed = 0usize;
+    let mut still_refused = 0usize;
+    for reject in &stored {
+        let r = &reject.rejection;
+        println!("  {}/{} at {}: {}", r.index, r.doc_id, r.lsn, r.reason);
+        if !replay {
+            continue;
+        }
+        let ack = sink
+            .write(vec![pg2osync_core::sink::LsnOp {
+                lsn: r.lsn,
+                op: r.op.clone(),
+            }])
+            .await?;
+        if ack.rejected.is_empty() {
+            // cleared only once the target has taken it: the record is the only
+            // copy of this document, so removing it first could lose it
+            sink.clear_reject(&reject.id).await?;
+            replayed += 1;
+            // "no longer refused" rather than "written": a document the source
+            // has changed since is declined by the version rule instead, and
+            // either way the record has done its job
+            println!("    ✓ no longer refused, cleared from the store");
+        } else {
+            still_refused += 1;
+            println!("    ✗ still refused: {}", ack.rejected[0].reason);
+        }
+    }
+    if replay {
+        println!("\nreplayed {replayed}, still refused {still_refused}");
+        if still_refused > 0 {
+            bail!("{still_refused} document(s) are still refused");
+        }
+    }
+    Ok(())
+}
+
 async fn validate(path: &Path) -> Result<()> {
     let cfg = config::AppConfig::load(path)?;
     let secrets = cfg.resolve_secrets()?;
@@ -354,6 +431,14 @@ async fn validate(path: &Path) -> Result<()> {
     match sink.health().await? {
         Health::Up => println!("✓ {} reachable at {}", cfg.target.flavor, cfg.target.url),
         Health::Down(reason) => bail!("{} is reachable but unhealthy: {reason}", cfg.target.flavor),
+    }
+    run::check_rejection_policy(&cfg, sink.as_ref())?;
+    if cfg.engine.on_permanent_rejection == pg2osync_engine::RejectionPolicy::Quarantine {
+        let (_, held) = sink.list_rejects(0).await.unwrap_or_default();
+        println!(
+            "✓ quarantine on permanent rejection, {held} of {} used",
+            cfg.engine.max_rejects
+        );
     }
 
     println!("\nall checks passed");
