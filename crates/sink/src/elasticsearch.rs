@@ -259,9 +259,17 @@ impl ElasticsearchSink {
                 tracing::trace!(target: "pg2osync::sink",
                     "version conflict on {} left the newer document in place",
                     entry["_id"].as_str().unwrap_or("?"));
+            } else if entry["result"] == "not_found" {
+                // a delete with nothing to delete: the end state we wanted, and
+                // at-least-once delivery replays deletes after every restart
+                tracing::trace!(target: "pg2osync::sink",
+                    "{} was already absent", entry["_id"].as_str().unwrap_or("?"));
             } else if !(200..300).contains(&s) {
-                let reason = entry["error"]["reason"].as_str().unwrap_or(error_type);
-                permanent.push((nth, format!("{error_type}: {reason}")));
+                let reason = match entry["error"]["reason"].as_str() {
+                    Some(reason) => format!("{error_type}: {reason}"),
+                    None => format!("http {s}"),
+                };
+                permanent.push((nth, reason));
             }
         }
         if retryable {

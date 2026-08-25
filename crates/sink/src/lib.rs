@@ -423,11 +423,24 @@ impl OpenSearchSink {
                     "version conflict on {} left the newer document in place: {}",
                     entry["_id"].as_str().unwrap_or("?"),
                     entry["error"]["reason"].as_str().unwrap_or("?"));
+            } else if entry["result"] == "not_found" {
+                // A delete with nothing to delete, which is the desired end
+                // state and arrives 404. Delivery is at-least-once, so a replay
+                // after any restart re-sends deletes whose documents are already
+                // gone — counting those as refusals halted the pipeline on its
+                // own correctness.
+                tracing::debug!(target: "pg2osync::sink",
+                    "{} was already absent", entry["_id"].as_str().unwrap_or("?"));
             } else if !(200..300).contains(&item_status) {
                 // the reason, not only the type: a mapping error's detail is
                 // what tells an operator which field to fix
-                let reason = entry["error"]["reason"].as_str().unwrap_or(error_type);
-                permanent.push((nth, format!("{error_type}: {reason}")));
+                // An item with no error object would otherwise read
+                // "unknown: unknown", which says nothing about what happened
+                let reason = match entry["error"]["reason"].as_str() {
+                    Some(reason) => format!("{error_type}: {reason}"),
+                    None => format!("http {item_status}"),
+                };
+                permanent.push((nth, reason));
             }
         }
         if retryable_http {
@@ -1236,6 +1249,25 @@ mod tests {
     fn only_transient_errors_are_retried() {
         assert!(is_retryable(&CoreError::SinkTransient("429".into())));
         assert!(!is_retryable(&CoreError::Sink("bad mapping".into())));
+    }
+
+    #[test]
+    fn a_delete_of_something_already_gone_is_not_a_refusal() {
+        // Delivery is at-least-once, so a restart replays deletes whose
+        // documents are already gone. The target answers 404 with no error
+        // object, and counting that as a refusal halted the pipeline on its own
+        // correctness.
+        let item = json!({"delete": {"_id": "7", "status": 404, "result": "not_found"}});
+        let entry = item
+            .as_object()
+            .and_then(|f| f.values().next())
+            .cloned()
+            .unwrap();
+        assert_eq!(entry["result"], "not_found");
+        assert!(
+            !(200..300).contains(&entry["status"].as_u64().unwrap()),
+            "which is exactly why the status alone cannot decide it"
+        );
     }
 
     #[test]
