@@ -401,5 +401,55 @@ check "an enum is its label" "$(os_field e2e_mysql_types 1 grade)" "medium"
 check "a set is its labels" "$(os_field e2e_mysql_types 1 tags)" "['a', 'c']"
 stop_sync
 
+say "14. re-snapshot one table on demand"
+# The MySQL loader is a separate implementation from PostgreSQL's, so the command
+# is exercised on both rather than assumed to work from one.
+nohup $BIN run -c "$RCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sleep 4
+curl -s -XDELETE "$OS/e2e_mysql_resume/_doc/500" > /dev/null
+# Corrupting by hand uses internal versioning, which bumps the version one past
+# the source's current position, so the binlog has to move on before a
+# re-snapshot can replace it — as it always has by the time a fix is deployed.
+curl -s -XPUT "$OS/e2e_mysql_resume/_doc/600" -H 'Content-Type: application/json' \
+  -d '{"id":600,"v":"CORRUPT"}' > /dev/null
+my "INSERT INTO resume_probe VALUES (500001,'moves-the-binlog-on');"
+sleep 2
+refresh
+check "a document was removed from the index" "$(os_status e2e_mysql_resume 500)" "404"
+
+$BIN resnapshot -c "$RCONFIG" --table sourcedb.resume_probe >> "$LOG" 2>&1
+refresh
+check "the missing document is back" "$(os_status e2e_mysql_resume 500)" "200"
+if [ "$(os_field e2e_mysql_resume 600 v)" != "CORRUPT" ]; then
+  ok "the wrong value was replaced by the source's"
+else
+  bad "the wrong value survived the re-snapshot"
+fi
+check "the other table was left alone" \
+  "$(os_count e2e_mysql_composite)" "$composite_rows"
+
+curl -s -XDELETE "$OS/e2e_mysql_resume/_doc/700" > /dev/null
+curl -s -XDELETE "$OS/e2e_mysql_resume/_doc/701" > /dev/null
+# the hand deletion leaves a tombstone one version past the source, so the source
+# moves on before the re-snapshot can replace it
+my "INSERT INTO resume_probe VALUES (500003,'moves-the-binlog-on-again');"
+sleep 2
+refresh
+$BIN resnapshot -c "$RCONFIG" --table sourcedb.resume_probe --where "id = 700" >> "$LOG" 2>&1
+refresh
+check "--where restored the row it names" "$(os_status e2e_mysql_resume 700)" "200"
+check "--where left the others alone" "$(os_status e2e_mysql_resume 701)" "404"
+check "no load progress left behind" \
+  "$(curl -s "$OS/.pg2osync_meta/_search?q=_id:load*&size=20" | jqf "len(d['hits']['hits'])")" "0"
+
+# Attributable only with the pipeline stopped: while it streams the position
+# advances on its own from whatever else the server is doing.
+stop_sync
+sleep 1
+before=$($BIN status -c "$RCONFIG" | grep -o 'position=[^ ]*' | head -1)
+$BIN resnapshot -c "$RCONFIG" --table sourcedb.resume_probe >> "$LOG" 2>&1
+check "a re-snapshot does not move the checkpoint" \
+  "$($BIN status -c "$RCONFIG" | grep -o 'position=[^ ]*' | head -1)" "$before"
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

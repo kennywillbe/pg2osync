@@ -63,6 +63,7 @@ replay, and no transformation language — if you need those, you want Kafka.
 | Polling fallback for managed databases without replication | ✅ upserts, plus deletes via `soft_delete` |
 | Index mappings you define (`mapping_file`) | ✅ applied at creation, compared at startup |
 | Reconcile an index against its table (`reconcile`) | ✅ names or removes documents whose row is gone |
+| Re-snapshot one table (`resnapshot`) | ✅ on demand, `--where` to narrow it, safe beside the stream |
 | Survive one document the target refuses | ✅ opt-in quarantine with its position, bounded, replayable |
 | **Read-your-writes** (`/synced`) | ✅ wait for your own commit to be searchable |
 | Prometheus metrics | ✅ built-in endpoint |
@@ -209,6 +210,7 @@ Every option is documented in
 | `validate -c <cfg>` | Config, connectivity and server prerequisites |
 | `bootstrap -c <cfg>` | Create the slot, publication and target indices, then exit |
 | `status -c <cfg>` | Checkpoint position versus the source's current position |
+| `resnapshot -c <cfg> --table T` | Read one table again into its index, without reloading the rest |
 | `rejects -c <cfg>` | What the target refused, and `--replay` to submit it again |
 | `drop-slot -c <cfg>` | Drop the slot and publication when decommissioning |
 

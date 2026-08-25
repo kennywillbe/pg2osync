@@ -97,6 +97,55 @@ pub async fn unfinished<'a>(
     Ok(false)
 }
 
+/// What one load run covers.
+///
+/// Shared by both sources' loaders so they cannot drift on what a scope means:
+/// the initial load reads everything and remembers where it got to, an on-demand
+/// re-snapshot reads one table and remembers nothing.
+#[derive(Debug, Clone, Default)]
+pub struct LoadScope {
+    /// Only this qualified table, or every configured one.
+    pub only: Option<String>,
+    /// An extra SQL predicate ANDed into every chunk's read.
+    pub filter: Option<String>,
+    /// Whether progress is recorded, so an interruption resumes instead of
+    /// starting over.
+    ///
+    /// A re-snapshot records none. Its bookkeeping would live under the key the
+    /// initial load uses, and leaving it behind would be read as an unfinished
+    /// initial load at the next pipeline start — the silent skip that
+    /// [`unfinished`] exists to prevent. Restarting a re-snapshot is cheap;
+    /// corrupting the load's own state is not.
+    pub resumable: bool,
+}
+
+impl LoadScope {
+    /// Every configured table, resumable.
+    pub fn initial_load() -> Self {
+        Self {
+            only: None,
+            filter: None,
+            resumable: true,
+        }
+    }
+
+    /// One table, optionally narrowed, recording nothing.
+    pub fn resnapshot(qualified_table: &str, filter: Option<String>) -> Self {
+        Self {
+            only: Some(qualified_table.to_string()),
+            filter,
+            resumable: false,
+        }
+    }
+
+    /// Whether this run should read `qualified_table` at all.
+    pub fn covers(&self, qualified_table: &str) -> bool {
+        self.only
+            .as_deref()
+            .is_none_or(|only| only == qualified_table)
+    }
+}
+
 /// Where one table's progress is stored, as a document id.
 ///
 /// Two pipelines may share a target, so the stream is part of the name for the
@@ -156,6 +205,24 @@ mod tests {
     fn an_unreadable_document_is_absent_rather_than_wrong() {
         // an older or corrupt layout must cost a reload, never a skipped range
         assert_eq!(LoadProgress::from_doc(&json!({"done": 3})), None);
+    }
+
+    #[test]
+    fn a_scope_selects_one_table_or_all_of_them() {
+        let all = LoadScope::initial_load();
+        assert!(all.covers("public.users") && all.covers("public.orders"));
+        assert!(
+            all.resumable,
+            "an initial load has somewhere to resume from"
+        );
+
+        let one = LoadScope::resnapshot("public.users", Some("tenant = 1".into()));
+        assert!(one.covers("public.users"));
+        assert!(!one.covers("public.orders"));
+        assert!(
+            !one.resumable,
+            "its progress would be read as an unfinished initial load"
+        );
     }
 
     #[test]

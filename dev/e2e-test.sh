@@ -485,5 +485,76 @@ curl -s -XPOST "$OS/.pg2osync_rejects/_refresh" > /dev/null
 check "and the quarantine store is empty" \
   "$(curl -s "$OS/.pg2osync_rejects/_count" | jqf "d.get('count', 0)")" "0"
 
+say "15. re-snapshot one table on demand"
+# resume_probe is still here from section 12, streaming under $RCONFIG, with a
+# composite-key table beside it — so this exercises one table out of two.
+nohup $BIN run -c "$RCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sleep 4
+# A document that went missing: no version at all, so a re-snapshot restores it.
+curl -s -XDELETE "$OS/e2e_resume/_doc/500" > /dev/null
+# And one whose value is wrong. Corrupting it by hand uses internal versioning,
+# which bumps the version one past the source's current position — so the source
+# has to move on before a re-snapshot can replace it, exactly as it always has by
+# the time a fix is deployed.
+curl -s -XPUT "$OS/e2e_resume/_doc/600" -H 'Content-Type: application/json' \
+  -d '{"id":600,"v":"CORRUPT"}' > /dev/null
+pg "INSERT INTO resume_probe VALUES (500001,'moves-the-wal-on');" > /dev/null
+sleep 2
+refresh
+check "a document was removed from the index" "$(os_status e2e_resume 500)" "404"
+check "and another holds a wrong value" "$(os_field e2e_resume 600 v)" "CORRUPT"
+
+$BIN resnapshot -c "$RCONFIG" --table public.resume_probe >> "$LOG" 2>&1
+refresh
+check "the missing document is back" "$(os_status e2e_resume 500)" "200"
+if [ "$(os_field e2e_resume 600 v)" != "CORRUPT" ]; then
+  ok "the wrong value was replaced by the source's"
+else
+  bad "the wrong value survived the re-snapshot"
+fi
+# streaming is unaffected by a re-snapshot having run beside it
+pg "INSERT INTO resume_probe VALUES (500002,'after-the-resnapshot');" > /dev/null
+for _ in $(seq 1 20); do
+  refresh
+  [ "$(os_status e2e_resume 500002)" = "200" ] && break
+  sleep 1
+done
+check "streaming continues afterwards" "$(os_field e2e_resume 500002 v)" "after-the-resnapshot"
+
+# --where narrows what is re-read
+curl -s -XDELETE "$OS/e2e_resume/_doc/700" > /dev/null
+curl -s -XDELETE "$OS/e2e_resume/_doc/701" > /dev/null
+# the hand deletion leaves a tombstone one version past the source, so the source
+# moves on before the re-snapshot can replace it
+pg "INSERT INTO resume_probe VALUES (500003,'moves-the-wal-on-again');" > /dev/null
+sleep 2
+refresh
+$BIN resnapshot -c "$RCONFIG" --table public.resume_probe --where "id = 700" >> "$LOG" 2>&1
+refresh
+check "--where restored the row it names" "$(os_status e2e_resume 700)" "200"
+check "--where left the others alone" "$(os_status e2e_resume 701)" "404"
+
+# a re-snapshot must not leave bookkeeping a later start would read as an
+# unfinished initial load
+progress_left=$(curl -s "$OS/.pg2osync_meta/_search?q=_id:load*&size=20" | jqf "len(d['hits']['hits'])")
+check "no load progress left behind" "$progress_left" "0"
+# captured rather than piped: the command exits non-zero on purpose, and under
+# `set -o pipefail` that fails the `if` however the grep went
+refusal=$($BIN resnapshot -c "$RCONFIG" --table public.not_configured 2>&1 || true)
+case "$refusal" in
+  *"not in this config"*) ok "a table with no index mapping is refused, naming the configured ones" ;;
+  *) bad "an unconfigured table was accepted: $refusal" ;;
+esac
+
+# The claim is that a re-snapshot does not move the checkpoint, and it can only
+# be attributed with the pipeline stopped: while it streams the position advances
+# on its own from whatever else the database is doing.
+stop_sync
+sleep 1
+before=$($BIN status -c "$RCONFIG" | grep -o 'position=[^ ]*' | head -1)
+$BIN resnapshot -c "$RCONFIG" --table public.resume_probe >> "$LOG" 2>&1
+check "a re-snapshot does not move the checkpoint" \
+  "$($BIN status -c "$RCONFIG" | grep -o 'position=[^ ]*' | head -1)" "$before"
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]
