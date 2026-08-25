@@ -23,3 +23,15 @@ process will exit. Add at least one table.
 
 NOTE: target.url is still the chart default (http://opensearch:9200).
 {{- end }}
+{{- if not (hasKey .Values.config.source "flavor") }}
+
+NOTE: on PostgreSQL, set `max_slot_wal_keep_size` on the server before this
+runs in earnest:
+
+  ALTER SYSTEM SET max_slot_wal_keep_size = '10GB';
+  SELECT pg_reload_conf();
+
+An unread replication slot retains WAL until the database's disk is full.
+Past the limit PostgreSQL invalidates the slot instead, and pg2osync falls
+back to a full initial load — expensive, but the database stays up.
+{{- end }}

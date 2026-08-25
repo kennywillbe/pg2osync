@@ -28,7 +28,8 @@ metric()  { curl -s http://127.0.0.1:9113/metrics | awk -v k="$1" '$1 == k {prin
 now()     { python3 -c "import time;print(time.time())"; }
 
 stop_sync() { pkill -f "pg2osync run" 2> /dev/null || true; }
-cleanup()   { stop_sync; rm -f "$CONFIG"; }
+drop_own_slot() { pg "SELECT pg_drop_replication_slot('pg2osync_bench') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='pg2osync_bench');" > /dev/null 2>&1 || true; }
+cleanup()   { stop_sync; drop_own_slot; rm -f "$CONFIG"; }
 trap cleanup EXIT
 
 cat > "$CONFIG" <<'TOML'

@@ -58,6 +58,18 @@ Alert on **source disk** too. An unconsumed PostgreSQL replication slot retains
 WAL indefinitely; that fills the database's disk long before it inconveniences
 pg2osync.
 
+Set `max_slot_wal_keep_size` before you need it:
+
+```sql
+ALTER SYSTEM SET max_slot_wal_keep_size = '10GB';
+SELECT pg_reload_conf();
+```
+
+It is the one setting that turns a full disk into a recoverable incident. Past
+the limit PostgreSQL invalidates the slot instead of retaining more WAL, and
+pg2osync then falls back to a full initial load — expensive, but the database
+stays up. PostgreSQL 13+.
+
 ## Day-to-day commands
 
 ```sh
@@ -71,11 +83,23 @@ pg2osync drop-slot -c pg2osync.toml  # teardown when decommissioning
 
 ```
 checkpoint: source=postgres stream=pg2osync position=0/C174158
-slot pg2osync: active=true confirmed_flush=0/C173020 retained_wal=4456 bytes
+slot pg2osync (configured): active=true retained_wal=4 kB
+slot pg2osync_old: active=false retained_wal=3 GB
+
+1 inactive slot(s) not named in this config: pg2osync_old
+each holds WAL until it is dropped. If one is a former slot_name of this
+pipeline: SELECT pg_drop_replication_slot('pg2osync_old');
 ```
 
 `retained_wal` growing over hours means the target is not keeping up, or the
 process is not running while the slot still exists.
+
+Every logical slot on the server is listed, not only the configured one.
+Changing `slot_name` leaves the old slot behind, still pinning WAL with nothing
+reading it, and that orphan is invisible to anyone who only asks about the name
+in the config. `drop-slot` only ever touches the configured slot, so an orphan
+is dropped with the SQL above — deliberately, since a slot may belong to
+another consumer.
 
 ## Logging
 

@@ -216,6 +216,97 @@ pub async fn ensure_publication(
     Ok(())
 }
 
+
+/// One replication slot as the server sees it.
+#[derive(Debug, Clone)]
+pub struct SlotInfo {
+    pub name: String,
+    pub active: bool,
+    /// WAL the slot is holding back, in bytes. `None` before the slot's first
+    /// use, when it has no confirmed position yet.
+    pub retained_bytes: Option<i64>,
+}
+
+impl SlotInfo {
+    pub fn retained_pretty(&self) -> String {
+        match self.retained_bytes {
+            None => "unknown".into(),
+            Some(bytes) => {
+                let units = ["B", "kB", "MB", "GB", "TB"];
+                let mut value = bytes as f64;
+                let mut unit = 0;
+                while value >= 1024.0 && unit < units.len() - 1 {
+                    value /= 1024.0;
+                    unit += 1;
+                }
+                format!("{value:.0} {}", units[unit])
+            }
+        }
+    }
+}
+
+/// Every logical slot on the server, largest retention first.
+///
+/// Reporting only the configured slot is what let ten forgotten ones pile up
+/// here: each was created by a run with a different `slot_name`, and nothing
+/// that anybody looked at ever mentioned them again.
+pub async fn all_slots(client: &Client) -> Result<Vec<SlotInfo>> {
+    let rows = client
+        .query(
+            "SELECT slot_name, active, \
+                    pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)::bigint \
+             FROM pg_replication_slots \
+             WHERE slot_type = 'logical' \
+             ORDER BY 3 DESC NULLS LAST, 1",
+            &[],
+        )
+        .await
+        .context("listing replication slots failed")?;
+    Ok(rows
+        .iter()
+        .map(|r| SlotInfo {
+            name: r.get(0),
+            active: r.get(1),
+            retained_bytes: r.get(2),
+        })
+        .collect())
+}
+
+/// Say something about slots nobody is reading.
+///
+/// An inactive slot pins WAL forever at no cost to us and unbounded cost to the
+/// database's disk. Dropping one automatically would be wrong — it may belong
+/// to another consumer — so the most this can do is make it impossible to miss.
+pub async fn warn_about_idle_slots(client: &Client, configured: &str) {
+    let slots = match all_slots(client).await {
+        Ok(slots) => slots,
+        // this is advice, never a reason to fail a run
+        Err(e) => {
+            tracing::debug!(target: "pg2osync::catalog", "cannot list slots: {e}");
+            return;
+        }
+    };
+    for slot in slots.iter().filter(|s| !s.active) {
+        let retained = slot.retained_pretty();
+        if slot.name == configured {
+            if slot.retained_bytes.unwrap_or(0) >= IDLE_SLOT_WARN_BYTES {
+                tracing::warn!(target: "pg2osync::catalog",
+                    "slot {} was idle and is holding {retained} of WAL; \
+                     that is the state that precedes a full disk", slot.name);
+            }
+            continue;
+        }
+        tracing::warn!(target: "pg2osync::catalog",
+            "replication slot {} is inactive and holding {retained} of WAL. \
+             If it is a former slot_name of this pipeline, drop it: \
+             SELECT pg_drop_replication_slot('{}');", slot.name, slot.name);
+    }
+}
+
+/// Big enough that a healthy restart does not trip it, small enough to arrive
+/// well before the disk does.
+const IDLE_SLOT_WARN_BYTES: i64 = 1024 * 1024 * 1024;
+
 /// Ensure the logical replication slot exists; returns its confirmed_flush_lsn.
 pub async fn ensure_slot(client: &Client, slot_name: &str) -> Result<Option<String>> {
     match client
@@ -290,5 +381,23 @@ pub async fn confirmed_flush_lsn(client: &Client, slot_name: &str) -> Result<Opt
     match row.and_then(|r| r.get::<_, Option<String>>(0)) {
         Some(text) => Ok(Some(text.parse()?)),
         None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retention_is_reported_in_units_an_operator_reads() {
+        let slot = |bytes| SlotInfo {
+            name: "s".into(),
+            active: false,
+            retained_bytes: bytes,
+        };
+        assert_eq!(slot(Some(512)).retained_pretty(), "512 B");
+        assert_eq!(slot(Some(3 * 1024 * 1024 * 1024)).retained_pretty(), "3 GB");
+        // a slot created but never read has no confirmed position yet
+        assert_eq!(slot(None).retained_pretty(), "unknown");
     }
 }
