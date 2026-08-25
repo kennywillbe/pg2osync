@@ -203,6 +203,10 @@ pub struct TableSync {
     /// poll mode: overrides `[source] poll_column` for this table
     #[serde(default)]
     pub poll_column: Option<String>,
+    /// SQL predicate marking a row as deleted, e.g. `deleted_at IS NOT NULL`.
+    /// Poll mode turns a matching row into a delete; the initial load skips it.
+    #[serde(default)]
+    pub soft_delete: Option<String>,
     /// Column transformations, e.g. email = "hash" | "redact"
     #[serde(default)]
     pub transform: std::collections::HashMap<String, String>,
@@ -373,6 +377,18 @@ impl AppConfig {
                 }
             }
         }
+        for (key, table) in &self.sync {
+            // the predicate is evaluated by the database inside the poll query;
+            // WAL mode has no query to put it in, and sees a soft delete as the
+            // ordinary UPDATE it is
+            if table.soft_delete.is_some() && self.source.mode != "poll" {
+                anyhow::bail!(
+                    "[sync.{key}] soft_delete only applies in poll mode; \
+                     WAL mode already propagates deletes"
+                );
+            }
+        }
+
         Ok(())
     }
 

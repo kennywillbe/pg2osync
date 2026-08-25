@@ -705,6 +705,7 @@ fn poll_config(
                     .clone()
                     .unwrap_or_else(|| cfg.source.poll_column.clone()),
                 pk_columns: vec![t.primary_key.clone().unwrap_or_else(|| "id".into())],
+                soft_delete: t.soft_delete.clone(),
             })
             .collect(),
         interval_secs: cfg.source.poll_interval_secs,
