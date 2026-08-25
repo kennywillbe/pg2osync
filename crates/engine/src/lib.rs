@@ -461,7 +461,16 @@ pub async fn run(
                     };
 
                 for row in &rows {
-                    let index = ctx.mapping.index_for(&row.schema, &row.table);
+                    // Defence in depth rather than a second filter: the source
+                    // drops what it cannot map, and a panic in a worker thread
+                    // is the worst way to find out it missed something — it
+                    // takes the process down and every reconnect repeats it.
+                    let Some(index) = ctx.mapping.opt_index_for(&row.schema, &row.table) else {
+                        tracing::error!(target: "pg2osync::engine",
+                            "no index is configured for {}.{}; its rows are being dropped",
+                            row.schema, row.table);
+                        continue;
+                    };
                     let previous = completion_id(&row.kind)
                         .and_then(|id| completions.get(&(index.to_string(), id)))
                         .and_then(Option::as_ref);
@@ -950,8 +959,10 @@ async fn fetch_completions(
         let Some(id) = completion_id(&row.kind) else {
             continue;
         };
-        let index = mapping.index_for(&row.schema, &row.table).to_string();
-        let ids = wanted.entry(index).or_default();
+        let Some(index) = mapping.opt_index_for(&row.schema, &row.table) else {
+            continue;
+        };
+        let ids = wanted.entry(index.to_string()).or_default();
         // the same row updated twice in one group needs one read, not two
         if !ids.contains(&id) {
             ids.push(id);
