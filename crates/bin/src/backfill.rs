@@ -67,7 +67,12 @@ pub async fn columns_of(
 /// by orders of magnitude, and unlike a correlated lateral it does not depend
 /// on the child's foreign key being indexed — which a general-purpose tool
 /// cannot assume.
-fn copy_statement(qualified_table: &str, cols: &[ColMeta], children: &[ChildSpec]) -> String {
+fn copy_statement(
+    qualified_table: &str,
+    cols: &[ColMeta],
+    children: &[ChildSpec],
+    soft_delete: Option<&str>,
+) -> String {
     let mut selected: Vec<String> = cols
         .iter()
         .map(|c| format!("p.{}::text", quote_ident(&c.name)))
@@ -88,11 +93,18 @@ fn copy_statement(qualified_table: &str, cols: &[ColMeta], children: &[ChildSpec
         ));
     }
 
+    // a row that is already deleted has no business being indexed and then
+    // deleted again on the first poll cycle
+    let filter = match soft_delete {
+        Some(predicate) => format!(" WHERE NOT ({predicate})"),
+        None => String::new(),
+    };
     format!(
-        "COPY (SELECT {} FROM {} p{}) TO STDOUT (FORMAT text)",
+        "COPY (SELECT {} FROM {} p{}{}) TO STDOUT (FORMAT text)",
         selected.join(", "),
         qualify(qualified_table),
-        joins
+        joins,
+        filter
     )
 }
 
@@ -154,6 +166,7 @@ pub async fn run(
             &tbl.table,
             &cols[..cols.len() - child_specs.len()],
             child_specs,
+            tbl.soft_delete.as_deref(),
         );
 
         let started = std::time::Instant::now();
@@ -310,6 +323,17 @@ fn quote_ident(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_soft_deleted_row_is_not_loaded_only_to_be_deleted_later() {
+        let sql = copy_statement(
+            "public.users",
+            &[col("id")],
+            &[],
+            Some("deleted_at IS NOT NULL"),
+        );
+        assert!(sql.contains("WHERE NOT (deleted_at IS NOT NULL)"), "{sql}");
+    }
+
     use super::*;
 
     #[test]
@@ -334,7 +358,7 @@ mod tests {
 
     #[test]
     fn a_table_without_children_reads_straight_through() {
-        let sql = copy_statement("public.users", &[col("id"), col("name")], &[]);
+        let sql = copy_statement("public.users", &[col("id"), col("name")], &[], None);
         assert_eq!(
             sql,
             concat!(
@@ -350,6 +374,7 @@ mod tests {
             "public.customers",
             &[col("id")],
             &[child("orders", "public.orders", "customer_id", "id")],
+            None,
         );
         assert!(
             sql.contains("COALESCE(c0.agg, '[]'::jsonb)::text"),
@@ -375,6 +400,7 @@ mod tests {
                 child("orders", "public.orders", "customer_id", "id"),
                 child("tickets", "support.tickets", "cust", "id"),
             ],
+            None,
         );
         assert!(sql.contains("c0.k = p.\"id\""), "{sql}");
         assert!(sql.contains("c1.k = p.\"id\""), "{sql}");
@@ -388,6 +414,7 @@ mod tests {
             "public.we\"ird",
             &[col("od\"d")],
             &[child("kids", "public.ch\"ild", "fk\"y", "pk\"y")],
+            None,
         );
         assert!(sql.contains("\"we\"\"ird\""), "{sql}");
         assert!(sql.contains("\"od\"\"d\""), "{sql}");

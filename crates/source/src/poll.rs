@@ -2,8 +2,8 @@
 //! replication cannot be enabled.
 //!
 //! Requires a monotonically increasing timestamp column per table (config:
-//! `poll_column`). Upserts propagate; DELETES CANNOT BE DETECTED in this mode
-//! — a documented limitation, users needing deletes must use WAL mode.
+//! `poll_column`). A hard `DELETE` leaves nothing to poll and cannot be seen
+//! here at all; a soft delete can, which is what `soft_delete` is for.
 //!
 //! No source position exists to checkpoint, so the caller re-runs the backfill
 //! on every start; at-least-once semantics make the replay harmless.
@@ -24,6 +24,9 @@ pub struct PollTable {
     pub poll_column: String,
     /// Primary-key columns; a single column yields a scalar `_id`.
     pub pk_columns: Vec<String>,
+    /// SQL predicate marking a row as deleted, e.g. `deleted_at IS NOT NULL`.
+    /// Evaluated by the database, since only it knows the column types.
+    pub soft_delete: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -95,9 +98,14 @@ impl PollSource {
                     Some(_) => format!("WHERE {}::text > $1", quote_ident(&t.poll_column)),
                     None => String::new(),
                 };
+                // the predicate is evaluated inside the subquery, where the
+                // row's own columns are in scope and typed
+                let deleted = t.soft_delete.as_deref().unwrap_or("false");
                 let sql = format!(
-                    "SELECT to_jsonb(t), t.{col}::text FROM (\
-                        SELECT * FROM {tbl} {filter} ORDER BY {col} LIMIT {limit}\
+                    "SELECT to_jsonb(t) - 'pg2osync_deleted', t.{col}::text, \
+                            t.pg2osync_deleted FROM (\
+                        SELECT *, ({deleted}) AS pg2osync_deleted \
+                        FROM {tbl} {filter} ORDER BY {col} LIMIT {limit}\
                      ) t",
                     col = quote_ident(&t.poll_column),
                     tbl = qualify(&t.qualified),
@@ -125,13 +133,17 @@ impl PollSource {
                         max_seen = Some(w);
                     }
                     let (schema, table) = split_qualified(&t.qualified);
+                    let pk = extract_pk(&doc, &t.pk_columns);
+                    let deleted: Option<bool> = row.get(2);
+                    let kind = if deleted.unwrap_or(false) {
+                        RowKind::Delete { pk }
+                    } else {
+                        RowKind::Insert { pk, doc }
+                    };
                     tx.send(ChangeEvent::Row(pg2osync_core::event::RowChange {
                         schema: schema.to_string(),
                         table: table.to_string(),
-                        kind: RowKind::Insert {
-                            pk: extract_pk(&doc, &t.pk_columns),
-                            doc,
-                        },
+                        kind,
                     }))
                     .await
                     .context("change channel closed")?;

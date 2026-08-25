@@ -124,6 +124,7 @@ One section per table. `<key>` is the index name when `index` is omitted.
 | `exclude_columns` | All columns except these; mutually exclusive with `columns` |
 | `transform` | Map of column to `"hash"` or `"redact"` |
 | `poll_column` | Poll mode: overrides `[source] poll_column` for this table |
+| `soft_delete` | SQL predicate marking a row as deleted, e.g. `deleted_at IS NOT NULL` |
 | `mapping_file` | JSON mapping to create the index with, see below |
 | `children` | Nested child collections, see below |
 
@@ -137,6 +138,29 @@ it can still be grouped on. `redact` replaces it with `***`. Null values are
 left alone in both cases.
 
 Two tables may not map to the same index: document identity would be ambiguous.
+
+### Soft deletes
+
+Poll mode has no replication log, so a row that is simply gone leaves nothing
+to poll and cannot be seen. A row *marked* deleted can be:
+
+```toml
+[sync.users]
+table = "public.users"
+soft_delete = "deleted_at IS NOT NULL"
+```
+
+A row matching the predicate is removed from the index instead of upserted, and
+the initial load skips it rather than indexing it only to delete it on the
+first cycle. The predicate is evaluated by the database — it is the only party
+that knows the column's type — so any boolean expression over the row's own
+columns works, `status = 'archived'` as much as a timestamp check.
+
+It is poll-mode only, and configuring it elsewhere is rejected rather than
+ignored. WAL mode sees a soft delete as the ordinary `UPDATE` it is, and
+turning that into a delete would mean evaluating the predicate here rather than
+in the database — which is where the column's type lives. Until that is worth
+building, a WAL-mode pipeline should filter on the column at query time.
 
 ### Index mappings
 
