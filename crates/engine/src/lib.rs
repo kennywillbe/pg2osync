@@ -207,9 +207,6 @@ pub async fn run(
     // an event pulled off the channel while gathering rows, to be handled on
     // the next turn rather than dropped
     let mut deferred: Option<ChangeEvent> = None;
-    // the position the open transaction commits at, which is the document
-    // version for every row it produces
-    let mut version: Option<u64> = None;
     // when the current run of coalesced transactions started, so a busy stream
     // cannot postpone a flush indefinitely
     let mut coalescing_since: Option<std::time::Instant> = None;
@@ -234,10 +231,6 @@ pub async fn run(
         match ev {
             ChangeEvent::Transaction(TransactionBoundary::Begin { lsn }) => {
                 tracing::debug!(target: "pg2osync::engine", "BEGIN at {lsn}");
-                // every document this transaction writes is versioned by the
-                // position it becomes visible at, so a write carrying an older
-                // position can never overwrite a newer one at the target
-                version = Some(lsn.0);
             }
             ChangeEvent::Transaction(TransactionBoundary::Commit {
                 lsn,
@@ -339,7 +332,7 @@ pub async fn run(
                         &ctx.projections,
                         &ctx.transforms,
                         previous,
-                        version,
+                        row.version,
                     ) {
                         Ok(ops) => ops,
                         Err(e) => {
@@ -376,7 +369,11 @@ pub async fn run(
                     break Err(e);
                 }
             }
-            ChangeEvent::TableTruncated { schema, table } => {
+            ChangeEvent::TableTruncated {
+                schema,
+                table,
+                version,
+            } => {
                 ctx.metrics.incr_event("truncate");
                 let Some(index) = ctx.mapping.opt_index_for(&schema, &table) else {
                     continue;
@@ -803,6 +800,10 @@ mod pipeline_tests {
     }
 
     fn row(id: i64) -> ChangeEvent {
+        row_at(id, None)
+    }
+
+    fn row_at(id: i64, version: Option<u64>) -> ChangeEvent {
         ChangeEvent::Row(RowChange {
             schema: "public".into(),
             table: "users".into(),
@@ -810,6 +811,7 @@ mod pipeline_tests {
                 pk: json!(id),
                 doc: json!({"id": id}),
             },
+            version,
         })
     }
 
@@ -882,37 +884,49 @@ mod pipeline_tests {
     }
 
     #[tokio::test]
-    async fn a_transaction_versions_its_documents_by_the_position_it_commits_at() {
-        // pgoutput reports the commit position at BEGIN, so the version is known
-        // before the rows arrive. It is what stops a stale write from
-        // overwriting a newer document at the target.
-        let sink = run_script(10, vec![begin(0x200), row(1), row(2), commit(0x200)]).await;
-        assert_eq!(sink.events(), vec!["write[upsert:1@512 upsert:2@512]"]);
+    async fn a_document_is_written_at_the_version_its_row_carries() {
+        // the version stops a stale write from overwriting a newer document at
+        // the target, so it has to reach the sink unchanged
+        let sink = run_script(10, vec![row_at(1, Some(0x200)), commit(0x200)]).await;
+        assert_eq!(sink.events(), vec!["write[upsert:1@512]"]);
     }
 
     #[tokio::test]
-    async fn coalescing_transactions_into_one_batch_does_not_blur_their_versions() {
+    async fn coalescing_into_one_batch_does_not_blur_versions() {
         let sink = run_script(
             10,
             vec![
-                begin(0x100),
-                row(1),
+                row_at(1, Some(0x100)),
                 commit(0x100),
-                begin(0x300),
-                row(2),
+                row_at(2, Some(0x300)),
                 commit(0x300),
             ],
         )
         .await;
-        // whole transactions share a batch, and each row still carries the
-        // position of the transaction it belongs to
         assert_eq!(sink.events(), vec!["write[upsert:1@256 upsert:2@768]"]);
     }
 
     #[tokio::test]
-    async fn rows_with_no_transaction_of_their_own_go_unversioned() {
-        // the initial load sends rows without a BEGIN, because it has no
-        // position to offer yet
+    async fn interleaved_producers_keep_their_own_versions() {
+        // a copy row landing between a transaction's BEGIN and its rows must
+        // not take that transaction's position, nor lend it its own: this is
+        // what makes copying beside the stream safe
+        let sink = run_script(
+            10,
+            vec![
+                begin(0x900),
+                row_at(1, Some(0x100)),
+                row_at(2, Some(0x900)),
+                commit(0x900),
+            ],
+        )
+        .await;
+        assert_eq!(sink.events(), vec!["write[upsert:1@256 upsert:2@2304]"]);
+    }
+
+    #[tokio::test]
+    async fn rows_with_no_position_go_unversioned() {
+        // a polling source reconstructs state and has no log position to offer
         let sink = run_script(10, vec![row(1), commit(0)]).await;
         assert_eq!(sink.events(), vec!["write[upsert:1]"]);
     }
@@ -948,6 +962,7 @@ mod pipeline_tests {
                 ChangeEvent::TableTruncated {
                     schema: "public".into(),
                     table: "users".into(),
+                    version: None,
                 },
                 row(2),
                 commit(0x500),
@@ -999,6 +1014,7 @@ mod pipeline_tests {
                 doc: json!({"id": to}),
                 unchanged_toast_columns: toast.iter().map(|c| c.to_string()).collect(),
             },
+            version: None,
         })
     }
 
@@ -1024,6 +1040,7 @@ mod pipeline_tests {
                 doc: json!({"id": 7}),
                 unchanged_toast_columns: vec![],
             },
+            version: None,
         });
         let sink = run_script(500, vec![unchanged, commit(0x800)]).await;
         assert_eq!(sink.events(), vec!["write[upsert:7]"]);
@@ -1048,6 +1065,7 @@ mod pipeline_tests {
             vec![ChangeEvent::TableTruncated {
                 schema: "public".into(),
                 table: "not_synced".into(),
+                version: None,
             }],
         )
         .await;

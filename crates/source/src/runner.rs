@@ -113,6 +113,9 @@ impl WalSource {
         // it mid-transaction would acknowledge a position the buffered rows
         // have not reached yet.
         let mut in_transaction = false;
+        // The commit position of the open transaction, stamped onto each row it
+        // produces so the engine never has to infer it from event order.
+        let mut txn_version: Option<u64> = None;
         // Only child re-fetch needs SQL, so without children the connection the
         // caller passed is left alone.
         let needs_admin = !self.cfg.children.is_empty() || !self.cfg.child_parents.is_empty();
@@ -140,6 +143,7 @@ impl WalSource {
             match ev {
                 ReplicationEvent::Begin { final_lsn, .. } => {
                     in_transaction = true;
+                    txn_version = Some(to_core_lsn(final_lsn).0);
                     // pgoutput reports the commit position before the rows, so
                     // every document this transaction produces can be versioned
                     // by the position it becomes visible at
@@ -157,6 +161,7 @@ impl WalSource {
                     ..
                 } => {
                     in_transaction = false;
+                    txn_version = None;
                     // end_lsn, not the commit record's own position: this is
                     // what pg_current_wal_lsn() reports after the commit, so a
                     // caller waiting for its own write compares like with like.
@@ -199,6 +204,7 @@ impl WalSource {
                                 tx.send(ChangeEvent::TableTruncated {
                                     schema: rel.schema.clone(),
                                     table: rel.name.clone(),
+                                    version: txn_version,
                                 })
                                 .await
                                 .context("change channel closed")?;
@@ -207,10 +213,11 @@ impl WalSource {
                         msg @ (crate::pgoutput::Message::Insert(_)
                         | crate::pgoutput::Message::Update(_)
                         | crate::pgoutput::Message::Delete(_)) => {
-                            if let Some(ChangeEvent::Row(row_change)) = self
+                            if let Some(ChangeEvent::Row(mut row_change)) = self
                                 .build_change_from_message(&msg, &relations, admin_client)
                                 .await?
                             {
+                                row_change.version = txn_version;
                                 send_change(&tx, row_change).await?;
                             }
                         }
@@ -373,6 +380,8 @@ impl WalSource {
                         schema: parent_key.0.clone(),
                         table: parent_key.1.clone(),
                         kind: pg2osync_core::event::RowKind::Insert { pk: fk_json, doc },
+                        // stamped by the caller, which knows the transaction
+                        version: None,
                     })))
                 }
                 None => Ok(None),

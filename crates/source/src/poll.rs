@@ -144,6 +144,9 @@ impl PollSource {
                         schema: schema.to_string(),
                         table: table.to_string(),
                         kind,
+                        // polling reconstructs state, it does not observe a log:
+                        // there is no position a row became visible at
+                        version: None,
                     }))
                     .await
                     .context("change channel closed")?;

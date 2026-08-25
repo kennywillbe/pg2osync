@@ -131,6 +131,10 @@ impl MySqlSource {
                     schema: schema.clone(),
                     table: table.clone(),
                     kind: RowKind::Insert { pk, doc },
+                    // a binlog coordinate is a file and an offset, not one
+                    // monotonic number, so there is nothing to version by until
+                    // checkpoints move to GTIDs
+                    version: None,
                 }))
                 .await
                 .context("change channel closed during snapshot")?;
@@ -228,9 +232,13 @@ impl MySqlSource {
                         if let Some((schema, table)) = binlog::truncated_table(&q.sql, &q.database)
                         {
                             if self.is_configured(&schema, &table) {
-                                tx.send(ChangeEvent::TableTruncated { schema, table })
-                                    .await
-                                    .context("change channel closed")?;
+                                tx.send(ChangeEvent::TableTruncated {
+                                    schema,
+                                    table,
+                                    version: None,
+                                })
+                                .await
+                                .context("change channel closed")?;
                                 continue;
                             }
                             // a truncate we decline to act on is worth naming:
@@ -422,6 +430,8 @@ fn build_change(
         schema: rt.schema.clone(),
         table: rt.table.clone(),
         kind,
+        // see the snapshot path: file-and-offset does not order as a version
+        version: None,
     }))
 }
 

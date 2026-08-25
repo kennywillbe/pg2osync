@@ -334,6 +334,13 @@ pub async fn run(
         let started = std::time::Instant::now();
         let mut count: u64 = 0;
         for range in &ranges {
+            // The position read before the range becomes the version of every
+            // document the range produces. A change committed after this point
+            // necessarily has a higher position, so it wins at the target
+            // whichever order the two arrive in — which is what allows the copy
+            // to run beside the stream instead of before it. It is a version
+            // only: the range's rows still never advance the checkpoint.
+            let chunk_lsn = current_lsn(admin).await?;
             let sql = copy_statement(
                 &tbl.table,
                 data_cols,
@@ -369,7 +376,7 @@ pub async fn run(
                         let text = String::from_utf8_lossy(line);
                         let fields: Vec<Option<Vec<u8>>> =
                             split_copy_line(&text).iter().map(unescape_copy).collect();
-                        build_change(schema, table, &cols, &fields)?
+                        build_change(schema, table, &cols, &fields, chunk_lsn)?
                     };
                     if tx.send(ChangeEvent::Row(change)).await.is_err() {
                         bail!("engine closed during backfill");
@@ -391,6 +398,26 @@ pub async fn run(
     Ok(())
 }
 
+/// The source's current position, for versioning the rows a range is about to
+/// produce.
+async fn current_lsn(client: &tokio_postgres::Client) -> Result<Option<u64>> {
+    let row = client
+        .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        .await
+        .context("cannot read the current WAL position")?;
+    let text: String = row.get(0);
+    match text.parse::<Lsn>() {
+        Ok(lsn) => Ok(Some(lsn.0)),
+        // Unversioned rows still load correctly; they just lose the protection
+        // against a concurrent change, so the fact has to be visible.
+        Err(_) => {
+            tracing::warn!(target: "pg2osync::backfill",
+                "cannot read the WAL position ({text:?}); loaded rows will be unversioned");
+            Ok(None)
+        }
+    }
+}
+
 /// A boundary carrying `Lsn(0)`: it flushes the batch without advancing the
 /// checkpoint, because backfill rows have no WAL position of their own.
 async fn send_boundary(tx: &Sender<ChangeEvent>) -> Result<()> {
@@ -407,6 +434,7 @@ fn build_change(
     table: &str,
     cols: &[ColMeta],
     fields: &[Option<Vec<u8>>],
+    version: Option<u64>,
 ) -> Result<pg2osync_core::event::RowChange> {
     let mut doc = serde_json::Map::new();
     let mut pk_map = serde_json::Map::new();
@@ -439,6 +467,7 @@ fn build_change(
             pk,
             doc: serde_json::Value::Object(doc),
         },
+        version,
     })
 }
 
