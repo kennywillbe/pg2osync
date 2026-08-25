@@ -58,6 +58,10 @@ checkpoint_interval_ms = 500
 enabled = true
 # use 0.0.0.0:9100 inside a container so probes can reach it
 bind = "127.0.0.1:9100"
+# Requires a bearer token on /metrics. Worth setting once the port is not
+# loopback: the exposition names every table and how far behind the pipeline
+# is. /healthz stays open, because probes cannot carry a token.
+# token_env = "PG2OSYNC_METRICS_TOKEN"
 
 [sync.users]
 table = "public.users"               # database.table for MySQL
@@ -65,6 +69,11 @@ index = "users"
 # primary_key = "id"                 # default: detected from the primary key
 # columns = ["id", "name", "email"]  # or exclude_columns, not both
 exclude_columns = ["password_hash"]
+# Mapping to create the index with, resolved relative to this file. Applied
+# only when the index does not exist; an existing one is compared against it.
+# mapping_file = "users-mapping.json"
+# Poll mode only: a row matching this becomes a delete instead of an upsert.
+# soft_delete = "deleted_at IS NOT NULL"
 
 [sync.users.transform]
 email = "redact"                     # "redact" -> "***", "hash" -> SHA-256 prefix
