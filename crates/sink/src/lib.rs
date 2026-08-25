@@ -550,6 +550,49 @@ impl Sink for OpenSearchSink {
         Ok(())
     }
 
+
+    async fn scan_keys(
+        &self,
+        index: &str,
+        key_field: &str,
+        after: Option<&Value>,
+        size: usize,
+    ) -> Result<Vec<(String, Value)>, CoreError> {
+        let mut body = json!({
+            "size": size,
+            "sort": [{ key_field: "asc" }],
+            "_source": [key_field],
+        });
+        if let Some(after) = after {
+            body["search_after"] = json!([after]);
+        }
+        let resp = self
+            .client
+            .search(opensearch::SearchParts::Index(&[index]))
+            .body(body)
+            .send()
+            .await
+            .map_err(http_err)?;
+        let body: Value = resp.json().await.map_err(http_err)?;
+        if let Some(error) = body.get("error") {
+            return Err(CoreError::Sink(format!("scan {index}: {error}")));
+        }
+        Ok(body["hits"]["hits"]
+            .as_array()
+            .map(|hits| {
+                hits.iter()
+                    .filter_map(|hit| {
+                        let id = hit["_id"].as_str()?.to_string();
+                        // the sort value rather than _source: it is what
+                        // search_after needs back, in the form the index holds
+                        let key = hit["sort"].as_array()?.first()?.clone();
+                        Some((id, key))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     async fn write_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), CoreError> {
         self.ensure_meta_index().await?;
         let resp = self

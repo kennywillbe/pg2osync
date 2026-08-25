@@ -74,7 +74,9 @@ Stated up front, because finding these out in production is expensive:
   every document written before it keeps the old one until the index is
   rebuilt. `validate` refuses a `columns` list naming a column that no longer
   exists.
-- **Poll mode cannot see deletes.** It has no access to the replication log.
+- **Poll mode cannot see a hard delete.** It has no access to the replication
+  log. A soft delete it can see (`soft_delete`), and `pg2osync reconcile`
+  removes index documents whose row is gone.
 - **Nested children are one level deep**, re-fetched with a query per changed
   parent — a wide fan-out slows the initial load.
 - **MySQL needs `binlog_row_image = FULL`**, and refuses

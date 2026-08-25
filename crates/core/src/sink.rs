@@ -104,6 +104,24 @@ pub trait Sink: Send + Sync {
         Ok(())
     }
 
+    /// One page of `(document id, key value)` from an index, ordered by
+    /// `key_field`, starting after `after`.
+    ///
+    /// Used to walk an index against its source. Targets that cannot page an
+    /// index in key order say so rather than returning a partial answer, since
+    /// a caller acting on this deletes things.
+    async fn scan_keys(
+        &self,
+        _index: &str,
+        _key_field: &str,
+        _after: Option<&Value>,
+        _size: usize,
+    ) -> Result<Vec<(String, Value)>, CoreError> {
+        Err(CoreError::Sink(
+            "this target cannot page an index in key order".into(),
+        ))
+    }
+
     /// Persist the pipeline checkpoint durably.
     async fn write_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), CoreError>;
 
