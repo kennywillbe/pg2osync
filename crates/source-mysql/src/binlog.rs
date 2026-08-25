@@ -3,10 +3,18 @@
 //! Scope: ROW-format streams from MySQL 8.0 defaults — FORMAT_DESCRIPTION,
 //! ROTATE, TABLE_MAP, WRITE/UPDATE/DELETE_ROWS (v1+v2), XID, QUERY.
 //!
+//! A row image does not describe itself: a string column carries no charset, so
+//! `char` and `binary` share a type code and so do `text` and `blob`, and an
+//! enum arrives as an ordinal with its labels nowhere. Those columns are decoded
+//! against the shape the catalog resolved from the declared type, which is what
+//! keeps a streamed value equal to the one the initial load read.
+//!
 //! Known limitations:
 //! - GEOMETRY decodes as base64 blob
 //! - MariaDB-specific event types (Annotate_rows etc.) are tolerated, ignored
 
+use crate::typemap::ValueShape;
+use base64::Engine as _;
 use serde_json::Value;
 
 #[derive(Debug, thiserror::Error)]
@@ -298,6 +306,13 @@ pub struct ColMeta {
     /// Optional-metadata signedness bit (numeric columns).
     pub unsigned: bool,
     pub primary_key: bool,
+    /// What the declared type says the value is, filled in from the catalog.
+    ///
+    /// The row image cannot say: a string column carries no charset here, so
+    /// `char` and `binary` share a type code and so do `text` and `blob`, and an
+    /// enum arrives as an ordinal with its labels nowhere. Without this the
+    /// stream and the initial load disagree about the same row.
+    pub shape: Option<crate::typemap::ValueShape>,
 }
 
 pub fn parse_table_map(payload: &[u8]) -> Result<(u64, TableMeta, OptionalMeta), DecodeError> {
@@ -349,6 +364,7 @@ pub fn parse_table_map(payload: &[u8]) -> Result<(u64, TableMeta, OptionalMeta),
         let meta = meta_area.get(mpos..mpos + sz).unwrap_or(&[]).to_vec();
         mpos += sz;
         columns.push(ColMeta {
+            shape: None,
             name: String::new(),
             type_code: ty,
             meta,
@@ -547,6 +563,7 @@ fn decode_image(
                 cm.type_code,
                 &cm.meta,
                 cm.unsigned,
+                cm.shape.as_ref(),
             )?));
         }
         nth += 1;
@@ -559,7 +576,20 @@ fn decode_value_inner(
     ty: u8,
     meta: &[u8],
     unsigned: bool,
+    shape: Option<&ValueShape>,
 ) -> Result<Value, DecodeError> {
+    // A string column's bytes are characters or they are not, and only the
+    // declared type knows which. Without it the old default stood: strings for
+    // the VARCHAR and STRING codes, base64 for the BLOB codes — which made
+    // `varbinary` text and `text` base64.
+    let string_like = |bytes: &[u8]| -> Value {
+        match shape {
+            Some(ValueShape::Bytes) => {
+                str_val(base64::engine::general_purpose::STANDARD.encode(bytes))
+            }
+            _ => str_from_bytes(bytes),
+        }
+    };
     let signed_int = |r: &mut R, nbytes: usize| -> Result<Value, DecodeError> {
         let raw = r.take(nbytes)?;
         let mut buf = [0u8; 8];
@@ -718,17 +748,32 @@ fn decode_value_inner(
             } else {
                 r.u16v()? as usize
             };
-            Ok(str_from_bytes(r.take(len)?))
+            Ok(string_like(r.take(len)?))
         }
         254 => {
             // STRING: high meta byte may hide ENUM/SET/legacy VARCHAR
             let real = meta.first().copied().unwrap_or(254);
             match real {
-                247 => Ok(num(r.u8v()? as u64)), // ENUM index
+                // ENUM carries an ordinal into the declared labels, and SET a
+                // bitmask over them, lowest bit first. Both are meaningless
+                // without the labels, which is why the load used to report a
+                // name where the stream reported a number.
+                247 => {
+                    let ordinal = r.u8v()? as u64;
+                    Ok(match shape {
+                        Some(ValueShape::Enum(labels)) => {
+                            crate::typemap::enum_label(labels, ordinal)
+                        }
+                        _ => num(ordinal),
+                    })
+                }
                 248 => {
                     let nbytes = meta.get(1).copied().unwrap_or(1) as usize;
-                    let v = read_uint_n(r, nbytes)?;
-                    Ok(num(v))
+                    let mask = read_uint_n(r, nbytes)?;
+                    Ok(match shape {
+                        Some(ValueShape::Set(labels)) => crate::typemap::set_labels(labels, mask),
+                        _ => num(mask),
+                    })
                 }
                 _ => {
                     let len_byte = meta.get(1).copied().unwrap_or(0);
@@ -737,7 +782,7 @@ fn decode_value_inner(
                     } else {
                         r.u8v()? as usize
                     };
-                    Ok(str_from_bytes(r.take(len)?))
+                    Ok(string_like(r.take(len)?))
                 }
             }
         }
@@ -763,23 +808,27 @@ fn decode_value_inner(
         249..=252 => {
             let size = *meta.first().unwrap_or(&1) as usize;
             let len = read_uint_n(r, size)? as usize;
-            use base64::Engine as _;
-            Ok(str_val(
-                base64::engine::general_purpose::STANDARD.encode(r.take(len)?),
-            ))
+            // TEXT and BLOB share these codes; only the declared type separates
+            // them, and getting it wrong made every TEXT column base64.
+            Ok(string_like(r.take(len)?))
         }
         16 => {
-            // BIT: meta = [bits % 8, bits / 8]
-            let bits = (*meta.first().unwrap_or(&0) as usize) * 256
-                + (meta.get(1).copied().unwrap_or(0) as usize);
-            let nbytes = bits.div_ceil(8);
-            Ok(num(read_uint_n(r, nbytes)?))
+            // BIT: the server writes meta[0] = bits % 8 and meta[1] = bits / 8,
+            // so the width is meta[1] * 8 + meta[0] — not meta[0] * 256 + meta[1],
+            // which read one byte for every BIT wider than eight and left the
+            // reader mid-column for everything after it.
+            //
+            // The bits themselves are stored most significant byte first, unlike
+            // every other integer in this format.
+            let bits = (meta.get(1).copied().unwrap_or(0) as usize) * 8
+                + (*meta.first().unwrap_or(&0) as usize);
+            let nbytes = bits.div_ceil(8).max(1);
+            Ok(num(crate::typemap::be_uint(r.take(nbytes)?)))
         }
         255 => {
             // GEOMETRY: blob-like
             let size = *meta.first().unwrap_or(&1) as usize;
             let len = read_uint_n(r, size)? as usize;
-            use base64::Engine as _;
             Ok(str_val(
                 base64::engine::general_purpose::STANDARD.encode(r.take(len)?),
             ))
@@ -1188,6 +1237,101 @@ mod tests {
             Some(Value::String(s)) => assert_eq!(s, "x@y.z"),
             other => panic!("bad email {other:?}"),
         }
+    }
+
+    /// One value out of a row image, as the stream reads it.
+    fn streamed(ty: u8, meta: &[u8], shape: &ValueShape, image: &[u8]) -> Value {
+        let mut r = R::new(image);
+        decode_value_inner(&mut r, ty, meta, false, Some(shape)).expect("decodes")
+    }
+
+    /// The same logical value, as the initial load reads it off the text
+    /// protocol.
+    fn loaded(shape: &ValueShape, text: &[u8]) -> Value {
+        crate::typemap::convert(shape, Some(text))
+    }
+
+    #[test]
+    fn both_readers_agree_on_every_type_the_row_image_cannot_describe() {
+        // The disagreement this pins is invisible to a test of either path
+        // alone: the row image gives a string column no charset and an enum no
+        // labels, so `text` used to arrive as base64 while the load called it a
+        // string, and an enum arrived as `2` while the load called it "medium".
+        let labels = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // TEXT: a BLOB code with a character charset
+        let shape = ValueShape::Text;
+        let mut image = vec![5, 0];
+        image.extend_from_slice(b"hello");
+        assert_eq!(
+            streamed(252, &[2], &shape, &image),
+            loaded(&shape, b"hello"),
+            "text is characters on both sides"
+        );
+
+        // VARBINARY: the same code family as VARCHAR, and not characters
+        let shape = ValueShape::Bytes;
+        let bytes = [0x00u8, 0xFF, 0x10];
+        let mut image = vec![3];
+        image.extend_from_slice(&bytes);
+        assert_eq!(
+            streamed(253, &16u16.to_le_bytes(), &shape, &image),
+            loaded(&shape, &bytes),
+            "bytes are base64 of the bytes, not of their text"
+        );
+
+        // BINARY: the STRING code, whose metadata hides the real type
+        let mut image = vec![3];
+        image.extend_from_slice(&bytes);
+        assert_eq!(
+            streamed(254, &[254, 16], &shape, &image),
+            loaded(&shape, &bytes)
+        );
+
+        // BLOB
+        let mut image = vec![3, 0];
+        image.extend_from_slice(&bytes);
+        assert_eq!(streamed(252, &[2], &shape, &image), loaded(&shape, &bytes));
+
+        // ENUM: an ordinal in the image, a label in the text protocol
+        let shape = ValueShape::Enum(labels(&["low", "medium", "high"]));
+        assert_eq!(
+            streamed(254, &[247, 0], &shape, &[2]),
+            loaded(&shape, b"medium")
+        );
+
+        // SET: a bitmask in the image, the labels in the text protocol
+        let shape = ValueShape::Set(labels(&["a", "b", "c"]));
+        assert_eq!(
+            streamed(254, &[248, 1], &shape, &[0b101]),
+            loaded(&shape, b"a,c")
+        );
+        assert_eq!(streamed(254, &[248, 1], &shape, &[0]), loaded(&shape, b""));
+
+        // BIT: big-endian in the image, the same bytes in the text protocol
+        let shape = ValueShape::Bits;
+        assert_eq!(
+            streamed(16, &[0, 2], &shape, &[0x00, 0xFF]),
+            loaded(&shape, &[0x00, 0xFF]),
+            "a two-byte BIT is 255, not 65280"
+        );
+    }
+
+    #[test]
+    fn a_bit_wider_than_a_byte_consumes_both_of_them() {
+        // The width is meta[1] * 8 + meta[0]. Getting it backwards read one byte
+        // and left the reader inside the column, corrupting every value after
+        // it — so the guard is that the reader ends where the value ends.
+        let mut r = R::new(&[0x01, 0x00, 0x7B]);
+        let bits = decode_value_inner(&mut r, 16, &[0, 2], false, Some(&ValueShape::Bits))
+            .expect("decodes");
+        assert_eq!(bits, Value::from(256));
+        let next = decode_value_inner(&mut r, 1, &[], true, None).expect("decodes");
+        assert_eq!(
+            next,
+            Value::from(123),
+            "the next column starts where it should"
+        );
     }
 
     #[test]

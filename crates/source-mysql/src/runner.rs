@@ -284,6 +284,14 @@ impl MySqlSource {
                             columns.len()
                         );
                     }
+                    // The row image says nothing about whether a string column
+                    // holds characters or bytes, nor what an enum ordinal means.
+                    // Handing the decoder the declared shape is what keeps a
+                    // streamed value equal to the one the load read.
+                    let mut meta = meta;
+                    for (col, resolved) in meta.columns.iter_mut().zip(&resolved.columns) {
+                        col.shape = Some(resolved.shape.clone());
+                    }
                     registered.insert(
                         tid,
                         RegisteredTable {

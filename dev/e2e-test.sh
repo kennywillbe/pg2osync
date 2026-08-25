@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # End-to-end test suite for the PostgreSQL -> OpenSearch pipeline.
 #
+# Runs one at a time: stopping the pipeline kills every pg2osync process, so
+# two suites at once take each other's down and report failures that are not.
+#
 # Prerequisites:
 #   docker compose -f dev/docker-compose.yml up -d
 #   docker exec -i dev-postgres-1 psql -U postgres -d sourcedb < dev/seed.sql
@@ -28,7 +31,7 @@ bad()   { printf "  \033[31m✗ %s\033[0m\n" "$1"; FAIL=$((FAIL + 1)); }
 check() { if [ "$2" = "$3" ]; then ok "$1 ($2)"; else bad "$1 (got '$2', want '$3')"; fi }
 
 jqf()        { python3 -c "import sys,json;d=json.load(sys.stdin);print($1)"; }
-os_count()   { curl -s "$OS/$1/_count" | jqf "d['count']"; }
+os_count()   { curl -s "$OS/$1/_count" | jqf "d.get('count', 0)"; }
 os_field()   { curl -s "$OS/$1/_doc/$2" | jqf "d.get('_source',{}).get('$3','<missing>')"; }
 os_has()     { curl -s "$OS/$1/_doc/$2" | jqf "'$3' in d.get('_source',{})"; }
 os_status()  { curl -s -o /dev/null -w "%{http_code}" "$OS/$1/_doc/$2"; }

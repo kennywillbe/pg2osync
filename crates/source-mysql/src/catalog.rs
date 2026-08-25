@@ -5,8 +5,8 @@
 //! dump connection cannot run queries once streaming has started.
 
 use crate::connection::MySqlConnection;
+use crate::typemap::{self, ValueShape};
 use anyhow::{Context as _, Result, bail};
-use base64::Engine as _;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 
@@ -20,8 +20,8 @@ pub struct TableSchema {
 #[derive(Debug, Clone)]
 pub struct Column {
     pub name: String,
-    /// `information_schema.columns.data_type`, lowercase (`int`, `json`, …).
-    pub data_type: String,
+    /// What the column's bytes mean, decided once so both readers agree.
+    pub shape: ValueShape,
 }
 
 impl TableSchema {
@@ -69,7 +69,7 @@ pub async fn table_schema(
 ) -> Result<TableSchema> {
     let rows = conn
         .query_text_rows(&format!(
-            "SELECT column_name, data_type FROM information_schema.columns \
+            "SELECT column_name, data_type, column_type FROM information_schema.columns \
              WHERE table_schema = {} AND table_name = {} ORDER BY ordinal_position",
             quote_str(schema),
             quote_str(table)
@@ -79,16 +79,20 @@ pub async fn table_schema(
     if rows.is_empty() {
         bail!("table {schema}.{table} does not exist or is not visible to this user");
     }
+    let lower = |r: &Vec<Option<String>>, i: usize| -> String {
+        r.get(i)
+            .cloned()
+            .flatten()
+            .unwrap_or_default()
+            .to_lowercase()
+    };
     let columns: Vec<Column> = rows
         .iter()
         .map(|r| Column {
             name: r.first().cloned().flatten().unwrap_or_default(),
-            data_type: r
-                .get(1)
-                .cloned()
-                .flatten()
-                .unwrap_or_default()
-                .to_lowercase(),
+            // column_type carries what data_type leaves out: the declared enum
+            // and set labels
+            shape: typemap::shape_of(&lower(r, 1), &lower(r, 2)),
         })
         .collect();
 
@@ -242,36 +246,12 @@ pub fn parse_position(text: &str) -> Option<(String, u32)> {
     Some((file.to_string(), pos.parse().ok()?))
 }
 
-/// Convert one text-protocol value into JSON using the declared column type.
-///
-/// `decimal` stays a string for the same reason PostgreSQL `numeric` does:
-/// a float round-trip loses precision.
-pub fn convert(data_type: &str, raw: Option<&str>) -> Value {
-    let Some(s) = raw else { return Value::Null };
-    match data_type {
-        "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint" | "year" => s
-            .parse::<i64>()
-            .map(|n| Value::Number(n.into()))
-            .unwrap_or_else(|_| Value::String(s.to_string())),
-        "float" | "double" => s
-            .parse::<f64>()
-            .ok()
-            .and_then(serde_json::Number::from_f64)
-            .map(Value::Number)
-            .unwrap_or_else(|| Value::String(s.to_string())),
-        "json" => serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.to_string())),
-        "bit" | "binary" | "varbinary" | "blob" | "tinyblob" | "mediumblob" | "longblob"
-        | "geometry" => Value::String(base64::engine::general_purpose::STANDARD.encode(s)),
-        _ => Value::String(s.to_string()),
-    }
-}
-
 /// Build one backfill document plus its primary key.
-pub fn build_document(schema: &TableSchema, row: &[Option<String>]) -> (Value, Value) {
+pub fn build_document(schema: &TableSchema, row: &[Option<Vec<u8>>]) -> (Value, Value) {
     let mut doc = Map::new();
     let mut pk = Map::new();
     for (i, col) in schema.columns.iter().enumerate() {
-        let value = convert(&col.data_type, row.get(i).and_then(|v| v.as_deref()));
+        let value = typemap::convert(&col.shape, row.get(i).and_then(|v| v.as_deref()));
         if schema.pk_columns.contains(&col.name) {
             pk.insert(col.name.clone(), value.clone());
         }
@@ -327,32 +307,22 @@ mod tests {
     }
 
     #[test]
-    fn conversion_preserves_decimal_precision() {
-        assert_eq!(
-            convert("decimal", Some("12345678901234567890.123")),
-            Value::String("12345678901234567890.123".into())
-        );
-        assert_eq!(convert("int", Some("-7")), Value::Number((-7).into()));
-        assert_eq!(convert("json", Some(r#"{"a":1}"#))["a"], Value::from(1));
-        assert_eq!(convert("varchar", None), Value::Null);
-    }
-
-    #[test]
     fn documents_carry_scalar_and_composite_keys() {
         let schema = TableSchema {
             columns: vec![
                 Column {
                     name: "id".into(),
-                    data_type: "int".into(),
+                    shape: ValueShape::Int,
                 },
                 Column {
                     name: "tenant".into(),
-                    data_type: "varchar".into(),
+                    shape: ValueShape::Text,
                 },
             ],
             pk_columns: vec!["id".into()],
         };
-        let (doc, pk) = build_document(&schema, &[Some("5".into()), Some("acme".into())]);
+        let row = [Some(b"5".to_vec()), Some(b"acme".to_vec())];
+        let (doc, pk) = build_document(&schema, &row);
         assert_eq!(pk, Value::from(5));
         assert_eq!(doc["tenant"], Value::from("acme"));
 
@@ -360,7 +330,7 @@ mod tests {
             pk_columns: vec!["id".into(), "tenant".into()],
             ..schema
         };
-        let (_, pk) = build_document(&composite, &[Some("5".into()), Some("acme".into())]);
+        let (_, pk) = build_document(&composite, &row);
         assert_eq!(pk["tenant"], Value::from("acme"));
     }
 

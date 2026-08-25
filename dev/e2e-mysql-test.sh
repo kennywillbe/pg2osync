@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # End-to-end test suite for the MySQL/MariaDB source.
 #
+# Runs one at a time: stopping the pipeline kills every pg2osync process, so
+# two suites at once take each other's down and report failures that are not.
+#
 # Prerequisites: a MySQL 8.0+ or MariaDB 10.6+ server with log_bin,
 # binlog_format=ROW, binlog_row_image=FULL and a mysql_native_password user
 # holding SELECT, REPLICATION SLAVE and REPLICATION CLIENT.
@@ -32,7 +35,7 @@ bad()   { printf "  \033[31m✗ %s\033[0m\n" "$1"; FAIL=$((FAIL + 1)); }
 check() { if [ "$2" = "$3" ]; then ok "$1 ($2)"; else bad "$1 (got '$2', want '$3')"; fi }
 
 jqf()       { python3 -c "import sys,json;d=json.load(sys.stdin);print($1)"; }
-os_count()  { curl -s "$OS/$1/_count" | jqf "d['count']"; }
+os_count()  { curl -s "$OS/$1/_count" | jqf "d.get('count', 0)"; }
 os_field()  { curl -s "$OS/$1/_doc/$2" | jqf "d.get('_source',{}).get('$3','<missing>')"; }
 os_has()    { curl -s "$OS/$1/_doc/$2" | jqf "'$3' in d.get('_source',{})"; }
 os_status() { curl -s -o /dev/null -w "%{http_code}" "$OS/$1/_doc/$2"; }
@@ -320,6 +323,82 @@ check "a row deleted during the load is not resurrected by it" \
 # the load holding one read view for its whole duration is what this replaced
 open_trx=$(my "SELECT count(*) FROM information_schema.innodb_trx;")
 check "no transaction outlives the load" "$open_trx" "0"
+stop_sync
+
+say "13. the load and the stream agree on every column type"
+stop_sync
+TCONFIG=$(mktemp /tmp/pg2osync-mysql-types.XXXXXX)
+cat > "$TCONFIG" <<TOML
+[source]
+flavor = "mysql"
+url_env = "PG2OSYNC_MYSQL_URL"
+server_id = 990003
+
+[target]
+url = "$OS"
+
+[metrics]
+bind = "127.0.0.1:9114"
+
+[sync.types]
+table = "sourcedb.types_probe"
+index = "e2e_mysql_types"
+TOML
+types_cleanup() {
+  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  my "DROP TABLE IF EXISTS types_probe;" > /dev/null 2>&1 || true
+  rm -f "$TCONFIG"
+}
+trap 'cleanup; resume_cleanup; types_cleanup' EXIT
+
+# The row image says nothing about whether a string column holds characters or
+# bytes, and nothing about what an enum ordinal means, so these are exactly the
+# types the two readers used to disagree on. Row 1 arrives through the initial
+# load and row 2 through the binlog, from identical values.
+my "DROP TABLE IF EXISTS types_probe;
+    CREATE TABLE types_probe(
+      id     bigint PRIMARY KEY,
+      txt    text,
+      bin    varbinary(16),
+      blb    blob,
+      bits   bit(16),
+      grade  enum('low','medium','high'),
+      tags   set('a','b','c'));"
+my "INSERT INTO types_probe VALUES (1,'hello',0x00FF10,0x0102,b'0000000011111111','medium','a,c');"
+curl -s -XDELETE "$OS/e2e_mysql_types" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/checkpoint-mysql-990003" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/load-mysql-990003-sourcedb_types_probe" > /dev/null
+
+nohup $BIN run -c "$TCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_count e2e_mysql_types)" = "1" ] && break
+  sleep 0.5
+done
+# same values again, this time reaching the target through the binlog
+my "INSERT INTO types_probe VALUES (2,'hello',0x00FF10,0x0102,b'0000000011111111','medium','a,c');"
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_count e2e_mysql_types)" = "2" ] && break
+  sleep 0.5
+done
+check "both rows arrived" "$(os_count e2e_mysql_types)" "2"
+for col in txt bin blb bits grade tags; do
+  loaded=$(os_field e2e_mysql_types 1 $col)
+  streamed=$(os_field e2e_mysql_types 2 $col)
+  if [ "$loaded" = "$streamed" ]; then
+    ok "$col reads the same from the load and the stream ($loaded)"
+  else
+    bad "$col disagrees (load '$loaded', stream '$streamed')"
+  fi
+done
+# and the shapes themselves, so "agreeing on the wrong thing" still fails
+check "text is characters" "$(os_field e2e_mysql_types 1 txt)" "hello"
+check "varbinary is base64 of its bytes" "$(os_field e2e_mysql_types 1 bin)" "AP8Q"
+check "blob is base64 of its bytes" "$(os_field e2e_mysql_types 1 blb)" "AQI="
+check "a two-byte bit is a number" "$(os_field e2e_mysql_types 1 bits)" "255"
+check "an enum is its label" "$(os_field e2e_mysql_types 1 grade)" "medium"
+check "a set is its labels" "$(os_field e2e_mysql_types 1 tags)" "['a', 'c']"
 stop_sync
 
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
