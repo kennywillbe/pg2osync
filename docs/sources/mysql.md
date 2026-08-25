@@ -99,9 +99,10 @@ full initial load.
    `binlog_row_image`, `binlog_row_value_options`), plus column and
    primary-key resolution from
    `information_schema`.
-2. **Initial load** inside `START TRANSACTION WITH CONSISTENT SNAPSHOT`. The
-   binlog coordinate is read *inside* that transaction, so streaming from it can
-   only re-deliver rows, never skip them.
+2. **Initial load** in primary-key chunks, each one statement, with the binlog
+   coordinate read *before* the first chunk and the stream running from it — so
+   anything a chunk missed or read stale is replayed onto an idempotent write.
+   The load runs beside the stream, not before it.
 3. **`COM_BINLOG_DUMP`** from that coordinate on a second connection, after
    `SET @master_binlog_checksum = @@global.binlog_checksum` so CRC32-checksummed
    events are usable.
@@ -125,7 +126,16 @@ always compares greater than any offset in the previous file.
 
 Consequence: the server must still hold the binlog you stopped at. Past
 `binlog_expire_logs_seconds` the position is gone and the next start runs a full
-initial load. Keep enough retention to cover your worst expected outage.
+initial load. Keep enough retention to cover your worst expected outage —
+MySQL's automatic purge does not spare files a consumer still needs.
+
+The same token is each document's version at the target, which is what lets the
+initial load run beside the stream. A version only ever goes up, so a binlog
+history that restarts under a running pipeline — `RESET BINARY LOGS AND GTIDS`,
+or the same address answered by a different server — leaves the target holding
+versions from a numbering that no longer exists. pg2osync refuses to start in
+that case rather than writing into silence; the fix is a fresh index name, since
+a reload cannot undo versions already in the target.
 
 ### MySQL vs MariaDB wire differences
 
@@ -139,6 +149,16 @@ Handled transparently:
 | v2 extra-data-length field | present | absent |
 | Client binary | `mysql` | `mariadb` |
 | Default binlog prefix | `binlog`/`mysql-bin` | `mariadb-bin` |
+| `end_log_pos` inside a transaction | filled in on every event | left at `0` except on the GTID and XID events |
+
+That last row is the one with teeth: a MariaDB group's final position is not
+known until the group is written, and not needing it per event is what lets the
+checksums be computed in advance. `binlog_legacy_event_pos` restores the old
+behaviour and is documented as costing binlog scalability, so pg2osync tracks
+the position itself instead — a stated position wins wherever one appears, a
+zero advances by the event size, and the two events that state a position
+without having moved the stream (the heartbeat, which is not even in the file,
+and the format description of a file resumed into the middle of) move nothing.
 
 ## Type mapping
 

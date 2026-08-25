@@ -978,7 +978,35 @@ async fn attempt_mysql(
         }
         None => {
             tracing::info!(target: "pg2osync::run", "no usable checkpoint; initial load");
-            mysql_catalog::master_position(&mut admin).await?
+            // Progress from an earlier load is unusable without a checkpoint to
+            // go with it. The load would carry on from its cursor while the
+            // stream could only start from here, and every change made in
+            // between to a key the cursor has already passed would be lost.
+            if load_pending {
+                tracing::warn!(target: "pg2osync::run",
+                    "an unfinished load has no checkpoint to resume its stream from, \
+                     so it starts over rather than leaving a gap behind its cursor");
+                for tbl in cfg.sync.values() {
+                    let key = pg2osync_core::load::load_progress_key(&stream_id, &tbl.table);
+                    if let Err(e) = sink.clear_state(&key).await {
+                        tracing::warn!(target: "pg2osync::run",
+                            "could not discard load progress {key}: {e}");
+                    }
+                }
+            }
+            let (file, pos) = mysql_catalog::master_position(&mut admin).await?;
+            // PostgreSQL keeps this coordinate in the slot, which survives
+            // whether or not a checkpoint was ever written. MySQL has nowhere
+            // else to put it, so it is persisted here, before the first chunk:
+            // the load's replay argument rests on the stream resuming from a
+            // position that predates every chunk, and this is what remembers it.
+            sink.write_checkpoint(&Checkpoint {
+                stream: stream_id.clone(),
+                token: mysql_catalog::position_token(&file, pos),
+                position: format!("{file}:{pos}"),
+            })
+            .await?;
+            (file, pos)
         }
     };
     let render: PositionRenderer = {
@@ -992,9 +1020,7 @@ async fn attempt_mysql(
     src_cfg.start_pos = start_pos;
 
     let (events_tx, events_rx) = mpsc::channel::<ChangeEvent>(EVENT_CHANNEL_DEPTH);
-    // MySQL's load does not run beside the stream yet, so the copy channel is
-    // closed immediately.
-    let (_, copy_rx) = mpsc::channel::<ChangeEvent>(1);
+    let (copy_tx, copy_rx) = mpsc::channel::<ChangeEvent>(COPY_CHANNEL_DEPTH);
     let (load_done_tx, load_done_rx) = watch::channel(0u64);
     let load_sink = sink.clone();
     let load_stream_id = stream_id.clone();
@@ -1009,26 +1035,50 @@ async fn attempt_mysql(
         shutdown_rx.clone(),
     );
 
-    if resume.is_none() || load_pending {
-        let tables = src_cfg.tables.clone();
-        with_bulk_load_settings(&load_sink, cfg, async {
-            pg2osync_source_mysql::load::run(
-                &mut admin,
-                &tables,
-                cfg.source.load_chunk_rows.max(1) as u64,
-                &events_tx,
-                load_sink.as_ref(),
-                &load_stream_id,
-                load_done_rx,
-            )
+    // The load runs *beside* the stream, not before it. What makes the overlap
+    // safe is that every document carries the position it became visible at, so
+    // a copied row that was already stale loses to the streamed change at the
+    // target regardless of which arrives first.
+    //
+    // Unlike PostgreSQL there is nothing to pause for. A replication slot
+    // retains WAL until it is consumed, so a slow consumer is what invalidates
+    // it; MySQL purges binlogs on its own time and space policy and ignores
+    // consumers entirely. Nothing accumulates because of us, and the hazard runs
+    // the other way — the file we still need being purged — which pausing the
+    // load would only make likelier.
+    let load = async {
+        // moved in, so the copy channel closes when the load is done and the
+        // engine can tell the difference between "paused" and "finished"
+        let copy_tx = copy_tx;
+        if resume.is_none() || load_pending {
+            let tables = src_cfg.tables.clone();
+            with_bulk_load_settings(&load_sink, cfg, async {
+                pg2osync_source_mysql::load::run(
+                    &mut admin,
+                    &tables,
+                    cfg.source.load_chunk_rows.max(1) as u64,
+                    &copy_tx,
+                    load_sink.as_ref(),
+                    &load_stream_id,
+                    load_done_rx,
+                )
+                .await
+            })
             .await
-        })
-        .await?;
-    }
+        } else {
+            Ok(())
+        }
+    };
 
     let started = std::time::Instant::now();
-    let mut streaming = MySqlSource::new(src_cfg);
-    let result = streaming.stream(events_tx, shutdown_rx.clone()).await;
+    let stream = async {
+        let mut streaming = MySqlSource::new(src_cfg.clone());
+        streaming.stream(events_tx, shutdown_rx.clone()).await
+    };
+    // Either failing abandons the other: a stream error is a reconnect, and the
+    // load picks up from its recorded progress on the next attempt.
+    let result = futures::future::try_join(load, stream).await.map(|_| ());
+    // dropping both senders above is what lets the engine drain and exit
     let _ = engine.await;
     result?;
 
