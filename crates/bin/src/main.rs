@@ -113,6 +113,58 @@ async fn validate(path: &Path) -> Result<()> {
     Ok(())
 }
 
+
+/// Check a table's configuration against the columns it actually has.
+///
+/// A `columns` list naming something that no longer exists is silently ignored
+/// today, so the field simply stops appearing in new documents and the index
+/// disagrees with the database with nothing to show for it. Naming it at
+/// startup is far cheaper than finding it later.
+fn check_configured_columns(table: &config::TableSync, live: &[String]) -> Result<()> {
+    let missing = |names: &[String]| -> Vec<String> {
+        names
+            .iter()
+            .filter(|n| !live.iter().any(|c| c.eq_ignore_ascii_case(n)))
+            .cloned()
+            .collect()
+    };
+
+    if let Some(columns) = &table.columns {
+        let gone = missing(columns);
+        if !gone.is_empty() {
+            bail!(
+                "table {} has no column(s) {}; the `columns` list would silently drop them",
+                table.table,
+                gone.join(", ")
+            );
+        }
+    }
+    if let Some(pk) = &table.primary_key
+        && !missing(std::slice::from_ref(pk)).is_empty()
+    {
+        bail!("table {} has no column {pk} to use as primary_key", table.table);
+    }
+    // an exclusion or a transform for a column that is gone changes nothing,
+    // so it is stale configuration rather than a fault
+    for (label, names) in [
+        ("exclude_columns", table.exclude_columns.clone()),
+        (
+            "transform",
+            table.transform.keys().cloned().collect::<Vec<_>>(),
+        ),
+    ] {
+        let gone = missing(&names);
+        if !gone.is_empty() {
+            println!(
+                "! {label} on {} names column(s) that do not exist: {}",
+                table.table,
+                gone.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn validate_postgres(cfg: &config::AppConfig, source_url: &str) -> Result<()> {
     let client = connect_pg(cfg, source_url).await?;
     println!(
@@ -135,7 +187,19 @@ async fn validate_postgres(cfg: &config::AppConfig, source_url: &str) -> Result<
         if exists.is_none() {
             bail!("table {} does not exist", table.table);
         }
-        println!("✓ table {} exists", table.table);
+        let live: Vec<String> = client
+            .query(
+                "SELECT attname::text FROM pg_attribute \
+                 WHERE attrelid = to_regclass($1) AND attnum > 0 AND NOT attisdropped \
+                 ORDER BY attnum",
+                &[&table.table],
+            )
+            .await?
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        check_configured_columns(table, &live)?;
+        println!("✓ table {} exists ({} columns)", table.table, live.len());
         tables.push(table.table.clone());
         for child in &table.children {
             tables.push(child.table.clone());
@@ -216,7 +280,18 @@ async fn validate_mysql(cfg: &config::AppConfig, source_url: &str) -> Result<()>
     println!("✓ log_bin, binlog_format = ROW, binlog_row_image = FULL");
     source.bootstrap(&mut admin).await?;
     for table in cfg.sync.values() {
-        println!("✓ table {} exists with a primary key", table.table);
+        let (schema, name) = table
+            .table
+            .split_once('.')
+            .context("table must be written as database.table for MySQL")?;
+        let live = pg2osync_source_mysql::catalog::table_schema(&mut admin, schema, name).await?;
+        let names: Vec<String> = live.columns.iter().map(|c| c.name.clone()).collect();
+        check_configured_columns(table, &names)?;
+        println!(
+            "✓ table {} exists with a primary key ({} columns)",
+            table.table,
+            names.len()
+        );
     }
     Ok(())
 }

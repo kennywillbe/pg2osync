@@ -107,7 +107,10 @@ other way.
 
 **Schema drift is reported, never applied.** pg2osync will not run DDL on the
 target's behalf. A publication that does not match the configuration is an
-error, not something to silently fix.
+error, not something to silently fix. A table whose columns change under a
+running pipeline is logged, naming what was added, removed or retyped — the
+index and the database now disagree about what a row looks like, and only a
+rebuild closes that. Which is why the index name is configuration.
 
 **No relational sources beyond PostgreSQL and MySQL/MariaDB**, and no
 non-relational sources. The value is depth on these, not breadth.

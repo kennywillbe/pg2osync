@@ -68,6 +68,41 @@ pub struct Relation {
     pub columns: Vec<RelationColumn>,
 }
 
+/// What changed between two descriptions of the same table.
+///
+/// PostgreSQL re-sends a RELATION message whenever a table's shape changes, and
+/// replacing the cached one silently is how an index comes to disagree with the
+/// database about what a row looks like: new documents carry the new column,
+/// every document written before it does not, and nothing said so.
+pub fn column_drift(before: &Relation, after: &Relation) -> Option<String> {
+    fn names(r: &Relation) -> Vec<&str> {
+        r.columns.iter().map(|c| c.name.as_str()).collect()
+    }
+    let (old, new) = (names(before), names(after));
+    let added: Vec<&str> = new.iter().filter(|c| !old.contains(c)).copied().collect();
+    let removed: Vec<&str> = old.iter().filter(|c| !new.contains(c)).copied().collect();
+    let retyped: Vec<String> = before
+        .columns
+        .iter()
+        .filter_map(|b| {
+            let a = after.columns.iter().find(|a| a.name == b.name)?;
+            (a.type_oid != b.type_oid).then(|| format!("{} ({} -> {})", b.name, b.type_oid, a.type_oid))
+        })
+        .collect();
+
+    let mut parts = Vec::new();
+    if !added.is_empty() {
+        parts.push(format!("added {}", added.join(", ")));
+    }
+    if !removed.is_empty() {
+        parts.push(format!("removed {}", removed.join(", ")));
+    }
+    if !retyped.is_empty() {
+        parts.push(format!("retyped {}", retyped.join(", ")));
+    }
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
+
 /// One column of a row tuple.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TupleValue {
@@ -363,6 +398,49 @@ pub fn parse(msg: &[u8]) -> Result<Message, ParseError> {
 
 #[cfg(test)]
 mod tests {
+    fn relation_with(columns: &[(&str, u32)]) -> Relation {
+        Relation {
+            rel_id: 1,
+            schema: "public".into(),
+            name: "users".into(),
+            replica_identity: ReplicaIdentity::Default,
+            columns: columns
+                .iter()
+                .map(|(name, type_oid)| RelationColumn {
+                    name: (*name).into(),
+                    type_oid: *type_oid,
+                    typmod: -1,
+                    in_replica_identity: false,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn an_unchanged_table_reports_nothing() {
+        let r = relation_with(&[("id", 23), ("name", 25)]);
+        assert_eq!(column_drift(&r, &r), None);
+    }
+
+    #[test]
+    fn every_shape_change_is_named() {
+        let before = relation_with(&[("id", 23), ("name", 25), ("old", 25)]);
+        let after = relation_with(&[("id", 20), ("name", 25), ("new", 25)]);
+        let drift = column_drift(&before, &after).expect("changed");
+        assert!(drift.contains("added new"), "{drift}");
+        assert!(drift.contains("removed old"), "{drift}");
+        assert!(drift.contains("id (23 -> 20)"), "{drift}");
+    }
+
+    #[test]
+    fn a_rename_reads_as_a_drop_and_an_add() {
+        // the wire carries no rename, so this is the honest description
+        let before = relation_with(&[("email", 25)]);
+        let after = relation_with(&[("mail", 25)]);
+        let drift = column_drift(&before, &after).expect("changed");
+        assert!(drift.contains("added mail") && drift.contains("removed email"), "{drift}");
+    }
+
     use super::*;
 
     fn put_str(v: &mut Vec<u8>, s: &str) {

@@ -164,6 +164,17 @@ impl WalSource {
                         .map_err(|e| anyhow::anyhow!("pgoutput decode failed: {e}"))?;
                     match msg {
                         crate::pgoutput::Message::Relation(rel) => {
+                            if let Some(previous) = relations.get(&rel.rel_id)
+                                && let Some(drift) = crate::pgoutput::column_drift(previous, &rel)
+                            {
+                                // documents written before this point keep the
+                                // old shape until the index is rebuilt, which
+                                // is why the index name is configuration
+                                tracing::warn!(target: "pg2osync::source",
+                                    "{}.{} changed shape: {drift}. Documents already in \
+                                     the index keep the old shape until it is rebuilt",
+                                    rel.schema, rel.name);
+                            }
                             relations.insert(rel.rel_id, rel.clone());
                         }
                         crate::pgoutput::Message::Truncate(tr) => {
