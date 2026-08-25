@@ -22,6 +22,7 @@ index = "users"
 
 ```sh
 export PG2OSYNC_SOURCE_URL="postgres://user:pass@db-host/mydb"
+pg2osync setup-sql -c pg2osync.toml  # the SQL your DBA needs to run, if any
 pg2osync validate -c pg2osync.toml   # check connections and prerequisites
 pg2osync run -c pg2osync.toml        # consistent initial load, then streaming
 ```
