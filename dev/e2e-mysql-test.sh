@@ -287,6 +287,14 @@ nohup $BIN run -c "$RCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
 # stopping the stale copied row from landing on top of it.
 sleep 1
 my "UPDATE resume_probe SET v='changed-during-the-load' WHERE id = 131000;"
+# And a row deleted while the load is still running. The version cannot protect
+# this one on its own: a delete leaves a tombstone that lives for gc_deletes, and
+# a copy row starved past that would be accepted back. The engine drops such a
+# row instead of offering it. This case only pins the ordering — the starvation
+# that breaks it cannot be staged from a shell script.
+my "DELETE FROM resume_probe WHERE id = 130000;"
+# one row fewer to wait for, now that the load itself is racing a delete
+src_rows=$((src_rows - 1))
 for _ in $(seq 1 180); do
   refresh
   [ "$(os_count e2e_mysql_resume)" = "$src_rows" ] && break
@@ -307,6 +315,8 @@ check "a row added while down arrived" "$(os_field e2e_mysql_resume 400001 v)" "
 check "a row updated while down is current" "$(os_field e2e_mysql_resume 77 v)" "updated-while-down"
 check "a row changed during the load is not overwritten by it" \
   "$(os_field e2e_mysql_resume 131000 v)" "changed-during-the-load"
+check "a row deleted during the load is not resurrected by it" \
+  "$(os_status e2e_mysql_resume 130000)" "404"
 # the load holding one read view for its whole duration is what this replaced
 open_trx=$(my "SELECT count(*) FROM information_schema.innodb_trx;")
 check "no transaction outlives the load" "$open_trx" "0"

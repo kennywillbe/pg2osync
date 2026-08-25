@@ -133,6 +133,35 @@ versions from a numbering that no longer exists and would reject everything
 written under the new one, so a position behind the checkpoint refuses to start
 rather than reloading into silence.
 
+**A write the stream has already removed is dropped, not offered.** Versioning
+alone does not make the overlap safe, and this is the one place it does not. A
+versioned delete leaves a tombstone carrying the delete's version, the target
+keeps that tombstone only for `index.gc_deletes` — 60s by default — and once it
+is gone `external_gte` accepts *any* version, including one below the delete's.
+So a copied row starved behind a busy stream for longer than that would put the
+document back. Measured against a real target at `gc_deletes = 1s`: the same
+write is refused with a 409 immediately and accepted two seconds later. `TRUNCATE`
+has the same shape, since it clears an index with versioned deletes.
+
+The engine therefore remembers what the stream removed and drops a copied row
+that is older than the removal, rather than asking the target for a comparison it
+cannot make. This is the move DBLog makes for the same problem — it buffers a
+chunk and removes every key the log touched between two watermarks — except that
+watermarks exist there to substitute for versions, and versions already order
+everything else here, so only the case they cannot express needs it.
+
+What bounds the state is the load's own protocol: a chunk's rows, then a mark,
+then a *wait* for that mark to be written. When a mark arrives, every row of its
+chunk has been handed over and none of the next chunk can exist yet, so the
+window closes and the memory is one chunk's worth of deletes rather than the
+load's. A loader that sent the next chunk before its mark was confirmed would
+reopen the hole silently, which is why the ordering is stated in both places.
+
+Raising `index.gc_deletes` for the duration of the load was the alternative and
+is rejected: it moves the window instead of closing it, costs target heap for
+every tombstone it holds, and an interrupted load would leave the setting raised
+the way one already leaves `refresh_interval` at `-1`.
+
 **The load runs beside the stream, not before it.** Loading first means nothing
 acknowledges a position for the load's whole duration, so retained WAL grows
 monotonically and a large enough table invalidates the slot — which forces the
