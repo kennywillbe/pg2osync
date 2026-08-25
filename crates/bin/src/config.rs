@@ -69,6 +69,17 @@ pub struct SourceConfig {
     /// pt-online-schema-change aims for with its 0.5s chunk target.
     #[serde(default = "default_load_chunk_rows")]
     pub load_chunk_rows: i64,
+    /// How many ranges of the initial load are read at once, each on its own
+    /// connection.
+    ///
+    /// One is the default because the read was never the constraint: a single
+    /// `COPY` hands over rows more than twenty times faster than the pipeline
+    /// indexes them. It becomes worth raising only once the write path is
+    /// concurrent enough that this process's own parsing is the limit — and it
+    /// multiplies the read load on the operator's database, which is not a
+    /// default anyone should inherit unmeasured. PostgreSQL only.
+    #[serde(default = "default_load_workers")]
+    pub load_workers: usize,
     #[serde(default = "default_slot_name")]
     pub slot_name: String,
     #[serde(default = "default_publication")]
@@ -109,6 +120,10 @@ fn default_reconnect_backoff() -> u64 {
 
 fn default_load_chunk_rows() -> i64 {
     50_000
+}
+
+fn default_load_workers() -> usize {
+    1
 }
 
 fn default_slot_name() -> String {

@@ -314,9 +314,21 @@ pub async fn run(
     // is its own statement and its own snapshot. Holding one open for the whole
     // load pins the xmin horizon, so autovacuum cannot clean anything that died
     // after it started — minutes are fine, an hour on a busy table is not.
-    let reader = pg2osync_source::tls::connect(tls, source_url)
-        .await
-        .context("backfill connection failed")?;
+    // One connection per reader, and they outlive the table loop: opening them
+    // per wave would pay a handshake for every few hundred milliseconds of work.
+    // At the default width this is the single connection it always was.
+    let mut readers = Vec::new();
+    for _ in 0..cfg.source.load_workers.max(1) {
+        readers.push(
+            pg2osync_source::tls::connect(tls, source_url)
+                .await
+                .context("backfill connection failed")?,
+        );
+    }
+    if readers.len() > 1 {
+        tracing::info!(target: "pg2osync::backfill",
+            "reading the load with {} connections", readers.len());
+    }
     // One counter for the whole load: a mark only has to be increasing, and a
     // single sequence keeps the wait condition a comparison.
     let mut mark: u64 = 0;
@@ -418,70 +430,42 @@ pub async fn run(
 
         let started = std::time::Instant::now();
         let mut count: u64 = 0;
-        for (nth, range) in ranges.iter().enumerate().skip(first) {
-            // Between ranges, never inside one. A `COPY` paused mid-stream would
+        let plan = RangePlan {
+            schema,
+            table,
+            qualified: &tbl.table,
+            cols: &cols,
+            data_cols,
+            child_specs,
+            soft_delete: tbl.soft_delete.as_deref(),
+            pk_column: pk_column.as_deref(),
+            filter: scope.filter.as_deref(),
+        };
+        // Ranges are read in waves, one per reader, with a barrier at the end of
+        // each. A free-running pool would be faster by the width of the skew
+        // between ranges and wrong in two ways: the engine forgets its record of
+        // stream-removed keys on every load mark, which is only safe while
+        // nothing from before that mark is still in flight; and progress is a
+        // count of *leading* ranges written, which out-of-order completion
+        // cannot advance. A wave satisfies both by construction — it is
+        // contiguous, and it is finished before its mark is sent.
+        for wave_start in (first..ranges.len()).step_by(readers.len()) {
+            let wave = &ranges[wave_start..(wave_start + readers.len()).min(ranges.len())];
+            // Between waves, never inside one. A `COPY` paused mid-stream would
             // hold its snapshot open for as long as the pause lasts, which is
             // the long transaction this design exists to avoid — and a range is
             // under a second's work at measured rates, so waiting for one to
             // finish costs nothing worth having.
             wait_for_slot_room(admin, &cfg.source.slot_name).await?;
-            // The position read before the range becomes the version of every
-            // document the range produces. A change committed after this point
-            // necessarily has a higher position, so it wins at the target
-            // whichever order the two arrive in — which is what allows the copy
-            // to run beside the stream instead of before it. It is a version
-            // only: the range's rows still never advance the checkpoint.
-            let chunk_lsn = current_lsn(admin).await?;
-            let sql = copy_statement(
-                &tbl.table,
-                data_cols,
-                child_specs,
-                tbl.soft_delete.as_deref(),
-                range,
-                pk_column.as_deref(),
-                scope.filter.as_deref(),
-            );
-            let copy_stream = reader.copy_out(&sql).await?;
-            use futures::StreamExt;
-            // A cursor rather than draining each line off the front: draining
-            // from the front shifts everything behind it, so a network chunk
-            // full of short rows paid one memmove of the whole chunk per row.
-            // Measured no faster on a load this size — the target's indexing
-            // rate dominates by two orders of magnitude — but the quadratic
-            // shape is gone and there is one allocation less per row.
-            let mut pending: Vec<u8> = Vec::new();
-            let mut stream = std::pin::pin!(copy_stream);
-            while let Some(chunk) = stream.next().await {
-                let chunk: bytes::Bytes = chunk.context("copy stream failed")?;
-                pending.extend_from_slice(&chunk);
-                let mut consumed = 0usize;
-                while let Some(nl) = pending[consumed..].iter().position(|&b| b == b'\n') {
-                    let line = &pending[consumed..consumed + nl];
-                    consumed += nl + 1;
-                    if line.is_empty() {
-                        continue;
-                    }
-                    count += 1;
-                    // child collections arrive as ordinary jsonb columns of this
-                    // very row, so nothing extra is fetched per parent
-                    let change = {
-                        let text = String::from_utf8_lossy(line);
-                        let fields: Vec<Option<Vec<u8>>> =
-                            split_copy_line(&text).iter().map(unescape_copy).collect();
-                        build_change(schema, table, &cols, &fields, chunk_lsn, child_specs)?
-                    };
-                    if tx.send(ChangeEvent::Row(change)).await.is_err() {
-                        bail!("engine closed during backfill");
-                    }
-                    if count.is_multiple_of(ROWS_PER_BOUNDARY) {
-                        send_boundary(&tx).await?;
-                    }
-                }
-                // one compaction per network chunk, not one per row
-                pending.drain(..consumed);
+            let read = wave
+                .iter()
+                .zip(readers.iter())
+                .map(|(range, reader)| read_range(&plan, reader, range, &tx));
+            for rows in futures::future::try_join_all(read).await? {
+                count += rows;
             }
             // Strict order: rows, then the mark, then the progress document. A
-            // crash anywhere in it can only lose the range and redo it, which an
+            // crash anywhere in it can only lose the wave and redo it, which an
             // idempotent write makes free — the reverse order would claim a
             // range that was never written.
             mark += 1;
@@ -493,7 +477,7 @@ pub async fn run(
                 .await
                 .map_err(|_| anyhow::anyhow!("engine stopped before the range was written"))?;
             if let LoadCursor::Ranges { done, .. } = &mut progress.cursor {
-                *done = nth + 1;
+                *done = wave_start + wave.len();
             }
             if scope.resumable {
                 sink.write_state(&progress_key, &progress.to_doc()).await?;
@@ -517,6 +501,99 @@ pub async fn run(
         }
     }
     Ok(())
+}
+
+/// Everything about a table that every range of it shares.
+///
+/// Pinned once per table rather than per range: a column added mid-load would
+/// otherwise leave earlier ranges shaped one way and later ranges another.
+struct RangePlan<'a> {
+    schema: &'a str,
+    table: &'a str,
+    qualified: &'a str,
+    cols: &'a [ColMeta],
+    data_cols: &'a [ColMeta],
+    child_specs: &'a [ChildSpec],
+    soft_delete: Option<&'a str>,
+    pk_column: Option<&'a str>,
+    filter: Option<&'a str>,
+}
+
+/// Read one range on one connection, and return how many rows it produced.
+///
+/// Everything a range needs is either in the plan or read on its own
+/// connection, so several of these run at once without sharing anything but the
+/// channel they send to — which is safe because ranges cover disjoint keys and
+/// every document carries the position it was read at.
+async fn read_range(
+    plan: &RangePlan<'_>,
+    reader: &tokio_postgres::Client,
+    range: &KeyRange,
+    tx: &Sender<ChangeEvent>,
+) -> Result<u64> {
+    // The position read before the range becomes the version of every document
+    // the range produces. A change committed after this point necessarily has a
+    // higher position, so it wins at the target whichever order the two arrive
+    // in — which is what allows the copy to run beside the stream instead of
+    // before it. It is a version only: the range's rows still never advance the
+    // checkpoint.
+    let chunk_lsn = current_lsn(reader).await?;
+    let sql = copy_statement(
+        plan.qualified,
+        plan.data_cols,
+        plan.child_specs,
+        plan.soft_delete,
+        range,
+        plan.pk_column,
+        plan.filter,
+    );
+    let copy_stream = reader.copy_out(&sql).await?;
+    use futures::StreamExt;
+    let mut count: u64 = 0;
+    // A cursor rather than draining each line off the front: draining from the
+    // front shifts everything behind it, so a network chunk full of short rows
+    // paid one memmove of the whole chunk per row. Measured no faster on a load
+    // this size — the target's indexing rate dominates — but the quadratic
+    // shape is gone and there is one allocation less per row.
+    let mut pending: Vec<u8> = Vec::new();
+    let mut stream = std::pin::pin!(copy_stream);
+    while let Some(chunk) = stream.next().await {
+        let chunk: bytes::Bytes = chunk.context("copy stream failed")?;
+        pending.extend_from_slice(&chunk);
+        let mut consumed = 0usize;
+        while let Some(nl) = pending[consumed..].iter().position(|&b| b == b'\n') {
+            let line = &pending[consumed..consumed + nl];
+            consumed += nl + 1;
+            if line.is_empty() {
+                continue;
+            }
+            count += 1;
+            // child collections arrive as ordinary jsonb columns of this very
+            // row, so nothing extra is fetched per parent
+            let change = {
+                let text = String::from_utf8_lossy(line);
+                let fields: Vec<Option<Vec<u8>>> =
+                    split_copy_line(&text).iter().map(unescape_copy).collect();
+                build_change(
+                    plan.schema,
+                    plan.table,
+                    plan.cols,
+                    &fields,
+                    chunk_lsn,
+                    plan.child_specs,
+                )?
+            };
+            if tx.send(ChangeEvent::Row(change)).await.is_err() {
+                bail!("engine closed during backfill");
+            }
+            if count.is_multiple_of(ROWS_PER_BOUNDARY) {
+                send_boundary(tx).await?;
+            }
+        }
+        // one compaction per network chunk, not one per row
+        pending.drain(..consumed);
+    }
+    Ok(count)
 }
 
 /// Hold the copy back while the replication slot is beyond the WAL the server

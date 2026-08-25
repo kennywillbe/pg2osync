@@ -748,5 +748,77 @@ check "streaming resumes once the name matches again" \
   "$(os_field e2e_rename 3 v)" "after-rename-back"
 stop_sync
 
+echo -e "\n\033[1m== 18. the load read by several connections at once ==\033[0m"
+# Waves, not a free-running pool: progress counts *leading* ranges written, and
+# the engine forgets its record of stream-removed keys on every load mark. Both
+# hold only if a wave is contiguous and finished before its mark.
+PWCONFIG=$(mktemp /tmp/pg2osync-e2e-workers.XXXXXX)
+PWSLOT=pg2osync_e2e_workers
+# Its own log: the shared one already holds two dozen "resuming the load" lines
+# from earlier sections, so grepping it would prove nothing about this run.
+LOG18=/tmp/pg2osync-e2e-workers.log
+: > "$LOG18"
+sed -e "s/^slot_name = .*/slot_name = \"$PWSLOT\"/" \
+    -e "s/^publication = .*/publication = \"${PWSLOT}_pub\"/" \
+    -e "s/^index = .*/index = \"e2e_workers\"/" \
+    -e "s#^bind = .*#bind = \"127.0.0.1:9120\"#" \
+    -e "s/^\[source\]/[source]\nload_workers = 4\nload_chunk_rows = 2000/" \
+    "$RCONFIG" > "$PWCONFIG"
+workers_cleanup() {
+  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  pg "SELECT pg_drop_replication_slot('$PWSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$PWSLOT');" > /dev/null 2>&1 || true
+  pg "DROP PUBLICATION IF EXISTS ${PWSLOT}_pub;" > /dev/null 2>&1 || true
+  rm -f "$PWCONFIG"
+}
+trap 'cleanup; resume_cleanup; conc_cleanup; rename_cleanup; workers_cleanup' EXIT
+pg "DROP PUBLICATION IF EXISTS ${PWSLOT}_pub; CREATE PUBLICATION ${PWSLOT}_pub FOR TABLE resume_probe;" > /dev/null 2>&1
+curl -s -XDELETE "$OS/e2e_workers?ignore_unavailable=true" > /dev/null
+PWPROG=load-postgres-$PWSLOT-public_resume_probe
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/$PWPROG" > /dev/null
+src_rows=$(pg "SELECT count(*) FROM resume_probe;")
+pw_done() { curl -s "$OS/.pg2osync_meta/_doc/$PWPROG" | jqf "(d.get('_source') or {}).get('done', -1)"; }
+nohup $BIN run -c "$PWCONFIG" > "$LOG18" 2>&1 < /dev/null & disown
+# Caught while it runs: the document is removed once the load finishes, so a
+# slow poll sees nothing rather than something wrong.
+done_at_kill=-1
+for _ in $(seq 1 400); do
+  seen=$(pw_done)
+  if [ "$seen" -gt 0 ] 2> /dev/null; then
+    done_at_kill=$seen
+    break
+  fi
+  sleep 0.05
+done
+pkill -9 -f "pg2osync run"; sleep 1
+if [ "$done_at_kill" -gt 0 ]; then
+  if [ $((done_at_kill % 4)) = 0 ]; then
+    ok "progress advances a wave at a time ($done_at_kill ranges, a multiple of 4)"
+  else
+    bad "progress recorded $done_at_kill ranges, which no wave of 4 could produce"
+  fi
+else
+  echo "  - not asserted: the load finished before any progress could be read"
+fi
+if grep -q "reading the load with 4 connections" "$LOG18"; then
+  ok "it really used four connections"
+else
+  bad "it did not report reading with four connections"
+fi
+nohup $BIN run -c "$PWCONFIG" >> "$LOG18" 2>&1 < /dev/null & disown
+for _ in $(seq 1 180); do
+  refresh
+  [ "$(os_count e2e_workers)" = "$src_rows" ] && break
+  sleep 1
+done
+check "every row is indexed after a parallel load" "$(os_count e2e_workers)" "$src_rows"
+if [ "$done_at_kill" -gt 0 ]; then
+  if grep -q "resuming the load of public.resume_probe" "$LOG18"; then
+    ok "and it resumed from the wave it had finished"
+  else
+    bad "the parallel load restarted from the beginning"
+  fi
+fi
+stop_sync
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

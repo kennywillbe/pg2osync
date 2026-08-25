@@ -265,6 +265,7 @@ read this as an order of magnitude, not a capacity plan:
 | Initial load | 200K docs in ~5.8 s (**~35,000 docs/s**) |
 | Initial load, 2M rows | ~43,000 rows/s with one write request open, **~87,000 with four** (`[engine] write_concurrency`) |
 | Initial load, 10M rows | ~43,000 rows/s at one, **~90,000 at four** — the ratio holds at scale |
+| Initial load with nested children | 27,400 parents/s with one reader, **42,100 with four** (`[source] load_workers`) |
 | Pipeline latency, commit to indexed | **p50 2 ms**, p99 3 ms |
 | Commit to searchable, single row | ~80 ms including the client round-trip and a forced index refresh |
 | One 50K-row transaction | propagated in ~1.4 s |

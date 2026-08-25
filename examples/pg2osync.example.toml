@@ -18,6 +18,10 @@ publication = "pg2osync_pub"
 # reconnect_max = 10
 # reconnect_backoff_ms = 1000
 # admin_url_env = "PG2OSYNC_ADMIN_URL"   # separate user for catalog queries
+# Ranges of the initial load read at once, each on its own connection. Worth
+# raising only for tables with nested children, where the server aggregates per
+# parent row: +53% there, +5-8% on ordinary tables for four times the read load.
+# load_workers = 1
 
 # MySQL only:
 # server_id = 424242                     # unique across the server's replicas
