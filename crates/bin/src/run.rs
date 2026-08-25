@@ -477,6 +477,32 @@ async fn run_postgres(
     .await
 }
 
+/// Run an initial load with the target's per-load settings relaxed.
+///
+/// Restoring is not optional and not conditional on success: an index left with
+/// refresh suspended looks empty to every search against it, and nothing would
+/// ever put it back.
+async fn with_bulk_load_settings<F, T>(
+    sink: &Arc<dyn Sink>,
+    cfg: &AppConfig,
+    load: F,
+) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    let indices: Vec<String> = cfg.sync.iter().map(|(k, t)| t.index_name(k)).collect();
+    let saved = sink.begin_bulk_load(&indices).await?;
+    let result = load.await;
+    // the tail still in the event channel is written after this, which is a
+    // batch or two out of millions
+    if let Err(e) = sink.end_bulk_load(&saved).await {
+        tracing::error!(target: "pg2osync::run",
+            "could not restore index settings after the initial load: {e}. \
+             Set refresh_interval and number_of_replicas back by hand");
+    }
+    result
+}
+
 /// One PostgreSQL streaming attempt: decide where to resume, build the
 /// pipeline, load if needed, stream until it stops.
 ///
@@ -540,6 +566,7 @@ async fn attempt_postgres(
     }
 
     let (events_tx, events_rx) = mpsc::channel::<ChangeEvent>(EVENT_CHANNEL_DEPTH);
+    let load_sink = sink.clone();
     let ctx = pipeline_ctx(cfg, sink, metrics, ack_tx)?;
     let engine = spawn_engine(
         events_rx,
@@ -551,7 +578,10 @@ async fn attempt_postgres(
     );
 
     if resume_from.is_none() {
-        crate::backfill::run(cfg, admin_url, tls, admin, children, events_tx.clone()).await?;
+        with_bulk_load_settings(&load_sink, cfg, async {
+            crate::backfill::run(cfg, admin_url, tls, admin, children, events_tx.clone()).await
+        })
+        .await?;
     }
 
     let started = std::time::Instant::now();
@@ -868,6 +898,7 @@ async fn attempt_mysql(
     };
 
     let (events_tx, events_rx) = mpsc::channel::<ChangeEvent>(EVENT_CHANNEL_DEPTH);
+    let load_sink = sink.clone();
     let ctx = pipeline_ctx(cfg, sink, metrics, ack_tx)?;
     let engine = spawn_engine(
         events_rx,
@@ -887,7 +918,10 @@ async fn attempt_mysql(
         }
         None => {
             tracing::info!(target: "pg2osync::run", "no usable checkpoint; initial load");
-            let start = source.snapshot(&mut admin, &events_tx).await?;
+            let start = with_bulk_load_settings(&load_sink, cfg, async {
+                source.snapshot(&mut admin, &events_tx).await
+            })
+            .await?;
             tracing::info!(target: "pg2osync::run",
                 "snapshot complete; streaming from {}@{}", start.file, start.pos);
             src_cfg.start_file = Some(start.file);

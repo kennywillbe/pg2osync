@@ -12,7 +12,7 @@ use opensearch::{BulkOperation, BulkParts, GetParts, IndexParts, OpenSearch};
 use pg2osync_core::checkpoint::Checkpoint;
 use pg2osync_core::error::CoreError;
 use pg2osync_core::lsn::Lsn;
-use pg2osync_core::sink::{Health, IndexSpec, LsnOp, Sink, SinkAck};
+use pg2osync_core::sink::{BulkLoadSettings, Health, IndexSpec, LsnOp, Sink, SinkAck};
 use serde_json::{Value, json};
 
 pub const META_INDEX: &str = ".pg2osync_meta";
@@ -127,6 +127,51 @@ impl OpenSearchSink {
     }
 
     /// Create the hidden checkpoint index if missing.
+    /// Say so when an index is still not refreshing.
+    ///
+    /// An initial load suspends refresh and puts it back afterwards. A load
+    /// killed in between leaves it suspended, and the symptom is the worst
+    /// kind: writes are accepted, the pipeline looks healthy, and searches
+    /// return nothing.
+    async fn warn_on_suspended_refresh(&self, tables: &[IndexSpec]) {
+        if self.serverless || tables.is_empty() {
+            return;
+        }
+        let names: Vec<&str> = tables.iter().map(|s| s.name.as_str()).collect();
+        let Ok(resp) = self
+            .client
+            .indices()
+            .get_settings(opensearch::indices::IndicesGetSettingsParts::Index(&names))
+            .send()
+            .await
+        else {
+            return;
+        };
+        let Ok(body) = resp.json::<Value>().await else {
+            return;
+        };
+        for name in names {
+            if body[name]["settings"]["index"]["refresh_interval"] == json!("-1") {
+                tracing::warn!(target: "pg2osync::sink",
+                    "index {name} has refresh_interval = -1, so nothing written to it is \
+                     searchable. An initial load that was interrupted leaves it this way; \
+                     restore it with PUT /{name}/_settings {{\"index\":{{\"refresh_interval\":null}}}}");
+            }
+        }
+    }
+
+    async fn put_settings(&self, index: &str, body: Value) -> Result<(), CoreError> {
+        let resp = self
+            .client
+            .indices()
+            .put_settings(opensearch::indices::IndicesPutSettingsParts::Index(&[index]))
+            .body(body)
+            .send()
+            .await
+            .map_err(http_err)?;
+        check_status(resp, &format!("settings for {index}")).await
+    }
+
     pub async fn ensure_meta_index(&self) -> Result<(), CoreError> {
         let exists = self
             .client
@@ -341,6 +386,7 @@ impl Sink for OpenSearchSink {
                 report_mapping(&spec.name, mapping, &body[&spec.name])?;
             }
         }
+        self.warn_on_suspended_refresh(tables).await;
         Ok(())
     }
 
@@ -439,6 +485,69 @@ impl Sink for OpenSearchSink {
             .await
             .map_err(http_err)?;
         check_status(resp, "refresh").await
+    }
+
+
+    async fn begin_bulk_load(&self, indices: &[String]) -> Result<BulkLoadSettings, CoreError> {
+        if self.serverless || indices.is_empty() {
+            // Serverless manages refresh and replication itself and rejects
+            // the settings call outright
+            return Ok(BulkLoadSettings::default());
+        }
+        let names: Vec<&str> = indices.iter().map(String::as_str).collect();
+        let resp = self
+            .client
+            .indices()
+            .get_settings(opensearch::indices::IndicesGetSettingsParts::Index(&names))
+            .send()
+            .await
+            .map_err(http_err)?;
+        let body: Value = resp.json().await.map_err(http_err)?;
+
+        let mut saved = Vec::new();
+        for index in indices {
+            let settings = &body[index]["settings"]["index"];
+            // "-1" means a previous load was interrupted before it could put
+            // the setting back; restoring that would make the damage
+            // permanent, so it is treated as "whatever the default is"
+            let refresh = settings["refresh_interval"]
+                .as_str()
+                .map(str::to_string)
+                .filter(|v| v != "-1");
+            let replicas = settings["number_of_replicas"].as_str().map(str::to_string);
+            saved.push((index.clone(), refresh, replicas));
+        }
+        for (index, _, _) in &saved {
+            self.put_settings(
+                index,
+                json!({"index": {"refresh_interval": "-1", "number_of_replicas": 0}}),
+            )
+            .await?;
+        }
+        tracing::info!(target: "pg2osync::sink",
+            "refresh and replicas suspended on {} index(es) for the initial load",
+            saved.len());
+        Ok(BulkLoadSettings(saved))
+    }
+
+    async fn end_bulk_load(&self, saved: &BulkLoadSettings) -> Result<(), CoreError> {
+        for (index, refresh, replicas) in &saved.0 {
+            // null restores the target's own default, which is the honest
+            // answer when the index did not set the value itself
+            self.put_settings(
+                index,
+                json!({"index": {
+                    "refresh_interval": refresh,
+                    "number_of_replicas": replicas
+                }}),
+            )
+            .await?;
+        }
+        if !saved.0.is_empty() {
+            tracing::info!(target: "pg2osync::sink",
+                "refresh and replicas restored on {} index(es)", saved.0.len());
+        }
+        Ok(())
     }
 
     async fn write_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), CoreError> {

@@ -53,6 +53,11 @@ pub struct IndexSpec {
     pub mapping: Option<Value>,
 }
 
+/// Index settings put aside while an initial load runs, so they can be put
+/// back afterwards. Opaque to the engine: only the sink knows what it saved.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BulkLoadSettings(pub Vec<(String, Option<String>, Option<String>)>);
+
 #[async_trait::async_trait]
 pub trait Sink: Send + Sync {
     /// Create/verify indices, mappings, aliases. Called once before backfill.
@@ -79,6 +84,25 @@ pub trait Sink: Send + Sync {
     /// engines that refresh on an interval need to be asked. Implementations
     /// where acceptance already implies visibility do nothing here.
     async fn refresh(&self, indices: &[String]) -> Result<(), CoreError>;
+
+    /// Relax the settings that only cost during a bulk load, returning what
+    /// they were.
+    ///
+    /// An index that refreshes every second and writes replicas while millions
+    /// of rows land is doing work nobody is waiting for: nothing searches an
+    /// index that is still being filled. Targets with no such settings do
+    /// nothing here.
+    async fn begin_bulk_load(
+        &self,
+        _indices: &[String],
+    ) -> Result<BulkLoadSettings, CoreError> {
+        Ok(BulkLoadSettings::default())
+    }
+
+    /// Put back what `begin_bulk_load` set aside.
+    async fn end_bulk_load(&self, _saved: &BulkLoadSettings) -> Result<(), CoreError> {
+        Ok(())
+    }
 
     /// Persist the pipeline checkpoint durably.
     async fn write_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), CoreError>;
