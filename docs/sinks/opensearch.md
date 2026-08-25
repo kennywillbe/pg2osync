@@ -28,15 +28,46 @@ url = "http://localhost:9200"
 
 ## Amazon OpenSearch Serverless
 
+**This has never been run against a real collection.** The profile exists and
+skips the calls AOSS is documented to reject, but nobody has pointed it at
+`*.aoss.amazonaws.com`. Read the rest of this section before planning around
+it.
+
 ```toml
 [target]
 url = "https://<collection-id>.<region>.aoss.amazonaws.com"
 serverless = true
 ```
 
-Serverless mode skips operations that AOSS rejects (`_refresh`, settings
-changes) and expects requests to be IAM-signed — deploy behind a SigV4
-signing proxy/gateway (or an AWS-side auth bridge) and point pg2osync at it.
+What the AWS documentation says, and what each point means here:
+
+- **SigV4 is the only authentication.** Every request to a collection endpoint
+  must be signed with service name `aoss`; there is no basic-auth path, and no
+  AWS-supported proxy that provides one. `aws-sigv4-proxy` is an AWS Labs
+  sample rather than a documented AOSS component. Whatever you put in front,
+  it is yours to run.
+- **Your collection must be a SEARCH collection.** Time-series and vector
+  collections reject a custom document id
+  (`illegal_argument_exception: Document ID is not supported in create/index
+  operation request`), and this tool writes the primary key as `_id` — that is
+  what makes replay idempotent. There is no version of this that works without
+  it.
+- **`TRUNCATE` cannot work.** It runs as `_delete_by_query`, which is not in
+  the supported-operations list. A truncate on the source would fail against a
+  collection.
+- **`/synced` cannot work.** The refresh interval is roughly ten seconds,
+  `_refresh` is unsupported, and `refresh=true`/`wait_for` are rejected. There
+  is no way to make a write visible on demand, so read-your-writes is not
+  available on Serverless — only on a provisioned domain.
+- **Unchanged-TOAST completion may not work.** It reads documents back with
+  `_mget`, which AOSS lists only as a GET; the client here sends it as a POST.
+- **The checkpoint index is `.pg2osync_meta`.** A leading dot is not documented
+  as forbidden, but it is the convention for system indices, which AOSS manages
+  itself. This is the least tested corner of an untested path.
+
+None of that is fatal to the idea — a search collection, a signing proxy, no
+truncates and no `/synced` is a real configuration. It is simply not one that
+has been demonstrated, and the matrix in the README now says so.
 
 ## Index naming rules
 
