@@ -380,10 +380,11 @@ impl Sink for ElasticsearchSink {
     }
 
     async fn write_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), CoreError> {
+        let doc_id = crate::checkpoint_doc_id(&checkpoint.stream);
         let (status, _) = self
             .send(
                 reqwest::Method::PUT,
-                &format!("/{META_INDEX}/_doc/{}", crate::CHECKPOINT_DOC_ID),
+                &format!("/{META_INDEX}/_doc/{doc_id}"),
                 Some(crate::checkpoint_doc(checkpoint).to_string()),
             )
             .await?;
@@ -393,16 +394,32 @@ impl Sink for ElasticsearchSink {
         Ok(())
     }
 
-    async fn read_checkpoint(&self) -> Result<Option<Checkpoint>, CoreError> {
+    async fn read_checkpoint(
+        &self,
+        stream: &pg2osync_core::checkpoint::StreamId,
+    ) -> Result<Option<Checkpoint>, CoreError> {
+        let doc_id = crate::checkpoint_doc_id(stream);
         let (status, body) = self
             .send(
                 reqwest::Method::GET,
-                &format!("/{META_INDEX}/_doc/{}", crate::CHECKPOINT_DOC_ID),
+                &format!("/{META_INDEX}/_doc/{doc_id}"),
                 None,
             )
             .await?;
         if status == 404 {
-            return Ok(None);
+            // written before checkpoints were kept per stream; the caller
+            // still checks that it belongs to this one
+            let (status, body) = self
+                .send(
+                    reqwest::Method::GET,
+                    &format!("/{META_INDEX}/_doc/{}", crate::CHECKPOINT_DOC_ID),
+                    None,
+                )
+                .await?;
+            if status != 200 {
+                return Ok(None);
+            }
+            return Ok(crate::checkpoint_from_doc(&body["_source"]));
         }
         if status != 200 {
             return Err(CoreError::Sink(format!("read checkpoint: {status}")));

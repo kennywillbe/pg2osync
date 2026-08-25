@@ -761,7 +761,10 @@ mod pipeline_tests {
             Ok(())
         }
 
-        async fn read_checkpoint(&self) -> Result<Option<Checkpoint>, CoreError> {
+        async fn read_checkpoint(
+            &self,
+            _stream: &pg2osync_core::checkpoint::StreamId,
+        ) -> Result<Option<Checkpoint>, CoreError> {
             Ok(self.last_checkpoint())
         }
 

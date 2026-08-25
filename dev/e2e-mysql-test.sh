@@ -144,8 +144,8 @@ synced
 check "streaming continues after TRUNCATE" "$(os_count e2e_mysql_users)" "1"
 
 say "6. checkpoint format"
-source_kind=$(curl -s "$OS/.pg2osync_meta/_doc/default" | jqf "d['_source']['source']")
-position=$(curl -s "$OS/.pg2osync_meta/_doc/default" | jqf "d['_source']['position']")
+source_kind=$(curl -s "$OS/.pg2osync_meta/_doc/mysql-990001" | jqf "d['_source']['source']")
+position=$(curl -s "$OS/.pg2osync_meta/_doc/mysql-990001" | jqf "d['_source']['position']")
 check "checkpoint source" "$source_kind" "mysql"
 if [[ "$position" == *":"* ]]; then
   ok "binlog position stored ($position)"

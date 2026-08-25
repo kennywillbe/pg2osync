@@ -184,6 +184,18 @@ Two honest caveats:
 Serverless targets skip both, since they manage refresh and replication
 themselves and reject the call.
 
+## Checkpoints
+
+One document per stream in the target, named `<source>-<slot_name>` for
+PostgreSQL and `<source>-<server_id>` for MySQL. Per stream rather than one
+shared document, because two pipelines writing to the same target — a
+zero-downtime re-index, or tables split across instances — otherwise overwrite
+each other's position, and either one restarting then finds a checkpoint
+belonging to the other and re-runs a full initial load.
+
+A checkpoint written before that change lives under `default`, and is still
+read when a stream has no document of its own, so an upgrade does not re-load.
+
 ## Row fidelity
 
 - **Unchanged TOAST** (PostgreSQL): an UPDATE omits large unchanged columns. If

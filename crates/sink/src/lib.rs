@@ -18,7 +18,25 @@ use serde_json::{Value, json};
 pub const META_INDEX: &str = ".pg2osync_meta";
 /// Single checkpoint document per pipeline; per-document atomicity is what
 /// makes the write crash-safe without any compare-and-swap.
+/// The document every pipeline used to write its checkpoint to, whatever
+/// stream it belonged to. Still read as a fallback so an existing deployment
+/// does not re-run its initial load on upgrade; never written any more.
 pub const CHECKPOINT_DOC_ID: &str = "default";
+
+/// Where one stream's checkpoint lives.
+///
+/// Two pipelines writing to the same target used to share a single document,
+/// so each overwrote the other's position — which is exactly what the
+/// documented reindex recipe asks you to run, and what "split tables across
+/// instances" means as well. Either instance restarting then found a
+/// checkpoint belonging to the other, rejected it, and re-ran a full load.
+pub fn checkpoint_doc_id(stream: &pg2osync_core::checkpoint::StreamId) -> String {
+    let tame: String = format!("{}-{}", stream.source, stream.stream)
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    tame
+}
 /// Bumped when the document layout changes; v1 stored only `confirmed_lsn`.
 pub const CHECKPOINT_SCHEMA_VERSION: u32 = 2;
 
@@ -593,11 +611,55 @@ impl Sink for OpenSearchSink {
             .unwrap_or_default())
     }
 
-    async fn write_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), CoreError> {
-        self.ensure_meta_index().await?;
+
+    async fn switch_alias(&self, alias: &str, index: &str) -> Result<(), CoreError> {
+        // where it points now, so the remove names real indices: a remove
+        // against a wildcard errors when the alias does not exist yet
         let resp = self
             .client
-            .index(IndexParts::IndexId(META_INDEX, CHECKPOINT_DOC_ID))
+            .indices()
+            .get_alias(opensearch::indices::IndicesGetAliasParts::Name(&[alias]))
+            .send()
+            .await
+            .map_err(http_err)?;
+        // an alias that does not exist yet answers 404 with an error body, and
+        // its keys are not index names — reading them would ask the target to
+        // remove the alias from an index called "error"
+        let current: Value = if resp.status_code().is_success() {
+            resp.json().await.map_err(http_err)?
+        } else {
+            json!({})
+        };
+
+        let mut actions: Vec<Value> = current
+            .as_object()
+            .map(|indices| {
+                indices
+                    .keys()
+                    .filter(|name| name.as_str() != index)
+                    .map(|name| json!({"remove": {"index": name, "alias": alias}}))
+                    .collect()
+            })
+            .unwrap_or_default();
+        actions.push(json!({"add": {"index": index, "alias": alias}}));
+
+        let resp = self
+            .client
+            .indices()
+            .update_aliases()
+            .body(json!({"actions": actions}))
+            .send()
+            .await
+            .map_err(http_err)?;
+        check_status(resp, &format!("point alias {alias} at {index}")).await
+    }
+
+    async fn write_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), CoreError> {
+        self.ensure_meta_index().await?;
+        let doc_id = crate::checkpoint_doc_id(&checkpoint.stream);
+        let resp = self
+            .client
+            .index(IndexParts::IndexId(META_INDEX, &doc_id))
             .body(checkpoint_doc(checkpoint))
             .send()
             .await
@@ -605,15 +667,31 @@ impl Sink for OpenSearchSink {
         check_status(resp, "write checkpoint").await
     }
 
-    async fn read_checkpoint(&self) -> Result<Option<Checkpoint>, CoreError> {
+    async fn read_checkpoint(
+        &self,
+        stream: &pg2osync_core::checkpoint::StreamId,
+    ) -> Result<Option<Checkpoint>, CoreError> {
+        let doc_id = crate::checkpoint_doc_id(stream);
         let resp = self
             .client
-            .get(GetParts::IndexId(META_INDEX, CHECKPOINT_DOC_ID))
+            .get(GetParts::IndexId(META_INDEX, &doc_id))
             .send()
             .await
             .map_err(http_err)?;
         if resp.status_code().as_u16() == 404 {
-            return Ok(None);
+            // written before checkpoints were kept per stream; the caller
+            // still checks that it belongs to this one
+            let legacy = self
+                .client
+                .get(GetParts::IndexId(META_INDEX, CHECKPOINT_DOC_ID))
+                .send()
+                .await
+                .map_err(http_err)?;
+            if !legacy.status_code().is_success() {
+                return Ok(None);
+            }
+            let body: Value = legacy.json().await.map_err(|e| CoreError::Sink(e.to_string()))?;
+            return Ok(checkpoint_from_doc(&body["_source"]));
         }
         if !resp.status_code().is_success() {
             let status = resp.status_code();

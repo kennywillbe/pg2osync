@@ -122,11 +122,27 @@ pub trait Sink: Send + Sync {
         ))
     }
 
+    /// Point `alias` at `index`, removing it from wherever it was, in one
+    /// step.
+    ///
+    /// The swap has to be atomic: a reader that resolves the alias between a
+    /// remove and an add gets an error, and this is the moment a zero-downtime
+    /// reindex exists to avoid.
+    async fn switch_alias(&self, _alias: &str, _index: &str) -> Result<(), CoreError> {
+        Err(CoreError::Sink(
+            "this target has no aliases to switch".into(),
+        ))
+    }
+
     /// Persist the pipeline checkpoint durably.
     async fn write_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), CoreError>;
 
-    /// Read the last persisted checkpoint; None before the first persist.
-    async fn read_checkpoint(&self) -> Result<Option<Checkpoint>, CoreError>;
+    /// Read the last persisted checkpoint for one stream; None before the
+    /// first persist.
+    async fn read_checkpoint(
+        &self,
+        stream: &crate::checkpoint::StreamId,
+    ) -> Result<Option<Checkpoint>, CoreError>;
 
     /// Cheap health probe for /status and reconnect logic.
     async fn health(&self) -> Result<Health, CoreError>;

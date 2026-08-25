@@ -98,7 +98,18 @@ impl MeilisearchSink {
         Err(CoreError::Sink("task timed out after 30s".into()))
     }
 
-    fn checkpoint_path(&self) -> String {
+    /// Named after the stream, so two pipelines sharing a state directory do
+    /// not overwrite each other's position.
+    fn checkpoint_path(&self, stream: &pg2osync_core::checkpoint::StreamId) -> String {
+        format!(
+            "{}/checkpoint-{}.json",
+            self.state_dir,
+            crate::checkpoint_doc_id(stream)
+        )
+    }
+
+    /// Where checkpoints lived before they were kept per stream.
+    fn legacy_checkpoint_path(&self) -> String {
         format!("{}/checkpoint.json", self.state_dir)
     }
 }
@@ -252,7 +263,7 @@ impl Sink for MeilisearchSink {
     }
 
     async fn write_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), CoreError> {
-        let path = self.checkpoint_path();
+        let path = self.checkpoint_path(&checkpoint.stream);
         let tmp = format!("{path}.tmp");
         let bytes = serde_json::to_vec_pretty(&crate::checkpoint_doc(checkpoint))
             .map_err(|e| CoreError::Sink(e.to_string()))?;
@@ -263,15 +274,22 @@ impl Sink for MeilisearchSink {
         std::fs::rename(&tmp, &path).map_err(|e| CoreError::Sink(format!("checkpoint rename: {e}")))
     }
 
-    async fn read_checkpoint(&self) -> Result<Option<Checkpoint>, CoreError> {
-        match std::fs::read(self.checkpoint_path()) {
-            Ok(bytes) => {
-                let v: Value =
-                    serde_json::from_slice(&bytes).map_err(|e| CoreError::Sink(e.to_string()))?;
-                Ok(crate::checkpoint_from_doc(&v))
-            }
+    async fn read_checkpoint(
+        &self,
+        stream: &pg2osync_core::checkpoint::StreamId,
+    ) -> Result<Option<Checkpoint>, CoreError> {
+        let read = |path: String| match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice::<Value>(&bytes)
+                .map(|v| crate::checkpoint_from_doc(&v))
+                .map_err(|e| CoreError::Sink(e.to_string())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(CoreError::Sink(format!("checkpoint read: {e}"))),
+        };
+        match read(self.checkpoint_path(stream))? {
+            Some(checkpoint) => Ok(Some(checkpoint)),
+            // written before checkpoints were kept per stream; the caller
+            // still checks that it belongs to this one
+            None => read(self.legacy_checkpoint_path()),
         }
     }
 
