@@ -11,6 +11,10 @@ use std::sync::{Arc, Mutex};
 pub struct Metrics {
     pub events_total: Mutex<HashMap<String, AtomicU64>>,
     pub batches_flushed: AtomicU64,
+    /// Reads of the target to complete an update whose unchanged TOASTed
+    /// columns arrived as markers. Each one is a round-trip in the middle of
+    /// the pipeline, so it is worth being able to see how many there are.
+    pub toast_readbacks_total: AtomicU64,
     pub sink_errors_total: AtomicU64,
     pub reconnects_total: AtomicU64,
     /// 1 while the source is streaming, 0 while it is being retried. The
@@ -28,12 +32,16 @@ pub type SharedMetrics = Arc<Metrics>;
 
 impl Metrics {
     pub fn incr_event(&self, kind: &str) {
+        self.incr_event_by(kind, 1);
+    }
+
+    pub fn incr_event_by(&self, kind: &str, n: u64) {
         self.events_total
             .lock()
             .unwrap()
             .entry(kind.to_string())
             .or_insert_with(|| AtomicU64::new(0))
-            .fetch_add(1, Ordering::Relaxed);
+            .fetch_add(n, Ordering::Relaxed);
     }
 
     pub fn set_source_connected(&self, connected: bool) {
@@ -87,6 +95,13 @@ impl Metrics {
             "Batches written to the sink",
             "counter",
             self.batches_flushed.load(Ordering::Relaxed).to_string(),
+        );
+        push(
+            &mut out,
+            "pg2osync_toast_readbacks_total",
+            "Reads of the target to complete unchanged TOASTed columns",
+            "counter",
+            self.toast_readbacks_total.load(Ordering::Relaxed).to_string(),
         );
         push(
             &mut out,

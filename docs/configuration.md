@@ -319,6 +319,7 @@ scrape_configs:
 ```
 pg2osync_events_total{type="row|truncate"}
 pg2osync_batches_flushed
+pg2osync_toast_readbacks_total                  # reads to complete TOASTed columns
 pg2osync_sink_errors_total
 pg2osync_reconnects_total
 pg2osync_latency_ms{quantile="0.5|0.9|0.99"}   # source commit to indexed

@@ -144,6 +144,19 @@ sleep 2; refresh
 check "UPDATE propagated" "$(os_field e2e_users 4 name)" "dave-renamed"
 check "transform applied on update" "$(os_field e2e_users 4 email)" "***"
 
+# a wide, incompressible value is stored out of line, so an update that does
+# not touch it sends a marker instead of the value and the engine has to
+# complete the document from the one already indexed
+pg "UPDATE users SET metadata = (SELECT jsonb_build_object('blob', string_agg(md5(random()::text), ''))
+                                 FROM generate_series(1, 400)) WHERE id = 4;" > /dev/null
+sleep 2; refresh
+toast_len=$(curl -s "$OS/e2e_users/_doc/4" | jqf "len(d['_source']['metadata']['blob'])")
+pg "UPDATE users SET name = 'dave-toast' WHERE id = 4;" > /dev/null
+sleep 2; refresh
+check "an update that leaves a TOASTed column alone keeps its value" \
+  "$(curl -s "$OS/e2e_users/_doc/4" | jqf "len(d['_source']['metadata']['blob'])")" "$toast_len"
+check "the rest of that update still applied" "$(os_field e2e_users 4 name)" "dave-toast"
+
 pg "DELETE FROM users WHERE id=3;" > /dev/null
 sleep 2; refresh
 check "DELETE propagated" "$(os_status e2e_users 3)" "404"
@@ -151,7 +164,7 @@ check "DELETE propagated" "$(os_status e2e_users 3)" "404"
 say "5. changing a primary key moves the document"
 pg "UPDATE users SET id = 40 WHERE id = 4;" > /dev/null
 sleep 2; refresh
-check "row lives at its new id" "$(os_field e2e_users 40 name)" "dave-renamed"
+check "row lives at its new id" "$(os_field e2e_users 40 name)" "dave-toast"
 # the old document must not survive: nothing would ever collect it
 check "old document removed" "$(os_status e2e_users 4)" "404"
 pg "DELETE FROM users WHERE id = 40;" > /dev/null

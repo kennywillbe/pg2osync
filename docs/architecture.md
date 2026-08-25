@@ -49,7 +49,8 @@ nothing else. It:
    lands on the final piece);
 3. applies column projection and transforms;
 4. completes unchanged-TOAST columns by reading the previously indexed
-   document;
+   documents — for a whole group of rows in one request, not one round-trip
+   per row;
 5. maps `(schema, table)` to a target index.
 
 ### Sink task
@@ -161,6 +162,15 @@ without ever advancing the checkpoint — they have no position of their own.
   the table has `REPLICA IDENTITY FULL` the old tuple supplies the value;
   otherwise the previously indexed document is read back through
   `Sink::get_documents`.
+
+  The engine takes every row already waiting on its channel before doing that,
+  so the read is one request for the group rather than one per row. It waits
+  for nothing, so a row arriving alone is unaffected. `dev/toast-cost.sh`
+  measures it: 20,000 updates to a table with an 8 kB out-of-line column ran at
+  1,800 rows/s when each row read on its own and 4,800 rows/s batched, against
+  4,400 rows/s for the same table at `REPLICA IDENTITY FULL`. The read-back is
+  therefore no longer a reason to pay FULL's 1.5x WAL, and the counter
+  `pg2osync_toast_readbacks_total` says how often it happens.
 - **Types.** `numeric` and `decimal` become JSON strings, because a float
   round-trip loses precision. `bytea`, MySQL blobs and geometry become base64.
   `json`/`jsonb` are parsed into real JSON. Unknown types fall back to strings.

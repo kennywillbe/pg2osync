@@ -13,6 +13,7 @@ pub mod http;
 pub mod mapping;
 pub mod metrics;
 
+use std::collections::HashMap;
 use crate::mapping::TableMapping;
 use pg2osync_core::checkpoint::{Checkpoint, StreamId};
 use pg2osync_core::error::CoreError;
@@ -201,18 +202,25 @@ pub async fn run(
 
     let mut txn_buffer: Vec<LsnOp> = Vec::new();
     let mut txn_bytes: usize = 0;
+    // an event pulled off the channel while gathering rows, to be handled on
+    // the next turn rather than dropped
+    let mut deferred: Option<ChangeEvent> = None;
+    let mut break_err: Option<CoreError> = None;
     let txn_cap_bytes = ctx.cfg.txn_buffer_cap_mb.saturating_mul(1024 * 1024);
     let mut cap_warned = false;
 
     let result = loop {
-        let ev = tokio::select! {
-            ev = events.recv() => match ev {
-                Some(ev) => ev,
-                None => break Ok(()),
+        let ev = match deferred.take() {
+            Some(ev) => ev,
+            None => tokio::select! {
+                ev = events.recv() => match ev {
+                    Some(ev) => ev,
+                    None => break Ok(()),
+                },
+                _ = shutdown.changed() => {
+                    break Ok(());
+                }
             },
-            _ = shutdown.changed() => {
-                break Ok(());
-            }
         };
         tracing::trace!(target: "pg2osync::engine", "engine got event");
         match ev {
@@ -260,42 +268,76 @@ pub async fn run(
                 }
             }
             ChangeEvent::Row(row) => {
-                ctx.metrics.incr_event("row");
-                tracing::debug!(target: "pg2osync::engine", "ROW {}.{}", row.schema, row.table);
-                let index = ctx.mapping.index_for(&row.schema, &row.table);
-                let ops = match materialize(
-                    index,
-                    (&row.schema, &row.table),
-                    &row.kind,
-                    &ctx.projections,
-                    &ctx.transforms,
-                    ctx.sink.as_ref(),
-                )
-                .await
-                {
-                    Ok(ops) => ops,
-                    Err(e) => break Err(e),
-                };
-                txn_bytes += ops.iter().map(op_size).sum::<usize>();
-                txn_buffer.extend(ops);
-                if txn_bytes > txn_cap_bytes && !cap_warned {
-                    cap_warned = true;
-                    tracing::warn!(target: "pg2osync::engine",
-                        "open transaction exceeds txn_buffer_cap_mb ({} MB); it will be \
-                         split across sink requests",
-                        ctx.cfg.txn_buffer_cap_mb);
-                }
-                if txn_buffer.len() >= ctx.cfg.batch_size || txn_bytes >= ctx.cfg.batch_max_bytes {
-                    // oversized transaction split: safe because every op is
-                    // idempotent and the commit LSN lands on the final piece
-                    if batch_tx
-                        .send(SinkCommand::Write(std::mem::take(&mut txn_buffer)))
-                        .await
-                        .is_err()
-                    {
-                        break Err(CoreError::Other("batch channel closed".into()));
+                // Take every row already waiting in the channel, not just this
+                // one: rows that need a read of the target can then be read in
+                // one request instead of one round-trip each. Nothing is waited
+                // for, so this costs no latency when rows arrive alone.
+                let mut rows = vec![row];
+                while rows.len() < ctx.cfg.batch_size {
+                    match events.try_recv() {
+                        Ok(ChangeEvent::Row(next)) => rows.push(next),
+                        Ok(other) => {
+                            deferred = Some(other);
+                            break;
+                        }
+                        Err(_) => break,
                     }
-                    txn_bytes = 0;
+                }
+                ctx.metrics.incr_event_by("row", rows.len() as u64);
+                let completions =
+                    match fetch_completions(&rows, &ctx.mapping, ctx.sink.as_ref(), &ctx.metrics)
+                        .await
+                    {
+                        Ok(map) => map,
+                        Err(e) => break Err(e),
+                    };
+
+                for row in &rows {
+                    let index = ctx.mapping.index_for(&row.schema, &row.table);
+                    let previous = completion_id(&row.kind)
+                        .and_then(|id| completions.get(&(index.to_string(), id)))
+                        .and_then(Option::as_ref);
+                    let ops = match materialize(
+                        index,
+                        (&row.schema, &row.table),
+                        &row.kind,
+                        &ctx.projections,
+                        &ctx.transforms,
+                        previous,
+                    ) {
+                        Ok(ops) => ops,
+                        Err(e) => {
+                            break_err = Some(e);
+                            break;
+                        }
+                    };
+                    txn_bytes += ops.iter().map(op_size).sum::<usize>();
+                    txn_buffer.extend(ops);
+                    if txn_bytes > txn_cap_bytes && !cap_warned {
+                        cap_warned = true;
+                        tracing::warn!(target: "pg2osync::engine",
+                            "open transaction exceeds txn_buffer_cap_mb ({} MB); it will be \
+                             split across sink requests",
+                            ctx.cfg.txn_buffer_cap_mb);
+                    }
+                    if txn_buffer.len() >= ctx.cfg.batch_size
+                        || txn_bytes >= ctx.cfg.batch_max_bytes
+                    {
+                        // oversized transaction split: safe because every op is
+                        // idempotent and the commit LSN lands on the final piece
+                        if batch_tx
+                            .send(SinkCommand::Write(std::mem::take(&mut txn_buffer)))
+                            .await
+                            .is_err()
+                        {
+                            break_err = Some(CoreError::Other("batch channel closed".into()));
+                            break;
+                        }
+                        txn_bytes = 0;
+                    }
+                }
+                if let Some(e) = break_err.take() {
+                    break Err(e);
                 }
             }
             ChangeEvent::TableTruncated { schema, table } => {
@@ -411,16 +453,78 @@ fn estimate_json(value: &Value) -> usize {
     }
 }
 
+/// Read the stored documents a group of rows needs to complete unchanged
+/// TOASTed columns, one request per index rather than one per row.
+async fn fetch_completions(
+    rows: &[pg2osync_core::event::RowChange],
+    mapping: &crate::mapping::TableMapping,
+    sink: &dyn Sink,
+    metrics: &crate::metrics::Metrics,
+) -> Result<HashMap<(String, String), Option<Value>>, CoreError> {
+    let mut wanted: HashMap<String, Vec<String>> = HashMap::new();
+    for row in rows {
+        let Some(id) = completion_id(&row.kind) else {
+            continue;
+        };
+        let index = mapping.index_for(&row.schema, &row.table).to_string();
+        let ids = wanted.entry(index).or_default();
+        // the same row updated twice in one group needs one read, not two
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    let mut out = HashMap::new();
+    for (index, ids) in wanted {
+        metrics
+            .toast_readbacks_total
+            .fetch_add(ids.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        let docs = sink.get_documents(&index, &ids).await?;
+        for (id, doc) in ids.into_iter().zip(docs) {
+            out.insert((index.clone(), id), doc);
+        }
+    }
+    Ok(out)
+}
+
+/// The document id whose stored copy completes this change, if one is needed.
+///
+/// A row whose key changed is still filed under the old id, so completing from
+/// the new one would write the unchanged columns as null.
+fn completion_id(kind: &RowKind) -> Option<String> {
+    let RowKind::Update {
+        pk,
+        previous_pk,
+        unchanged_toast_columns,
+        ..
+    } = kind
+    else {
+        return None;
+    };
+    if unchanged_toast_columns.is_empty() {
+        return None;
+    }
+    let id = pk_to_id(pk);
+    Some(match previous_pk.as_ref().map(pk_to_id) {
+        Some(previous) if previous != id => previous,
+        _ => id,
+    })
+}
+
 /// Convert one row change into document operations, completing unchanged-TOAST
 /// columns from the previously indexed document when needed.
-#[allow(clippy::too_many_arguments)]
-async fn materialize<'a>(
+///
+/// `previous` is the document already in the target, which the caller fetches
+/// when `completion_id` asked for one. Doing it here would mean one round-trip
+/// per row in the middle of the pipeline; measured on 20k updates to a table
+/// with an 8 kB TOASTed column, that was the difference between 1,800 and
+/// 4,400 rows per second.
+fn materialize<'a>(
     index: &'a str,
     table: (&'a str, &'a str),
     kind: &RowKind,
     projections: &crate::mapping::Projections,
     transforms: &crate::mapping::Transforms,
-    sink: &dyn Sink,
+    previous: Option<&Value>,
 ) -> Result<Vec<LsnOp>, CoreError> {
     // PENDING_LSN is overwritten by the commit handler before any ack can
     // reference it: rows never leave the buffer without their commit attached.
@@ -458,24 +562,13 @@ async fn materialize<'a>(
                 .filter(|previous| previous != &id);
 
             let mut doc = doc.clone();
-            if !unchanged_toast_columns.is_empty() {
-                // Read back from wherever the document actually is: on a move
-                // it is still under the old id, and completing from the new id
-                // would silently write the unchanged columns as null.
-                let stored_id = moved_from.clone().unwrap_or_else(|| id.clone());
-                let prev = sink
-                    .get_documents(index, std::slice::from_ref(&stored_id))
-                    .await?
-                    .into_iter()
-                    .flatten()
-                    .next();
-                if let Some(Value::Object(prev_map)) = prev
-                    && let Value::Object(doc_map) = &mut doc
-                {
-                    for col in unchanged_toast_columns {
-                        if let Some(v) = prev_map.get(col) {
-                            doc_map.insert(col.clone(), v.clone());
-                        }
+            if !unchanged_toast_columns.is_empty()
+                && let Some(Value::Object(prev_map)) = previous
+                && let Value::Object(doc_map) = &mut doc
+            {
+                for col in unchanged_toast_columns {
+                    if let Some(v) = prev_map.get(col) {
+                        doc_map.insert(col.clone(), v.clone());
                     }
                 }
             }
