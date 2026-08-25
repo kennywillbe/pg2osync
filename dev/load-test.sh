@@ -21,7 +21,10 @@ OS_CONTAINER=${OS_CONTAINER:-dev-opensearch-1}
 CLIENTS=${CLIENTS:-8}
 STEP_SECONDS=${STEP_SECONDS:-20}
 RATES=${RATES:-"200 1000 5000 10000"}
-CONFIG=$(mktemp /tmp/pg2osync-load-XXXX.toml)
+# BSD mktemp only substitutes X's at the *end* of the template: with a
+# suffix after them it creates the literal name instead, and one killed run
+# then breaks every later one with "File exists".
+CONFIG=$(mktemp /tmp/pg2osync-load.XXXXXX)
 LOG=/tmp/pg2osync-load.log
 export PG2OSYNC_SOURCE_URL="postgres://postgres:postgres@localhost:15432/sourcedb"
 

@@ -13,7 +13,10 @@ cd "$(dirname "$0")/.."
 BIN=./target/release/pg2osync
 OS=${OS_URL:-http://localhost:9200}
 PG_CONTAINER=${PG_CONTAINER:-dev-postgres-1}
-CONFIG=$(mktemp /tmp/pg2osync-e2e-XXXX.toml)
+# BSD mktemp only substitutes X's at the *end* of the template: with a
+# suffix after them it creates the literal name instead, and one killed run
+# then breaks every later one with "File exists".
+CONFIG=$(mktemp /tmp/pg2osync-e2e.XXXXXX)
 MAPPING=$(dirname "$CONFIG")/pg2osync-e2e-mapping.json
 LOG=/tmp/pg2osync-e2e.log
 export PG2OSYNC_SOURCE_URL="postgres://postgres:postgres@localhost:15432/sourcedb"
