@@ -151,6 +151,16 @@ Handled transparently:
 
 Decimals stay strings on purpose: a float round-trip loses precision on money.
 
+## TRUNCATE and DROP
+
+`TRUNCATE` is logged as a statement rather than as row events, so it is read out
+of the SQL and turned into an index clear, ordered against the writes queued
+before it — the same behaviour as the PostgreSQL source.
+
+`DROP TABLE` is only warned about. Clearing the index would be presumptuous when
+the table may be about to be recreated, but a dropped table whose index still
+holds its documents is worth saying out loud.
+
 ## DDL
 
 An `ALTER` or `RENAME` in the binlog invalidates the cached schema, so the next
@@ -167,7 +177,6 @@ field names.
 | Limitation | Detail | Workaround |
 |---|---|---|
 | Nested children | Not implemented for MySQL | Use PostgreSQL, or denormalize in a view |
-| `TRUNCATE` | Not propagated (it is a `QUERY` event, not a row event) | Clear the index yourself |
 | `JSON` while streaming | MySQL's binary JSON format is not parsed; a hex placeholder is stored | Store JSON as `TEXT`, or re-run the initial load |
 | GTID positions | Checkpoints use file and offset, not GTID sets | Fine for a single server; failover to a replica needs a fresh initial load |
 | Timezone edge cases | `DATETIME` values decode naive | Prefer `TIMESTAMP`, or verify your setup |

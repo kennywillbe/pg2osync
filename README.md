@@ -58,7 +58,7 @@ replay, and no transformation language — if you need those, you want Kafka.
 | Nested child collections (one level) | ✅ parent document embeds child arrays |
 | Column projection (`columns` / `exclude_columns`) | ✅ |
 | Column transforms (`hash`, `redact`) | ✅ |
-| TRUNCATE propagation | ✅ |
+| TRUNCATE propagation | ✅ PostgreSQL and MySQL/MariaDB |
 | Polling fallback for managed databases without replication | ✅ upsert-only |
 | **Read-your-writes** (`/synced`) | ✅ wait for your own commit to be searchable |
 | Prometheus metrics | ✅ built-in endpoint |

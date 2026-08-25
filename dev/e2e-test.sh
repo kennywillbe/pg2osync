@@ -31,6 +31,7 @@ os_status()  { curl -s -o /dev/null -w "%{http_code}" "$OS/$1/_doc/$2"; }
 os_len()     { curl -s "$OS/$1/_doc/$2" | jqf "len(d.get('_source',{}).get('$3',[]))"; }
 pg()         { docker exec "$PG_CONTAINER" psql -U postgres -d sourcedb -qtAc "$1"; }
 refresh()    { curl -s -XPOST "$OS/_refresh" > /dev/null; }
+synced()     { curl -s "http://127.0.0.1:9131/synced?refresh=true&timeout=10000" > /dev/null; refresh; }
 
 start_sync() {
   nohup $BIN run -c "$CONFIG" >> "$LOG" 2>&1 < /dev/null & disown
@@ -157,10 +158,10 @@ check "child DELETE refreshes parent" "$(os_len e2e_customers 2 orders)" "1"
 
 say "7. TRUNCATE clears the index"
 pg "TRUNCATE users;" > /dev/null
-sleep 3; refresh
+synced
 check "index cleared after TRUNCATE" "$(os_count e2e_users)" "0"
 pg "INSERT INTO users (id,name,email) VALUES (7,'grace','grace@test.io');" > /dev/null
-sleep 2; refresh
+synced
 check "streaming continues after TRUNCATE" "$(os_count e2e_users)" "1"
 
 say "8. checkpoint and WAL safety"
