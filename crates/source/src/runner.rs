@@ -49,6 +49,9 @@ pub struct WalSourceConfig {
 
 pub struct WalSource {
     cfg: WalSourceConfig,
+    /// Tables seen in the stream that nothing maps, so the warning is said once
+    /// rather than per row.
+    unmapped: std::collections::HashSet<(String, String)>,
 }
 
 /// How many held rows and parent keys resolve in one go.
@@ -60,7 +63,26 @@ const PENDING_FLUSH_ROWS: usize = 5_000;
 
 impl WalSource {
     pub fn new(cfg: WalSourceConfig) -> Self {
-        Self { cfg }
+        Self {
+            cfg,
+            unmapped: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Whether this table is one the config asked for.
+    ///
+    /// Children count: their rows are not documents, but they are ours to act
+    /// on. Everything else in the publication is not, and cannot be — the
+    /// engine has no index to write it to.
+    fn is_configured(&self, schema: &str, table: &str) -> bool {
+        let key = (schema.to_string(), table.to_string());
+        self.cfg.children.contains_key(&key)
+            || self.cfg.child_parents.contains_key(&key)
+            || self
+                .cfg
+                .tables
+                .iter()
+                .any(|t| t == &format!("{schema}.{table}"))
     }
 
     /// Idempotent bootstrap: wal_level check, publication aligned to config
@@ -316,7 +338,7 @@ impl WalSource {
     /// re-read. Holding them is what allows one query per collection per
     /// transaction instead of one per row.
     fn classify(
-        &self,
+        &mut self,
         msg: &crate::pgoutput::Message,
         relations: &HashMap<u32, crate::pgoutput::Relation>,
     ) -> Result<Classified> {
@@ -389,6 +411,24 @@ impl WalSource {
                 parent: parent.clone(),
                 key: fk_json,
             });
+        }
+
+        // A table the publication carries but the config does not name. The
+        // publication normally holds exactly the configured tables, and then a
+        // rename moves one out from under its entry without leaving it: the
+        // rows keep arriving under a name nothing maps. Dropping them here is
+        // what keeps the engine's mapping an internal invariant rather than
+        // something an `ALTER TABLE` can violate from outside.
+        if !self.is_configured(&rel.schema, &rel.name) {
+            if self.unmapped.insert(table.clone()) {
+                tracing::warn!(target: "pg2osync::source",
+                    "{}.{} is in publication {} but not in [sync]; its rows are being \
+                     dropped. A renamed table does this — the index still holds what it \
+                     had under the old name, and nothing will update it until the config \
+                     names the new one",
+                    rel.schema, rel.name, self.cfg.publication);
+            }
+            return Ok(Classified::Skip);
         }
 
         let change = super::docbuild::build_row_change(rel, incoming)?;
@@ -491,5 +531,56 @@ impl WalSourceConfig {
             .get(&(schema.to_string(), table.to_string()))
             .cloned()
             .unwrap_or_else(|| "id".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source(tables: &[&str]) -> WalSource {
+        WalSource::new(WalSourceConfig {
+            host: "h".into(),
+            port: 5432,
+            user: "u".into(),
+            password: String::new(),
+            database: "d".into(),
+            slot_name: "s".into(),
+            publication: "p".into(),
+            tables: tables.iter().map(|t| t.to_string()).collect(),
+            start_lsn: None,
+            admin_url: None,
+            tls: Default::default(),
+            children: HashMap::new(),
+            child_parents: HashMap::new(),
+            parent_pk_columns: HashMap::new(),
+            durable: None,
+        })
+    }
+
+    #[test]
+    fn a_table_the_publication_carries_but_the_config_does_not_is_not_ours() {
+        let src = source(&["public.users"]);
+        assert!(src.is_configured("public", "users"));
+        // What a rename leaves behind: the publication follows the table, so its
+        // rows keep arriving under a name nothing maps. Acting on them means
+        // asking the engine for an index that does not exist.
+        assert!(!src.is_configured("public", "users_old"));
+        assert!(!src.is_configured("other", "users"));
+    }
+
+    #[test]
+    fn a_child_table_is_ours_even_though_it_is_not_a_document() {
+        let mut cfg = source(&["public.customers"]).cfg;
+        cfg.child_parents.insert(
+            ("public".into(), "orders".into()),
+            ("public".into(), "customers".into()),
+        );
+        let src = WalSource::new(cfg);
+        assert!(
+            src.is_configured("public", "orders"),
+            "a child row is not a document, but dropping it would stop its parent \
+             from being re-read"
+        );
     }
 }

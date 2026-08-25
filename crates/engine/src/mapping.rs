@@ -139,13 +139,6 @@ impl TableMapping {
         }
     }
 
-    /// Target index; unmapped tables are ignored upstream, so this only sees
-    /// configured tables — but stay defensive with a derived name.
-    pub fn index_for(&self, schema: &str, table: &str) -> &str {
-        self.opt_index_for(schema, table)
-            .expect("unmapped table reached the engine; source filter is broken")
-    }
-
     pub fn opt_index_for(&self, schema: &str, table: &str) -> Option<&str> {
         self.map
             .get(&(schema.to_string(), table.to_string()))
@@ -225,7 +218,7 @@ mod tests {
     #[test]
     fn unmapped_tables_have_no_index() {
         let m = TableMapping::from_pairs([(("public".into(), "users".into()), "users_v1".into())]);
-        assert_eq!(m.index_for("public", "users"), "users_v1");
+        assert_eq!(m.opt_index_for("public", "users"), Some("users_v1"));
         assert_eq!(m.opt_index_for("public", "orders"), None);
     }
 }

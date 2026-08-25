@@ -672,5 +672,81 @@ check "streaming resumes from a position written under concurrency" \
   "$(os_field e2e_conc 900001 v)" "after-the-restart"
 stop_sync
 
+echo -e "\n\033[1m== 17. a renamed table does not take the pipeline down ==\033[0m"
+# A publication follows a table through a rename, so its rows keep arriving
+# under a name nothing maps. That used to reach an assertion in the engine and
+# panic a worker thread, which the replay then repeated on every reconnect.
+RNCONFIG=$(mktemp /tmp/pg2osync-e2e-rename.XXXXXX)
+RNSLOT=pg2osync_e2e_rename
+sed -e "s/^slot_name = .*/slot_name = \"$RNSLOT\"/" \
+    -e "s/^publication = .*/publication = \"${RNSLOT}_pub\"/" \
+    -e "s/^index = .*/index = \"e2e_rename\"/" \
+    -e "s#^bind = .*#bind = \"127.0.0.1:9119\"#" \
+    "$RCONFIG" > "$RNCONFIG"
+rename_cleanup() {
+  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  pg "SELECT pg_drop_replication_slot('$RNSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$RNSLOT');" > /dev/null 2>&1 || true
+  pg "DROP PUBLICATION IF EXISTS ${RNSLOT}_pub;" > /dev/null 2>&1 || true
+  pg "ALTER TABLE IF EXISTS renamed_probe RENAME TO rename_probe;" > /dev/null 2>&1 || true
+  pg "DROP TABLE IF EXISTS rename_probe;" > /dev/null 2>&1 || true
+  rm -f "$RNCONFIG"
+}
+trap 'cleanup; resume_cleanup; conc_cleanup; rename_cleanup' EXIT
+pg "DROP TABLE IF EXISTS rename_probe, renamed_probe;" > /dev/null 2>&1
+pg "CREATE TABLE rename_probe(id bigint primary key, v text);" > /dev/null
+pg "INSERT INTO rename_probe VALUES (1,'before');" > /dev/null
+pg "DROP PUBLICATION IF EXISTS ${RNSLOT}_pub; CREATE PUBLICATION ${RNSLOT}_pub FOR TABLE rename_probe;" > /dev/null 2>&1
+# point the config at this table rather than the resume probe's
+python3 - "$RNCONFIG" <<'PYEOF'
+import re, sys
+path = sys.argv[1]
+text = open(path).read()
+text = re.sub(r"table = .*", 'table = "public.rename_probe"', text)
+open(path, "w").write(text)
+PYEOF
+curl -s -XDELETE "$OS/e2e_rename?ignore_unavailable=true" > /dev/null
+nohup $BIN run -c "$RNCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_count e2e_rename)" = "1" ] && break
+  sleep 1
+done
+check "the table is synced before the rename" "$(os_count e2e_rename)" "1"
+pg "ALTER TABLE rename_probe RENAME TO renamed_probe;" > /dev/null
+pg "INSERT INTO renamed_probe VALUES (2,'after-rename');" > /dev/null
+sleep 4
+# The process has to still be there. A panic in a worker thread takes it down
+# and the replay repeats it, so "is it alive" is the whole assertion.
+if pgrep -f "pg2osync run" > /dev/null; then
+  ok "the pipeline survived the rename"
+else
+  bad "the pipeline died on the rename"
+fi
+if grep -q "unmapped table reached the engine" "$LOG"; then
+  bad "it panicked on a table it could not map"
+else
+  ok "no panic on a table nothing maps"
+fi
+if grep -q "renamed_probe is in publication" "$LOG"; then
+  ok "and it named the table whose rows it is dropping"
+else
+  bad "it dropped the rows without saying which table"
+fi
+# A row under the old name is still there: nothing was undone, it just stopped
+# being updated — the same rule a dropped column already follows.
+check "what was indexed before the rename is untouched" \
+  "$(os_field e2e_rename 1 v)" "before"
+# And the stream is still working, which a crash loop would not be
+pg "ALTER TABLE renamed_probe RENAME TO rename_probe;" > /dev/null
+pg "INSERT INTO rename_probe VALUES (3,'after-rename-back');" > /dev/null
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_status e2e_rename 3)" = "200" ] && break
+  sleep 1
+done
+check "streaming resumes once the name matches again" \
+  "$(os_field e2e_rename 3 v)" "after-rename-back"
+stop_sync
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]
