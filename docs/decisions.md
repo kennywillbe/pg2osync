@@ -78,8 +78,11 @@ rather than used to resume into an unrelated position space.
 ## Checkpoints
 
 **State lives in the target.** A hidden `.pg2osync_meta` index holds one
-document; per-document atomicity gives the crash safety for free, with no
-compare-and-swap. A local file breaks on ephemeral containers, and a table in
+document per stream; per-document atomicity gives the crash safety for free,
+with no compare-and-swap. Per stream rather than one shared document, because
+two pipelines writing to the same target otherwise overwrite each other's
+position — which is what a zero-downtime re-index runs, and what splitting
+tables across instances means. A local file breaks on ephemeral containers, and a table in
 the source database pollutes the user's schema and risks replicating itself.
 Meilisearch has nowhere to put an arbitrary document, so it uses a
 write-then-rename state file — the documented exception.
