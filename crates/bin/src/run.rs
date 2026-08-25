@@ -943,6 +943,26 @@ async fn attempt_mysql(
         cfg.sync.values().map(|t| t.table.as_str()),
     )
     .await?;
+    // The position token is now a document version as well as a checkpoint, and
+    // a version at the target only ever goes up. So a history that restarted —
+    // RESET BINARY LOGS AND GTIDS, or a different server behind the same
+    // address — would have every write from the new, lower numbering silently
+    // rejected as a version conflict, leaving the index quietly stale. Reloading
+    // would not fix it either: the old versions are in the target, not here.
+    if let Some((file, pos)) = &resume {
+        let (current_file, current_pos) = mysql_catalog::master_position(&mut admin).await?;
+        let stored = mysql_catalog::position_token(file, *pos);
+        if mysql_catalog::position_token(&current_file, current_pos) < stored {
+            bail!(
+                "the source is at {current_file}@{current_pos}, behind the checkpointed \
+                 {file}@{pos}: this server's binlog history restarted, or it is not the \
+                 server the checkpoint came from. The target's document versions come from \
+                 the old numbering and would reject everything written under the new one, \
+                 so pg2osync will not continue. Point [sync] at a fresh index name, or \
+                 delete the target index, to load again from here"
+            );
+        }
+    }
     // The coordinate is read *before* the first chunk, so streaming from it
     // replays anything a chunk missed or read stale onto an idempotent write.
     // That, not a snapshot, is what makes chunked reads correct.
