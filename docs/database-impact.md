@@ -174,6 +174,15 @@ so a PostgreSQL load under WAL pressure deliberately pauses and takes longer.
 The MySQL load never pauses, because there is no retention of ours to protect
 and waiting would only widen the window for a purge.
 
+`[source] load_workers` is the other direction: it costs the *source* one
+concurrent `COPY` per worker for the duration of the load. Worth paying only
+where the server is doing per-row work for the read, which in practice means a
+table with a nested collection — its `COPY` runs an aggregate subquery per parent
+row, and more backends run them in parallel. Measured on the dev stack, 200,000
+parents with five children each: 27,400 parents/s with one reader, 42,100 with
+four. On an ordinary table the same four readers buy 5–8%, which is not worth
+four times the read load.
+
 `[engine] write_concurrency` costs the source nothing and the *target*
 proportionally: it is how many write requests stay open at once, so raising it to
 four means four concurrent bulk requests against a cluster that may be serving

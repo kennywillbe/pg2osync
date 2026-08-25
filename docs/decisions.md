@@ -262,6 +262,28 @@ which needs nothing else to be exact. A checkpoint alone is not proof the
 load finished — the two are separate facts, and conflating them is what
 silently skips a load.
 
+**The load reads in waves, and only for the tables where reading is the cost.**
+Parallel readers were the obvious answer to a slow load and are worth almost
+nothing on an ordinary table: measured, four readers buy 8% on a narrow table
+and 5% on a wide one, because the target is what the pipeline waits for. On a
+table with a nested collection they buy **53%** — there the `COPY` runs an
+aggregate subquery per parent row, so the *server* is doing per-row work and
+more backends do it in parallel. That is the whole justification, and
+`[source] load_workers` stays at 1 because outside that case it multiplies the
+read load on someone's production database for single digits.
+
+Waves rather than a free-running pool, and that is not a matter of taste. The
+engine forgets its record of stream-removed keys on every load mark, which is
+only safe while nothing from before that mark is still in flight; with a pool,
+one worker's confirmed mark says nothing about the others. And progress is a
+count of *leading* ranges written, which out-of-order completion cannot advance.
+A wave satisfies both by construction: it is contiguous, and it is finished
+before its mark is sent. The cost is the skew inside a wave, which sampled
+ranges of equal row counts keep small.
+
+The tombstone window is therefore bounded by a wave instead of a chunk — the
+same argument, `load_workers` times wider.
+
 **The load is made faster on the write side, because that is where the limit
 is.** The obvious move is parallel readers, and it would have bought nothing.
 Measured on an 8-core laptop against the dev stack, 2M rows: one `COPY` hands
