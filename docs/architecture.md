@@ -301,9 +301,6 @@ Two honest caveats:
   A later load treats `-1` as "no saved value" rather than restoring it, and
   startup warns about any configured index still in that state.
 
-Serverless targets skip both, since they manage refresh and replication
-themselves and reject the call.
-
 ## Checkpoints
 
 One document per stream in the target, named `<source>-<slot_name>` for

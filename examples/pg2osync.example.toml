@@ -40,7 +40,6 @@ username = "admin"
 password_env = "PG2OSYNC_TARGET_PASSWORD"
 tls_verify = true
 # api_key_env = "ES_API_KEY"             # Elasticsearch API key / Meilisearch key
-# serverless = true                      # Amazon OpenSearch Serverless
 # state_dir = "./.pg2osync-state"        # Meilisearch checkpoint directory
 
 [engine]

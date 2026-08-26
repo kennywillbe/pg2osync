@@ -471,6 +471,20 @@ that is not running, metrics unscraped because nothing is serving them. So
 something a cron job can own, and it looks at every slot rather than the
 configured one: an orphan from a former `slot_name` fills the same disk.
 
+**No Amazon OpenSearch Serverless.** It looks like one more OpenSearch endpoint
+and is a different target: SigV4 is the only authentication a collection
+accepts, a custom document id works only on a *search* collection, and the
+service owns refresh and index settings. The first rules out talking to it at
+all without a signing implementation, the second would make the `_id`-is-the-
+primary-key rule fail on two of the three collection types, and the third
+removes the load's refresh suspension and `/synced`.
+
+A `serverless = true` flag existed from the first commit and was never run
+against the service. That is a support claim nobody could stand behind, so it is
+gone and the url is refused instead. Nothing in the competitive set advertises
+Serverless either — the tools that do are log shippers and AWS's own ingestion
+pipeline, not database-to-index replication — so this closes no gap.
+
 ## Scope
 
 **One-way replication only.** No bidirectional sync, no conflict resolution.
