@@ -3,6 +3,12 @@
 One TOML file describes the whole pipeline. Unknown keys are rejected at load
 time, so a typo fails immediately instead of silently doing nothing.
 
+You do not have to write it from this page. `pg2osync init --table users` writes
+the smallest config that runs, qualifying the table name from the source's own
+catalogue and refusing a table with no primary key; this reference is for the
+options you add afterwards. Every command defaults to `pg2osync.toml`, which is
+what `init` writes.
+
 Full example: [examples/pg2osync.example.toml](../examples/pg2osync.example.toml).
 
 Everything structural is checked by `pg2osync validate`, which also connects to
