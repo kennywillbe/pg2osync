@@ -269,6 +269,7 @@ read this as an order of magnitude, not a capacity plan:
 | Commit to searchable, single row | ~80 ms including the client round-trip and a forced index refresh |
 | One 50K-row transaction | propagated in ~1.4 s |
 | Resident memory under load | ~90 MB |
+| Cores the pipeline needs | **1** — 51,900 rows/s capped at one core, 54,500 at two, and 9 MB of memory when starved to a quarter |
 | What the **source database** pays while replicated | **−0.4% throughput, 0.19 of a core** at ~14,000 tps ([how that was separated from co-location](docs/database-impact.md#load-while-streaming)) |
 
 Under sustained concurrent writers (`dev/load-test.sh`, 8 clients on the same
