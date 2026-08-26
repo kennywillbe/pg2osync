@@ -7,6 +7,10 @@
 //! both sources, and a source can never be half encrypted.
 
 use anyhow::{Context as _, Result, bail};
+// through rustls rather than as a dependency of its own: rustls-pemfile, which
+// used to do this, was folded into pki-types and is now unmaintained
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem::PemObject as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -175,9 +179,8 @@ fn load_roots(path: &Path) -> Result<rustls::RootCertStore> {
     let pem = std::fs::read(path)
         .with_context(|| format!("cannot read root certificate {}", path.display()))?;
     let mut store = rustls::RootCertStore::empty();
-    let mut cursor = std::io::Cursor::new(pem);
     let mut added = 0usize;
-    for cert in rustls_pemfile::certs(&mut cursor) {
+    for cert in CertificateDer::pem_slice_iter(&pem) {
         let cert = cert.with_context(|| format!("malformed PEM in {}", path.display()))?;
         store
             .add(cert)

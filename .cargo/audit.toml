@@ -1,0 +1,14 @@
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]
+
+# RUSTSEC-2023-0071 is the Marvin attack against the `rsa` crate: a timing
+# sidechannel in RSA *decryption* that can recover a private key. There is no
+# fixed release — rsa 0.10, which reworks the affected code, is still a release
+# candidate.
+#
+# It is ignored rather than accepted blindly because this binary never decrypts.
+# The single use of `rsa` is in the MySQL handshake
+# (crates/source-mysql/src/auth.rs): the password is encrypted to the *server's*
+# public key for `caching_sha2_password` over an unencrypted connection. No
+# private key exists in this process, so there is no key for the sidechannel to
+# leak. Revisit when rsa 0.10 ships a stable release.

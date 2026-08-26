@@ -1,0 +1,28 @@
+name: Audit
+
+on:
+  # Not on every pull request: an advisory published upstream would start
+  # failing changes that have nothing to do with it. It runs when the
+  # dependencies themselves move, and weekly so a new advisory is still found.
+  push:
+    branches: [main]
+    paths: ["**/Cargo.toml", "Cargo.lock", ".github/workflows/audit.yml"]
+  pull_request:
+    paths: ["**/Cargo.toml", "Cargo.lock", ".github/workflows/audit.yml"]
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: dependencies have no known advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2.86.8
+        with:
+          tool: cargo-audit
+      - run: cargo audit --deny warnings
