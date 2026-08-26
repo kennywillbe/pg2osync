@@ -1,0 +1,30 @@
+name: Release Please
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    name: keep the release PR up to date
+    runs-on: ubuntu-latest
+    steps:
+      # Collects every conventional commit since the last release into one pull
+      # request that bumps the workspace versions and writes CHANGELOG.md. It
+      # does not release anything: `skip-github-release` is set, so merging that
+      # pull request only lands the changelog and the version bump.
+      #
+      # The tag is pushed by a person afterwards, and that is deliberate. A
+      # personal repository cannot grant the Actions app a bypass on the `v*`
+      # tag rule — GitHub refuses with "must be part of the ruleset source or
+      # owner organization" — and the alternative is keeping a personal access
+      # token in the repository so a bot can do what one command does. The tag
+      # rule is worth more than the keystroke.
+      - uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
