@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   release-please:
     name: keep the release PR up to date
@@ -34,7 +37,10 @@ jobs:
       # The token is a fine-grained PAT belonging to a repository admin, which is
       # what lets the tag through the `v*` rule and what makes the tag push
       # trigger the Release workflow.
-      - uses: googleapis/release-please-action@v4
+      # Pinned by commit rather than by tag: this is the one workflow holding a
+      # personal access token, so a tag moved under us would move what the token
+      # runs. Dependabot bumps the pin with the version in the comment.
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
           token: ${{ env.RELEASE_TOKEN }}
           config-file: release-please-config.json
