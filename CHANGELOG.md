@@ -2,9 +2,9 @@
 
 **Maintained by [release-please](https://github.com/googleapis/release-please)
 from here on.** It reads the commit subjects and keeps one open pull request that
-bumps the versions and writes the entry below; the 1.0.0 entry was written by
-hand because no commit before it followed the convention. See
-[docs/releasing.md](docs/releasing.md).
+bumps the versions and writes the entry below; merging that pull request tags and
+publishes. The 1.0.0 entry was written by hand because no commit before it
+followed the convention. See [docs/releasing.md](docs/releasing.md).
 
 Notable changes, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the versions
@@ -21,7 +21,8 @@ re-read a table from the start, is a major version.
 Pushing `v1.0.0` is what publishes it: the release workflow builds static
 binaries for Linux and macOS on x86-64 and arm64 and pushes the container image.
 Until that tag exists there is no downloadable release, whatever the version
-numbers in `Cargo.toml` say.
+numbers in `Cargo.toml` say. This first one is tagged by hand; releases after it
+come from merging the release pull request.
 
 ### Added
 
