@@ -820,5 +820,53 @@ if [ "$done_at_kill" -gt 0 ]; then
 fi
 stop_sync
 
+echo -e "\n\033[1m== 19. init writes a config that runs ==\033[0m"
+# The first thing a new user needs, and the one thing no subcommand did: every
+# other one takes a `-c FILE` that has to exist first. Measured before this
+# existed, the first hand-written config failed on an unqualified table name.
+#
+# Nothing is edited after `init` here, deliberately: the out-of-the-box path is
+# what is being tested, down to the default config name and target url.
+ABIN="$(pwd)/$BIN"
+INITDIR=$(mktemp -d /tmp/pg2osync-e2e-init.XXXXXX)
+pg "DROP TABLE IF EXISTS init_probe, init_no_pk;" > /dev/null 2>&1
+pg "CREATE TABLE init_probe(id bigint primary key, v text);" > /dev/null
+pg "INSERT INTO init_probe VALUES (1,'from-init');" > /dev/null
+pg "CREATE TABLE init_no_pk(v text);" > /dev/null
+init_cleanup() {
+  rm -rf "$INITDIR"
+  pg "DROP TABLE IF EXISTS init_probe, init_no_pk;" > /dev/null 2>&1 || true
+}
+trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup; init_cleanup' EXIT
+
+# unqualified on purpose: the point is that it comes out qualified
+if (cd "$INITDIR" && "$ABIN" init --table init_probe > /dev/null 2>&1); then
+  ok "init wrote a config without being told the schema"
+else
+  bad "init failed against a live source"
+fi
+check "and qualified the table from the catalogue" \
+  "$(grep -c 'table = "public.init_probe"' "$INITDIR/pg2osync.toml" 2> /dev/null || echo 0)" "1"
+# No primary key means no stable document id, so it has to be refused here
+# rather than at the first row of the load.
+if (cd "$INITDIR" && "$ABIN" init --force --table init_no_pk > /dev/null 2>&1); then
+  bad "init accepted a table with no primary key"
+else
+  ok "init refused a table with no primary key"
+fi
+if (cd "$INITDIR" && "$ABIN" init --table init_probe > /dev/null 2>&1); then
+  bad "init overwrote an existing config without --force"
+else
+  ok "init refuses to overwrite without --force"
+fi
+# The whole point: what it writes validates, unedited and with no -c flag.
+if (cd "$INITDIR" && "$ABIN" validate > /dev/null 2>&1); then
+  ok "validate passes on the generated config, unedited"
+else
+  bad "the generated config does not validate"
+fi
+init_cleanup
+trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup' EXIT
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

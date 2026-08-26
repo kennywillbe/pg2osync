@@ -96,6 +96,7 @@ than continuing into a gap.
 ## Day-to-day commands
 
 ```sh
+pg2osync init --table users          # write a starter config, checked against the source
 pg2osync setup-sql -c pg2osync.toml  # the SQL a DBA needs, from your config
 pg2osync reconcile -c pg2osync.toml  # find index documents whose row is gone
 pg2osync validate -c pg2osync.toml   # config, connectivity, server settings

@@ -28,22 +28,22 @@ struct Cli {
 enum Command {
     /// Initial load plus continuous streaming (main mode).
     Run {
-        #[arg(short, long, value_name = "FILE")]
+        #[arg(short, long, value_name = "FILE", default_value = "pg2osync.toml")]
         config: PathBuf,
     },
     /// Validate the config and check both connections.
     Validate {
-        #[arg(short, long, value_name = "FILE")]
+        #[arg(short, long, value_name = "FILE", default_value = "pg2osync.toml")]
         config: PathBuf,
     },
     /// Create source-side objects and target indices, then exit.
     Bootstrap {
-        #[arg(short, long, value_name = "FILE")]
+        #[arg(short, long, value_name = "FILE", default_value = "pg2osync.toml")]
         config: PathBuf,
     },
     /// Show the checkpoint and the source's current position.
     Status {
-        #[arg(short, long, value_name = "FILE")]
+        #[arg(short, long, value_name = "FILE", default_value = "pg2osync.toml")]
         config: PathBuf,
         /// Exit 0 only once the checkpoint has reached the source's current
         /// position, so a script can wait instead of comparing by eye.
@@ -60,7 +60,7 @@ enum Command {
     },
     /// Point an alias at this config's index, atomically.
     SwitchAlias {
-        #[arg(short, long, value_name = "FILE")]
+        #[arg(short, long, value_name = "FILE", default_value = "pg2osync.toml")]
         config: PathBuf,
         /// The alias to move. Applies to the single configured table.
         #[arg(long)]
@@ -69,15 +69,40 @@ enum Command {
     /// Compare each index against its source table and report documents whose
     /// row is gone. Reports only unless --delete is given.
     Reconcile {
-        #[arg(short, long, value_name = "FILE")]
+        #[arg(short, long, value_name = "FILE", default_value = "pg2osync.toml")]
         config: PathBuf,
         /// Remove the documents instead of only naming them.
         #[arg(long)]
         delete: bool,
     },
+    /// Write a starter config, checking the tables it names against the source.
+    ///
+    /// The first thing anyone needs and the one thing the other subcommands
+    /// cannot do: every one of them takes a `-c FILE` that has to exist first.
+    Init {
+        /// Where to write it. Refuses to overwrite without --force.
+        #[arg(short, long, value_name = "FILE", default_value = "pg2osync.toml")]
+        config: PathBuf,
+        /// Tables to sync. An unqualified name is qualified from the source, so
+        /// `--table users` becomes `public.users` rather than an error later.
+        #[arg(long = "table", value_name = "TABLE")]
+        tables: Vec<String>,
+        /// Source URL. Defaults to $PG2OSYNC_SOURCE_URL, which is also what the
+        /// generated config reads at run time.
+        #[arg(long, value_name = "URL")]
+        source: Option<String>,
+        /// Target URL.
+        #[arg(long, value_name = "URL", default_value = "http://localhost:9200")]
+        target: String,
+        /// "postgres" (default) or "mysql".
+        #[arg(long, default_value = "postgres")]
+        flavor: String,
+        #[arg(long)]
+        force: bool,
+    },
     /// Print the SQL a DBA needs to run, derived from the config.
     SetupSql {
-        #[arg(short, long, value_name = "FILE")]
+        #[arg(short, long, value_name = "FILE", default_value = "pg2osync.toml")]
         config: PathBuf,
     },
     /// Read one table again into its index, without reloading everything else.
@@ -86,7 +111,7 @@ enum Command {
     /// run while the pipeline is streaming: its rows carry the position they were
     /// read at, so a concurrent change wins.
     Resnapshot {
-        #[arg(short, long, value_name = "FILE")]
+        #[arg(short, long, value_name = "FILE", default_value = "pg2osync.toml")]
         config: PathBuf,
         /// Qualified table name, as it appears in the config.
         #[arg(long, value_name = "SCHEMA.TABLE")]
@@ -98,7 +123,7 @@ enum Command {
     /// List the documents the target refused and, with --replay, submit them
     /// again once the mapping that refused them is fixed.
     Rejects {
-        #[arg(short, long, value_name = "FILE")]
+        #[arg(short, long, value_name = "FILE", default_value = "pg2osync.toml")]
         config: PathBuf,
         /// Submit each one again, clearing the ones the target now accepts.
         #[arg(long)]
@@ -109,7 +134,7 @@ enum Command {
     },
     /// Drop the replication slot (PostgreSQL only).
     DropSlot {
-        #[arg(short, long, value_name = "FILE")]
+        #[arg(short, long, value_name = "FILE", default_value = "pg2osync.toml")]
         config: PathBuf,
         /// Also drop the publication. Off by default: a second pipeline may be
         /// reading the same one.
@@ -145,6 +170,14 @@ async fn main() -> Result<()> {
         }
         Command::Reconcile { config, delete } => reconcile_cmd(&config, delete).await,
         Command::SwitchAlias { config, alias } => switch_alias(&config, &alias).await,
+        Command::Init {
+            config,
+            tables,
+            source,
+            target,
+            flavor,
+            force,
+        } => init(&config, &tables, source, &target, &flavor, force).await,
         Command::SetupSql { config } => setup_sql(&config),
         Command::Resnapshot {
             config,
@@ -179,6 +212,231 @@ async fn pipeline(path: &Path, mode: run::Mode) -> Result<()> {
         mode,
     )
     .await
+}
+
+/// Write a starter config, and check what it names against the real source.
+///
+/// The friction this removes was measured rather than guessed: every other
+/// subcommand needs a `-c FILE`, nothing created one, so the first step was
+/// reading a 500-line reference — and the first hand-written attempt failed on
+/// an unqualified table name. So this qualifies names from the catalogue, says
+/// which tables are eligible when none are given, and prints the two commands
+/// that come next.
+async fn init(
+    path: &Path,
+    tables: &[String],
+    source: Option<String>,
+    target: &str,
+    flavor: &str,
+    force: bool,
+) -> Result<()> {
+    if path.exists() && !force {
+        bail!(
+            "{} already exists; pass --force to overwrite it",
+            path.display()
+        );
+    }
+    let mysql = flavor == "mysql";
+    if !mysql && flavor != "postgres" && flavor != "postgresql" {
+        bail!("--flavor must be \"postgres\" or \"mysql\", not {flavor:?}");
+    }
+    let source_url = source.or_else(|| std::env::var("PG2OSYNC_SOURCE_URL").ok());
+
+    // Everything below is advice, not a requirement: a config can be written
+    // without ever reaching the database, which is what makes this work before
+    // the credentials exist.
+    let mut resolved: Vec<String> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    match &source_url {
+        Some(url) => match eligible_tables(url, mysql).await {
+            Ok(found) => {
+                if found.is_empty() {
+                    notes.push(
+                        "no tables with a primary key were found; pg2osync needs one to \
+                         derive a stable document id"
+                            .into(),
+                    );
+                }
+                for wanted in tables {
+                    match qualify(wanted, &found) {
+                        Some(full) => resolved.push(full),
+                        None => bail!(
+                            "table {wanted:?} does not exist in the source, or has no primary \
+                             key. Tables it can sync: {}",
+                            preview(&found)
+                        ),
+                    }
+                }
+                if tables.is_empty() && !found.is_empty() {
+                    notes.push(format!(
+                        "tables available to sync: {}. Add one with --table, or edit the \
+                         [sync.*] section below",
+                        preview(&found)
+                    ));
+                }
+            }
+            Err(e) => notes.push(format!(
+                "could not read the source catalogue ({e}); the table names below are \
+                 unchecked"
+            )),
+        },
+        None => notes.push(
+            "no source URL given and PG2OSYNC_SOURCE_URL is unset, so nothing was checked \
+             against the database"
+                .into(),
+        ),
+    }
+    if resolved.is_empty() {
+        // A placeholder rather than an empty file: a config with no table is
+        // rejected at load time, and an example is what makes the shape obvious.
+        resolved.push(if mysql {
+            "appdb.users".into()
+        } else {
+            "public.users".into()
+        });
+    }
+
+    std::fs::write(path, starter_config(&resolved, target, mysql))
+        .with_context(|| format!("cannot write {}", path.display()))?;
+
+    println!("✓ wrote {}", path.display());
+    for note in &notes {
+        println!("  note: {note}");
+    }
+    println!();
+    println!("Next:");
+    if source_url.is_none() {
+        println!("  export PG2OSYNC_SOURCE_URL=\"postgres://user:pass@host:5432/db\"");
+    }
+    // `-c` only when it is not the default, so the printed commands are the
+    // shortest ones that actually work.
+    let flag = if path == Path::new("pg2osync.toml") {
+        String::new()
+    } else {
+        format!(" -c {}", path.display())
+    };
+    println!("  pg2osync validate{flag}     # checks both ends and the server's settings");
+    println!("  pg2osync run{flag}          # initial load, then streaming");
+    Ok(())
+}
+
+/// Qualified names of tables that have a primary key.
+///
+/// The primary key is the filter because it is the hard requirement: without one
+/// there is no stable document id, and the run would fail on that table later.
+async fn eligible_tables(source_url: &str, mysql: bool) -> Result<Vec<String>> {
+    if mysql {
+        let url = url::Url::parse(source_url).context("source url is not a valid URL")?;
+        let tls = pg2osync_source::tls::TlsSettings::resolve(source_url, None, None)?;
+        let mut conn = pg2osync_source_mysql::connection::MySqlConnection::connect(
+            &pg2osync_source_mysql::connection::MySqlConfig {
+                host: url.host_str().unwrap_or("localhost").into(),
+                port: url.port().unwrap_or(3306),
+                user: url.username().into(),
+                password: url.password().unwrap_or_default().into(),
+                database: None,
+                // Only used by a replication stream, and this opens none.
+                server_id: 0,
+                tls,
+            },
+        )
+        .await
+        .context("cannot connect to the source")?;
+        let rows = conn
+            .query_text_rows(
+                "SELECT t.table_schema, t.table_name FROM information_schema.tables t                  JOIN information_schema.table_constraints c                    ON c.table_schema = t.table_schema AND c.table_name = t.table_name                   AND c.constraint_type = 'PRIMARY KEY'                  WHERE t.table_type = 'BASE TABLE'                    AND t.table_schema NOT IN ('mysql','information_schema','performance_schema','sys')                  ORDER BY 1, 2",
+            )
+            .await?;
+        return Ok(rows
+            .iter()
+            .filter_map(
+                |r| match (r.first().cloned().flatten(), r.get(1).cloned().flatten()) {
+                    (Some(schema), Some(table)) => Some(format!("{schema}.{table}")),
+                    _ => None,
+                },
+            )
+            .collect());
+    }
+    // Resolved from the URL alone: there is no config yet, which is the point.
+    let tls = pg2osync_source::tls::TlsSettings::resolve(source_url, None, None)?;
+    let client = pg2osync_source::tls::connect(&tls, source_url)
+        .await
+        .context("cannot connect to the source")?;
+    let rows = client
+        .query(
+            "SELECT n.nspname, c.relname FROM pg_class c              JOIN pg_namespace n ON n.oid = c.relnamespace              WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog', 'information_schema')                AND EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary)              ORDER BY 1, 2",
+            &[],
+        )
+        .await
+        .context("cannot list tables")?;
+    Ok(rows
+        .iter()
+        .map(|r| format!("{}.{}", r.get::<_, String>(0), r.get::<_, String>(1)))
+        .collect())
+}
+
+/// Turn `users` into `public.users`, using what the source actually has.
+///
+/// An unqualified name is the mistake a first config makes, and it surfaces two
+/// commands later as a validation error. Resolving it here is the whole point.
+fn qualify(wanted: &str, found: &[String]) -> Option<String> {
+    if found.iter().any(|f| f == wanted) {
+        return Some(wanted.to_string());
+    }
+    if wanted.contains('.') {
+        return None;
+    }
+    let suffix = format!(".{wanted}");
+    let mut matches = found.iter().filter(|f| f.ends_with(&suffix));
+    let first = matches.next()?;
+    // An ambiguous bare name is not resolved silently: two schemas holding the
+    // same table name is exactly when guessing writes the wrong config.
+    matches.next().is_none().then(|| first.clone())
+}
+
+fn preview(found: &[String]) -> String {
+    let shown: Vec<&str> = found.iter().take(12).map(String::as_str).collect();
+    if found.len() > shown.len() {
+        format!(
+            "{} … and {} more",
+            shown.join(", "),
+            found.len() - shown.len()
+        )
+    } else {
+        shown.join(", ")
+    }
+}
+
+/// The smallest config that runs, with the two decisions an operator has to
+/// make left visible rather than buried.
+fn starter_config(tables: &[String], target: &str, mysql: bool) -> String {
+    let mut out = String::new();
+    out.push_str("# Written by `pg2osync init`. Every option is documented in\n");
+    out.push_str("# docs/configuration.md; what is here is what a run needs.\n\n");
+    out.push_str("[source]\n");
+    if mysql {
+        out.push_str("flavor = \"mysql\"\n");
+    }
+    out.push_str("# The URL is read from the environment so it never lands in version control.\n");
+    out.push_str("url_env = \"PG2OSYNC_SOURCE_URL\"\n");
+    if mysql {
+        out.push_str("# Must be unique among the server's replicas.\n");
+        out.push_str("server_id = 424242\n");
+    }
+    out.push_str("\n[target]\n");
+    out.push_str(&format!("url = \"{target}\"\n"));
+    out.push_str("\n[metrics]\n");
+    out.push_str("bind = \"127.0.0.1:9100\"\n");
+    for table in tables {
+        let index = table
+            .split_once('.')
+            .map(|(_, t)| t.to_string())
+            .unwrap_or_else(|| table.clone());
+        out.push_str(&format!("\n[sync.{index}]\n"));
+        out.push_str(&format!("table = \"{table}\"\n"));
+        out.push_str(&format!("index = \"{index}\"\n"));
+    }
+    out
 }
 
 /// Print the source-side setup script for this config.
@@ -841,4 +1099,67 @@ fn mysql_source(
             tls: cfg.tls_settings(source_url)?,
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn found() -> Vec<String> {
+        vec![
+            "public.products".to_string(),
+            "public.users".to_string(),
+            "shop.users".to_string(),
+        ]
+    }
+
+    #[test]
+    fn a_bare_name_is_qualified_from_the_catalogue() {
+        // The mistake a first config makes, which used to surface two commands
+        // later as a validation error.
+        assert_eq!(
+            qualify("products", &found()),
+            Some("public.products".to_string())
+        );
+    }
+
+    #[test]
+    fn a_bare_name_two_schemas_share_is_not_guessed() {
+        assert_eq!(
+            qualify("users", &found()),
+            None,
+            "guessing here writes a config that syncs the wrong table"
+        );
+    }
+
+    #[test]
+    fn a_qualified_name_is_taken_only_if_the_source_has_it() {
+        assert_eq!(
+            qualify("shop.users", &found()),
+            Some("shop.users".to_string())
+        );
+        assert_eq!(qualify("public.missing", &found()), None);
+    }
+
+    #[test]
+    fn the_starter_config_loads_and_names_the_table_it_was_given() {
+        let toml_text = starter_config(&["public.orders".to_string()], "http://os:9200", false);
+        let parsed: config::AppConfig =
+            toml::from_str(&toml_text).expect("what init writes has to load");
+        assert_eq!(parsed.sync.len(), 1);
+        let table = parsed.sync.get("orders").expect("named after the table");
+        assert_eq!(table.table, "public.orders");
+        assert_eq!(parsed.target.url, "http://os:9200");
+    }
+
+    #[test]
+    fn the_mysql_starter_says_so_and_carries_a_server_id() {
+        let toml_text = starter_config(&["appdb.users".to_string()], "http://os:9200", true);
+        let parsed: config::AppConfig = toml::from_str(&toml_text).expect("loads");
+        assert_eq!(parsed.source.flavor, "mysql");
+        assert_ne!(
+            parsed.source.server_id, 0,
+            "a replica id of zero is not usable against a real server"
+        );
+    }
 }

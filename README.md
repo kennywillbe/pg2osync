@@ -8,6 +8,37 @@ PostgreSQL's WAL or MySQL's binlog — and writes them to OpenSearch,
 Elasticsearch or Meilisearch within milliseconds. Inserts, updates, deletes and
 truncates included. One static Rust binary, one TOML file.
 
+```sh
+git clone https://github.com/kennywillbe/pg2osync && cd pg2osync
+cargo build --release
+
+export PG2OSYNC_SOURCE_URL="postgres://user:pass@db-host/mydb"
+./target/release/pg2osync init --table users   # writes pg2osync.toml, checks the table exists
+./target/release/pg2osync validate             # checks both ends and the server's settings
+./target/release/pg2osync run                  # initial load, then streaming
+```
+
+`init` reads your database to write the config, so an unqualified `users` comes
+out as `public.users` and a table without a primary key is refused before you
+find out at run time. `validate` is worth reading rather than skipping:
+
+```
+✓ config structure valid (1 table mappings)
+✓ connected to PostgreSQL (sslmode=prefer)
+✓ wal_level = logical
+✓ table public.products exists (3 columns)
+✓ privileges sufficient to create the missing objects
+✓ opensearch reachable at http://localhost:9200
+
+all checks passed
+```
+
+Then `run` loads the table once and streams every change after it, resuming
+exactly where it left off if the process dies. Measured on a laptop: 1.1 seconds
+from starting it to the first document being searchable.
+
+The config it writes is this small:
+
 ```toml
 [source]
 url_env = "PG2OSYNC_SOURCE_URL"
@@ -19,17 +50,6 @@ url = "http://localhost:9200"
 table = "public.users"
 index = "users"
 ```
-
-```sh
-export PG2OSYNC_SOURCE_URL="postgres://user:pass@db-host/mydb"
-pg2osync setup-sql -c pg2osync.toml  # the SQL your DBA needs to run, if any
-pg2osync validate -c pg2osync.toml   # check connections and prerequisites
-pg2osync run -c pg2osync.toml        # consistent initial load, then streaming
-```
-
-That's the whole setup. `run` loads the table once from a consistent snapshot,
-then streams every subsequent change until you stop it — resuming exactly where
-it left off if the process dies.
 
 ## Why this instead of the usual stack
 
@@ -106,16 +126,30 @@ every connection via `[source] sslmode` (libpq semantics, `prefer` by default).
 
 ## Install
 
-```sh
-# from source
-cargo install --path crates/bin
+**From source, which is the only path today.** There is no published binary or
+image yet — the release workflow builds both, and nothing has been tagged. A
+`docker pull` line lived here for a while and returned `denied` to anyone who
+tried it, which is worse than saying so.
 
-# container
+```sh
+git clone https://github.com/kennywillbe/pg2osync && cd pg2osync
+cargo build --release          # ./target/release/pg2osync
+# or put it on PATH:
+cargo install --path crates/bin
+```
+
+Rust 1.98 or newer. The binary links no C libraries, so the build needs nothing
+but a toolchain.
+
+**From a release, once one exists.** Tagging `v*` publishes static binaries for
+Linux and macOS on x86-64 and arm64, plus a container image:
+
+```sh
 docker run --rm \
   -e PG2OSYNC_SOURCE_URL="postgres://user:pass@db:5432/appdb" \
   -v "$PWD/pg2osync.toml:/etc/pg2osync/pg2osync.toml:ro" \
   -p 9100:9100 \
-  ghcr.io/kennywillbe/pg2osync:0.6.0
+  ghcr.io/kennywillbe/pg2osync:<version>
 ```
 
 Kubernetes manifests are in [deploy/kubernetes](deploy/kubernetes)
@@ -124,27 +158,17 @@ Kubernetes manifests are in [deploy/kubernetes](deploy/kubernetes)
 
 ## Try it locally
 
+Both ends in containers and a seeded table, from a clone of this repository:
+
 ```sh
-# PostgreSQL on :15432 with logical replication, OpenSearch on :9200
-docker compose -f dev/docker-compose.yml up -d
+docker compose -f dev/docker-compose.yml up -d          # PostgreSQL :15432, OpenSearch :9200
 docker exec -i dev-postgres-1 psql -U postgres -d sourcedb < dev/seed.sql
-
 cargo build --release
-cat > pg2osync.toml <<'TOML'
-[source]
-url_env = "PG2OSYNC_SOURCE_URL"
-
-[target]
-url = "http://localhost:9200"
-
-[sync.users]
-table = "public.users"
-index = "users"
-TOML
 
 export PG2OSYNC_SOURCE_URL="postgres://postgres:postgres@localhost:15432/sourcedb"
-./target/release/pg2osync validate -c pg2osync.toml
-./target/release/pg2osync run -c pg2osync.toml
+./target/release/pg2osync init --table users
+./target/release/pg2osync validate
+./target/release/pg2osync run
 ```
 
 In another shell, watch a change land:
@@ -154,6 +178,11 @@ docker exec dev-postgres-1 psql -U postgres -d sourcedb \
   -c "UPDATE users SET name = 'renamed' WHERE id = 1;"
 curl -s localhost:9200/users/_doc/1 | jq .
 ```
+
+Against **your own** database the only difference is the URL: `init` finds the
+tables, and `validate` names anything the server still needs — `wal_level`, a
+replication role, a primary key. `pg2osync setup-sql` prints the SQL for a DBA
+to run when you do not hold those privileges yourself.
 
 ## A fuller configuration
 
@@ -203,15 +232,22 @@ Every option is documented in
 
 ## Commands
 
+Every one takes `-c <file>` and defaults to `pg2osync.toml`, so the common case
+needs no flag at all.
+
 | Command | What it does |
 |---|---|
-| `run -c <cfg>` | Initial load plus continuous streaming (main mode) |
-| `validate -c <cfg>` | Config, connectivity and server prerequisites |
-| `bootstrap -c <cfg>` | Create the slot, publication and target indices, then exit |
-| `status -c <cfg>` | Checkpoint position versus the source's current position |
-| `resnapshot -c <cfg> --table T` | Read one table again into its index, without reloading the rest |
-| `rejects -c <cfg>` | What the target refused, and `--replay` to submit it again |
-| `drop-slot -c <cfg>` | Drop the slot and publication when decommissioning |
+| `init --table T` | Write a starter config, qualifying `T` and checking the source has it |
+| `validate` | Config, connectivity and server prerequisites, one line each |
+| `run` | Initial load plus continuous streaming (main mode) |
+| `bootstrap` | Create the slot, publication and target indices, then exit |
+| `status` | Checkpoint position versus the source's, and what each slot retains |
+| `setup-sql` | Print the SQL a DBA needs, derived from your config |
+| `resnapshot --table T` | Read one table again into its index, without reloading the rest |
+| `reconcile` | Name index documents whose row is gone; `--delete` removes them |
+| `rejects` | What the target refused, and `--replay` to submit it again |
+| `switch-alias --alias A` | Point an alias at this config's index, atomically |
+| `drop-slot` | Drop the slot and publication when decommissioning |
 
 ## Operating it
 
