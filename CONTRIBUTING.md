@@ -31,6 +31,7 @@ cargo build --release
 ./dev/e2e-mysql-test.sh              # MySQL source (needs a MySQL container)
 ./dev/failover-probe.sh              # MySQL failover; builds its own primary and replica
 ./dev/db-load-impact.sh              # what the source database pays while busy
+./dev/many-tables.sh                 # what a table costs, apart from its rows
 ```
 
 `failover-probe.sh` is separate because it is the only check that needs two

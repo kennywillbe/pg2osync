@@ -112,6 +112,29 @@ Two things follow for capacity planning. Give the pipeline its own cores, and
 expect the *database* side of CDC to cost a fraction of a core per ~10,000
 transactions a second, growing with write volume rather than with table size.
 
+**A table costs about 46 ms, whatever it holds.** Measured with
+`dev/many-tables.sh`: the same 500,000 rows loaded once as a single table and
+once spread over fifty.
+
+| | wall time | rows/s | peak RSS |
+|---|---|---|---|
+| 1 table, 500,000 rows | 3.9 s | 128,800 | 57 MB |
+| 50 tables, 10,000 rows each | 6.2 s | 81,200 | 30 MB |
+
+The 2.3 s difference over fifty tables is the fixed cost of a table: one boundary
+sample, one column lookup, one index to create and one progress document to
+write, once each, however few rows it holds. A child collection adds roughly
+100 ms more for that table, since its `COPY` aggregates per parent row.
+
+Two things it is worth noticing in that table. The cost is **linear** — five
+hundred tables would be around 23 s of setup, not a wall — and memory is *lower*
+with fifty tables than with one, because a single large table keeps more rows in
+flight in the copy channel. Nothing here grows with the number of tables.
+
+Nor does the streaming side: fifty relations written round-robin keep up, and a
+single commit touching all fifty propagates in **0.19 s**, so per-transaction
+bookkeeping does not fan out either.
+
 **Idle streaming costs nothing measurable.** Over 20 seconds with no writes,
 pg2osync issued **0 queries**. Logical replication is push-based: the server
 sends changes over the replication connection, and there is no polling.
