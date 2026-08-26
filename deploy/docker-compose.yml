@@ -9,7 +9,7 @@
 
 services:
   pg2osync:
-    image: ghcr.io/kennywillbe/pg2osync:0.6.0
+    image: ghcr.io/kennywillbe/pg2osync:1.0.0
     restart: unless-stopped
     environment:
       RUST_LOG: pg2osync=info
