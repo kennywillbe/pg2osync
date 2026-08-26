@@ -46,6 +46,5 @@
         "pg2osync-tls"
       ]
     }
-  ],
-  "skip-github-release": true
+  ]
 }

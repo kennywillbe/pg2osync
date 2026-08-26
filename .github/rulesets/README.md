@@ -43,8 +43,8 @@ gh api repos/kennywillbe/pg2osync/branches/main/protection > /tmp/protection.jso
   the outside world — it belongs to whoever owns the release, not to CI and not
   to a contributor.
 
-  This is also why release-please is configured with `skip-github-release`: a
-  personal repository cannot grant the Actions app a bypass here, GitHub refuses
-  with *"must be part of the ruleset source or owner organization"*, and the way
-  around it is a standing personal access token kept in the repository. The bot
-  prepares the release, a person tags it. `docs/releasing.md` has the rest.
+  release-please tags through `RELEASE_PLEASE_TOKEN`, a fine-grained token owned
+  by an admin, which is what satisfies this rule — the Actions app cannot be
+  given a bypass on a personal repository at all, and GitHub also refuses to
+  start a workflow from an event its own `GITHUB_TOKEN` created, so a bot tag
+  would publish nothing. `docs/releasing.md` has both traps written out.
