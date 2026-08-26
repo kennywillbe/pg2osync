@@ -107,16 +107,13 @@ pub fn checkpoint_from_doc(src: &Value) -> Option<Checkpoint> {
 
 pub struct OpenSearchSink {
     client: OpenSearch,
-    serverless: bool,
     retry: RetryPolicy,
 }
 
 #[derive(Debug, Clone)]
 pub struct OpenSearchSinkConfig {
     pub url: String,
-    /// Amazon OpenSearch Serverless: skip refresh/setting operations the
     /// service does not support; index policies must exist beforehand.
-    pub serverless: bool,
     pub username: Option<String>,
     pub password: Option<String>,
     pub tls_verify: bool,
@@ -141,11 +138,10 @@ impl Default for RetryPolicy {
 
 /// Whether a URL points straight at an OpenSearch Serverless collection.
 ///
-/// Every request to one has to be signed with SigV4 and this client cannot sign
-/// anything, so the endpoint answers 403 to all of it. Naming that at startup
-/// is the difference between a configuration error and an afternoon spent
-/// reading rejected requests. A signing proxy is addressed by its own host, so
-/// the supported arrangement does not trip on this.
+/// Serverless is not a supported target: every request to a collection has to be
+/// signed with SigV4, which this client does not do, and the service rejects the
+/// refresh and settings calls the pipeline relies on. Saying so at startup is
+/// better than an afternoon of 403s.
 fn is_serverless_endpoint(url: &str) -> bool {
     let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
     let host = after_scheme.split(['/', ':']).next().unwrap_or("");
@@ -156,10 +152,10 @@ impl OpenSearchSink {
     pub fn new(cfg: OpenSearchSinkConfig) -> Result<Self, CoreError> {
         if is_serverless_endpoint(&cfg.url) {
             return Err(CoreError::Sink(format!(
-                "{} is an OpenSearch Serverless endpoint, and every request to one must be \
-                 signed with SigV4 — which pg2osync does not do. Point [target] url at a \
-                 signing proxy that forwards to the collection, and keep serverless = true \
-                 so the calls AOSS rejects are skipped",
+                "{} is an Amazon OpenSearch Serverless endpoint, which pg2osync does not \
+                 support: every request to a collection must be signed with SigV4, and the \
+                 service rejects the refresh and index-settings calls the pipeline needs. \
+                 Use a provisioned OpenSearch domain, Elasticsearch or Meilisearch",
                 cfg.url
             )));
         }
@@ -176,7 +172,6 @@ impl OpenSearchSink {
             .map_err(|e| CoreError::Sink(format!("transport build failed: {e}")))?;
         Ok(Self {
             client: OpenSearch::new(transport),
-            serverless: cfg.serverless,
             retry: cfg.retry,
         })
     }
@@ -259,7 +254,7 @@ impl OpenSearchSink {
     }
 
     async fn warn_on_suspended_refresh(&self, tables: &[IndexSpec]) {
-        if self.serverless || tables.is_empty() {
+        if tables.is_empty() {
             return;
         }
         let names: Vec<&str> = tables.iter().map(|s| s.name.as_str()).collect();
@@ -769,16 +764,14 @@ impl Sink for OpenSearchSink {
         // delete_by_query only removes documents a search can see, so writes
         // still sitting in the translog would survive the TRUNCATE and
         // resurrect rows the source has already dropped
-        if !self.serverless {
-            let resp = self
-                .client
-                .indices()
-                .refresh(opensearch::indices::IndicesRefreshParts::Index(&[index]))
-                .send()
-                .await
-                .map_err(http_err)?;
-            check_status(resp, "pre-truncate refresh").await?;
-        }
+        let resp = self
+            .client
+            .indices()
+            .refresh(opensearch::indices::IndicesRefreshParts::Index(&[index]))
+            .send()
+            .await
+            .map_err(http_err)?;
+        check_status(resp, "pre-truncate refresh").await?;
 
         // Where documents carry versions, the truncate must carry one too.
         // delete_by_query cannot: it is internally versioned, so it leaves a
@@ -804,8 +797,7 @@ impl Sink for OpenSearchSink {
     }
 
     async fn refresh(&self, indices: &[String]) -> Result<(), CoreError> {
-        if self.serverless || indices.is_empty() {
-            // Serverless manages visibility itself and rejects the call
+        if indices.is_empty() {
             return Ok(());
         }
         let names: Vec<&str> = indices.iter().map(String::as_str).collect();
@@ -820,9 +812,7 @@ impl Sink for OpenSearchSink {
     }
 
     async fn begin_bulk_load(&self, indices: &[String]) -> Result<BulkLoadSettings, CoreError> {
-        if self.serverless || indices.is_empty() {
-            // Serverless manages refresh and replication itself and rejects
-            // the settings call outright
+        if indices.is_empty() {
             return Ok(BulkLoadSettings::default());
         }
         let names: Vec<&str> = indices.iter().map(String::as_str).collect();
@@ -1011,18 +1001,16 @@ impl Sink for OpenSearchSink {
         // A search only sees refreshed segments, and this total is what bounds
         // the quarantine: reading it stale would hand back budget that has
         // already been spent, and would hide a document from `rejects`.
-        if !self.serverless {
-            let resp = self
-                .client
-                .indices()
-                .refresh(opensearch::indices::IndicesRefreshParts::Index(&[
-                    REJECTS_INDEX,
-                ]))
-                .send()
-                .await
-                .map_err(http_err)?;
-            check_status(resp, "refresh rejects index").await?;
-        }
+        let resp = self
+            .client
+            .indices()
+            .refresh(opensearch::indices::IndicesRefreshParts::Index(&[
+                REJECTS_INDEX,
+            ]))
+            .send()
+            .await
+            .map_err(http_err)?;
+        check_status(resp, "refresh rejects index").await?;
         let resp = self
             .client
             .search(opensearch::SearchParts::Index(&[REJECTS_INDEX]))
@@ -1348,14 +1336,9 @@ mod tests {
     }
 
     #[test]
-    fn a_signing_proxy_is_the_supported_arrangement_and_passes() {
-        // What the docs tell an operator to run: the proxy holds the credentials
-        // and is addressed by its own host, so this must not be refused.
-        assert!(!super::is_serverless_endpoint("http://localhost:8080"));
-        assert!(!super::is_serverless_endpoint(
-            "https://aoss-proxy.internal:9200"
-        ));
-        // and a provisioned domain, which is a different service entirely
+    fn every_other_target_still_passes() {
+        assert!(!super::is_serverless_endpoint("http://localhost:9200"));
+        // a provisioned domain is a different service, and is supported
         assert!(!super::is_serverless_endpoint(
             "https://search-mine-xyz.eu-west-1.es.amazonaws.com"
         ));

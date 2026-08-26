@@ -106,7 +106,6 @@ It re-reads rows whose timestamp column advanced since the last cycle.
 | `password` / `password_env` | — | Basic-auth password |
 | `api_key_env` | — | Elasticsearch API key, or Meilisearch master key |
 | `tls_verify` | `true` | Only disable for self-signed development certificates |
-| `serverless` | `false` | Amazon OpenSearch Serverless profile: skips the refresh and settings calls it rejects. Needs a **search** collection and your own SigV4 proxy — an `*.aoss.amazonaws.com` url is refused at startup, since nothing here can sign a request. [Never verified against a real collection](sinks/opensearch.md#amazon-opensearch-serverless) |
 | `state_dir` | `./.pg2osync-state` | Meilisearch only: directory for the checkpoint file |
 
 Meilisearch has no place to store an arbitrary document, so its checkpoint is a

@@ -28,74 +28,31 @@ url = "http://localhost:9200"
 
 ## Amazon OpenSearch Serverless
 
-**This has never been run against a real collection.** The profile exists and
-skips the calls AOSS is documented to reject, but nobody has pointed it at
-`*.aoss.amazonaws.com`. Read the rest of this section before planning around
-it.
+**Not supported, deliberately.** A provisioned OpenSearch domain works —
+including the AWS-managed kind — but a Serverless *collection* does not, and a
+url ending in `.aoss.amazonaws.com` is refused at startup rather than left to
+answer 403 to everything.
 
-```toml
-[target]
-url = "https://<collection-id>.<region>.aoss.amazonaws.com"
-serverless = true
-```
+Three things would have to change, and each is a real piece of work:
 
-What the AWS documentation says, and what each point means here:
+- **SigV4 is the only authentication a collection accepts.** There is no
+  basic-auth path, so pg2osync would have to sign every request with service
+  name `aoss` — an AWS credential chain and a signing implementation, for one
+  target.
+- **A custom document id works only on a *search* collection.** Every document
+  here carries its row's primary key as `_id`, because that is what makes a
+  replay overwrite instead of duplicate. Time-series and vector collections
+  reject it outright, so they could never work at all.
+- **The service owns refresh and index settings.** Suspending refresh for an
+  initial load, refreshing before a `TRUNCATE`, and `/synced` all depend on
+  calls the service rejects. Each would need a documented degradation rather
+  than a silent skip.
 
-- **SigV4 is the only authentication.** Every request to a collection endpoint
-  must be signed with service name `aoss`; there is no basic-auth path, and no
-  AWS-supported proxy that provides one. `aws-sigv4-proxy` is an AWS Labs
-  sample rather than a documented AOSS component. Whatever you put in front,
-  it is yours to run.
-
-  pg2osync refuses to start when `[target] url` is an `*.aoss.amazonaws.com`
-  host, because it cannot sign anything and every request would come back 403.
-  Point the url at your proxy and keep `serverless = true`; the proxy is
-  addressed by its own host, so the supported arrangement is unaffected.
-- **Your collection must be a SEARCH collection.** Time-series and vector
-  collections reject a custom document id
-  (`illegal_argument_exception: Document ID is not supported in create/index
-  operation request`), and this tool writes the primary key as `_id` — that is
-  what makes replay idempotent. There is no version of this that works without
-  it.
-- **`TRUNCATE` cannot work.** It runs as `_delete_by_query`, which is not in
-  the supported-operations list. A truncate on the source would fail against a
-  collection.
-- **`/synced` cannot work.** The refresh interval is roughly ten seconds,
-  `_refresh` is unsupported, and `refresh=true`/`wait_for` are rejected. There
-  is no way to make a write visible on demand, so read-your-writes is not
-  available on Serverless — only on a provisioned domain.
-- **Unchanged-TOAST completion may not work.** It reads documents back with
-  `_mget`, which AOSS lists only as a GET; the client here sends it as a POST.
-- **The checkpoint index is `.pg2osync_meta`.** A leading dot is not documented
-  as forbidden, but it is the convention for system indices, which AOSS manages
-  itself. This is the least tested corner of an untested path.
-
-None of that is fatal to the idea — a search collection, a signing proxy, no
-truncates and no `/synced` is a real configuration. It is simply not one that
-has been demonstrated, and the matrix in the README now says so.
-
-### What a verification run would have to cover
-
-Written down so whoever has an AWS account can do it without rediscovering the
-list. Each item is a claim above that nobody has tested:
-
-1. A **SEARCH** collection, a data access policy granting the index and document
-   permissions, and a SigV4 proxy in front. Anything else fails at step 3.
-2. `pg2osync bootstrap` — does creating `.pg2osync_meta` succeed, and does a
-   dot-prefixed index name behave like an ordinary one?
-3. An initial load — do writes with an explicit `_id` land? This is the one that
-   decides whether a non-search collection is usable at all.
-4. Streaming an update and a delete, then a restart — does the checkpoint
-   round-trip through `.pg2osync_meta`?
-5. A `TRUNCATE` on the source — `_delete_by_query` is not listed as supported,
-   so the expected outcome is a clear failure rather than a silent no-op.
-6. An update to a row whose TOASTed column did not change — the completion path
-   reads documents back with `_mget` as a POST, which AOSS lists only as a GET.
-7. `GET /synced` — refresh is the service's business, so the honest expectation
-   is that read-your-writes cannot be offered here.
-
-Until that has been run, the matrix says unverified. Guessing at it from the
-documentation is how a support claim becomes a lie.
+None of that is impossible; it simply has never been asked for, and carrying a
+flag that had never been run against the service was a support claim nobody
+could stand behind. If you need it, open an issue — with SigV4 done properly
+rather than a proxy the operator has to run, and verified against a real
+collection before the matrix says anything.
 
 ## Index naming rules
 

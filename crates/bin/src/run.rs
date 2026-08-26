@@ -157,7 +157,6 @@ pub fn build_sink(cfg: &AppConfig, target_password: Option<String>) -> Result<Ar
                 username: cfg.target.username.clone(),
                 password: target_password,
                 tls_verify: cfg.target.tls_verify,
-                serverless: cfg.target.serverless,
                 retry,
             },
         )?),

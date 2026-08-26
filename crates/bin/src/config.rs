@@ -147,11 +147,6 @@ pub struct TargetConfig {
     pub api_key_env: Option<String>,
     #[serde(default = "default_true")]
     pub tls_verify: bool,
-    /// Amazon OpenSearch Serverless profile: skips operations
-    /// Serverless rejects (refresh, settings changes) and expects IAM-signed
-    /// access via an authorization token env (proxy or SigV4 gateway).
-    #[serde(default)]
-    pub serverless: bool,
     /// meilisearch only: checkpoint fallback directory
     #[serde(default = "default_state_dir")]
     pub state_dir: String,
