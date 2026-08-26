@@ -1,0 +1,51 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "release-type": "rust",
+  "bootstrap-sha": "66f780cfc2ee21b586a2e910678c4aff9f8ba763",
+  "include-component-in-tag": false,
+  "separate-pull-requests": false,
+  "packages": {
+    "crates/bin": {
+      "component": "pg2osync",
+      "changelog-path": "../../CHANGELOG.md"
+    },
+    "crates/core": {
+      "component": "pg2osync-core"
+    },
+    "crates/engine": {
+      "component": "pg2osync-engine"
+    },
+    "crates/sink": {
+      "component": "pg2osync-sink"
+    },
+    "crates/source": {
+      "component": "pg2osync-source"
+    },
+    "crates/source-mysql": {
+      "component": "pg2osync-source-mysql"
+    },
+    "crates/tls": {
+      "component": "pg2osync-tls"
+    }
+  },
+  "plugins": [
+    {
+      "type": "cargo-workspace",
+      "merge": true
+    },
+    {
+      "type": "linked-versions",
+      "groupName": "pg2osync",
+      "components": [
+        "pg2osync",
+        "pg2osync-core",
+        "pg2osync-engine",
+        "pg2osync-sink",
+        "pg2osync-source",
+        "pg2osync-source-mysql",
+        "pg2osync-tls"
+      ]
+    }
+  ],
+  "skip-github-release": true
+}

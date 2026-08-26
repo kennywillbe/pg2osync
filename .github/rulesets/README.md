@@ -42,3 +42,9 @@ gh api repos/kennywillbe/pg2osync/branches/main/protection > /tmp/protection.jso
   publishes binaries and a container image, so it is the one action that reaches
   the outside world — it belongs to whoever owns the release, not to CI and not
   to a contributor.
+
+  This is also why release-please is configured with `skip-github-release`: a
+  personal repository cannot grant the Actions app a bypass here, GitHub refuses
+  with *"must be part of the ruleset source or owner organization"*, and the way
+  around it is a standing personal access token kept in the repository. The bot
+  prepares the release, a person tags it. `docs/releasing.md` has the rest.

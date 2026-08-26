@@ -1,5 +1,11 @@
 # Changelog
 
+**Maintained by [release-please](https://github.com/googleapis/release-please)
+from here on.** It reads the commit subjects and keeps one open pull request that
+bumps the versions and writes the entry below; the 1.0.0 entry was written by
+hand because no commit before it followed the convention. See
+[docs/releasing.md](docs/releasing.md).
+
 Notable changes, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the versions
 follow [Semantic Versioning](https://semver.org/) — the version is `1.0.0`, the
