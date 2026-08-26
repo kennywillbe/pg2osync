@@ -1,0 +1,7 @@
+# Everything, for now. This is here so ownership is written down rather than
+# implied by who happens to have push access.
+#
+# Deliberately not enforced through `require_code_owner_reviews`: GitHub does not
+# let anyone approve their own pull request, so on a single-maintainer repository
+# that setting blocks every merge including the maintainer's own.
+*       @kennywillbe

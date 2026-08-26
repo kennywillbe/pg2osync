@@ -40,6 +40,12 @@ servers: it promotes a replica and asserts that the stream resumes *and* that
 documents written afterwards still land. Run it when touching checkpoints,
 versions or the MySQL protocol.
 
+Commit subjects follow [Conventional Commits](https://www.conventionalcommits.org/)
+— `feat:`, `fix:`, `docs:`, `chore:`, and `feat!:` for anything that breaks a
+config or a checkpoint. Only the subject line: the body stays prose, and for
+anything non-obvious it should say why. That subject is what writes the changelog
+and picks the next version; see [docs/releasing.md](docs/releasing.md).
+
 Every bug fix needs a regression test that fails without the fix. Protocol
 decoders (`pgoutput.rs`, `binlog.rs`) are tested with byte-level vectors — add
 one for the case you fix rather than only testing through the pipeline.

@@ -1,0 +1,41 @@
+name: Release Please
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  release-please:
+    name: keep the release PR up to date
+    runs-on: ubuntu-latest
+    # Mapped to an env var deliberately: the `secrets` context is not dependably
+    # available in a step-level `if`, and a guard that quietly fails to evaluate
+    # is worse than no guard.
+    env:
+      RELEASE_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+    steps:
+      # Fail here rather than half-release later. Without the token the action
+      # falls back to GITHUB_TOKEN, and that fails in two ways at once: the `v*`
+      # tag rule refuses the Actions app, and even if it did not, GitHub does not
+      # start a workflow from an event its own GITHUB_TOKEN created — the tag
+      # would appear with no binaries and no image behind it.
+      - name: the release token has to be present
+        if: ${{ env.RELEASE_TOKEN == '' }}
+        run: |
+          echo "::error::RELEASE_PLEASE_TOKEN is not set. See docs/releasing.md;" \
+               "without it a release would be tagged with nothing built behind it."
+          exit 1
+
+      # Collects every conventional commit since the last release into one pull
+      # request that bumps all seven crates and writes CHANGELOG.md. Merging that
+      # pull request is what tags and releases — and merging is restricted to the
+      # owner, so the release gate and the merge gate are the same gate.
+      #
+      # The token is a fine-grained PAT belonging to a repository admin, which is
+      # what lets the tag through the `v*` rule and what makes the tag push
+      # trigger the Release workflow.
+      - uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ env.RELEASE_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
