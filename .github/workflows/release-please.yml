@@ -11,6 +11,7 @@ jobs:
   release-please:
     name: keep the release PR up to date
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # Mapped to an env var deliberately: the `secrets` context is not dependably
     # available in a step-level `if`, and a guard that quietly fails to evaluate
     # is worse than no guard.

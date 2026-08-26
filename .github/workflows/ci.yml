@@ -22,6 +22,7 @@ jobs:
   lint:
     name: fmt + clippy + unit tests
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -37,6 +38,7 @@ jobs:
   msrv:
     name: minimum supported Rust version
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
@@ -51,6 +53,7 @@ jobs:
   e2e-postgres:
     name: e2e PostgreSQL to OpenSearch
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:17
@@ -90,12 +93,13 @@ jobs:
           docker restart dev-postgres-1
           until docker exec dev-postgres-1 pg_isready -U postgres -d sourcedb; do sleep 2; done
       - run: docker exec -i dev-postgres-1 psql -U postgres -d sourcedb < dev/seed.sql
-      - run: cargo build --release -p pg2osync
+      - run: cargo build --release --locked -p pg2osync
       - run: ./dev/e2e-test.sh
 
   e2e-mysql:
     name: e2e MySQL to OpenSearch
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     services:
       mysql:
         image: mysql:8.0
@@ -150,12 +154,13 @@ jobs:
           docker exec mysql-test mysql -uroot -pmysqlpw -e "SET @@GLOBAL.GTID_MODE = ON;"
           docker exec mysql-test mysql -uroot -pmysqlpw -N -B -e "SELECT @@GLOBAL.gtid_mode;"
       - run: docker exec -i mysql-test mysql -uroot -pmysqlpw sourcedb < dev/mysql-seed.sql
-      - run: cargo build --release -p pg2osync
+      - run: cargo build --release --locked -p pg2osync
       - run: ./dev/e2e-mysql-test.sh
 
   docker:
     name: container image builds
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
@@ -176,6 +181,7 @@ jobs:
   helm:
     name: helm chart lints
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: azure/setup-helm@v5

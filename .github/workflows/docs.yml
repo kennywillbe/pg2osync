@@ -26,6 +26,7 @@ jobs:
   build:
     name: the book builds
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - name: Every page is in the table of contents
@@ -60,6 +61,7 @@ jobs:
     # code. The guard removes itself the moment the repository goes public.
     if: github.ref == 'refs/heads/main' && github.event.repository.private == false
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       pages: write
       id-token: write
