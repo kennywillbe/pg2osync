@@ -42,6 +42,15 @@ os_len()    { curl -s "$OS/$1/_doc/$2" | jqf "len(d.get('_source',{}).get('$3') 
 os_status() { curl -s -o /dev/null -w "%{http_code}" "$OS/$1/_doc/$2"; }
 my()        { docker exec "$CONTAINER" "$CLIENT" -uroot -p"$ROOT_PASSWORD" -N -B sourcedb -e "$1" 2>/dev/null; }
 refresh()   { curl -s -XPOST "$OS/_refresh" > /dev/null; }
+# Every table loads beside the stream, so one table reaching the source's count
+# says nothing about another one; each index has to be waited for on its own.
+await_count() {
+  for _ in $(seq 1 180); do
+    refresh
+    [ "$(os_count "$1")" = "$2" ] && return 0
+    sleep 1
+  done
+}
 synced()    { curl -s "http://127.0.0.1:9132/synced?refresh=true&timeout=10000" > /dev/null; refresh; }
 
 start_sync() { nohup $BIN run -c "$CONFIG" >> "$LOG" 2>&1 < /dev/null & disown; }
@@ -299,17 +308,14 @@ my "UPDATE resume_probe SET v='changed-during-the-load' WHERE id = 131000;"
 my "DELETE FROM resume_probe WHERE id = 130000;"
 # one row fewer to wait for, now that the load itself is racing a delete
 src_rows=$((src_rows - 1))
-for _ in $(seq 1 180); do
-  refresh
-  [ "$(os_count e2e_mysql_resume)" = "$src_rows" ] && break
-  sleep 1
-done
+await_count e2e_mysql_resume "$src_rows"
 check "every row is indexed after the restart" "$(os_count e2e_mysql_resume)" "$src_rows"
 if grep -q "resuming the load of sourcedb.resume_probe after key" "$LOG"; then
   ok "the load resumed from its cursor instead of starting over"
 else
   bad "the load restarted from the beginning"
 fi
+await_count e2e_mysql_composite "$composite_rows"
 check "a composite key loads completely" "$(os_count e2e_mysql_composite)" "$composite_rows"
 # no /synced endpoint on this config, and the row count matching only proves the
 # changes it counts have landed — the rest of the stream needs a moment
