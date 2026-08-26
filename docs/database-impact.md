@@ -83,6 +83,35 @@ no ownership requirement.
 
 ## Load while streaming
 
+**What a busy database pays: about 0.2 of a core, and no measurable throughput.**
+Measured with `dev/db-load-impact.sh`: pgbench, 8 clients, 30 seconds a phase,
+against a database whose hot table is the one being replicated.
+
+| | foreground tps | average latency |
+|---|---|---|
+| nothing replicating | 13,775 | 0.581 ms |
+| **the same logical decoding, nothing behind it** | **13,716 (−0.4%)** | 0.583 ms (+0.3%) |
+| pg2osync streaming, on the same machine | 8,160 (−40.8%) | 0.980 ms |
+| initial load beside the workload | 7,774 (−43.6%) | 1.029 ms |
+
+The second row is the one to quote, and the difference between it and the third
+is the point of measuring both. It is `pg_recvlogical` doing byte-for-byte the
+same decoding through the same publication with its output going to
+`/dev/null` — so it is what the *database* pays, and it is under half a percent.
+The walsender burned 5.7 s of CPU over 30 s, **0.19 of a core**, to decode a
+workload of ~14,000 transactions a second.
+
+The 40% below it is not replication's cost. It is one laptop running the
+database, the pipeline and OpenSearch on the same eight cores; the walsender's
+own CPU only rises from 0.19 to 0.32 cores between those rows, which is nowhere
+near 40% of anything. A deployment where the pipeline and the target are not on
+the database's cores does not pay it — and if yours is that deployment, the
+control row is your number.
+
+Two things follow for capacity planning. Give the pipeline its own cores, and
+expect the *database* side of CDC to cost a fraction of a core per ~10,000
+transactions a second, growing with write volume rather than with table size.
+
 **Idle streaming costs nothing measurable.** Over 20 seconds with no writes,
 pg2osync issued **0 queries**. Logical replication is push-based: the server
 sends changes over the replication connection, and there is no polling.
