@@ -1,0 +1,71 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths: ["docs/**", "book.toml", ".github/workflows/docs.yml"]
+  pull_request:
+    paths: ["docs/**", "book.toml", ".github/workflows/docs.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A queued deployment should replace an older one rather than cancel the run
+# that is already publishing, which would leave the site half-updated.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  # pinned rather than "latest" so a book that builds here builds the same way
+  # in six months; dependabot does not track this, so bump it by hand
+  MDBOOK_VERSION: "0.4.52"
+
+jobs:
+  build:
+    name: the book builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Every page is in the table of contents
+        # mdBook only warns about a file it never links to, which would silently
+        # publish a page nobody can reach from the sidebar
+        run: |
+          missing=0
+          while IFS= read -r page; do
+            case "$page" in docs/SUMMARY.md|docs/index.md) continue ;; esac
+            grep -q "(${page#docs/})" docs/SUMMARY.md || { echo "not in SUMMARY.md: $page"; missing=1; }
+          done < <(find docs -name '*.md' | sort)
+          exit $missing
+      - name: Install mdBook
+        run: |
+          url="https://github.com/rust-lang/mdbook/releases/download/v$MDBOOK_VERSION/mdbook-v$MDBOOK_VERSION-x86_64-unknown-linux-gnu.tar.gz"
+          mkdir -p "$RUNNER_TEMP/mdbook"
+          curl -sSfL "$url" | tar -xz --directory="$RUNNER_TEMP/mdbook"
+          echo "$RUNNER_TEMP/mdbook" >> "$GITHUB_PATH"
+      - run: mdbook build
+      - uses: actions/configure-pages@v5
+        if: github.ref == 'refs/heads/main' && github.event.repository.private == false
+      - uses: actions/upload-pages-artifact@v4
+        if: github.ref == 'refs/heads/main' && github.event.repository.private == false
+        with:
+          path: target/book
+
+  deploy:
+    name: published to GitHub Pages
+    needs: build
+    # GitHub Pages on this plan is always public, so publishing while the
+    # repository is private would put the docs on the open internet ahead of the
+    # code. The guard removes itself the moment the repository goes public.
+    if: github.ref == 'refs/heads/main' && github.event.repository.private == false
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

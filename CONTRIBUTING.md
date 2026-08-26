@@ -69,6 +69,12 @@ Design rationale lives in [docs/decisions.md](docs/decisions.md). If your
 change contradicts a recorded decision, update that document in the same pull
 request and explain why.
 
+`docs/` is also the source of <https://kennywillbe.github.io/pg2osync/>, built
+with mdBook. A new page has to be listed in
+[docs/SUMMARY.md](docs/SUMMARY.md) or CI fails, since a page nothing links to is
+a page nobody finds. Build it locally with `mdbook build` and read it with
+`mdbook serve`.
+
 ## Style
 
 - Comments explain **why**, not what. No commented-out code, no changelog

@@ -89,3 +89,21 @@ The last row is the one that matters most: what a major version promises here is
 that a `pg2osync.toml` keeps loading and a running pipeline does not re-read a
 table from the start. Breaking either is a major, whatever else the change looks
 like.
+
+## The documentation site
+
+The **Docs** workflow builds this book out of `docs/` with mdBook and publishes
+it to GitHub Pages on every push to `main` that touches the documentation. Pull
+requests build it without publishing, so a broken page or a chapter missing from
+`SUMMARY.md` fails there rather than on the live site.
+
+Publishing is switched off while the repository is private, because Pages on this
+plan is public whatever the repository is, and the docs must not lead the code
+out. Once the repository is public, one setting starts it:
+
+```sh
+gh api -X POST repos/kennywillbe/pg2osync/pages -f build_type=workflow
+```
+
+Or **Settings → Pages → Source: GitHub Actions**. The site is then
+<https://kennywillbe.github.io/pg2osync/>, and nothing else has to be done again.
