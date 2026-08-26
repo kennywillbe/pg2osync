@@ -108,9 +108,17 @@ near 40% of anything. A deployment where the pipeline and the target are not on
 the database's cores does not pay it — and if yours is that deployment, the
 control row is your number.
 
-Two things follow for capacity planning. Give the pipeline its own cores, and
-expect the *database* side of CDC to cost a fraction of a core per ~10,000
-transactions a second, growing with write volume rather than with table size.
+Two things follow for capacity planning. Give the pipeline its own cores — one
+is enough, [measured](operations.md#capacity-notes) — and expect the *database*
+side of CDC to cost a fraction of a core per ~10,000 transactions a second,
+growing with write volume rather than with table size.
+
+What a *distant* source or target costs is still unmeasured, and deliberately so
+rather than by omission: on a single machine the attempt reproducibly says that
+adding 50 ms of network delay makes the initial load **faster**, which is
+contention relieving itself and not a latency result. `dev/resource-limits.sh`
+carries the harness and the reasoning; the number needs hardware where the
+target is not already the bottleneck.
 
 **A table costs about 46 ms, whatever it holds.** Measured with
 `dev/many-tables.sh`: the same 500,000 rows loaded once as a single table and

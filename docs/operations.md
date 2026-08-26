@@ -395,6 +395,25 @@ checkpoint and re-run the initial load, which is safe but expensive.
 - The initial load's cost is dominated by the target's indexing throughput, not
   by pg2osync. `dev/benchmark.sh` reproduces the numbers in the README against a
   local stack.
+- **Give the pipeline one core.** Measured with `dev/resource-limits.sh`, which
+  runs it in its own container under a `--cpus` cap against a 500,000-row load:
+
+  | cap | throughput | peak memory |
+  |---|---|---|
+  | 0.25 cores | 10,500 rows/s | 9 MB |
+  | 0.5 cores | 30,900 rows/s | 8 MB |
+  | **1 core** | **51,900 rows/s** | 12 MB |
+  | 2 cores | 54,500 rows/s | 25 MB |
+
+  One core reaches the target's own ceiling; past that the extra cores wait
+  alongside it. Below it the pipeline slows down and *nothing else happens* —
+  at a quarter of a core it is five times slower on 9 MB of memory, because the
+  bounded channels mean falling behind costs latency and retained WAL rather
+  than growing memory. That is the number to put in a deployment: one core, two
+  if it also serves `/synced`, and not on the database's cores — the 40% figure
+  in [database-impact](database-impact.md#load-while-streaming) is what
+  co-location costs the *database*.
+
 - **That ceiling is what `[engine] write_concurrency` moves.** One request open
   at a time is the default and is what the figures above are measured at; the
   source is not the constraint, since a single `COPY` hands over rows more than
