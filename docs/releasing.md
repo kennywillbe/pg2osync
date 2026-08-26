@@ -40,7 +40,12 @@ A fine-grained personal access token belonging to a repository admin, stored as
 the repository secret **`RELEASE_PLEASE_TOKEN`**:
 
 - **Repository access:** only this repository.
-- **Permissions:** *Contents* read and write, *Pull requests* read and write.
+- **Permissions:** *Contents* read and write, *Pull requests* read and write, and
+  *Issues* read and write. The last one is not obvious and is required: the
+  labels release-please puts on its own pull request (`autorelease: pending`)
+  go through the issues API, which is how GitHub models labels on a pull
+  request. *Metadata* read-only is added for you and is mandatory.
+- **Account permissions:** none.
 - **Expiry:** whatever you are willing to renew. When it expires, release pull
   requests silently stop appearing — the workflow keeps passing because there is
   nothing for it to do. Put the expiry date somewhere you will see it.
