@@ -386,6 +386,12 @@ checkpoint and re-run the initial load, which is safe but expensive.
   ~90 MB resident while loading 200K docs, and lower at steady state.
 - One instance is single-threaded in effect — the source, engine and sink tasks
   pipeline but do not shard. Scale by splitting tables across instances.
+- **Table count is not what makes you split.** Measured, a table costs about
+  46 ms of fixed setup in the initial load and nothing per table afterwards:
+  memory does not grow with the count, and a commit touching fifty tables
+  propagates in 0.19 s. What makes you split is aggregate write *volume* — one
+  instance is one stream and one write path, so the number to compare against is
+  the sustained rate in the section above, not how many tables you have.
 - The initial load's cost is dominated by the target's indexing throughput, not
   by pg2osync. `dev/benchmark.sh` reproduces the numbers in the README against a
   local stack.
