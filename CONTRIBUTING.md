@@ -46,6 +46,11 @@ config or a checkpoint. Only the subject line: the body stays prose, and for
 anything non-obvious it should say why. That subject is what writes the changelog
 and picks the next version; see [docs/releasing.md](docs/releasing.md).
 
+**Give the pull request itself a conventional title too.** Pull requests are
+squash-merged, so the title — not your commit subjects — is what lands on `main`
+and what the changelog is written from. A check fails the pull request if it does
+not parse.
+
 Every bug fix needs a regression test that fails without the fix. Protocol
 decoders (`pgoutput.rs`, `binlog.rs`) are tested with byte-level vectors — add
 one for the case you fix rather than only testing through the pipeline.

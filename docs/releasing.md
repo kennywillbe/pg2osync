@@ -30,6 +30,12 @@ accumulated since the last release goes out as one version.
 Merge the open pull request titled `chore: release …`. That is the whole
 procedure.
 
+Every other pull request is **squash-merged**, and its title becomes the commit
+subject on `main`. That is what release-please reads, so the title has to be a
+conventional commit — a required check enforces it. Merge commits are switched
+off: the one that did land (`Merge pull request #52 …`) made release-please
+consider zero commits and propose nothing.
+
 Watch the **Release** workflow afterwards. It builds static binaries for Linux
 and macOS on x86-64 and arm64, attaches them with checksums, and pushes
 `ghcr.io/kennywillbe/pg2osync` tagged with the version and with `major.minor`.
