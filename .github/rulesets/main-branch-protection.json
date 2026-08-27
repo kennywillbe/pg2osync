@@ -1,12 +1,19 @@
 {
   "allow_deletions": false,
   "allow_force_pushes": false,
+  "allow_fork_syncing": false,
+  "block_creations": false,
   "enforce_admins": true,
+  "lock_branch": false,
   "required_conversation_resolution": true,
+  "required_linear_history": true,
   "required_pull_request_reviews": {
     "dismiss_stale_reviews": true,
+    "require_code_owner_reviews": false,
+    "require_last_push_approval": false,
     "required_approving_review_count": 0
   },
+  "required_signatures": false,
   "required_status_checks": {
     "contexts": [
       "fmt + clippy + unit tests",
@@ -14,7 +21,8 @@
       "e2e MySQL to OpenSearch",
       "minimum supported Rust version",
       "container image builds",
-      "helm chart lints"
+      "helm chart lints",
+      "the title is a conventional commit"
     ],
     "strict": true
   }

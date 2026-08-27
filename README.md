@@ -349,6 +349,10 @@ buffer cap, retry policy, checkpoint interval.
 
 ## Documentation
 
+All of it, browsable and searchable, is at
+**<https://kennywillbe.github.io/pg2osync/>** — the same files as below, built
+from `docs/` on every change.
+
 - [Architecture](docs/architecture.md) — how the pipeline works
 - [Database impact](docs/database-impact.md) — connections, privileges and the load it puts on your source
 - [Configuration](docs/configuration.md) — every option

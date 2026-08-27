@@ -552,3 +552,9 @@ matchable variants; the CLI gets readable messages.
 **YAGNI on configuration.** An option that does nothing is worse than a missing
 one, because it implies a guarantee. Options that had no effect were removed
 rather than documented.
+
+**Advisories are reviewed, not muted.** `cargo audit` runs in CI when the
+dependencies move, and every entry in [`.cargo/audit.toml`](https://github.com/kennywillbe/pg2osync/blob/main/.cargo/audit.toml)
+carries the argument for why the advisory does not reach this binary — for the
+`rsa` sidechannel, that the process holds no private key to leak. An advisory
+with no such argument is a bug to fix, not a line to add there.

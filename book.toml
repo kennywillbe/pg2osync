@@ -1,0 +1,28 @@
+[book]
+title = "pg2osync"
+description = "Real-time PostgreSQL and MySQL replication into OpenSearch, Elasticsearch and Meilisearch"
+authors = ["kennywillbe"]
+language = "en"
+# The book is built straight out of docs/, so the site and the files people read
+# on GitHub are the same files. Nothing is copied or generated into a second
+# place that could fall behind.
+src = "docs"
+
+[build]
+build-dir = "target/book"
+# a page missing from SUMMARY.md should fail the build, not be invented
+create-missing = false
+
+[output.html]
+git-repository-url = "https://github.com/kennywillbe/pg2osync"
+edit-url-template = "https://github.com/kennywillbe/pg2osync/edit/main/{path}"
+site-url = "/pg2osync/"
+default-theme = "rust"
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.search]
+enable = true
+boost-title = 3

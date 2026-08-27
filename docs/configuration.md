@@ -9,7 +9,7 @@ catalogue and refusing a table with no primary key; this reference is for the
 options you add afterwards. Every command defaults to `pg2osync.toml`, which is
 what `init` writes.
 
-Full example: [examples/pg2osync.example.toml](../examples/pg2osync.example.toml).
+Full example: [examples/pg2osync.example.toml](https://github.com/kennywillbe/pg2osync/blob/main/examples/pg2osync.example.toml).
 
 Everything structural is checked by `pg2osync validate`, which also connects to
 both ends and verifies server prerequisites.
