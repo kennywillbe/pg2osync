@@ -2,8 +2,7 @@
 
 ## Supported versions
 
-pg2osync is pre-1.0. Security fixes land on the latest released 0.x version;
-there are no long-term support branches yet.
+`1.0.x` — latest patch is supported. There are no other versions.
 
 ## Reporting a vulnerability
 
