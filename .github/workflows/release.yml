@@ -72,7 +72,7 @@ jobs:
   image:
     name: container image
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 180
     permissions:
       packages: write
     steps:
