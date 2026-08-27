@@ -1,0 +1,286 @@
+/* pg2osync — mdBook overrides: keep Rust's structure, make it feel like 2026 */
+/* Sadece Rust kalsın */
+#theme-list #default_theme, #theme-list #light, #theme-list #coal, #theme-list #navy, #theme-list #ayu { display: none; }
+
+:root {
+  --content-max-width: 860px;
+  --sidebar-target-width: 300px;
+}
+
+/* System font stack — no external request, instant load, native feel */
+html {
+  font-family: ui-sans-system, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    Inter, "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+.content main {
+  line-height: 1.7;
+  font-size: 15.5px;
+  letter-spacing: -0.011em;
+}
+
+/* Headings: tighter, bolder, more hierarchy */
+.content h1 {
+  font-size: 2rem;
+  font-weight: 750;
+  letter-spacing: -0.025em;
+  margin-top: 2.2em;
+  border-bottom: 1px solid var(--table-border-color);
+  padding-bottom: 0.35em;
+}
+.content h2 {
+  font-size: 1.45rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin-top: 2em;
+}
+.content h3 {
+  font-size: 1.15rem;
+  font-weight: 650;
+  letter-spacing: -0.015em;
+}
+.content h4 {
+  font-weight: 650;
+}
+
+/* Links: modern blue, subtle underline */
+.content a {
+  text-decoration-thickness: 0.08em;
+  text-underline-offset: 0.18em;
+}
+.content a:hover {
+  text-decoration-thickness: 0.12em;
+}
+
+/* Inline code: pill-like, not harsh */
+.content code:not(pre code) {
+  background: color-mix(in srgb, var(--bg) 92%, var(--fg) 8%);
+  border: 1px solid color-mix(in srgb, var(--table-border-color) 80%, transparent);
+  border-radius: 6px;
+  padding: 0.15em 0.38em;
+  font-size: 0.88em;
+  font-weight: 500;
+}
+
+/* Code blocks: rounded, bordered, breathing room */
+.content pre {
+  border-radius: 10px;
+  border: 1px solid var(--table-border-color);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+  margin: 1.4em 0;
+}
+.content pre > code {
+  padding: 1.1em 1.2em;
+  line-height: 1.6;
+}
+
+/* Admonitions (native mdBook > [!NOTE] etc. — mdBook 0.4.40+) */
+.content blockquote {
+  border-left-width: 3px;
+  border-radius: 0 8px 8px 0;
+  padding: 0.85em 1.1em;
+  margin: 1.4em 0;
+}
+.content blockquote:has(> p > strong:first-child) {
+  background: var(--quote-bg);
+  border-left-color: var(--links);
+}
+
+/* Tables: card-like */
+.content table {
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid var(--table-border-color);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+  display: table;
+  width: 100%;
+}
+.content table thead th {
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  font-size: 0.9em;
+  text-transform: none;
+}
+
+/* Search: pill, softer */
+#searchbar {
+  border-radius: 8px;
+  padding: 6px 10px;
+}
+
+/* Sidebar: more air, clearer hierarchy */
+.sidebar .chapter li.chapter-item {
+  margin: 1px 0;
+}
+.sidebar .chapter li a {
+  border-radius: 6px;
+  padding: 4px 8px;
+  margin-right: 6px;
+}
+.sidebar .chapter li a.active {
+  font-weight: 650;
+}
+.sidebar .chapter li.part-title {
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  margin-top: 1.2em;
+  font-size: 0.78em;
+  text-transform: uppercase;
+  opacity: 0.7;
+}
+
+/* Menu bar: slightly taller, cleaner */
+.menu-bar {
+  border-bottom: 1px solid var(--table-border-color);
+  backdrop-filter: saturate(1.2) blur(6px);
+}
+
+/* Rust — warm modern (bej kalıyor ama temiz) */
+.rust {
+  --bg: #fdfbf7;
+  --fg: #1c1917;
+  --sidebar-bg: #1c1917;
+  --sidebar-fg: #e7e5e4;
+  --sidebar-non-existant: #a8a29e;
+  --sidebar-active: #fb923c;
+  --sidebar-spacer: #292524;
+  --scrollbar: #a8a29e;
+  --icons: #a8a29e;
+  --icons-hover: #fff7ed;
+  --links: #c2410c;
+  --inline-code-color: #9a3412;
+  --quote-bg: #fff7ed;
+  --quote-border: #fed7aa;
+  --table-border-color: #f5e6d3;
+  --table-header-bg: #ffedd5;
+  --table-alternate-bg: #fffbf7;
+  --searchbar-bg: #ffffff;
+  --searchbar-fg: #1c1917;
+  --searchbar-border-color: #e7d5c4;
+  --searchbar-shadow-color: #fed7aa;
+  --searchresults-header-fg: #78716c;
+  --searchresults-border-color: #e7d5c4;
+  --searchresults-li-bg: #fff7ed;
+  --search-mark-bg: #fed7aa;
+  --theme-popup-bg: #1c1917;
+  --theme-popup-border: #44403c;
+  --theme-hover: #292524;
+  --warning-border: #f97316;
+  --copy-button-filter: invert(60%) sepia(20%) saturate(400%) hue-rotate(350deg);
+  --copy-button-filter-hover: invert(55%) sepia(80%) saturate(800%) hue-rotate(350deg);
+  --footnote-highlight: #fed7aa;
+  --overlay-bg: rgba(28, 25, 23, 0.35);
+}
+.rust .content pre {
+  background: #f6f7f6;
+  border-color: #e7d5c4;
+  color: #1c1917;
+}
+.rust .content pre code { color: #1c1917; }
+/* highlight.js yorumları rust'ta çok açıktı — koyulaştır */
+.rust .hljs-comment, .rust .hljs-quote { color: #6b6b6b !important; }
+.rust .hljs-meta { color: #8a5a44 !important; }
+.rust .content code:not(pre code) {
+  background: #fff7ed;
+  border-color: #fed7aa;
+}
+
+/* Light theme tuning — away from rust brown */
+.light {
+  --bg: #ffffff;
+  --fg: #1a1a1e;
+  --sidebar-bg: #f8f9fb;
+  --sidebar-fg: #2a2a30;
+  --sidebar-active: #0b57d0;
+  --sidebar-spacer: #eceef2;
+  --links: #0b57d0;
+  --inline-code-color: #1a1a1e;
+  --quote-bg: #f0f4ff;
+  --quote-border: #c2d6ff;
+  --table-border-color: #e8eaee;
+  --table-header-bg: #f1f3f7;
+  --table-alternate-bg: #f8f9fb;
+  --searchbar-bg: #ffffff;
+  --searchbar-border-color: #dde1e7;
+  --theme-popup-bg: #ffffff;
+  --theme-popup-border: #dde1e7;
+}
+
+/* Dark themes — screenshot'taki siyah çamuru düzelt */
+.navy {
+  --bg: #0f172a;
+  --fg: #e2e8f0;
+  --sidebar-bg: #1e293b;
+  --sidebar-fg: #cbd5e1;
+  --sidebar-active: #38bdf8;
+  --sidebar-spacer: #334155;
+  --links: #38bdf8;
+  --inline-code-color: #7dd3fc;
+  --quote-bg: #1e293b;
+  --quote-border: #334155;
+  --table-border-color: #1e293b;
+  --table-header-bg: #1e293b;
+  --table-alternate-bg: #0f172a;
+  --searchbar-bg: #1e293b;
+  --searchbar-border-color: #334155;
+  --searchbar-fg: #e2e8f0;
+  --theme-popup-bg: #1e293b;
+  --theme-popup-border: #334155;
+  --icons: #94a3b8;
+  --icons-hover: #f1f5f9;
+}
+.ayu {
+  --bg: #0b1416;
+  --fg: #cbd5e1;
+  --sidebar-bg: #111d20;
+  --sidebar-fg: #94a3b8;
+  --sidebar-active: #2dd4bf;
+  --links: #2dd4bf;
+  --inline-code-color: #5eead4;
+  --quote-bg: #142a2e;
+  --quote-border: #1e3a3f;
+  --table-border-color: #1e2e33;
+  --table-header-bg: #1a2e33;
+}
+.coal {
+  --bg: #0f1115;
+  --fg: #d1d5db;
+  --sidebar-bg: #181b20;
+  --sidebar-fg: #9ca3af;
+  --sidebar-active: #60a5fa;
+  --links: #60a5fa;
+  --inline-code-color: #93c5fd;
+  --quote-bg: #1a1d23;
+  --quote-border: #252a33;
+  --table-border-color: #1f242e;
+  --table-header-bg: #1a1f2a;
+}
+
+/* Koyu temalarda code block daha belirgin */
+.navy .content pre, .ayu .content pre, .coal .content pre {
+  background: #0b1220;
+  border-color: #1e293b;
+}
+.navy .content code:not(pre code), .ayu .content code:not(pre code), .coal .content code:not(pre code) {
+  background: #1e293b;
+  border-color: #334155;
+}
+
+/* Mermaid diagrams centered */
+pre.mermaid, .mermaid {
+  background: var(--bg);
+  display: flex;
+  justify-content: center;
+  padding: 1em;
+}
+
+/* Copy button: a bit bigger hit area */
+.copy-button {
+  border-radius: 6px;
+}
+
+/* Footer / edit link subtle */
+.nav-wrapper a.mobile-nav-chapters { border-radius: 8px; }
