@@ -19,9 +19,20 @@ gh api repos/kennywillbe/pg2osync/branches/main/protection > /tmp/protection.jso
 
 `main-branch-protection.json`
 
-- **Every change arrives by pull request.** No direct pushes, and the six CI
-  jobs have to be green — `strict` means the branch must also be up to date, so
-  a passing check on a stale base does not count.
+- **Every change arrives by pull request.** No direct pushes, and the required
+  checks have to be green — `strict` means the branch must also be up to date,
+  so a passing check on a stale base does not count. The **Docs** and **Audit**
+  workflows are deliberately not required: both only run when the files they
+  care about change, and a required check that never starts blocks the merge
+  for ever.
+- **The pull request title is a required check.** Merges are squash-only, so
+  the title becomes the commit subject on `main`, and release-please reads that
+  subject to pick the next version and write the changelog. A title that does
+  not parse is a change that never shows up in a release.
+- **Linear history.** A merge commit's subject is `Merge pull request #52 …`,
+  which release-please cannot parse — it did exactly that once, and considered
+  zero commits. Squash-only merges keep every commit on `main` a conventional
+  one.
 - **No force pushes and no deletion.** The history was rewritten once by force;
   after this it cannot be.
 - **`enforce_admins` is true, the owner included.** The first version of this

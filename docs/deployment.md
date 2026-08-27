@@ -29,11 +29,11 @@ docker run --rm … ghcr.io/kennywillbe/pg2osync:1.0.0 \
 
 Build it yourself with `docker build -t pg2osync:local .`.
 
-A compose example lives in [deploy/docker-compose.yml](../deploy/docker-compose.yml).
+A compose example lives in [deploy/docker-compose.yml](https://github.com/kennywillbe/pg2osync/blob/main/deploy/docker-compose.yml).
 
 ## Kubernetes with Helm
 
-The chart lives in [deploy/helm/pg2osync](../deploy/helm/pg2osync).
+The chart lives in [deploy/helm/pg2osync](https://github.com/kennywillbe/pg2osync/tree/main/deploy/helm/pg2osync).
 
 ```sh
 helm install pg2osync deploy/helm/pg2osync \
@@ -106,7 +106,7 @@ helm template pg2osync deploy/helm/pg2osync -f my-values.yaml
 ## Kubernetes without Helm
 
 Plain manifests with a Kustomization are in
-[deploy/kubernetes](../deploy/kubernetes):
+[deploy/kubernetes](https://github.com/kennywillbe/pg2osync/tree/main/deploy/kubernetes):
 
 ```sh
 kubectl apply -k deploy/kubernetes
