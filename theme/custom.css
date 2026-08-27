@@ -1,5 +1,5 @@
 /* pg2osync — mdBook overrides: keep Rust's structure, make it feel like 2026 */
-/* Sadece Rust kalsın */
+/* One theme only: the other entries stay in the DOM, out of the picker */
 #theme-list #default_theme, #theme-list #light, #theme-list #coal, #theme-list #navy, #theme-list #ayu { display: none; }
 
 :root {
@@ -9,7 +9,7 @@
 
 /* System font stack — no external request, instant load, native feel */
 html {
-  font-family: ui-sans-system, -apple-system, BlinkMacSystemFont, "Segoe UI",
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
     Inter, "Helvetica Neue", Arial, sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
@@ -138,7 +138,7 @@ html {
   backdrop-filter: saturate(1.2) blur(6px);
 }
 
-/* Rust — warm modern (bej kalıyor ama temiz) */
+/* Rust, warmed up: the beige stays, the greys around it do not */
 .rust {
   --bg: #fdfbf7;
   --fg: #1c1917;
@@ -180,7 +180,7 @@ html {
   color: #1c1917;
 }
 .rust .content pre code { color: #1c1917; }
-/* highlight.js yorumları rust'ta çok açıktı — koyulaştır */
+/* highlight.js comments were too pale to read on this background */
 .rust .hljs-comment, .rust .hljs-quote { color: #6b6b6b !important; }
 .rust .hljs-meta { color: #8a5a44 !important; }
 .rust .content code:not(pre code) {
@@ -209,7 +209,7 @@ html {
   --theme-popup-border: #dde1e7;
 }
 
-/* Dark themes — screenshot'taki siyah çamuru düzelt */
+/* Dark themes: reachable only by an old stored preference, not by the picker */
 .navy {
   --bg: #0f172a;
   --fg: #e2e8f0;

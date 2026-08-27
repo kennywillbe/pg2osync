@@ -1,18 +1,13 @@
-// Force Rust theme — picker'da tek Rust bıraktık, ama localStorage'da eski navy kalmışsa onu da temizle
+// Anyone who chose another theme before the picker was reduced to Rust still has
+// it in localStorage, and mdBook would keep honouring it. Migrate that once; new
+// readers get `default-theme` from book.toml and never reach this branch.
 try {
-  const cur = localStorage.getItem('mdbook-theme');
-  if (cur && cur !== 'rust' && cur !== '"rust"') {
+  const stored = localStorage.getItem('mdbook-theme');
+  if (stored && stored !== 'rust' && stored !== '"rust"') {
     localStorage.setItem('mdbook-theme', 'rust');
-    // class'ı anında düzelt ki reload beklemeden renk değişsin
-    document.documentElement.classList.remove('light','coal','navy','ayu');
+    document.documentElement.classList.remove('light', 'coal', 'navy', 'ayu');
     document.documentElement.classList.add('rust');
-    // mdBook'un tema JS'i zaten çalıştı, bir kez reload et ki tam otursun
-    if (!sessionStorage.getItem('rust-force-reloaded')) {
-      sessionStorage.setItem('rust-force-reloaded', '1');
-      location.reload();
-    }
-  } else if (!cur) {
-    localStorage.setItem('mdbook-theme', 'rust');
   }
-  sessionStorage.removeItem('rust-force-reloaded');
-} catch(e) {}
+} catch (e) {
+  // a browser with storage disabled renders the default theme, which is Rust
+}
