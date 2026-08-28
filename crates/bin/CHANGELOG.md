@@ -4,7 +4,7 @@
 from here on.** It reads the commit subjects and keeps one open pull request that
 bumps the versions and writes the entry below; merging that pull request tags and
 publishes. The 1.0.0 entry was written by hand because no commit before it
-followed the convention. See [docs/releasing.md](docs/releasing.md).
+followed the convention. See [docs/releasing.md](../../docs/releasing.md).
 
 Notable changes, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the versions

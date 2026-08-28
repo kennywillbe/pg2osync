@@ -9,7 +9,10 @@ Every push to `main` runs [release-please](https://github.com/googleapis/release
 which reads the [Conventional Commits](https://www.conventionalcommits.org/)
 since the last release and keeps **one open pull request** up to date — the
 release PR. It bumps every crate in the workspace to the same version and writes
-the `CHANGELOG.md` entry.
+the entry into `crates/bin/CHANGELOG.md`, the binary's changelog. The file lives
+inside the crate rather than at the repository root because release-please
+writes only within the package it releases from — a `changelog-path` that
+climbs out with `../` is refused.
 
 ```
 merge a feature PR   →  release PR updated. Nothing released.
