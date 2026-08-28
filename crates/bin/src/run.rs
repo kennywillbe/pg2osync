@@ -206,6 +206,51 @@ fn transforms(cfg: &AppConfig) -> Result<Transforms> {
     Ok(Transforms::from_pairs(pairs))
 }
 
+/// The key columns a table's id may be rendered from without a before-image,
+/// as far as the engine can tell: it has no catalog, and the WAL path takes
+/// the key from the replica identity rather than from configuration. The
+/// startup check beside it is what makes this declaration true — where the
+/// declared key and the database's own key disagree about a template, the
+/// table is required to be REPLICA IDENTITY FULL, so the before-image (which
+/// carries both) is what an id ever renders from.
+fn pk_columns_for(tbl: &crate::config::TableSync) -> Vec<String> {
+    vec![tbl.primary_key.clone().unwrap_or_else(|| "id".to_string())]
+}
+
+fn id_templates(cfg: &AppConfig) -> Result<pg2osync_engine::mapping::IdTemplates> {
+    let mut pairs = Vec::new();
+    for (key, tbl) in &cfg.sync {
+        let Some(spec) = &tbl.id else { continue };
+        let (schema, table) = split_qualified(&tbl.table);
+        let template = pg2osync_engine::mapping::IdTemplate::parse(spec, &pk_columns_for(tbl))
+            .map_err(|e| anyhow::anyhow!("[sync.{key}] id {spec:?} is not a usable id: {e}"))?;
+        pairs.push(((schema.to_string(), table.to_string()), template));
+    }
+    Ok(pg2osync_engine::mapping::IdTemplates::from_pairs(pairs))
+}
+
+fn fan_outs(cfg: &AppConfig) -> Result<pg2osync_engine::mapping::FanOuts> {
+    let mut pairs = Vec::new();
+    for (key, tbl) in &cfg.sync {
+        let Some(fan) = &tbl.fan_out else { continue };
+        let (schema, table) = split_qualified(&tbl.table);
+        let id = pg2osync_engine::mapping::IdTemplate::parse(&fan.id, &[]).map_err(|e| {
+            anyhow::anyhow!(
+                "[sync.{key}.fan_out] id {:?} is not a usable id: {e}",
+                fan.id
+            )
+        })?;
+        pairs.push((
+            (schema.to_string(), table.to_string()),
+            pg2osync_engine::mapping::FanOut {
+                field: fan.field.clone(),
+                id,
+            },
+        ));
+    }
+    Ok(pg2osync_engine::mapping::FanOuts::from_pairs(pairs))
+}
+
 /// Metrics outlive any one attempt: they are created once and the endpoint is
 /// served once, so a reconnect does not reset every counter or re-bind the port.
 fn start_metrics(cfg: &AppConfig) -> Result<SharedMetrics> {
@@ -324,11 +369,116 @@ pub fn pipeline_ctx(
         mapping: table_mapping(cfg),
         projections: projections(cfg),
         transforms: transforms(cfg)?,
+        id_templates: id_templates(cfg)?,
+        fan_outs: fan_outs(cfg)?,
         cfg: cfg.engine.clone(),
         ack_tx,
         load_done_tx,
         metrics,
     }))
+}
+
+/// Refuse to start a pipeline whose derived identity the source cannot supply.
+///
+/// An `id` that references columns outside the key, and a `fan_out` whose
+/// deletes and update-diffs need the row's old values, both depend on the
+/// whole old row arriving in the WAL — which only REPLICA IDENTITY FULL
+/// guarantees. Finding that out on the first delete, at 3am, is worse than
+/// naming the ALTER statement now, the same way child tables are checked.
+async fn check_derived_identity_requirements(
+    cfg: &AppConfig,
+    admin: &tokio_postgres::Client,
+) -> Result<()> {
+    for (key, tbl) in &cfg.sync {
+        // "outside the key" is decided twice, because there are two keys to
+        // ask: the one the engine sees at write time (`primary_key`, one
+        // column defaulting to `id`) and the one the database enforces. With
+        // a composite real key and a single declared one, a delete's scalar
+        // key could otherwise be bound to a placeholder naming a different
+        // column; requiring FULL where the two views disagree is what makes
+        // the before-image — already unavoidable for anything outside a key
+        // — the only thing an id is ever rendered from.
+        let needs_full = if tbl.fan_out.is_some() {
+            true
+        } else {
+            match &tbl.id {
+                Some(spec) => {
+                    let (schema, table) = split_qualified(&tbl.table);
+                    let info = pg2osync_source::catalog::table_info(admin, schema, table)
+                        .await
+                        .with_context(|| format!("cannot inspect table {}", tbl.table))?;
+                    let from_catalog =
+                        pg2osync_engine::mapping::IdTemplate::parse(spec, &info.pk_columns)
+                            .map_err(|e| anyhow::anyhow!("[sync.{key}] id {spec:?}: {e}"))?;
+                    let from_config =
+                        pg2osync_engine::mapping::IdTemplate::parse(spec, &pk_columns_for(tbl))
+                            .map_err(|e| anyhow::anyhow!("[sync.{key}] id {spec:?}: {e}"))?;
+                    !(from_catalog.is_pk_only() && from_config.is_pk_only())
+                }
+                None => false,
+            }
+        };
+        if !needs_full {
+            continue;
+        }
+        let (schema, table) = split_qualified(&tbl.table);
+        let info = pg2osync_source::catalog::table_info(admin, schema, table)
+            .await
+            .with_context(|| format!("cannot inspect table {}", tbl.table))?;
+        if info.relreplident != 'f' {
+            bail!(
+                "[sync.{key}] {} has REPLICA IDENTITY '{}', but its derived identity needs \
+                 the whole old row: deletes and updates could not find the documents they \
+                 replace. Run: ALTER TABLE {} REPLICA IDENTITY FULL",
+                tbl.table,
+                info.relreplident,
+                tbl.table
+            );
+        }
+        if tbl.fan_out.is_some() {
+            check_fan_out_column(admin, key, tbl).await?;
+        }
+    }
+    Ok(())
+}
+
+/// A `fan_out` field must hold an array: a PostgreSQL array column, or a
+/// jsonb/json whose value is one. Anything else fails per row at write time
+/// with a permanent rejection, which is a slow way of saying what the
+/// catalog can say at startup.
+async fn check_fan_out_column(
+    admin: &tokio_postgres::Client,
+    key: &str,
+    tbl: &crate::config::TableSync,
+) -> Result<()> {
+    let fan = tbl
+        .fan_out
+        .as_ref()
+        .expect("checked by the caller, which only calls this for fanned tables");
+    let dtype: Option<String> = admin
+        .query_opt(
+            "SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a \
+             WHERE a.attrelid = to_regclass($1) AND a.attname = $2 \
+               AND a.attnum > 0 AND NOT a.attisdropped",
+            &[&tbl.table, &fan.field],
+        )
+        .await?
+        .map(|r| r.get(0));
+    match dtype.as_deref() {
+        None => bail!(
+            "[sync.{key}.fan_out] table {} has no column {:?}",
+            tbl.table,
+            fan.field
+        ),
+        // json/jsonb is accepted on the promise that the *value* is an array,
+        // which is enforced per row when the documents are expanded
+        Some(t) if t.ends_with("[]") || t == "json" || t == "jsonb" => Ok(()),
+        Some(t) => bail!(
+            "[sync.{key}.fan_out] column {} is of type {t:?}; fan-out needs a PostgreSQL \
+             array column or a jsonb column holding a JSON array",
+            fan.field
+        ),
+    }
 }
 
 /// Start the read-your-writes endpoint, if the operator asked for one.
@@ -504,6 +654,7 @@ async fn run_postgres(
     if !polling {
         source.bootstrap(&admin).await?;
         warn_on_child_replica_identity(&cfg, &admin).await?;
+        check_derived_identity_requirements(&cfg, &admin).await?;
     }
     sink.ensure_ready(&index_specs).await?;
 

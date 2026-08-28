@@ -94,34 +94,7 @@ impl Default for EngineConfig {
     }
 }
 
-/// Render a primary-key JSON value into the OpenSearch `_id` string.
-///
-/// Scalars map directly; composite keys become a deterministic `col=val`
-/// list so the same row always yields the same id.
-pub fn pk_to_id(pk: &Value) -> String {
-    match pk {
-        Value::Null => "__null__".into(),
-        Value::String(s) => s.clone(),
-        Value::Number(n) => n.to_string(),
-        Value::Bool(b) => b.to_string(),
-        Value::Object(map) => {
-            let mut pairs: Vec<String> = map
-                .iter()
-                .map(|(k, v)| format!("{k}={}", scalar_display(v)))
-                .collect();
-            pairs.sort();
-            pairs.join(",")
-        }
-        other => other.to_string(),
-    }
-}
-
-fn scalar_display(v: &Value) -> String {
-    match v {
-        Value::String(s) => s.clone(),
-        other => other.to_string(),
-    }
-}
+pub use crate::mapping::pk_to_id;
 
 /// Shared durable position: how far ahead the source may acknowledge.
 #[derive(Clone, Default)]
@@ -172,6 +145,10 @@ pub struct PipelineCtx {
     pub mapping: TableMapping,
     pub projections: crate::mapping::Projections,
     pub transforms: crate::mapping::Transforms,
+    /// Configured document ids; a table with no entry keeps `pk_to_id`.
+    pub id_templates: crate::mapping::IdTemplates,
+    /// Tables whose rows fan out into one document per array element.
+    pub fan_outs: crate::mapping::FanOuts,
     pub cfg: EngineConfig,
     /// Updated by the sink task after every successful flush.
     pub ack_tx: watch::Sender<Option<Lsn>>,
@@ -452,13 +429,24 @@ pub async fn run(
                     }
                 }
                 ctx.metrics.incr_event_by("row", rows.len() as u64);
-                let completions =
-                    match fetch_completions(&rows, &ctx.mapping, ctx.sink.as_ref(), &ctx.metrics)
-                        .await
-                    {
-                        Ok(map) => map,
-                        Err(e) => break Err(e),
-                    };
+                let rules = Rules {
+                    projections: &ctx.projections,
+                    transforms: &ctx.transforms,
+                    id_templates: &ctx.id_templates,
+                    fan_outs: &ctx.fan_outs,
+                };
+                let completions = match fetch_completions(
+                    &rows,
+                    &ctx.mapping,
+                    ctx.sink.as_ref(),
+                    &ctx.metrics,
+                    &rules,
+                )
+                .await
+                {
+                    Ok(map) => map,
+                    Err(e) => break Err(e),
+                };
 
                 for row in &rows {
                     // Defence in depth rather than a second filter: the source
@@ -471,15 +459,14 @@ pub async fn run(
                             row.schema, row.table);
                         continue;
                     };
-                    let previous = completion_id(&row.kind)
+                    let previous = completion_id(&row.kind, &rules, (&row.schema, &row.table))
                         .and_then(|id| completions.get(&(index.to_string(), id)))
                         .and_then(Option::as_ref);
                     let ops = match materialize(
                         index,
                         (&row.schema, &row.table),
                         &row.kind,
-                        &ctx.projections,
-                        &ctx.transforms,
+                        &rules,
                         previous,
                         row.version,
                     ) {
@@ -953,10 +940,11 @@ async fn fetch_completions(
     mapping: &crate::mapping::TableMapping,
     sink: &dyn Sink,
     metrics: &crate::metrics::Metrics,
+    rules: &Rules<'_>,
 ) -> Result<HashMap<(String, String), Option<Value>>, CoreError> {
     let mut wanted: HashMap<String, Vec<String>> = HashMap::new();
     for row in rows {
-        let Some(id) = completion_id(&row.kind) else {
+        let Some(id) = completion_id(&row.kind, rules, (&row.schema, &row.table)) else {
             continue;
         };
         let Some(index) = mapping.opt_index_for(&row.schema, &row.table) else {
@@ -989,15 +977,67 @@ async fn fetch_completions(
 /// arrive ten to a batch instead of one.
 const COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_millis(10);
 
+/// The per-table rules that decide what a row becomes in the target:
+/// projection, transforms, the document id, and whether one row fans out
+/// into many documents. Everything that mints an `_id` goes through here.
+pub struct Rules<'a> {
+    pub projections: &'a crate::mapping::Projections,
+    pub transforms: &'a crate::mapping::Transforms,
+    pub id_templates: &'a crate::mapping::IdTemplates,
+    pub fan_outs: &'a crate::mapping::FanOuts,
+}
+
+/// The document id for the row state described by `doc`, or by `pk` alone
+/// for a delete. Identity renders from the RAW values — before projections
+/// and before transforms — and a missing or NULL column is an error naming
+/// the table and column: an id that quietly changed would strand the
+/// documents the row already owns.
+fn derived_id(
+    table: (&str, &str),
+    pk: &Value,
+    doc: Option<&Value>,
+    before: Option<&Value>,
+    templates: &crate::mapping::IdTemplates,
+) -> Result<String, CoreError> {
+    let halt = |e: String| CoreError::Other(format!("{}.{}: {e}", table.0, table.1));
+    let Some(template) = templates.for_table(table.0, table.1) else {
+        return Ok(pk_to_id(pk));
+    };
+    if let Some(doc) = doc {
+        return template.render(doc).map_err(halt);
+    }
+    // A key-only event. The before-image, when the source carries one, is
+    // the row exactly as the target last saw it, so it renders the id the
+    // current document is filed under. Without it the key alone has to be
+    // enough: `is_pk_only` is decided from the *configured* key, which can
+    // claim a single column where the real key is composite, so it is used
+    // only once the before-image is ruled out — and the startup check has
+    // already refused any template the catalogue's key cannot render.
+    if let Some(before) = before {
+        return template.render(before).map_err(halt);
+    }
+    if template.is_pk_only() || pk.is_object() {
+        return template.render_from_pk(pk).map_err(halt);
+    }
+    Err(halt(
+        "the configured id needs columns outside the primary key, but this event \
+         carries no before-image; the table needs REPLICA IDENTITY FULL"
+            .into(),
+    ))
+}
+
 /// The document id whose stored copy completes this change, if one is needed.
 ///
 /// A row whose key changed is still filed under the old id, so completing from
-/// the new one would write the unchanged columns as null.
-fn completion_id(kind: &RowKind) -> Option<String> {
+/// the new one would write the unchanged columns as null. The old id is what
+/// the template rendered for the row's previous state: for a key-only
+/// template that is the previous key, otherwise the before-image.
+fn completion_id(kind: &RowKind, rules: &Rules<'_>, table: (&str, &str)) -> Option<String> {
     let RowKind::Update {
         pk,
         previous_pk,
         unchanged_toast_columns,
+        before,
         ..
     } = kind
     else {
@@ -1006,11 +1046,26 @@ fn completion_id(kind: &RowKind) -> Option<String> {
     if unchanged_toast_columns.is_empty() {
         return None;
     }
-    let id = pk_to_id(pk);
-    Some(match previous_pk.as_ref().map(pk_to_id) {
-        Some(previous) if previous != id => previous,
-        _ => id,
-    })
+    let template = rules.id_templates.for_table(table.0, table.1);
+    let Some(template) = template else {
+        let id = pk_to_id(pk);
+        return Some(match previous_pk.as_ref().map(pk_to_id) {
+            Some(previous) if previous != id => previous,
+            _ => id,
+        });
+    };
+    if template.is_pk_only() {
+        return template
+            .render_from_pk(previous_pk.as_ref().unwrap_or(pk))
+            .ok();
+    }
+    // the row's previous document carries the before-image's id, when there
+    // is one; without it there is nothing to complete against and the write
+    // path halts on its own terms
+    before
+        .as_ref()
+        .and_then(|b| template.render(b).ok())
+        .or_else(|| template.render_from_pk(pk).ok())
 }
 
 /// Convert one row change into document operations, completing unchanged-TOAST
@@ -1021,51 +1076,67 @@ fn completion_id(kind: &RowKind) -> Option<String> {
 /// per row in the middle of the pipeline; measured on 20k updates to a table
 /// with an 8 kB TOASTed column, that was the difference between 1,800 and
 /// 4,400 rows per second.
-fn materialize<'a>(
-    index: &'a str,
-    table: (&'a str, &'a str),
+fn materialize(
+    index: &str,
+    table: (&str, &str),
     kind: &RowKind,
-    projections: &crate::mapping::Projections,
-    transforms: &crate::mapping::Transforms,
+    rules: &Rules<'_>,
     previous: Option<&Value>,
     version: Option<u64>,
 ) -> Result<Vec<LsnOp>, CoreError> {
     // PENDING_LSN is overwritten by the commit handler before any ack can
     // reference it: rows never leave the buffer without their commit attached.
     const PENDING_LSN: Lsn = Lsn(0);
-    let mk = |op| {
-        vec![LsnOp {
-            lsn: PENDING_LSN,
-            op,
-        }]
+    let mk = |op| LsnOp {
+        lsn: PENDING_LSN,
+        op,
+    };
+    let upsert = |id: String, doc: Value| {
+        mk(DocumentOp::Upsert {
+            index: index.into(),
+            id,
+            doc,
+            version,
+        })
+    };
+    let delete = |id: String| {
+        mk(DocumentOp::Delete {
+            index: index.into(),
+            id,
+            version,
+        })
+    };
+    let halt = |e: String| CoreError::Other(format!("{}.{}: {e}", table.0, table.1));
+    // Identity renders from the row's RAW values, so every derivation below
+    // reads the document before projections and transforms touch it.
+    let fan = rules.fan_outs.for_table(table.0, table.1);
+    let shape = |base: &str, doc: &Value| -> Result<Vec<(String, Value)>, CoreError> {
+        match fan {
+            None => Ok(vec![(base.to_string(), doc.clone())]),
+            Some(rule) => crate::mapping::fan_out_docs(rule, base, doc).map_err(halt),
+        }
+    };
+    let finish = |docs: Vec<(String, Value)>| -> Vec<LsnOp> {
+        docs.into_iter()
+            .map(|(id, mut doc)| {
+                rules.projections.apply(table.0, table.1, &mut doc);
+                rules.transforms.apply(table.0, table.1, &mut doc);
+                upsert(id, doc)
+            })
+            .collect()
     };
     match kind {
         RowKind::Insert { pk, doc } => {
-            let mut doc = doc.clone();
-            projections.apply(table.0, table.1, &mut doc);
-            transforms.apply(table.0, table.1, &mut doc);
-            Ok(mk(DocumentOp::Upsert {
-                index: index.into(),
-                id: pk_to_id(pk),
-                doc,
-                version,
-            }))
+            let base = derived_id(table, pk, Some(doc), None, rules.id_templates)?;
+            Ok(finish(shape(&base, doc)?))
         }
         RowKind::Update {
             pk,
             previous_pk,
             doc,
             unchanged_toast_columns,
+            before,
         } => {
-            let id = pk_to_id(pk);
-            // A changed key means the row moved to a different document. The
-            // old one still holds the previous version and has to be removed,
-            // or nothing will ever collect it.
-            let moved_from = previous_pk
-                .as_ref()
-                .map(pk_to_id)
-                .filter(|previous| previous != &id);
-
             let mut doc = doc.clone();
             if !unchanged_toast_columns.is_empty()
                 && let Some(Value::Object(prev_map)) = previous
@@ -1077,35 +1148,77 @@ fn materialize<'a>(
                     }
                 }
             }
-            projections.apply(table.0, table.1, &mut doc);
-            transforms.apply(table.0, table.1, &mut doc);
-
-            let mut ops = mk(DocumentOp::Upsert {
-                index: index.into(),
-                id,
-                doc,
-                version,
-            });
+            let before = before.as_ref();
+            let base = derived_id(table, pk, Some(&doc), before, rules.id_templates)?;
+            let new_docs = shape(&base, &doc)?;
+            let mut ops = finish(new_docs.clone());
             // write first, delete second: a crash between them leaves a
             // duplicate that the replay repairs, where the reverse order would
             // leave a gap that nothing repairs
-            if let Some(previous) = moved_from {
-                ops.push(LsnOp {
-                    lsn: PENDING_LSN,
-                    op: DocumentOp::Delete {
-                        index: index.into(),
-                        id: previous,
-                        version,
-                    },
-                });
+            if let Some(rule) = fan {
+                // the diff against the before-image: every document the row
+                // owned that its new state no longer produces is removed. The
+                // startup check required a before-image for fanned tables, so
+                // its absence means a source that broke its promise rather
+                // than a delete nobody asked for; lingering stale documents
+                // are the reconcile tool's to find.
+                if let Some(before) = before {
+                    let old_base = derived_id(
+                        table,
+                        previous_pk.as_ref().unwrap_or(pk),
+                        None,
+                        Some(before),
+                        rules.id_templates,
+                    )?;
+                    let held: std::collections::HashSet<&str> =
+                        new_docs.iter().map(|(id, _)| id.as_str()).collect();
+                    for (id, _) in crate::mapping::fan_out_docs(rule, &old_base, before)
+                        .map_err(|e| halt(format!("before-image of a fanned row: {e}")))?
+                    {
+                        if !held.contains(id.as_str()) {
+                            ops.push(delete(id));
+                        }
+                    }
+                }
+            } else {
+                // A changed key means the row moved to a different document.
+                // The old one still holds the previous version and has to be
+                // removed, or nothing will ever collect it.
+                let moved_from = match rules.id_templates.for_table(table.0, table.1) {
+                    None => previous_pk.as_ref().map(pk_to_id),
+                    Some(t) if t.is_pk_only() => {
+                        previous_pk.as_ref().and_then(|p| t.render_from_pk(p).ok())
+                    }
+                    Some(t) => before.and_then(|b| t.render(b).ok()),
+                }
+                .filter(|previous| previous != &base);
+                if let Some(previous) = moved_from {
+                    ops.push(delete(previous));
+                }
             }
             Ok(ops)
         }
-        RowKind::Delete { pk } => Ok(mk(DocumentOp::Delete {
-            index: index.into(),
-            id: pk_to_id(pk),
-            version,
-        })),
+        RowKind::Delete { pk, before } => {
+            let before = before.as_ref();
+            let base = derived_id(table, pk, None, before, rules.id_templates)?;
+            match fan {
+                None => Ok(vec![delete(base)]),
+                Some(rule) => {
+                    let row = before.ok_or_else(|| {
+                        halt(
+                            "a fanned row's delete needs its before-image, which this event \
+                             does not carry; the table needs REPLICA IDENTITY FULL"
+                                .into(),
+                        )
+                    })?;
+                    Ok(crate::mapping::fan_out_docs(rule, &base, row)
+                        .map_err(halt)?
+                        .into_iter()
+                        .map(|(id, _)| delete(id))
+                        .collect())
+                }
+            }
+        }
     }
 }
 
@@ -1391,6 +1504,8 @@ mod pipeline_tests {
             )]),
             projections: crate::mapping::Projections::default(),
             transforms: crate::mapping::Transforms::default(),
+            id_templates: crate::mapping::IdTemplates::default(),
+            fan_outs: crate::mapping::FanOuts::default(),
             cfg,
             ack_tx,
             load_done_tx,
@@ -1612,6 +1727,7 @@ mod pipeline_tests {
                 previous_pk: Some(json!(from)),
                 doc: json!({"id": to}),
                 unchanged_toast_columns: toast.iter().map(|c| c.to_string()).collect(),
+                before: None,
             },
             version: None,
         })
@@ -1638,6 +1754,7 @@ mod pipeline_tests {
                 previous_pk: Some(json!(7)),
                 doc: json!({"id": 7}),
                 unchanged_toast_columns: vec![],
+                before: None,
             },
             version: None,
         });
@@ -1661,7 +1778,10 @@ mod pipeline_tests {
         ChangeEvent::Row(RowChange {
             schema: "public".into(),
             table: "users".into(),
-            kind: RowKind::Delete { pk: json!(id) },
+            kind: RowKind::Delete {
+                pk: json!(id),
+                before: None,
+            },
             version: Some(version),
         })
     }
@@ -2233,5 +2353,372 @@ mod pipeline_tests {
             Some(Lsn(100)),
             "300 was written but sits behind a failure, so its position must not pass"
         );
+    }
+
+    /// As `drive_sink`, with derived ids and fan-out rules configured for
+    /// `public.users` → `users`. Everything else is the default pipeline.
+    async fn drive_rules(
+        ids: crate::mapping::IdTemplates,
+        fan: crate::mapping::FanOuts,
+        script: Vec<ChangeEvent>,
+    ) -> Arc<RecordingSink> {
+        drive_rules_at(500, ids, fan, script).await
+    }
+
+    async fn drive_rules_at(
+        batch_size: usize,
+        ids: crate::mapping::IdTemplates,
+        fan: crate::mapping::FanOuts,
+        script: Vec<ChangeEvent>,
+    ) -> Arc<RecordingSink> {
+        let (events_tx, events_rx) = mpsc::channel(1024);
+        let (copy_tx, copy_rx) = mpsc::channel(1024);
+        drop(copy_tx);
+        let (ack_tx, _ack_rx) = watch::channel(None);
+        let (load_done_tx, _load_done_rx) = watch::channel(0u64);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sink = Arc::new(RecordingSink::default());
+        let ctx = Arc::new(PipelineCtx {
+            sink: sink.clone(),
+            mapping: TableMapping::from_pairs([(
+                ("public".to_string(), "users".to_string()),
+                "users".to_string(),
+            )]),
+            projections: crate::mapping::Projections::default(),
+            transforms: crate::mapping::Transforms::default(),
+            id_templates: ids,
+            fan_outs: fan,
+            cfg: EngineConfig {
+                batch_size,
+                checkpoint_interval_ms: 100,
+                ..EngineConfig::default()
+            },
+            ack_tx,
+            load_done_tx,
+            metrics: Arc::new(crate::metrics::Metrics::default()),
+        });
+        let stream = StreamId {
+            source: SOURCE_POSTGRES.into(),
+            stream: "slot".into(),
+            publication: "pub".into(),
+        };
+        let render: PositionRenderer = Arc::new(|token| Lsn(token).to_string());
+        for event in script {
+            events_tx.send(event).await.expect("channel has room");
+        }
+        let engine = tokio::spawn(run(
+            events_rx,
+            copy_rx,
+            ctx,
+            stream,
+            render,
+            crate::mapping::DurableLsn::default(),
+            shutdown_rx,
+        ));
+        drop(events_tx);
+        engine.await.expect("task joined").expect("engine ran");
+        sink
+    }
+
+    fn users_ids(spec: &str, pk_columns: &[&str]) -> crate::mapping::IdTemplates {
+        let pk: Vec<String> = pk_columns.iter().map(|s| s.to_string()).collect();
+        crate::mapping::IdTemplates::from_pairs([(
+            ("public".to_string(), "users".to_string()),
+            crate::mapping::IdTemplate::parse(spec, &pk).expect("valid template"),
+        )])
+    }
+
+    fn users_fan(field: &str, spec: &str) -> crate::mapping::FanOuts {
+        crate::mapping::FanOuts::from_pairs([(
+            ("public".to_string(), "users".to_string()),
+            crate::mapping::FanOut {
+                field: field.into(),
+                id: crate::mapping::IdTemplate::parse(spec, &[]).expect("valid template"),
+            },
+        )])
+    }
+
+    fn row_doc(id: i64, doc: Value) -> ChangeEvent {
+        ChangeEvent::Row(RowChange {
+            schema: "public".into(),
+            table: "users".into(),
+            kind: RowKind::Insert { pk: json!(id), doc },
+            version: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_configured_id_is_rendered_from_the_row_before_projection() {
+        let sink = drive_rules(
+            users_ids("user-{id}", &["id"]),
+            Default::default(),
+            vec![
+                row_doc(7, json!({"id": 7, "email": "a@x.io"})),
+                commit(0x100),
+            ],
+        )
+        .await;
+        assert_eq!(sink.events(), vec!["write[upsert:user-7]"]);
+    }
+
+    #[tokio::test]
+    async fn a_row_without_an_id_config_is_filed_under_its_key_alone() {
+        // the regression that keeps every existing index byte-identical: the
+        // default derivation is untouched by the feature
+        let sink = drive_rules(
+            Default::default(),
+            Default::default(),
+            vec![row_doc(7, json!({"id": 7})), commit(0x100)],
+        )
+        .await;
+        assert_eq!(sink.events(), vec!["write[upsert:7]"]);
+    }
+
+    #[tokio::test]
+    async fn a_null_in_an_id_column_halts_the_pipeline() {
+        let (events_tx, events_rx) = mpsc::channel(4);
+        let (_copy_tx, copy_rx) = mpsc::channel(4);
+        let (ack_tx, _ack_rx) = watch::channel(None);
+        let (load_done_tx, _load_done_rx) = watch::channel(0u64);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sink = Arc::new(RecordingSink::default());
+        let ctx = Arc::new(PipelineCtx {
+            sink,
+            mapping: TableMapping::from_pairs([(
+                ("public".to_string(), "users".to_string()),
+                "users".to_string(),
+            )]),
+            projections: crate::mapping::Projections::default(),
+            transforms: crate::mapping::Transforms::default(),
+            id_templates: users_ids("user-{tenant}", &["tenant"]),
+            fan_outs: Default::default(),
+            cfg: EngineConfig::default(),
+            ack_tx,
+            load_done_tx,
+            metrics: Arc::new(crate::metrics::Metrics::default()),
+        });
+        events_tx
+            .send(row_doc(7, json!({"id": 7, "tenant": null})))
+            .await
+            .unwrap();
+        let error = run(
+            events_rx,
+            copy_rx,
+            ctx,
+            StreamId {
+                source: SOURCE_POSTGRES.into(),
+                stream: "slot".into(),
+                publication: "pub".into(),
+            },
+            Arc::new(|token| Lsn(token).to_string()),
+            crate::mapping::DurableLsn::default(),
+            shutdown_rx,
+        )
+        .await
+        .expect_err("a NULL where an id needs a value must stop the pipeline");
+        let message = error.to_string();
+        assert!(
+            message.contains("public.users")
+                && message.contains("tenant")
+                && message.contains("NULL"),
+            "the halt must name the table and the column: {message}"
+        );
+        drop(events_tx);
+    }
+
+    #[tokio::test]
+    async fn a_key_only_id_renders_deletes_from_the_key_alone() {
+        // Phase 1's promise: no before-image needed when the id names only
+        // the key, because a delete's key carries everything there is
+        let delete = ChangeEvent::Row(RowChange {
+            schema: "public".into(),
+            table: "users".into(),
+            kind: RowKind::Delete {
+                pk: json!(42),
+                before: None,
+            },
+            version: Some(0x100),
+        });
+        let sink = drive_rules(
+            users_ids("user-{id}", &["id"]),
+            Default::default(),
+            vec![delete, commit(0x100)],
+        )
+        .await;
+        assert_eq!(sink.events(), vec!["write[delete:user-42]"]);
+    }
+
+    #[tokio::test]
+    async fn a_delete_outside_the_key_renders_from_the_before_image() {
+        let delete = ChangeEvent::Row(RowChange {
+            schema: "public".into(),
+            table: "users".into(),
+            kind: RowKind::Delete {
+                pk: json!(42),
+                before: Some(json!({"id": 42, "tenant": "acme"})),
+            },
+            version: Some(0x100),
+        });
+        let sink = drive_rules(
+            users_ids("{tenant}-user-{id}", &["id"]),
+            Default::default(),
+            vec![delete, commit(0x100)],
+        )
+        .await;
+        assert_eq!(sink.events(), vec!["write[delete:acme-user-42]"]);
+    }
+
+    #[tokio::test]
+    async fn an_update_that_moves_a_derived_id_removes_the_document_it_left() {
+        // the id is derived from a column outside the key, so only the
+        // before-image says what the row used to be called
+        let update = ChangeEvent::Row(RowChange {
+            schema: "public".into(),
+            table: "users".into(),
+            kind: RowKind::Update {
+                pk: json!(7),
+                previous_pk: None,
+                doc: json!({"id": 7, "tenant": "globex"}),
+                unchanged_toast_columns: vec![],
+                before: Some(json!({"id": 7, "tenant": "acme"})),
+            },
+            version: Some(0x200),
+        });
+        let sink = drive_rules(
+            users_ids("{tenant}-user-{id}", &["id"]),
+            Default::default(),
+            vec![update, commit(0x200)],
+        )
+        .await;
+        assert_eq!(
+            sink.events(),
+            vec!["write[upsert:globex-user-7@512 delete:acme-user-7]"],
+            "write the new name first, remove the old one second"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_only_template_renders_the_same_id_with_or_without_the_before_image() {
+        // the before-image is preferred wherever it exists, so a key-only id
+        // must not depend on which one it rendered from: the regression is
+        // that the two derivations agree, and that neither invents a new name
+        // when an unrelated column changes
+        let delete = ChangeEvent::Row(RowChange {
+            schema: "public".into(),
+            table: "users".into(),
+            kind: RowKind::Delete {
+                pk: json!(42),
+                before: Some(json!({"id": 42, "email": "gone@x.io"})),
+            },
+            version: Some(0x100),
+        });
+        let sink = drive_rules(
+            users_ids("user-{id}", &["id"]),
+            Default::default(),
+            vec![delete, commit(0x100)],
+        )
+        .await;
+        assert_eq!(sink.events(), vec!["write[delete:user-42]"]);
+    }
+
+    #[tokio::test]
+    async fn a_fanned_row_becomes_one_document_per_element() {
+        let sink = drive_rules(
+            users_ids("user-{id}", &["id"]),
+            users_fan("tags", "user-{id}-{tags}"),
+            vec![
+                row_doc(7, json!({"id": 7, "tags": ["a", "b"]})),
+                commit(0x100),
+            ],
+        )
+        .await;
+        assert_eq!(
+            sink.events(),
+            vec!["write[upsert:user-7-a upsert:user-7-b]"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fanned_update_removes_dropped_elements_and_keeps_the_rest() {
+        let update = ChangeEvent::Row(RowChange {
+            schema: "public".into(),
+            table: "users".into(),
+            kind: RowKind::Update {
+                pk: json!(7),
+                previous_pk: None,
+                doc: json!({"id": 7, "tags": ["a", "c"]}),
+                unchanged_toast_columns: vec![],
+                before: Some(json!({"id": 7, "tags": ["a", "b"]})),
+            },
+            version: Some(0x200),
+        });
+        let sink = drive_rules(
+            users_ids("user-{id}", &["id"]),
+            users_fan("tags", "user-{id}-{tags}"),
+            vec![update, commit(0x200)],
+        )
+        .await;
+        assert_eq!(
+            sink.events(),
+            vec!["write[upsert:user-7-a@512 upsert:user-7-c@512 delete:user-7-b]"],
+            "kept and new elements are written, the dropped one is removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fanned_delete_removes_every_element_document() {
+        let delete = ChangeEvent::Row(RowChange {
+            schema: "public".into(),
+            table: "users".into(),
+            kind: RowKind::Delete {
+                pk: json!(7),
+                before: Some(json!({"id": 7, "tags": ["a", "b"]})),
+            },
+            version: Some(0x300),
+        });
+        let sink = drive_rules(
+            users_ids("user-{id}", &["id"]),
+            users_fan("tags", "user-{id}-{tags}"),
+            vec![delete, commit(0x300)],
+        )
+        .await;
+        assert_eq!(
+            sink.events(),
+            vec!["write[delete:user-7-a delete:user-7-b]"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fanned_row_with_a_null_array_still_owns_one_document() {
+        let sink = drive_rules(
+            users_ids("user-{id}", &["id"]),
+            users_fan("tags", "user-{id}-{tags}"),
+            vec![row_doc(7, json!({"id": 7, "tags": null})), commit(0x100)],
+        )
+        .await;
+        assert_eq!(sink.events(), vec!["write[upsert:user-7]"]);
+    }
+
+    #[tokio::test]
+    async fn a_fanned_update_that_empties_the_array_leaves_nothing_behind() {
+        let update = ChangeEvent::Row(RowChange {
+            schema: "public".into(),
+            table: "users".into(),
+            kind: RowKind::Update {
+                pk: json!(7),
+                previous_pk: None,
+                doc: json!({"id": 7, "tags": []}),
+                unchanged_toast_columns: vec![],
+                before: Some(json!({"id": 7, "tags": ["a"]})),
+            },
+            version: Some(0x200),
+        });
+        let sink = drive_rules(
+            users_ids("user-{id}", &["id"]),
+            users_fan("tags", "user-{id}-{tags}"),
+            vec![update, commit(0x200)],
+        )
+        .await;
+        assert_eq!(sink.events(), vec!["write[delete:user-7-a]"]);
     }
 }

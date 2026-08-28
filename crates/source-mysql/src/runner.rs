@@ -666,8 +666,18 @@ fn build_change(
             // binlog_row_image=FULL is a startup prerequisite, so every
             // column of the new row is present: nothing to complete
             unchanged_toast_columns: vec![],
+            // and the before-image is the whole row it replaced, which is what
+            // lets a derived id find the document the row used to own
+            before: row
+                .before
+                .as_ref()
+                .map(|before| Value::Object(document(&rt.columns, before))),
         },
-        RowsKind::Delete => RowKind::Delete { pk },
+        RowsKind::Delete => RowKind::Delete {
+            pk,
+            // the delete's only image *is* the before-image
+            before: Some(Value::Object(document(&rt.columns, values))),
+        },
     };
     Ok(ChangeEvent::Row(RowChange {
         schema: rt.schema.clone(),
@@ -748,13 +758,21 @@ mod tests {
         };
         assert_eq!(change.pk(), &json!(1));
         let RowKind::Update {
-            doc, previous_pk, ..
+            doc,
+            previous_pk,
+            before,
+            ..
         } = &change.kind
         else {
             panic!("expected an update");
         };
         assert_eq!(doc["total"], json!("9.00"));
         assert_eq!(previous_pk, &Some(json!(1)), "the key did not move");
+        assert_eq!(
+            before,
+            &Some(json!({"id": 1, "total": "5.00"})),
+            "binlog_row_image=FULL means the whole old row is always there"
+        );
     }
 
     #[test]
@@ -791,6 +809,14 @@ mod tests {
         };
         assert!(matches!(change.kind, RowKind::Delete { .. }));
         assert_eq!(change.pk(), &json!(42));
+        let RowKind::Delete { before, .. } = &change.kind else {
+            unreachable!("checked above")
+        };
+        assert_eq!(
+            before,
+            &Some(json!({"id": 42, "total": "1.00"})),
+            "a delete's only image is the row as it was"
+        );
     }
 
     #[test]

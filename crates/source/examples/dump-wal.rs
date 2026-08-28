@@ -86,6 +86,7 @@ async fn main() -> Result<()> {
                         previous_pk,
                         doc,
                         unchanged_toast_columns,
+                        ..
                     } => println!(
                         "[{}.{}] UPDATE pk={pk}{} toast_incomplete={unchanged_toast_columns:?}\n  {}",
                         r.schema,
@@ -96,7 +97,7 @@ async fn main() -> Result<()> {
                         },
                         serde_json::to_string_pretty(doc)?
                     ),
-                    RowKind::Delete { pk } => {
+                    RowKind::Delete { pk, .. } => {
                         println!("[{}.{}] DELETE pk={pk}", r.schema, r.table)
                     }
                 }

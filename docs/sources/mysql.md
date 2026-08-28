@@ -27,7 +27,10 @@ the `my.cnf` block, the user and the grants — so it can be handed to whoever
 holds the privileges. `pg2osync validate` then checks the settings, the
 connection and every configured table before you run anything.
 
-Every synced table needs a **primary key**; it becomes the document `_id`.
+Every synced table needs a **primary key**; it becomes the document `_id`,
+unless the table configures `id` to derive one from its columns or `fan_out`
+to turn an array column into one document per element. `binlog_row_image =
+FULL` already guarantees the before-images both need.
 
 ## TLS
 

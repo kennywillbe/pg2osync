@@ -163,16 +163,29 @@ pub fn build_row_change(rel: &Relation, incoming: Incoming) -> Result<RowChange,
             let previous_pk = old.as_ref().and_then(|prev| extract_pk(rel, prev).ok());
             let old_slices = old.as_ref().map(tuple_slices);
             let (doc, toast) = build_doc(rel, &new, old_slices.as_deref())?;
+            // Only REPLICA IDENTITY FULL guarantees the old tuple carries the
+            // whole row, and a partial before-image would be worse than none:
+            // the columns it omits would read as NULL to a derived id.
+            let before = match (old.as_ref(), rel.replica_identity) {
+                (Some(prev), ReplicaIdentity::Full) => Some(build_doc(rel, prev, None)?.0),
+                _ => None,
+            };
             Ok(change(RowKind::Update {
                 pk,
                 previous_pk,
                 doc,
                 unchanged_toast_columns: toast,
+                before,
             }))
         }
         Incoming::Delete(key) => {
             let pk = extract_pk(rel, &key)?;
-            Ok(change(RowKind::Delete { pk }))
+            let before = if rel.replica_identity == ReplicaIdentity::Full {
+                Some(build_doc(rel, &key, None)?.0)
+            } else {
+                None
+            };
+            Ok(change(RowKind::Delete { pk, before }))
         }
     }
 }
@@ -390,7 +403,7 @@ mod tests {
             TupleValue::Null,
         ]);
         let change = build_row_change(&rel, Incoming::Delete(key)).unwrap();
-        assert!(matches!(change.kind, RowKind::Delete { pk } if pk == serde_json::json!(42)));
+        assert!(matches!(change.kind, RowKind::Delete { pk, .. } if pk == serde_json::json!(42)));
     }
 
     #[test]
@@ -418,7 +431,101 @@ mod tests {
         ]);
         let change = build_row_change(&rel, Incoming::Delete(key)).unwrap();
         match change.kind {
-            RowKind::Delete { pk } => assert_eq!(pk, serde_json::json!({"id": 42, "tenant_id": 7})),
+            RowKind::Delete { pk, .. } => {
+                assert_eq!(pk, serde_json::json!({"id": 42, "tenant_id": 7}))
+            }
+            other => panic!("unexpected kind {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_full_old_tuple_becomes_the_update_before_image() {
+        let rel = users_relation(pgoutput::ReplicaIdentity::Full);
+        let old = tuple(vec![
+            TupleValue::Text(b"42".to_vec()),
+            TupleValue::Text(b"a@x.io".to_vec()),
+            TupleValue::Text(b"1".to_vec()),
+            TupleValue::Text(b"bio".to_vec()),
+        ]);
+        let new = tuple(vec![
+            TupleValue::Text(b"42".to_vec()),
+            TupleValue::Text(b"b@x.io".to_vec()),
+            TupleValue::Text(b"1".to_vec()),
+            TupleValue::Text(b"bio".to_vec()),
+        ]);
+        let change = build_row_change(&rel, Incoming::Update(Some(old), new)).unwrap();
+        match change.kind {
+            RowKind::Update { before, .. } => assert_eq!(
+                before,
+                Some(serde_json::json!({"id": 42, "email": "a@x.io", "score": "1", "bio": "bio"})),
+                "the before-image carries the row as it was, by column name"
+            ),
+            other => panic!("unexpected kind {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_default_identity_update_carries_no_before_image() {
+        // a key-only old tuple would read as NULLs in every other column,
+        // which is worse for a derived id than carrying nothing at all
+        let rel = users_relation(pgoutput::ReplicaIdentity::Default);
+        let old = tuple(vec![
+            TupleValue::Text(b"1".to_vec()),
+            TupleValue::Null,
+            TupleValue::Null,
+            TupleValue::Null,
+        ]);
+        let new = tuple(vec![
+            TupleValue::Text(b"2".to_vec()),
+            TupleValue::Text(b"a@x.io".to_vec()),
+            TupleValue::Text(b"1".to_vec()),
+            TupleValue::Text(b"bio".to_vec()),
+        ]);
+        let change = build_row_change(&rel, Incoming::Update(Some(old), new)).unwrap();
+        match change.kind {
+            RowKind::Update {
+                before,
+                previous_pk,
+                ..
+            } => {
+                assert_eq!(before, None, "nothing about the old row is reliable");
+                assert_eq!(previous_pk, Some(serde_json::json!(1)), "the key still is");
+            }
+            other => panic!("unexpected kind {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_full_key_tuple_is_the_delete_before_image() {
+        let rel = users_relation(pgoutput::ReplicaIdentity::Full);
+        let key = tuple(vec![
+            TupleValue::Text(b"42".to_vec()),
+            TupleValue::Text(b"a@x.io".to_vec()),
+            TupleValue::Text(b"7".to_vec()),
+            TupleValue::Null,
+        ]);
+        let change = build_row_change(&rel, Incoming::Delete(key)).unwrap();
+        match change.kind {
+            RowKind::Delete { before, .. } => assert_eq!(
+                before,
+                Some(serde_json::json!({"id": 42, "email": "a@x.io", "score": "7", "bio": null}))
+            ),
+            other => panic!("unexpected kind {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_default_identity_delete_carries_no_before_image() {
+        let rel = users_relation(pgoutput::ReplicaIdentity::Default);
+        let key = tuple(vec![
+            TupleValue::Text(b"42".to_vec()),
+            TupleValue::Null,
+            TupleValue::Null,
+            TupleValue::Null,
+        ]);
+        let change = build_row_change(&rel, Incoming::Delete(key)).unwrap();
+        match change.kind {
+            RowKind::Delete { before, .. } => assert_eq!(before, None),
             other => panic!("unexpected kind {other:?}"),
         }
     }

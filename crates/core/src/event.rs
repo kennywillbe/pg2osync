@@ -41,7 +41,9 @@ pub struct RowChange {
 impl RowChange {
     pub fn pk(&self) -> &Value {
         match &self.kind {
-            RowKind::Insert { pk, .. } | RowKind::Update { pk, .. } | RowKind::Delete { pk } => pk,
+            RowKind::Insert { pk, .. }
+            | RowKind::Update { pk, .. }
+            | RowKind::Delete { pk, .. } => pk,
         }
     }
 
@@ -73,9 +75,18 @@ pub enum RowKind {
         previous_pk: Option<Value>,
         doc: Value,
         unchanged_toast_columns: Vec<String>,
+        /// The row's before-image document, when the source can provide one
+        /// (PostgreSQL under REPLICA IDENTITY FULL, MySQL under
+        /// binlog_row_image = FULL). A derived document id that references
+        /// columns outside the key is rendered from it, which is what lets an
+        /// update that moved the id delete the document the row used to own.
+        before: Option<Value>,
     },
     Delete {
         pk: Value,
+        /// The row's before-image where the source carries one; the same role
+        /// as on `Update`, and required for deleting derived ids.
+        before: Option<Value>,
     },
 }
 

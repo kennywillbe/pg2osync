@@ -89,7 +89,9 @@ which is what a restart parses to resume.
 
 - **At-least-once.** A crash between a sink write and the checkpoint replays the
   last batch on restart. Correctness rests on idempotent writes: a document's
-  `_id` is its row's primary key, so a replay overwrites to the same value.
+  `_id` is its row's primary key — or the id `[sync.x] id` renders from the
+  row's raw values, and for a `fan_out` table one id per array element — so a
+  replay overwrites to the same value.
 - **Never acknowledge early.** The position reported to the source is clamped to
   the durable checkpoint. Acknowledging further would let the database recycle
   history for rows that are not indexed yet — the classic way CDC pipelines
@@ -107,7 +109,13 @@ which is what a restart parses to resume.
 - **A changed primary key is a move**: the document is written at its new
   identity and the old one is deleted, in that order. A crash between the two
   leaves a duplicate that the replay repairs, where the reverse order would
-  leave a document nothing ever collects.
+  leave a document nothing ever collects. An id derived from columns outside
+  the key moves the same way when those columns change, which is why such a
+  table requires the row's before-image from the source.
+- **A `fan_out` row owns one document per array element**, id rendered from
+  the merged child. Updates diff the element sets and deletes come from the
+  before-image, all as ordinary versioned ops; the sink never learns the
+  difference.
 
 ## Read-your-writes
 

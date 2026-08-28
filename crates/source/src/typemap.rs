@@ -25,6 +25,35 @@ mod oid {
     pub const FLOAT4: u32 = 700;
     pub const FLOAT8: u32 = 701;
     pub const JSONB: u32 = 3802;
+    pub const BOOL_ARRAY: u32 = 1000;
+    pub const INT2_ARRAY: u32 = 1005;
+    pub const INT4_ARRAY: u32 = 1007;
+    pub const INT8_ARRAY: u32 = 1016;
+    pub const JSON_ARRAY: u32 = 199;
+    pub const BPCHAR_ARRAY: u32 = 1014;
+    pub const TEXT_ARRAY: u32 = 1009;
+    pub const VARCHAR_ARRAY: u32 = 1015;
+    pub const FLOAT4_ARRAY: u32 = 1021;
+    pub const FLOAT8_ARRAY: u32 = 1022;
+    pub const JSONB_ARRAY: u32 = 3807;
+}
+
+/// The element type of an array type we decode structurally. Composite and
+/// domain arrays keep their textual form: their elements would have to be
+/// parsed against a type this map does not know.
+fn element_type(array_oid: u32) -> Option<u32> {
+    match array_oid {
+        oid::BOOL_ARRAY => Some(oid::BOOL),
+        oid::INT2_ARRAY => Some(oid::INT2),
+        oid::INT4_ARRAY => Some(oid::INT4),
+        oid::INT8_ARRAY => Some(oid::INT8),
+        oid::FLOAT4_ARRAY => Some(oid::FLOAT4),
+        oid::FLOAT8_ARRAY => Some(oid::FLOAT8),
+        oid::JSON_ARRAY => Some(oid::JSON),
+        oid::JSONB_ARRAY => Some(oid::JSONB),
+        oid::TEXT_ARRAY | oid::VARCHAR_ARRAY | oid::BPCHAR_ARRAY => Some(0), // plain text
+        _ => None,
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -74,6 +103,20 @@ pub fn convert(type_oid: u32, raw: Option<&[u8]>) -> Result<Value, TypeError> {
             serde_json::from_str(s).map_err(|_| TypeError::BadArray(s.to_string()))
         }
         oid::BYTEA => decode_bytea(s),
+        // pgoutput transmits arrays in their literal form (`{a,b}`); anything
+        // that fans out into documents needs them as real JSON arrays, and
+        // element types this map knows can be converted like scalars
+        array if element_type(array).is_some() => {
+            let elem = element_type(array).expect("checked by the guard");
+            parse_array_literal(s)?
+                .into_iter()
+                .map(|e| match e {
+                    None => Ok(Value::Null),
+                    Some(text) if elem == 0 => Ok(Value::String(text)),
+                    Some(text) => convert(elem, Some(text.as_bytes())),
+                })
+                .collect()
+        }
         _ => Ok(Value::String(s.to_string())),
     }
 }
@@ -207,6 +250,22 @@ mod tests {
     #[test]
     fn unknown_type_falls_back_to_string() {
         assert_eq!(conv_str(999999, "anything goes"), json!("anything goes"));
+    }
+
+    #[test]
+    fn known_array_types_decode_to_json_arrays() {
+        assert_eq!(
+            conv_str(oid::TEXT_ARRAY, r#"{red,"a b",NULL}"#),
+            json!(["red", "a b", null])
+        );
+        assert_eq!(conv_str(oid::INT8_ARRAY, "{1,2}"), json!([1, 2]));
+        assert_eq!(conv_str(oid::BOOL_ARRAY, "{t,f}"), json!([true, false]));
+        // jsonb[] arrives as quoted, escaped text exactly as PG writes it
+        assert_eq!(
+            conv_str(oid::JSONB_ARRAY, r#"{"{\"k\":1}","[1,2]"}"#),
+            json!([{"k": 1}, [1, 2]])
+        );
+        assert_eq!(conv_str(oid::INT4_ARRAY, "{}"), json!([]));
     }
 
     #[test]
