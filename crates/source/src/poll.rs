@@ -136,7 +136,12 @@ impl PollSource {
                     let pk = extract_pk(&doc, &t.pk_columns);
                     let deleted: Option<bool> = row.get(2);
                     let kind = if deleted.unwrap_or(false) {
-                        RowKind::Delete { pk }
+                        // the polled row is the before-image: a derived id can
+                        // be removed under the same name it was written under
+                        RowKind::Delete {
+                            pk,
+                            before: Some(doc),
+                        }
                     } else {
                         RowKind::Insert { pk, doc }
                     };

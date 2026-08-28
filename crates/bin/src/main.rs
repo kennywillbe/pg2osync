@@ -503,6 +503,16 @@ async fn reconcile_cmd(path: &Path, delete: bool) -> Result<()> {
 
     let mut total_orphans = 0usize;
     for (key, table) in &cfg.sync {
+        // reconcile pages an index by one key column, and a fanned table has
+        // many documents per row: the pagination would visit the same key
+        // over and over. Refuse until it can page by _id instead (#62).
+        if table.fan_out.is_some() {
+            bail!(
+                "[sync.{key}] fan_out is not supported by reconcile: it pages {} by \
+                 its key column, and one row now holds many documents under many ids",
+                table.index_name(key)
+            );
+        }
         let spec = reconcile::Table {
             qualified: table.table.clone(),
             index: table.index_name(key),
@@ -753,7 +763,12 @@ async fn validate(path: &Path) -> Result<()> {
 /// today, so the field simply stops appearing in new documents and the index
 /// disagrees with the database with nothing to show for it. Naming it at
 /// startup is far cheaper than finding it later.
-fn check_configured_columns(table: &config::TableSync, live: &[String]) -> Result<()> {
+fn check_configured_columns(
+    table: &config::TableSync,
+    live: &[String],
+    pk_columns: &[String],
+    nullable: &[String],
+) -> Result<()> {
     let missing = |names: &[String]| -> Vec<String> {
         names
             .iter()
@@ -778,6 +793,36 @@ fn check_configured_columns(table: &config::TableSync, live: &[String]) -> Resul
         bail!(
             "table {} has no column {pk} to use as primary_key",
             table.table
+        );
+    }
+    // an id placeholder naming a column that is gone could never render, and
+    // one naming a nullable column is a halt waiting to happen
+    if let Some(spec) = &table.id {
+        let template = pg2osync_engine::mapping::IdTemplate::parse(spec, pk_columns)
+            .map_err(|e| anyhow::anyhow!("id {spec:?} of {}: {e}", table.table))?;
+        for col in template.columns() {
+            if !live.iter().any(|c| c.eq_ignore_ascii_case(col)) {
+                bail!(
+                    "table {} has no column {col} to derive its id from",
+                    table.table
+                );
+            }
+            if nullable.iter().any(|c| c.eq_ignore_ascii_case(col)) {
+                println!(
+                    "! id placeholder {{{col}}} on {} is nullable; a NULL in it \
+                     halts the pipeline",
+                    table.table
+                );
+            }
+        }
+    }
+    if let Some(fan) = &table.fan_out
+        && !live.iter().any(|c| c.eq_ignore_ascii_case(&fan.field))
+    {
+        bail!(
+            "table {} has no column {} to fan out",
+            table.table,
+            fan.field
         );
     }
     // an exclusion or a transform for a column that is gone changes nothing,
@@ -834,7 +879,23 @@ async fn validate_postgres(cfg: &config::AppConfig, source_url: &str) -> Result<
             .iter()
             .map(|r| r.get(0))
             .collect();
-        check_configured_columns(table, &live)?;
+        let (schema, name) = table
+            .table
+            .split_once('.')
+            .context("table must be schema-qualified")?;
+        let info = pg2osync_source::catalog::table_info(&client, schema, name).await?;
+        let nullable: Vec<String> = client
+            .query(
+                "SELECT attname::text FROM pg_attribute \
+                 WHERE attrelid = to_regclass($1) AND attnum > 0 AND NOT attisdropped \
+                 AND NOT attnotnull",
+                &[&table.table],
+            )
+            .await?
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        check_configured_columns(table, &live, &info.pk_columns, &nullable)?;
         println!("✓ table {} exists ({} columns)", table.table, live.len());
         tables.push(table.table.clone());
         for child in &table.children {
@@ -922,7 +983,7 @@ async fn validate_mysql(cfg: &config::AppConfig, source_url: &str) -> Result<()>
             .context("table must be written as database.table for MySQL")?;
         let live = pg2osync_source_mysql::catalog::table_schema(&mut admin, schema, name).await?;
         let names: Vec<String> = live.columns.iter().map(|c| c.name.clone()).collect();
-        check_configured_columns(table, &names)?;
+        check_configured_columns(table, &names, &live.pk_columns, &[])?;
         println!(
             "✓ table {} exists with a primary key ({} columns)",
             table.table,

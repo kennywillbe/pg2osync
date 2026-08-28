@@ -219,6 +219,14 @@ pub struct TableSync {
     pub table: String,
     pub index: Option<String>,
     pub primary_key: Option<String>,
+    /// Derived document id: literals plus `{column}` placeholders, e.g.
+    /// `tenant-{tenant_id}-{id}`. Unset keeps the primary key as the id.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// One row to many documents: fan an array column out into one document
+    /// per element.
+    #[serde(default)]
+    pub fan_out: Option<FanOut>,
     #[serde(default)]
     pub columns: Option<Vec<String>>,
     #[serde(default)]
@@ -245,6 +253,17 @@ pub struct TableSync {
     /// or malformed file fails before anything connects.
     #[serde(skip)]
     pub mapping: Option<serde_json::Value>,
+}
+
+/// One array column fanned out into one document per element. `id` is the
+/// template element documents are filed under; it renders from the merged
+/// child document (parent-minus-array plus element), so its placeholders may
+/// name parent columns as well as fields of the element.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FanOut {
+    pub field: String,
+    pub id: String,
 }
 
 /// A child table joined into the parent document.
@@ -383,6 +402,52 @@ impl AppConfig {
             }
             if tbl.columns.as_ref().is_some_and(|c| c.is_empty()) {
                 anyhow::bail!("[sync.{key}] columns must not be empty");
+            }
+            // well-formedness only; whether a placeholder names a real column
+            // is a `validate` question, because only the catalogue knows
+            if let Some(spec) = &tbl.id {
+                pg2osync_engine::mapping::IdTemplate::parse(spec, &[]).map_err(|e| {
+                    anyhow::anyhow!("[sync.{key}] id {spec:?} is not a usable id: {e}")
+                })?;
+            }
+            if let Some(fan) = &tbl.fan_out {
+                if self.source.mode == "poll" {
+                    anyhow::bail!(
+                        "[sync.{key}] fan_out needs the replication log: a poll cycle \
+                         cannot see which elements left an array"
+                    );
+                }
+                if !tbl.children.is_empty() {
+                    anyhow::bail!(
+                        "[sync.{key}] fan_out and [[children]] both decide what a row's \
+                         array becomes; configuring them together has no coherent meaning"
+                    );
+                }
+                if fan.field.is_empty() {
+                    anyhow::bail!("[sync.{key}.fan_out] field must not be empty");
+                }
+                // identity must see the array raw: a projection that cuts it
+                // would leave fan-out with nothing to expand
+                if tbl
+                    .columns
+                    .as_ref()
+                    .is_some_and(|cols| cols.iter().any(|c| c == &fan.field))
+                    || tbl.exclude_columns.iter().any(|c| c == &fan.field)
+                {
+                    anyhow::bail!(
+                        "[sync.{key}.fan_out] field {:?} also appears in columns/exclude_columns; \
+                         projection would cut the array before identity and fan-out see it",
+                        fan.field
+                    );
+                }
+                // element ids render from the merged child document, whose
+                // element fields are not table columns: grammar only here
+                pg2osync_engine::mapping::IdTemplate::parse(&fan.id, &[]).map_err(|e| {
+                    anyhow::anyhow!(
+                        "[sync.{key}.fan_out] id {:?} is not a usable id: {e}",
+                        fan.id
+                    )
+                })?;
             }
             for (col, op) in &tbl.transform {
                 if op != "hash" && op != "redact" {
@@ -570,6 +635,58 @@ table = "public.users"
             .is_err(),
             "the key column cannot be excluded"
         );
+    }
+
+    #[test]
+    fn an_id_template_is_parsed_and_grammar_checked() {
+        let cfg = parse(&format!("{MINIMAL}id = \"user-{{id}}\"\n")).expect("valid");
+        assert_eq!(cfg.sync["users"].id.as_deref(), Some("user-{id}"));
+        for bad in ["user-{", "user-}", "user-{}", "user-{1x}", ""] {
+            assert!(
+                parse(&format!("{MINIMAL}id = \"{bad}\"\n")).is_err(),
+                "{bad:?} must not load as an id"
+            );
+        }
+    }
+
+    #[test]
+    fn fan_out_combinations_are_rejected_and_the_shape_accepted() {
+        let ok = format!(
+            "{MINIMAL}id = \"user-{{id}}\"\n[sync.users.fan_out]\nfield = \"tags\"\nid = \"user-{{id}}-{{tag}}\"\n"
+        );
+        assert!(parse(&ok).is_ok(), "a well-formed fan_out loads");
+        let poll = r#"[source]
+url = "postgres://u:p@localhost/db"
+mode = "poll"
+[target]
+url = "http://localhost:9200"
+[sync.users]
+table = "public.users"
+[sync.users.fan_out]
+field = "tags"
+id = "user-{id}-{tag}"
+"#;
+        assert!(parse(poll).is_err(), "fan_out needs the replication log");
+        let children = format!(
+            "{MINIMAL}[[sync.users.children]]\ntable = \"public.orders\"\nfield = \"orders\"\nforeign_key = \"customer_id\"\n[sync.users.fan_out]\nfield = \"tags\"\nid = \"user-{{id}}\"\n"
+        );
+        assert!(parse(&children).is_err(), "fan_out and children collide");
+        let projected = format!(
+            "{MINIMAL}exclude_columns = [\"tags\"]\n[sync.users.fan_out]\nfield = \"tags\"\nid = \"user-{{id}}\"\n"
+        );
+        assert!(
+            parse(&projected).is_err(),
+            "projection must not cut the array before fan-out"
+        );
+        let included = format!(
+            "{MINIMAL}columns = [\"id\", \"tags\"]\n[sync.users.fan_out]\nfield = \"tags\"\nid = \"user-{{id}}\"\n"
+        );
+        assert!(
+            parse(&included).is_err(),
+            "an array named in columns is the same collision"
+        );
+        let bad_id = format!("{MINIMAL}[sync.users.fan_out]\nfield = \"tags\"\nid = \"user-{{\"\n");
+        assert!(parse(&bad_id).is_err(), "the element id is grammar-checked");
     }
 
     #[test]

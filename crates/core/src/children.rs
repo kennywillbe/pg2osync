@@ -261,7 +261,10 @@ mod tests {
         let deleted = RowChange {
             schema: "public".into(),
             table: "customers".into(),
-            kind: RowKind::Delete { pk: json!(9) },
+            kind: RowKind::Delete {
+                pk: json!(9),
+                before: None,
+            },
             version: None,
         };
         assert!(keys_needing_refetch(&[deleted], vec![json!(9)]).is_empty());

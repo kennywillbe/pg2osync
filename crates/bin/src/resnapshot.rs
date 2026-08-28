@@ -49,6 +49,17 @@ pub async fn run_for(
         );
     };
     let index = tbl.index_name(key);
+    // A re-snapshot upserts rows; on a fanned table a row that shrank its
+    // array would leave the dropped element documents behind, because the
+    // delete half of fan-out comes from the WAL and a load has no log to
+    // read. reconcile is the tool for the difference, and it refuses too.
+    if tbl.fan_out.is_some() {
+        anyhow::bail!(
+            "{qualified_table} configures fan_out: a re-snapshot can only rewrite the \
+             documents a row has now, not remove the ones it used to have, so a fanned \
+             table is re-indexed by reloading its index"
+        );
+    }
 
     let sink = run::build_sink(cfg, target_password)?;
     // So a config pointed at a *new* index name gets its mapping first, which is

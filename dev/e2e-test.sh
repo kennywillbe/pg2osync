@@ -868,5 +868,156 @@ fi
 init_cleanup
 trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup' EXIT
 
+echo -e "\n\033[1m== 20. a derived id and a row that fans out into many documents ==\033[0m"
+# The identity question end to end (#62): a document id shaped by config, and
+# one row owning a document per element of a jsonb array — added, moved and
+# removed by the ordinary stream.
+FCONFIG=$(mktemp /tmp/pg2osync-e2e-fan.XXXXXX)
+FSLOT=pg2osync_e2e_fan
+cat > "$FCONFIG" <<TOML
+[source]
+url_env = "PG2OSYNC_SOURCE_URL"
+slot_name = "$FSLOT"
+publication = "${FSLOT}_pub"
+
+[target]
+url = "http://localhost:9200"
+
+[metrics]
+bind = "127.0.0.1:9121"
+
+[sync.fan]
+table = "public.fan_probe"
+index = "e2e_fan"
+id = "fan-{id}"
+
+[sync.fan.fan_out]
+field = "tags"
+id = "fan-{id}-{tags}"
+TOML
+fan_cleanup() {
+  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  pg "SELECT pg_drop_replication_slot('$FSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$FSLOT');" > /dev/null 2>&1 || true
+  pg "DROP PUBLICATION IF EXISTS ${FSLOT}_pub; DROP TABLE IF EXISTS fan_probe;" > /dev/null 2>&1 || true
+  rm -f "$FCONFIG"
+}
+trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup; init_cleanup; fan_cleanup' EXIT
+
+pg "DROP TABLE IF EXISTS fan_probe; CREATE TABLE fan_probe(id bigint primary key, tags jsonb);" > /dev/null 2>&1
+pg "ALTER TABLE fan_probe REPLICA IDENTITY FULL;" > /dev/null 2>&1
+pg "INSERT INTO fan_probe VALUES (1,'[\"a\",\"b\"]'::jsonb), (2,'[]'::jsonb), (3,NULL);" > /dev/null
+pg "DROP PUBLICATION IF EXISTS ${FSLOT}_pub; CREATE PUBLICATION ${FSLOT}_pub FOR TABLE fan_probe;" > /dev/null 2>&1
+curl -s -XDELETE "$OS/e2e_fan" > /dev/null
+# an id naming a column the table does not have must be refused where it can
+# still be fixed, not on the first row of the load
+sed 's/^id = "fan-{id}"/id = "fan-{nope}"/' "$FCONFIG" > "${FCONFIG}.bad"
+if $BIN validate -c "${FCONFIG}.bad" > /dev/null 2>&1; then
+  bad "validate accepted an id that fan_probe has no column for"
+else
+  ok "validate refuses an id naming a column the table does not have"
+fi
+rm -f "${FCONFIG}.bad"
+nohup $BIN run -c "$FCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_count e2e_fan)" = "3" ] && break
+  sleep 1
+done
+check "the load fans each array out into its own document" "$(os_count e2e_fan)" "3"
+check "element documents carry the configured id" "$(os_status e2e_fan fan-1-a)" "200"
+check "a NULL array keeps the row itself, under the base id" "$(os_status e2e_fan fan-3)" "200"
+check "an empty array emits nothing" "$(os_status e2e_fan fan-2)" "404"
+
+pg "UPDATE fan_probe SET tags='[\"a\",\"c\"]'::jsonb WHERE id = 1;" > /dev/null
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_status e2e_fan fan-1-c)" = "200" ] && break
+  sleep 1
+done
+check "a new element arrives" "$(os_status e2e_fan fan-1-c)" "200"
+check "the kept element is still there" "$(os_status e2e_fan fan-1-a)" "200"
+synced 2> /dev/null || { sleep 2; refresh; }
+check "the dropped element's document is gone" "$(os_status e2e_fan fan-1-b)" "404"
+
+pg "DELETE FROM fan_probe WHERE id = 1;" > /dev/null
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_count e2e_fan)" = "1" ] && break
+  sleep 1
+done
+check "a row delete removes every element document it owned" "$(os_count e2e_fan)" "1"
+stop_sync
+
+echo -e "\n\033[1m== 21. a derived id that needs the before-image ==\033[0m"
+BCONFIG=$(mktemp /tmp/pg2osync-e2e-bid.XXXXXX)
+BSLOT=pg2osync_e2e_bid
+cat > "$BCONFIG" <<TOML
+[source]
+url_env = "PG2OSYNC_SOURCE_URL"
+slot_name = "$BSLOT"
+publication = "${BSLOT}_pub"
+
+[target]
+url = "http://localhost:9200"
+
+[metrics]
+bind = "127.0.0.1:9122"
+
+[sync.bid]
+table = "public.bid_probe"
+index = "e2e_bid"
+id = "{tenant}-u{id}"
+TOML
+bid_cleanup() {
+  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  pg "SELECT pg_drop_replication_slot('$BSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$BSLOT');" > /dev/null 2>&1 || true
+  pg "DROP PUBLICATION IF EXISTS ${BSLOT}_pub; DROP TABLE IF EXISTS bid_probe;" > /dev/null 2>&1 || true
+  rm -f "$BCONFIG"
+}
+trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup; init_cleanup; fan_cleanup; bid_cleanup' EXIT
+
+pg "DROP TABLE IF EXISTS bid_probe; CREATE TABLE bid_probe(id bigint primary key, tenant text);" > /dev/null 2>&1
+# without the old row the pipeline could not find the document an id change
+# moves out of, so the tool refuses to start rather than strand it
+pg "INSERT INTO bid_probe VALUES (1,'acme');" > /dev/null
+pg "DROP PUBLICATION IF EXISTS ${BSLOT}_pub; CREATE PUBLICATION ${BSLOT}_pub FOR TABLE bid_probe;" > /dev/null 2>&1
+curl -s -XDELETE "$OS/e2e_bid" > /dev/null
+if $BIN run -c "$BCONFIG" > /tmp/pg2osync-e2e-bid.log 2>&1 & then
+  sleep 3
+  pkill -f "pg2osync run" 2>/dev/null || true
+  wait 2> /dev/null || true
+fi
+if grep -q "REPLICA IDENTITY FULL" /tmp/pg2osync-e2e-bid.log; then
+  ok "a non-key id on a non-FULL table is refused with the ALTER to run"
+else
+  bad "the pipeline started despite an id it cannot delete against"
+fi
+pg "ALTER TABLE bid_probe REPLICA IDENTITY FULL;" > /dev/null 2>&1
+nohup $BIN run -c "$BCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_status e2e_bid acme-u1)" = "200" ] && break
+  sleep 1
+done
+check "the id is rendered from the configured template" "$(os_status e2e_bid acme-u1)" "200"
+pg "UPDATE bid_probe SET tenant='globex' WHERE id = 1;" > /dev/null
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_status e2e_bid globex-u1)" = "200" ] && break
+  sleep 1
+done
+check "an update that moves the id writes the new document" "$(os_status e2e_bid globex-u1)" "200"
+synced 2> /dev/null || { sleep 2; refresh; }
+check "and removes the old one" "$(os_status e2e_bid acme-u1)" "404"
+pg "DELETE FROM bid_probe WHERE id = 1;" > /dev/null
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_status e2e_bid globex-u1)" = "404" ] && break
+  sleep 1
+done
+check "the delete finds the document by its derived id" "$(os_status e2e_bid globex-u1)" "404"
+stop_sync
+bid_cleanup
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]
