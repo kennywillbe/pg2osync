@@ -73,6 +73,10 @@ bind = "127.0.0.1:9100"
 table = "public.users"               # database.table for MySQL
 index = "users"
 # primary_key = "id"                 # default: detected from the primary key
+# Derived document id; unset keeps the primary key. Columns outside the key
+# need REPLICA IDENTITY FULL on PostgreSQL, and the table refuses to start
+# without it. A NULL in a named column halts the pipeline.
+# id = "tenant-{tenant_id}-{id}"
 # columns = ["id", "name", "email"]  # or exclude_columns, not both
 exclude_columns = ["password_hash"]
 # Mapping to create the index with, resolved relative to this file. Applied
@@ -95,3 +99,13 @@ email = "redact"                     # "redact" -> "***", "hash" -> SHA-256 pref
 # table = "public.orders"
 # field = "orders"
 # foreign_key = "customer_id"
+
+# Fan-out: one document per element of an array column (PostgreSQL array or
+# jsonb holding one; needs REPLICA IDENTITY FULL). The element id renders from
+# the parent-minus-array document merged with the element.
+# [sync.tickets]
+# table = "public.tickets"
+# id = "ticket-{id}"
+# [sync.tickets.fan_out]
+# field = "tags"
+# id = "ticket-{id}-{tags}"

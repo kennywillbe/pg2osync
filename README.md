@@ -77,6 +77,8 @@ replay, and no transformation language — if you need those, you want Kafka.
 | Crash recovery with no data loss (`kill -9` safe) | ✅ verified by the e2e suite |
 | Nested child collections (one level) | ✅ PostgreSQL and MySQL/MariaDB; the parent document embeds child arrays, resolved once per collection per transaction |
 | Column projection (`columns` / `exclude_columns`) | ✅ |
+| Derived document ids (`id = "tenant-{tenant_id}-{id}"`) | ✅ default stays the primary key; non-key columns need `REPLICA IDENTITY FULL` |
+| One row to many documents (`fan_out` over a JSON-array column) | ✅ elements added, moved and removed as versioned writes |
 | Column transforms (`hash`, `redact`) | ✅ |
 | TRUNCATE propagation | ✅ PostgreSQL and MySQL/MariaDB |
 | Polling fallback for managed databases without replication | ✅ upserts, plus deletes via `soft_delete` |
@@ -271,7 +273,8 @@ pipeline at a promoted replica resumes instead of reloading. `dev/failover-probe
 promotes a real replica and proves it. MariaDB needs no setting for this.
 
 **Crash safety** — restart the process; it resumes from the last checkpoint.
-Delivery is at-least-once with idempotent writes (`_id` is the primary key), so
+Delivery is at-least-once with idempotent writes (`_id` is the primary key, or
+an id shaped by configuration), so
 replays overwrite rather than duplicate. The acknowledgement sent back to the
 source is clamped to the durable checkpoint, so the database never recycles
 history for rows that are not indexed yet.

@@ -75,8 +75,9 @@ the sync user can't run DDL and a DBA provisions the objects instead.
 
 ### Row identity
 
-- Documents are keyed by the table's **primary key** (`_id = pk`). Composite
-  PKs are supported.
+- Documents are keyed by the table's **primary key** (`_id = pk`) unless the
+  table configures `id`, which derives the id from the row's raw values.
+  Composite PKs are supported.
 - `UPDATE`/`DELETE` events only carry the old row if the table has
   `REPLICA IDENTITY FULL`. Default (`DEFAULT`) is enough as long as you don't
   change primary keys; if PKs can change, set:
@@ -84,6 +85,11 @@ the sync user can't run DDL and a DBA provisions the objects instead.
 ```sql
 ALTER TABLE users REPLICA IDENTITY FULL;
 ```
+
+An `id` that references columns outside the key, and any `fan_out` table,
+need the same thing for the opposite reason: removing or moving a document
+means knowing the id the row *had*, and only the old row says that. Those are
+refused at startup without `REPLICA IDENTITY FULL`, naming the `ALTER`.
 
 pg2osync reads the actual setting from `pg_class.relreplident` and warns at
 startup when a table cannot support what your configuration asks of it.

@@ -51,6 +51,35 @@ without a shared transaction is a fiction. Every document's `_id` is its row's
 primary key, so a replay overwrites to the same value. Duplicates are therefore
 invisible, which is what makes the snapshot-then-stream overlap safe.
 
+**The id is configurable; the default is still the primary key.** (#62.)
+`[sync.x] id = "tenant-{tenant_id}-{id}"` renders an id from literals and
+placeholders; a table that configures nothing is filed under its key
+byte-for-byte as before, so no existing index needs a rebuild. Three rules
+make that safe, and they are the reason the feature was slow to arrive:
+identity renders from the row's **raw** values — before projections and
+before transforms, because identity is a property of the row, not of the
+projected document; exactly one place mints ids (`materialize` and
+`completion_id` in the engine), so the stream, the load, the re-snapshot and
+poll can never disagree; and a NULL in any column an id names halts the
+pipeline rather than inventing a name. An id that references columns outside
+the key additionally needs the row's before-image to delete and move its
+documents, which is why `run` refuses such a table unless PostgreSQL reports
+`REPLICA IDENTITY FULL` — on MySQL `binlog_row_image = FULL` already
+guarantees it.
+
+**One row can fan out into many documents.** (`fan_out`, #62.) A JSON-array
+column can be indexed as one document per element — each the parent-minus-array
+document merged with the element — so a search can match a single tag without
+the whole parent. The documents of one row then share a key, and identity has
+to say something about that too, which is why the element `id` is a second
+template rendered from the merged document. Deletes and update-diffs are
+computed from the row's before-image and issued as ordinary per-document
+versioned writes: `delete_by_query` was rejected because it cannot carry an
+external version and would have to act as a barrier, breaking
+`write_concurrency`. The `Sink` trait is unchanged. Reconcile and re-snapshot
+refuse fanned tables for now — both page by key, and one row is no longer one
+document.
+
 **Never acknowledge a position before it is durable.** The value reported to the
 source is clamped to the persisted checkpoint. Acknowledging further lets the
 database recycle history for rows that are not indexed yet — the classic way a

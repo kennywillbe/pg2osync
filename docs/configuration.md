@@ -127,6 +127,8 @@ One section per table. `<key>` is the index name when `index` is omitted.
 | `table` | **Required.** `schema.table` for PostgreSQL, `database.table` for MySQL |
 | `index` | Target index or collection; lowercase `[a-z0-9_-]`, not starting with `_` or `.` |
 | `primary_key` | Overrides key detection; also the join column for nested children |
+| `id` | Derived document id, e.g. `tenant-{tenant_id}-{id}`; see [Document ids](#document-ids) |
+| `fan_out` | One row becomes one document per element of an array column; see [Fan-out](#fan-out) |
 | `columns` | Only these columns are indexed |
 | `exclude_columns` | All columns except these; mutually exclusive with `columns` |
 | `transform` | Map of column to `"hash"` or `"redact"` |
@@ -138,7 +140,67 @@ One section per table. `<key>` is the index name when `index` is omitted.
 Projection and transforms apply to every path — initial load, live streaming and
 poll mode — so an excluded column never reaches the target. The primary key is
 read before projection, so excluding a key column is rejected at load time
-(it would collide document ids).
+(it would collide document ids). Ids, likewise, render from the row's raw
+values: before projection and before transforms.
+
+### Document ids
+
+By default a document's `_id` is its row's primary key, exactly as it always
+has been — configuring nothing changes nothing, and an existing index needs no
+rebuild. `id` overrides the shape:
+
+```toml
+[sync.orders]
+table = "public.orders"
+id = "tenant-{tenant_id}-{id}"
+```
+
+Literals plus `{column}` placeholders. The name has to be a column of the
+table, and the value renders like a key does: strings unquoted, numbers and
+booleans as text.
+
+- A NULL in a column the id references **halts the pipeline** — the id cannot
+  be invented, and the document the row already owns would be stranded.
+  `validate` warns up front for nullable columns.
+- An id naming only key columns works everywhere. An id that references
+  columns **outside** the key needs the row's before-image to delete and move
+  its documents, so on PostgreSQL the table must be
+  `REPLICA IDENTITY FULL`; `run` refuses to start otherwise. MySQL already
+  guarantees it (`binlog_row_image = FULL`).
+
+### Fan-out
+
+One row whose array column holds N elements can become N documents:
+
+```toml
+[sync.tickets]
+table = "public.tickets"
+id = "ticket-{id}"
+
+[sync.tickets.fan_out]
+field = "tags"            # a PostgreSQL array column, or jsonb holding an array
+id = "ticket-{id}-{tags}"
+```
+
+Each element document is the parent document **minus the array**, merged with
+the element: an object element's fields are merged in and win on collision, a
+scalar element lands under the array's own field name. The element `id`
+renders from that merged document, so its placeholders can name parent columns
+and element fields alike.
+
+- A row with an **empty or missing** array emits nothing; a row whose array is
+  **NULL** keeps one parent document under the plain `id`.
+- Updates diff before against after: elements that left the array have their
+  documents deleted, the rest are rewritten. Deletes remove every element
+  document the row owned. All of it as ordinary versioned writes, in the same
+  order as everything else — `write_concurrency` keeps working.
+- PostgreSQL: the table needs `REPLICA IDENTITY FULL` (checked at startup),
+  because deletes and diffs come from the row's old values. Poll mode and
+  `[[children]]` on the same table are refused; so is naming the fan-out
+  column in `columns`/`exclude_columns`, which would cut the array before
+  identity and fan-out ever see it. `reconcile` and `resnapshot` do not
+  support fanned tables yet: both page by key, and one row now has many
+  documents.
 
 `hash` replaces the value with a truncated SHA-256 digest, stable across runs so
 it can still be grouped on. `redact` replaces it with `***`. Null values are
