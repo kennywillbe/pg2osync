@@ -4,20 +4,13 @@
 //! packets with a sequence id; sequences >= 255 wrap to 0 and continue.
 //! Reassembly across packets is mandatory for large binlog events.
 
-#[derive(Debug, thiserror::Error)]
-pub enum FrameError {
-    #[error("connection closed mid-packet")]
-    Eof,
-    #[error("io: {0}")]
-    Io(String),
-}
+/// The most a single packet can carry. A payload of exactly this length is
+/// not the end of its message: the next packet continues it, and a message
+/// that fills the last packet completely is closed by an empty one. Both the
+/// writer and the reader in `connection` have to agree on this threshold.
+pub const MAX_PAYLOAD: usize = 0x00FF_FFFF;
 
-pub struct Packet {
-    pub seq: u8,
-    pub payload: Vec<u8>,
-}
-
-/// Build one framed packet (payload must be <= 16MB - 4).
+/// Build one framed packet (payload must be at most [`MAX_PAYLOAD`] bytes).
 pub fn frame(seq: &mut u8, payload: &[u8]) -> Vec<u8> {
     let len = payload.len() as u32;
     let mut out = Vec::with_capacity(payload.len() + 4);
@@ -29,44 +22,18 @@ pub fn frame(seq: &mut u8, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Split a >16MB logical payload into framed packets.
+/// Split a logical payload into framed packets.
 pub fn frame_all(start_seq: u8, payload: &[u8]) -> Vec<Vec<u8>> {
-    const MAX: usize = 0x00FF_FFFF;
     let mut out = Vec::new();
     let mut seq = start_seq;
-    for chunk in payload.chunks(MAX.max(1)) {
+    for chunk in payload.chunks(MAX_PAYLOAD) {
         out.push(frame(&mut seq, chunk));
     }
-    if payload.is_empty() || payload.len().is_multiple_of(MAX) {
+    if payload.is_empty() || payload.len().is_multiple_of(MAX_PAYLOAD) {
         // protocol requires an empty terminating packet at exact multiples
         out.push(frame(&mut seq, &[]));
     }
     out
-}
-
-/// Read one framed packet. `first_seq` is the expected sequence of this read.
-pub async fn read_packet<S>(stream: &mut S) -> Result<Packet, FrameError>
-where
-    S: tokio::io::AsyncRead + Unpin,
-{
-    use tokio::io::AsyncReadExt;
-    let mut head = [0u8; 4];
-    stream.read_exact(&mut head).await.map_err(io_err)?;
-    let len = u32::from_le_bytes([head[0], head[1], head[2], 0]) as usize;
-    let seq = head[3];
-    let mut payload = vec![0u8; len];
-    stream
-        .read_exact(&mut payload)
-        .await
-        .map_err(|e| match e.kind() {
-            tokio::io::ErrorKind::UnexpectedEof => FrameError::Eof,
-            _ => io_err(e),
-        })?;
-    Ok(Packet { seq, payload })
-}
-
-fn io_err(e: std::io::Error) -> FrameError {
-    FrameError::Io(e.to_string())
 }
 
 /// mysql_native_password scramble:

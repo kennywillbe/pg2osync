@@ -7,7 +7,7 @@
 //! the password never crosses the wire in the clear either way.
 
 use crate::auth;
-use crate::packet::{frame_all, parse_greeting};
+use crate::packet::{MAX_PAYLOAD, frame_all, parse_greeting};
 use anyhow::{Context as _, Result, bail};
 use pg2osync_tls::{SslMode, TlsSettings};
 use std::sync::Arc;
@@ -303,7 +303,8 @@ impl MySqlConnection {
     }
 }
 
-/// One packet with the sequence number the server stamped on it.
+/// One logical message with the sequence number of its last packet.
+#[derive(Debug)]
 struct SeqPacket {
     seq: u8,
     payload: Vec<u8>,
@@ -316,25 +317,49 @@ where
     Ok(read_one_with_seq(stream).await?.payload)
 }
 
+/// Read one logical message, reassembling it from as many packets as the
+/// server split it into.
+///
+/// A packet whose payload fills [`MAX_PAYLOAD`] exactly is a promise that the
+/// next packet continues the same message; a message that ends on that
+/// boundary is closed by an empty packet. A row event carrying a large `TEXT`
+/// or `BLOB` value is the usual reason for a split, and stopping after the
+/// first packet would hand the decoder a truncated event and leave the rest
+/// of it in the socket to be misread as the next one.
 async fn read_one_with_seq<S>(stream: &mut S) -> Result<SeqPacket>
 where
     S: AsyncRead + Unpin,
 {
-    let mut head = [0u8; 4];
-    stream
-        .read_exact(&mut head)
-        .await
-        .context("connection closed mid-packet")?;
-    let len = u32::from_le_bytes([head[0], head[1], head[2], 0]) as usize;
-    let mut payload = vec![0u8; len];
-    stream
-        .read_exact(&mut payload)
-        .await
-        .context("connection closed mid-payload")?;
-    Ok(SeqPacket {
-        seq: head[3],
-        payload,
-    })
+    let mut payload = Vec::new();
+    let mut expected_seq: Option<u8> = None;
+    loop {
+        let mut head = [0u8; 4];
+        stream
+            .read_exact(&mut head)
+            .await
+            .context("connection closed mid-packet")?;
+        let len = u32::from_le_bytes([head[0], head[1], head[2], 0]) as usize;
+        let seq = head[3];
+        // Only continuation packets are checked: the first packet of a
+        // message follows whatever the caller last wrote, which this reader
+        // does not know. Within a message the ids must be consecutive, and a
+        // gap means the stream is no longer framed the way we think it is.
+        if let Some(expected) = expected_seq
+            && seq != expected
+        {
+            bail!("packet sequence {seq} arrived where {expected} was expected");
+        }
+        let start = payload.len();
+        payload.resize(start + len, 0);
+        stream
+            .read_exact(&mut payload[start..])
+            .await
+            .context("connection closed mid-payload")?;
+        if len < MAX_PAYLOAD {
+            return Ok(SeqPacket { seq, payload });
+        }
+        expected_seq = Some(seq.wrapping_add(1));
+    }
 }
 
 async fn write_framed_at<S>(stream: &mut S, start_seq: u8, payload: &[u8]) -> Result<()>
@@ -614,5 +639,68 @@ mod tests {
         head.extend_from_slice(&300u16.to_le_bytes());
         assert_eq!(lenenc_at(&head, &mut 0), Some(300));
         assert_eq!(lenenc_at(&[7], &mut 0), Some(7));
+    }
+
+    /// Frame a message the way the server would and read it back through the
+    /// reassembling reader, so the write and read sides of the split rule are
+    /// checked against each other rather than against a hand-typed vector.
+    async fn roundtrip(start_seq: u8, message: &[u8]) -> SeqPacket {
+        let wire = frame_all(start_seq, message).concat();
+        let mut reader = wire.as_slice();
+        let packet = read_one_with_seq(&mut reader).await.expect("read");
+        assert!(reader.is_empty(), "reader left bytes behind");
+        packet
+    }
+
+    /// A deterministic body that is cheap to build and whose bytes differ
+    /// across the packet boundaries, so a chunk delivered in the wrong place
+    /// would not go unnoticed.
+    fn body(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[tokio::test]
+    async fn a_short_packet_is_one_message() {
+        let packet = roundtrip(3, b"hello").await;
+        assert_eq!(packet.seq, 3);
+        assert_eq!(packet.payload, b"hello");
+    }
+
+    #[tokio::test]
+    async fn a_message_spanning_three_packets_is_reassembled() {
+        let message = body(2 * MAX_PAYLOAD + 7);
+        let packet = roundtrip(254, &message).await;
+        // 254, 255 and, after the wrap, 0
+        assert_eq!(packet.seq, 0);
+        assert_eq!(packet.payload, message);
+    }
+
+    #[tokio::test]
+    async fn a_message_that_fills_its_last_packet_ends_at_the_empty_one() {
+        let message = body(MAX_PAYLOAD);
+        let packet = roundtrip(1, &message).await;
+        assert_eq!(packet.seq, 2);
+        assert_eq!(packet.payload, message);
+    }
+
+    #[tokio::test]
+    async fn a_continuation_out_of_sequence_is_an_error() {
+        let mut wire = frame_all(1, &body(MAX_PAYLOAD + 1)).concat();
+        // the second packet's id sits right after the first packet
+        wire[MAX_PAYLOAD + 4 + 3] = 9;
+        let err = read_one_with_seq(&mut wire.as_slice())
+            .await
+            .expect_err("mismatched sequence");
+        assert!(err.to_string().contains("sequence 9"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_ends_inside_a_split_message_is_an_error() {
+        let wire = frame_all(1, &body(MAX_PAYLOAD + 1)).concat();
+        // only the first packet made it
+        let err = read_one_with_seq(&mut &wire[..MAX_PAYLOAD + 4])
+            .await
+            .expect_err("truncated");
+        assert!(err.to_string().contains("mid-packet"), "{err}");
     }
 }
