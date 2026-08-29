@@ -36,7 +36,8 @@ demand — is managed from creation. See
 
 ## Version targeting
 
-Verified end to end against Elasticsearch 8.15 with security disabled. The sink
+The full `dev/e2e-test.sh` suite runs nightly against Elasticsearch 8.19.20
+with security disabled (see [compatibility](../compatibility.md)). The sink
 speaks raw REST (`_bulk`, `_mget`, `_delete_by_query`, `_refresh`, `_doc`)
 rather than using the official client, which keeps a second HTTP stack out of
 the binary.

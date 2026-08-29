@@ -9,11 +9,14 @@
 # holding SELECT, REPLICATION SLAVE and REPLICATION CLIENT.
 #
 # Usage: MYSQL_PORT=13306 MYSQL_CONTAINER=mysql-test ./dev/e2e-mysql-test.sh
+#   OS_URL         target base URL          (default http://localhost:9200)
+#   TARGET_FLAVOR  opensearch|elasticsearch (default opensearch)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 BIN=./target/release/pg2osync
 OS=${OS_URL:-http://localhost:9200}
+TARGET_FLAVOR=${TARGET_FLAVOR:-opensearch}
 CONTAINER=${MYSQL_CONTAINER:-mysql-test}
 PORT=${MYSQL_PORT:-13306}
 USER=${MYSQL_USER:-repl}
@@ -66,6 +69,7 @@ server_id = 990001
 
 [target]
 url = "$OS"
+flavor = "$TARGET_FLAVOR"
 
 [metrics]
 bind = "127.0.0.1:9112"
@@ -234,6 +238,7 @@ load_chunk_rows = 5000
 
 [target]
 url = "$OS"
+flavor = "$TARGET_FLAVOR"
 
 [metrics]
 bind = "127.0.0.1:9113"
@@ -353,6 +358,7 @@ server_id = 990003
 
 [target]
 url = "$OS"
+flavor = "$TARGET_FLAVOR"
 
 [metrics]
 bind = "127.0.0.1:9114"
@@ -484,6 +490,7 @@ server_id = $CSID
 
 [target]
 url = "$OS"
+flavor = "$TARGET_FLAVOR"
 
 [metrics]
 bind = "127.0.0.1:9116"
@@ -597,6 +604,7 @@ server_id = 990016
 
 [target]
 url = "$OS"
+flavor = "$TARGET_FLAVOR"
 
 [metrics]
 enabled = false
@@ -682,6 +690,7 @@ server_id = $WSID
 
 [target]
 url = "$OS"
+flavor = "$TARGET_FLAVOR"
 
 [metrics]
 bind = "127.0.0.1:9117"
@@ -748,6 +757,7 @@ server_id = $ESID
 
 [target]
 url = "$OS"
+flavor = "$TARGET_FLAVOR"
 
 [metrics]
 bind = "127.0.0.1:9118"
@@ -851,6 +861,7 @@ server_id = $PSID
 
 [target]
 url = "$OS"
+flavor = "$TARGET_FLAVOR"
 
 [metrics]
 bind = "127.0.0.1:9119"
@@ -921,6 +932,7 @@ server_id = $ASID
 
 [target]
 url = "$OS"
+flavor = "$TARGET_FLAVOR"
 
 [metrics]
 bind = "127.0.0.1:9120"

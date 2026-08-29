@@ -1,7 +1,9 @@
 # MySQL / MariaDB source
 
-Change capture through the **binary log**. Verified end to end against
-MySQL 8.0 and MariaDB 11.8: consistent initial load, live INSERT/UPDATE/DELETE
+Change capture through the **binary log**. `dev/e2e-mysql-test.sh` runs
+against MySQL 8.0 on every pull request, and against MySQL 8.4, MariaDB 10.6
+and MariaDB 11.8 nightly (see [compatibility](../compatibility.md)):
+consistent initial load, live INSERT/UPDATE/DELETE
 streaming with real column names, resumable positions and crash recovery
 (`dev/e2e-mysql-test.sh`).
 
@@ -18,9 +20,11 @@ CREATE USER 'pg2osync'@'%' IDENTIFIED WITH mysql_native_password BY '...';
 GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'pg2osync'@'%';
 ```
 
-`log_bin` must be enabled (it is by default on MySQL 8.0+ and MariaDB 10.6+;
-`binlog_format`/`binlog_row_image` are usually already `ROW`/`FULL`). Put the
-settings in `my.cnf` as well — `SET GLOBAL` does not survive a restart.
+`log_bin` must be enabled. MySQL 8.0+ enables it by default; MariaDB does
+not — it needs `log_bin` in the configuration file (or `--log-bin` on the
+command line) and a restart. `binlog_format`/`binlog_row_image` are usually
+already `ROW`/`FULL`. Put the settings in `my.cnf` as well — `SET GLOBAL` does
+not survive a restart.
 
 `pg2osync setup-sql -c pg2osync.toml` prints the whole script for your config —
 the `my.cnf` block, the user and the grants — so it can be handed to whoever
@@ -153,6 +157,8 @@ a reload cannot undo versions already in the target.
 ### MySQL vs MariaDB wire differences
 
 Handled transparently:
+
+CI runs MySQL 8.0 and 8.4, and MariaDB 10.6 and 11.8, over both dialects.
 
 | Aspect | MySQL 8.x | MariaDB 10/11.x |
 |---|---|---|

@@ -5,7 +5,8 @@ for real-time change capture with a consistent-snapshot backfill.
 
 ## Requirements
 
-- PostgreSQL 15 or newer
+- PostgreSQL 15 or newer — 17 runs on every pull request and 15, the floor,
+  runs nightly (see [compatibility](../compatibility.md))
 - `wal_level = logical` in `postgresql.conf` (restart required)
 - Sync user needs:
   - `REPLICATION` privilege (or superuser)

@@ -50,6 +50,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo check --workspace --locked
 
+  # One source version and one target version per pull request, deliberately:
+  # every other version the docs claim runs in compat.yml once a night.
   e2e-postgres:
     name: e2e PostgreSQL to OpenSearch
     runs-on: ubuntu-latest
