@@ -241,6 +241,10 @@ pub struct TableSync {
     /// Column transformations, e.g. email = "hash" | "redact"
     #[serde(default)]
     pub transform: std::collections::HashMap<String, String>,
+    /// Target field names, source column → field. Applied after every other
+    /// rule, so the rest of this section keeps naming source columns.
+    #[serde(default)]
+    pub fields: std::collections::HashMap<String, String>,
     /// One-to-many children embedded as JSON arrays (single level, 0.3).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<ChildJoin>,
@@ -286,6 +290,9 @@ pub struct ChildJoin {
     /// says so in `<field>_truncated` and `<field>_total`.
     #[serde(default)]
     pub max_rows: Option<u32>,
+    /// Target field names inside the embedded array, child column → field.
+    #[serde(default)]
+    pub fields: std::collections::HashMap<String, String>,
 }
 
 impl TableSync {
@@ -456,6 +463,55 @@ impl AppConfig {
                     );
                 }
             }
+            check_field_map(&format!("sync.{key}.fields"), &tbl.fields)?;
+            for (col, target) in &tbl.fields {
+                // a rename is a promise that the column reaches the target;
+                // projection dropping it would break that promise silently
+                if tbl.exclude_columns.contains(col) {
+                    anyhow::bail!(
+                        "[sync.{key}.fields] {col} is renamed but also excluded; \
+                         an excluded column never reaches the target"
+                    );
+                }
+                if let Some(cols) = &tbl.columns
+                    && !cols.contains(col)
+                {
+                    anyhow::bail!(
+                        "[sync.{key}.fields] {col} is renamed but not in columns; \
+                         it would never reach the target"
+                    );
+                }
+                if let Some(cols) = &tbl.columns
+                    && cols.contains(target)
+                    && !tbl.fields.contains_key(target)
+                {
+                    anyhow::bail!(
+                        "[sync.{key}.fields] {col} = {target:?} would overwrite column {target}"
+                    );
+                }
+            }
+            for child in &tbl.children {
+                // the child's field is not a column, so a parent rename that
+                // names it would either do nothing or bury the array
+                let claimed = [
+                    child.field.clone(),
+                    format!("{}_truncated", child.field),
+                    format!("{}_total", child.field),
+                ];
+                for name in &claimed {
+                    if tbl.fields.contains_key(name) || tbl.fields.values().any(|t| t == name) {
+                        anyhow::bail!(
+                            "[sync.{key}.fields] {name:?} is the field of child {}; \
+                             rename the child's columns in its own fields instead",
+                            child.table
+                        );
+                    }
+                }
+                check_field_map(
+                    &format!("sync.{key}.children({}).fields", child.table),
+                    &child.fields,
+                )?;
+            }
             // an excluded column silently dropped from the key would produce
             // colliding document ids
             if let Some(pk) = &tbl.primary_key
@@ -561,6 +617,32 @@ fn is_qualified_table(name: &str) -> bool {
     parts.len() == 2 && parts.iter().all(|p| !p.is_empty())
 }
 
+/// The shape checks a rename map needs regardless of what it applies to.
+/// A target that is another key of the same map is allowed: that column is
+/// itself renamed away, so nothing is overwritten.
+fn check_field_map(
+    section: &str,
+    fields: &std::collections::HashMap<String, String>,
+) -> Result<()> {
+    let mut by_target: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    let mut keys: Vec<&String> = fields.keys().collect();
+    keys.sort();
+    for col in keys {
+        let target = &fields[col];
+        if col.is_empty() || target.is_empty() {
+            anyhow::bail!("[{section}] a column name and its target must not be empty");
+        }
+        // an option that does nothing implies a guarantee it does not give
+        if col == target {
+            anyhow::bail!("[{section}] {col} renames a column to itself");
+        }
+        if let Some(other) = by_target.insert(target, col) {
+            anyhow::bail!("[{section}] {other} and {col} would both be stored as {target:?}");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,6 +716,70 @@ table = "public.users"
             ))
             .is_err(),
             "the key column cannot be excluded"
+        );
+    }
+
+    #[test]
+    fn fields_are_validated_against_projection_and_each_other() {
+        let refused = [
+            ("[sync.users.fields]\n\"\" = \"x\"\n", "empty column"),
+            ("[sync.users.fields]\nname = \"\"\n", "empty target"),
+            (
+                "[sync.users.fields]\nname = \"name\"\n",
+                "a column renamed to itself",
+            ),
+            (
+                "[sync.users.fields]\na = \"x\"\nb = \"x\"\n",
+                "two columns stored under one name",
+            ),
+            (
+                "exclude_columns = [\"secret\"]\n[sync.users.fields]\nsecret = \"s\"\n",
+                "an excluded column cannot be renamed",
+            ),
+            (
+                "columns = [\"id\"]\n[sync.users.fields]\nname = \"n\"\n",
+                "a column outside the projection cannot be renamed",
+            ),
+            (
+                "columns = [\"id\", \"email\"]\n[sync.users.fields]\nid = \"email\"\n",
+                "a target that is a surviving column would overwrite it",
+            ),
+            (
+                "[sync.users.fields]\nname = \"orders\"\n[[sync.users.children]]\ntable = \"public.orders\"\nfield = \"orders\"\nforeign_key = \"user_id\"\n",
+                "a target that is a child field",
+            ),
+            (
+                "[sync.users.fields]\norders = \"o\"\n[[sync.users.children]]\ntable = \"public.orders\"\nfield = \"orders\"\nforeign_key = \"user_id\"\n",
+                "a key that is a child field",
+            ),
+            (
+                "[[sync.users.children]]\ntable = \"public.orders\"\nfield = \"orders\"\nforeign_key = \"user_id\"\n[sync.users.children.fields]\ntotal = \"total\"\n",
+                "a child column renamed to itself",
+            ),
+            (
+                "[[sync.users.children]]\ntable = \"public.orders\"\nfield = \"orders\"\nforeign_key = \"user_id\"\n[sync.users.children.fields]\na = \"x\"\nb = \"x\"\n",
+                "two child columns stored under one name",
+            ),
+        ];
+        for (extra, why) in refused {
+            assert!(parse(&format!("{MINIMAL}{extra}")).is_err(), "{why}");
+        }
+
+        parse(&format!(
+            "{MINIMAL}[sync.users.fields]\na = \"b\"\nb = \"a\"\n"
+        ))
+        .expect("a swap renames both columns away, so neither is overwritten");
+        parse(&format!(
+            "{MINIMAL}[sync.users.fields]\nemail = \"contact\"\n[sync.users.transform]\nemail = \"redact\"\n"
+        ))
+        .expect("transforms keep naming the source column");
+        let cfg = parse(&format!(
+            "{MINIMAL}[[sync.users.children]]\ntable = \"public.orders\"\nfield = \"orders\"\nforeign_key = \"user_id\"\n[sync.users.children.fields]\ntotal = \"amount\"\n"
+        ))
+        .expect("a child rename parses");
+        assert_eq!(
+            cfg.sync["users"].children[0].fields["total"], "amount",
+            "the child's fields attach to that child"
         );
     }
 

@@ -132,6 +132,7 @@ One section per table. `<key>` is the index name when `index` is omitted.
 | `columns` | Only these columns are indexed |
 | `exclude_columns` | All columns except these; mutually exclusive with `columns` |
 | `transform` | Map of column to `"hash"` or `"redact"` |
+| `fields` | Map of source column to target field name; applied last, see [Field names](#field-names) |
 | `poll_column` | Poll mode: overrides `[source] poll_column` for this table |
 | `soft_delete` | SQL predicate marking a row as deleted, e.g. `deleted_at IS NOT NULL` |
 | `mapping_file` | JSON mapping to create the index with, see below |
@@ -141,7 +142,9 @@ Projection and transforms apply to every path — initial load, live streaming a
 poll mode — so an excluded column never reaches the target. The primary key is
 read before projection, so excluding a key column is rejected at load time
 (it would collide document ids). Ids, likewise, render from the row's raw
-values: before projection and before transforms.
+values: before projection and before transforms. `fields` renames run
+**last**, after projection and transforms; every other option names the column
+as the source knows it.
 
 ### Document ids
 
@@ -207,6 +210,40 @@ it can still be grouped on. `redact` replaces it with `***`. Null values are
 left alone in both cases.
 
 Two tables may not map to the same index: document identity would be ambiguous.
+
+### Field names
+
+An index that already exists is rarely named after the database. `fields`
+stores a column under another name:
+
+```toml
+[sync.users]
+table = "public.users"
+
+[sync.users.fields]
+usr_nm = "username"
+```
+
+The rename is the **last** shaping step — identity, fan-out, projection and
+transforms all run first — so every other option (`columns`,
+`exclude_columns`, `transform`, `id`, `fan_out.field`, `primary_key`,
+`soft_delete`, `poll_column`) keeps naming the column as the source knows it.
+The new name applies on the initial load, the stream, poll mode and a
+re-snapshot alike, and inside embedded child arrays through the child's own
+`fields` (see [Nested children](#nested-children)).
+
+Refused at load: an empty name, renaming a column to itself, two columns to
+the same name, renaming an excluded column or one missing from `columns`, a
+target that equals a non-renamed column in `columns`, and a parent rename that
+names or targets a child `field` (or its `_truncated`/`_total`). `validate`
+warns when a renamed column does not exist — a stale config, as with
+`exclude_columns` — and refuses a target that equals a live column that is not
+itself renamed away.
+
+- TOAST completion reads the stored document, so it finds the column under its
+  new name.
+- `mapping_file` must declare the **renamed** names: the mapping is compared
+  against the index, never against the table.
 
 ### Soft deletes
 
@@ -302,6 +339,21 @@ foreign_key = "customer_id"  # column on the CHILD referencing the parent key
 # max_rows = 1000            # optional: embed at most this many, see below
 ```
 
+A child's columns are renamed the same way, on the child element rather than
+on the parent:
+
+```toml
+[[sync.customers.children]]
+table = "public.orders"
+field = "orders"
+foreign_key = "customer_id"
+
+[sync.customers.children.fields]
+total = "amount"             # every element of `orders` carries `amount`
+```
+
+`<field>_truncated` and `<field>_total` follow the child `field`, not a rename.
+
 - PostgreSQL and MySQL/MariaDB alike.
 - One level deep only.
 - Children are fetched during the initial load and re-fetched whenever the
@@ -352,7 +404,9 @@ startup for the same reason.
   (`ALTER TABLE public.orders REPLICA IDENTITY FULL`). Without it a DELETE
   carries no foreign key, so the parent cannot be located; pg2osync warns at
   startup and fails on such a delete rather than silently going stale.
-- Not supported for the MySQL source yet.
+- MySQL/MariaDB: the child table is streamed from the binlog automatically;
+  `binlog_row_image = FULL` (already required) is what lets a child DELETE
+  carry its foreign key, so there is no REPLICA IDENTITY caveat.
 
 ## `[engine]`
 

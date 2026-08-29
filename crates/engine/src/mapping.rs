@@ -126,6 +126,84 @@ impl Transforms {
     }
 }
 
+/// Per-table field renames from `[sync.x.fields]` and the `fields` of each
+/// `[[sync.x.children]]`.
+///
+/// Applied last — after projection and transforms — so every other rule keeps
+/// naming the column as the source knows it, and identity, projection and
+/// transforms never have to know a rename exists.
+#[derive(Debug, Clone, Default)]
+pub struct Renames {
+    map: HashMap<(String, String), Rename>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Rename {
+    /// Source column → target field on the document itself.
+    pub columns: HashMap<String, String>,
+    /// Child field on the parent document → (child column → target field),
+    /// applied to every object of that embedded array.
+    pub nested: HashMap<String, HashMap<String, String>>,
+}
+
+impl Renames {
+    pub fn from_pairs(pairs: impl IntoIterator<Item = ((String, String), Rename)>) -> Self {
+        Self {
+            map: pairs.into_iter().collect(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// The name `col` of `schema.table` is stored under in the target — the
+    /// column itself when nothing renames it. TOAST completion reads the
+    /// stored document, which is the one place the target name leaks back
+    /// into a pipeline that otherwise thinks in source names.
+    pub fn target_name<'a>(&'a self, schema: &str, table: &str, col: &'a str) -> &'a str {
+        self.map
+            .get(&(schema.to_string(), table.to_string()))
+            .and_then(|r| r.columns.get(col))
+            .map_or(col, String::as_str)
+    }
+
+    /// Rename in place: the document's own fields, then the objects inside
+    /// each embedded child array.
+    pub fn apply(&self, schema: &str, table: &str, doc: &mut serde_json::Value) {
+        let Some(rule) = self.map.get(&(schema.to_string(), table.to_string())) else {
+            return;
+        };
+        let Some(obj) = doc.as_object_mut() else {
+            return;
+        };
+        rename_keys(obj, &rule.columns);
+        for (field, columns) in &rule.nested {
+            if let Some(serde_json::Value::Array(rows)) = obj.get_mut(field) {
+                for row in rows.iter_mut().filter_map(serde_json::Value::as_object_mut) {
+                    rename_keys(row, columns);
+                }
+            }
+        }
+    }
+}
+
+/// Every renamed key leaves the object before any lands under its new name,
+/// so a swap is well defined and a rename onto a surviving field is the one
+/// deterministic thing it can be: the renamed value wins.
+fn rename_keys(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    map: &HashMap<String, String>,
+) {
+    let moved: Vec<(&String, serde_json::Value)> = map
+        .iter()
+        .filter_map(|(from, to)| obj.remove(from).map(|v| (to, v)))
+        .collect();
+    for (to, v) in moved {
+        obj.insert(to.clone(), v);
+    }
+}
+
 /// A configured document id: literals plus `{column}` placeholders, e.g.
 /// `tenant-{tenant_id}-{id}`.
 ///
@@ -478,6 +556,87 @@ mod tests {
         t.apply("s", "t", &mut a);
         t.apply("s", "t", &mut b);
         assert_eq!(a, b);
+    }
+
+    fn users_renames(columns: &[(&str, &str)], nested: &[(&str, &[(&str, &str)])]) -> Renames {
+        let pairs = |m: &[(&str, &str)]| -> HashMap<String, String> {
+            m.iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect()
+        };
+        Renames::from_pairs([(
+            ("public".into(), "users".into()),
+            Rename {
+                columns: pairs(columns),
+                nested: nested
+                    .iter()
+                    .map(|(field, m)| (field.to_string(), pairs(m)))
+                    .collect(),
+            },
+        )])
+    }
+
+    #[test]
+    fn renames_move_top_level_fields_and_leave_other_tables_alone() {
+        let r = users_renames(&[("usr_nm", "username")], &[]);
+        let mut doc = json!({"usr_nm": "alice", "id": 1});
+        r.apply("public", "users", &mut doc);
+        assert_eq!(doc, json!({"username": "alice", "id": 1}));
+
+        let mut other = json!({"usr_nm": "alice"});
+        r.apply("public", "orders", &mut other);
+        assert_eq!(other, json!({"usr_nm": "alice"}));
+    }
+
+    #[test]
+    fn renames_reach_into_every_object_of_a_child_array() {
+        let r = users_renames(&[], &[("orders", &[("total", "amount")])]);
+        let mut doc = json!({
+            "id": 1,
+            "orders": [{"total": 1}, {"total": 2}, null],
+            "orders_total": 3,
+            "orders_truncated": true,
+        });
+        r.apply("public", "users", &mut doc);
+        assert_eq!(
+            doc,
+            json!({
+                "id": 1,
+                "orders": [{"amount": 1}, {"amount": 2}, null],
+                "orders_total": 3,
+                "orders_truncated": true,
+            }),
+            "objects are renamed, a null element and the cap fields are not"
+        );
+    }
+
+    #[test]
+    fn a_rename_after_a_transform_keeps_the_transformed_value() {
+        let t = Transforms::from_pairs([(
+            ("public".into(), "users".into()),
+            HashMap::from([("email".to_string(), TransformOp::Redact)]),
+        )]);
+        let r = users_renames(&[("email", "contact")], &[]);
+        let mut doc = json!({"email": "a@b.c"});
+        t.apply("public", "users", &mut doc);
+        r.apply("public", "users", &mut doc);
+        assert_eq!(doc, json!({"contact": "***"}));
+    }
+
+    #[test]
+    fn swapped_renames_are_well_defined() {
+        let r = users_renames(&[("a", "b"), ("b", "a")], &[]);
+        let mut doc = json!({"a": 1, "b": 2});
+        r.apply("public", "users", &mut doc);
+        assert_eq!(doc, json!({"a": 2, "b": 1}));
+    }
+
+    #[test]
+    fn target_name_is_identity_when_unmapped() {
+        let r = users_renames(&[("bio", "about")], &[]);
+        assert_eq!(r.target_name("public", "users", "bio"), "about");
+        assert_eq!(r.target_name("public", "users", "id"), "id");
+        assert_eq!(r.target_name("public", "orders", "bio"), "bio");
     }
 
     #[test]

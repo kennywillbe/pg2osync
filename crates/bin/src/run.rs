@@ -9,7 +9,7 @@ use pg2osync_core::event::ChangeEvent;
 use pg2osync_core::lsn::Lsn;
 use pg2osync_core::sink::{IndexSpec, Sink};
 use pg2osync_engine::mapping::{
-    DurableLsn, Projection, Projections, TableMapping, TransformOp, Transforms,
+    DurableLsn, Projection, Projections, Rename, Renames, TableMapping, TransformOp, Transforms,
 };
 use pg2osync_engine::metrics::SharedMetrics;
 use pg2osync_engine::{PipelineCtx, PositionRenderer};
@@ -206,6 +206,28 @@ fn transforms(cfg: &AppConfig) -> Result<Transforms> {
     Ok(Transforms::from_pairs(pairs))
 }
 
+fn renames(cfg: &AppConfig) -> Renames {
+    Renames::from_pairs(cfg.sync.values().filter_map(|tbl| {
+        let nested: HashMap<String, HashMap<String, String>> = tbl
+            .children
+            .iter()
+            .filter(|child| !child.fields.is_empty())
+            .map(|child| (child.field.clone(), child.fields.clone()))
+            .collect();
+        if tbl.fields.is_empty() && nested.is_empty() {
+            return None;
+        }
+        let (schema, table) = split_qualified(&tbl.table);
+        Some((
+            (schema.to_string(), table.to_string()),
+            Rename {
+                columns: tbl.fields.clone(),
+                nested,
+            },
+        ))
+    }))
+}
+
 /// The key columns a table's id may be rendered from without a before-image,
 /// as far as the engine can tell: it has no catalog, and the WAL path takes
 /// the key from the replica identity rather than from configuration. The
@@ -369,6 +391,7 @@ pub fn pipeline_ctx(
         mapping: table_mapping(cfg),
         projections: projections(cfg),
         transforms: transforms(cfg)?,
+        renames: renames(cfg),
         id_templates: id_templates(cfg)?,
         fan_outs: fan_outs(cfg)?,
         cfg: cfg.engine.clone(),

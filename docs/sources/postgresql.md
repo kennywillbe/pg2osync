@@ -106,7 +106,9 @@ exclude_columns = ["password_hash", "internal_notes"]
 ```
 
 Projection applies to the initial load and to live streaming alike, so an
-excluded column never reaches the target.
+excluded column never reaches the target. To store a column under another name
+see [Field names](../configuration.md#field-names); projection and transforms
+still refer to the source name.
 
 TOASTed columns (very large values) that an UPDATE did not modify arrive as
 markers rather than values. pg2osync completes them from the old tuple when the
