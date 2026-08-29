@@ -1,6 +1,8 @@
 # OpenSearch sink (default)
 
-The primary, most battle-tested target. Live-verified against OpenSearch 2.19.
+The primary, most battle-tested target. The full `dev/e2e-test.sh` suite runs
+against OpenSearch 2.19.6 on every pull request (see
+[compatibility](../compatibility.md)).
 
 ```toml
 [target]

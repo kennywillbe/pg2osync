@@ -39,4 +39,11 @@ Operational consequences:
 - Meilisearch has no mappings; searchable and filterable attributes are yours to
   configure on the index.
 
-Verified end to end against Meilisearch 1.11.
+## Version targeting
+
+`dev/e2e-meili-smoke.sh` runs nightly against Meilisearch v1.53.1 (see
+[compatibility](../compatibility.md)). It is a smoke suite rather than the
+full `dev/e2e-test.sh`, because that suite asserts over mappings, join fields
+and per-row indices — the three things this target does not have. What it does
+cover is the initial load, live INSERT/UPDATE/DELETE and the file checkpoint
+resuming after a restart.

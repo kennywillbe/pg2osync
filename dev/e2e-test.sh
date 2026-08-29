@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end test suite for the PostgreSQL -> OpenSearch pipeline.
+# End-to-end test suite for the PostgreSQL -> OpenSearch/Elasticsearch pipeline.
 #
 # Runs one at a time: stopping the pipeline kills every pg2osync process, so
 # two suites at once take each other's down and report failures that are not.
@@ -10,11 +10,14 @@
 #   cargo build --release
 #
 # Usage: ./dev/e2e-test.sh
+#   OS_URL         target base URL          (default http://localhost:9200)
+#   TARGET_FLAVOR  opensearch|elasticsearch (default opensearch)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 BIN=./target/release/pg2osync
 OS=${OS_URL:-http://localhost:9200}
+TARGET_FLAVOR=${TARGET_FLAVOR:-opensearch}
 PG_CONTAINER=${PG_CONTAINER:-dev-postgres-1}
 # BSD mktemp only substitutes X's at the *end* of the template: with a
 # suffix after them it creates the literal name instead, and one killed run
@@ -63,14 +66,15 @@ drop_idle_probe_slots() { pg "SELECT pg_drop_replication_slot(slot_name) FROM pg
 cleanup()   { stop_sync; drop_own_slot; rm -f "$CONFIG" "$MAPPING"; }
 trap cleanup EXIT
 
-cat > "$CONFIG" <<'TOML'
+cat > "$CONFIG" <<TOML
 [source]
 url_env = "PG2OSYNC_SOURCE_URL"
 slot_name = "pg2osync_e2e"
 publication = "pg2osync_e2e_pub"
 
 [target]
-url = "http://localhost:9200"
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
 
 [metrics]
 bind = "127.0.0.1:9111"
@@ -417,7 +421,8 @@ slot_name = "$RSLOT"
 publication = "${RSLOT}_pub"
 
 [target]
-url = "http://localhost:9200"
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
 
 [metrics]
 bind = "127.0.0.1:9112"
@@ -513,6 +518,7 @@ publication = "${QSLOT}_pub"
 
 [target]
 url = "$OS"
+flavor = "$TARGET_FLAVOR"
 
 [metrics]
 bind = "127.0.0.1:9115"
@@ -950,7 +956,8 @@ slot_name = "$FSLOT"
 publication = "${FSLOT}_pub"
 
 [target]
-url = "http://localhost:9200"
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
 
 [metrics]
 bind = "127.0.0.1:9121"
@@ -1031,7 +1038,8 @@ slot_name = "$BSLOT"
 publication = "${BSLOT}_pub"
 
 [target]
-url = "http://localhost:9200"
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
 
 [metrics]
 bind = "127.0.0.1:9122"
@@ -1106,7 +1114,8 @@ slot_name = "$SSLOT"
 publication = "${SSLOT}_pub"
 
 [target]
-url = "http://localhost:9200"
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
 
 [metrics]
 bind = "127.0.0.1:9123"
@@ -1185,7 +1194,8 @@ slot_name = "$RFSLOT"
 publication = "${RFSLOT}_pub"
 
 [target]
-url = "http://localhost:9200"
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
 
 [metrics]
 bind = "127.0.0.1:9124"
@@ -1285,7 +1295,8 @@ slot_name = "$JSLOT"
 publication = "${JSLOT}_pub"
 
 [target]
-url = "http://localhost:9200"
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
 
 [metrics]
 bind = "127.0.0.1:9125"
@@ -1457,7 +1468,8 @@ slot_name = "$USLOT"
 publication = "${USLOT}_pub"
 
 [target]
-url = "http://localhost:9200"
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
 
 [metrics]
 bind = "127.0.0.1:9126"
@@ -1568,7 +1580,8 @@ slot_name = "$ESLOT"
 publication = "${ESLOT}_pub"
 
 [target]
-url = "http://localhost:9200"
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
 
 [metrics]
 bind = "127.0.0.1:9127"
@@ -1701,7 +1714,8 @@ slot_name = "$PSLOT"
 publication = "${PSLOT}_pub"
 
 [target]
-url = "http://localhost:9200"
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
 
 [metrics]
 bind = "127.0.0.1:9128"
@@ -1779,7 +1793,8 @@ slot_name = "$ASLOT"
 publication = "${ASLOT}_pub"
 
 [target]
-url = "http://localhost:9200"
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
 
 [metrics]
 bind = "127.0.0.1:9129"

@@ -71,10 +71,10 @@ not expressions) — if you need those, you want Kafka.
 
 | | Status |
 |---|---|
-| **PostgreSQL → OpenSearch** (logical replication) | ✅ verified end to end |
-| PostgreSQL → Elasticsearch 8.x | ✅ verified end to end |
-| PostgreSQL → Meilisearch 1.x | ✅ verified end to end (file-based checkpoint) |
-| **MySQL 8.0 / MariaDB 10.6+ → any of the above** | ✅ verified end to end |
+| **PostgreSQL → OpenSearch** (logical replication) | ✅ full suite on every pull request (PostgreSQL 17, OpenSearch 2.19) |
+| PostgreSQL → Elasticsearch 8.x | ✅ full suite nightly, [one known gap](docs/compatibility.md) |
+| PostgreSQL → Meilisearch 1.x | ✅ smoke suite nightly (file-based checkpoint), [one known gap](docs/compatibility.md) |
+| **MySQL 8.0 / MariaDB 10.6+ → any of the above** | ✅ MySQL 8.0 on every pull request; MySQL 8.4 and MariaDB 10.6/11.8 nightly |
 | Consistent initial load, then live streaming | ✅ |
 | Crash recovery with no data loss (`kill -9` safe) | ✅ verified by the e2e suite |
 | Nested child collections (one level) | ✅ PostgreSQL and MySQL/MariaDB; the parent document embeds child arrays, resolved once per collection per transaction |
@@ -98,6 +98,9 @@ not expressions) — if you need those, you want Kafka.
 | Survive one document the target refuses | ✅ opt-in quarantine with its position, bounded, replayable |
 | **Read-your-writes** (`/synced`) | ✅ wait for your own commit to be searchable |
 | Prometheus metrics | ✅ built-in endpoint, with a Grafana dashboard to import |
+
+Which versions CI actually runs, and which are expected to work but are not
+exercised: [docs/compatibility.md](docs/compatibility.md).
 
 ### Known limitations
 
@@ -148,6 +151,10 @@ proxy cannot carry a replication or binlog-dump connection. The SQL connection
 may be pooled but must reach the primary. See [docs/proxies.md](docs/proxies.md).
 
 **Target** — OpenSearch 2.x, Elasticsearch 8.x or Meilisearch 1.x.
+
+The exact versions CI runs are listed in
+[docs/compatibility.md](docs/compatibility.md); the rest of the range is
+expected to work but untested.
 
 `pg2osync validate` checks all of this and tells you exactly what to fix.
 

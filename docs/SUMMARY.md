@@ -12,6 +12,7 @@
   - [OpenSearch](sinks/opensearch.md)
   - [Elasticsearch](sinks/elasticsearch.md)
   - [Meilisearch](sinks/meilisearch.md)
+- [Compatibility](compatibility.md)
 - [Proxies and connection poolers](proxies.md)
 - [Deployment](deployment.md)
 

@@ -1,0 +1,338 @@
+name: compatibility
+
+# The versions the README promises but ci.yml never runs. Every pull request
+# keeps paying for three cells only (PostgreSQL 17, MySQL 8.0, OpenSearch
+# 2.19.6); everything else the docs claim is exercised here once a night.
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+  # a matrix that only ever runs at night is a matrix nobody can fix: the
+  # change that breaks it is merged hours before it is told about it
+  pull_request:
+    paths:
+      - ".github/workflows/compat.yml"
+      - "dev/e2e-*.sh"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compat-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Most of an e2e job is the release build, and every cell needs the same
+  # binary: building it once and handing it around turns six sequential builds
+  # into one.
+  build:
+    name: build the binary the matrix runs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
+      - run: cargo build --release --locked -p pg2osync
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pg2osync
+          path: target/release/pg2osync
+          retention-days: 1
+
+  compat-postgres:
+    name: ${{ matrix.name }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: PostgreSQL 15 to OpenSearch 2.19.6
+            pg_image: postgres:15
+    services:
+      opensearch:
+        image: opensearchproject/opensearch:2.19.6
+        env:
+          discovery.type: single-node
+          DISABLE_SECURITY_PLUGIN: "true"
+          OPENSEARCH_JAVA_OPTS: -Xms512m -Xmx512m
+        ports: ["9200:9200"]
+        options: >-
+          --health-cmd "curl -s http://localhost:9200/_cluster/health | grep -q green"
+          --health-interval 10s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          name: pg2osync
+          path: target/release
+      - run: chmod +x target/release/pg2osync
+      # A service container takes no server flags, and the suite needs logical
+      # replication from the first connection, so this one is started by hand.
+      - name: Start PostgreSQL
+        run: |
+          docker run -d --name dev-postgres-1 -p 15432:5432 \
+            -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_DB=sourcedb ${{ matrix.pg_image }} \
+            -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10
+          for _ in $(seq 1 60); do
+            docker exec dev-postgres-1 pg_isready -U postgres -d sourcedb && break
+            sleep 2
+          done
+      - run: docker exec -i dev-postgres-1 psql -U postgres -d sourcedb < dev/seed.sql
+      - run: ./dev/e2e-test.sh
+
+  compat-elasticsearch:
+    name: PostgreSQL 17 to Elasticsearch 8.19.20
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Advisory: the suite stops at reconcile, which the Elasticsearch sink
+    # cannot run (kennywillbe/pg2osync#118). The cell stays so the gap keeps
+    # being reported rather than forgotten.
+    continue-on-error: true
+    services:
+      # Its own job rather than a second row of compat-postgres: OpenSearch
+      # refuses to start with an xpack setting it does not know, so one
+      # services block cannot describe both images.
+      elasticsearch:
+        image: docker.elastic.co/elasticsearch/elasticsearch:8.19.20
+        env:
+          discovery.type: single-node
+          xpack.security.enabled: "false"
+          xpack.security.enrollment.enabled: "false"
+          ES_JAVA_OPTS: -Xms512m -Xmx512m
+        ports: ["9200:9200"]
+        # Not "green": a single-node Elasticsearch leaves every replica
+        # unassigned, so the cluster never leaves yellow.
+        options: >-
+          --health-cmd "curl -sf http://localhost:9200/_cluster/health?wait_for_status=yellow"
+          --health-interval 10s --health-timeout 10s --health-retries 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          name: pg2osync
+          path: target/release
+      - run: chmod +x target/release/pg2osync
+      - name: Start PostgreSQL
+        run: |
+          docker run -d --name dev-postgres-1 -p 15432:5432 \
+            -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_DB=sourcedb postgres:17 \
+            -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10
+          for _ in $(seq 1 60); do
+            docker exec dev-postgres-1 pg_isready -U postgres -d sourcedb && break
+            sleep 2
+          done
+      - run: docker exec -i dev-postgres-1 psql -U postgres -d sourcedb < dev/seed.sql
+      - run: ./dev/e2e-test.sh
+        env:
+          TARGET_FLAVOR: elasticsearch
+
+  compat-meilisearch:
+    name: PostgreSQL 17 to Meilisearch v1.53
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Advisory: the smoke suite's restart section fails because a Meilisearch
+    # pipeline cannot start twice against the same index
+    # (kennywillbe/pg2osync#122). The cell stays so the gap keeps being
+    # reported rather than forgotten.
+    continue-on-error: true
+    services:
+      meilisearch:
+        image: getmeili/meilisearch:v1.53.1
+        env:
+          # a throwaway key, set so the sink's Bearer path is the one tested
+          MEILI_MASTER_KEY: e2e-master-key
+          MEILI_ENV: development
+        ports: ["7700:7700"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          name: pg2osync
+          path: target/release
+      - run: chmod +x target/release/pg2osync
+      - name: Start PostgreSQL
+        run: |
+          docker run -d --name dev-postgres-1 -p 15432:5432 \
+            -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_DB=sourcedb postgres:17 \
+            -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10
+          for _ in $(seq 1 60); do
+            docker exec dev-postgres-1 pg_isready -U postgres -d sourcedb && break
+            sleep 2
+          done
+      - run: docker exec -i dev-postgres-1 psql -U postgres -d sourcedb < dev/seed.sql
+      - name: Wait for Meilisearch
+        run: |
+          for _ in $(seq 1 60); do
+            curl -s http://localhost:7700/health | grep -q available && exit 0
+            sleep 2
+          done
+          echo "Meilisearch never became available"; exit 1
+      # Meilisearch has no mappings, no joins and no per-row indices, so the
+      # full suite cannot run against it; this is what it does support.
+      - run: ./dev/e2e-meili-smoke.sh
+        env:
+          MEILI_MASTER_KEY: e2e-master-key
+
+  compat-mysql:
+    name: MySQL 8.4 to OpenSearch 2.19.6
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: mysqlpw
+          MYSQL_DATABASE: sourcedb
+        ports: ["13306:3306"]
+        options: >-
+          --name mysql-test
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -pmysqlpw"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+      opensearch:
+        image: opensearchproject/opensearch:2.19.6
+        env:
+          discovery.type: single-node
+          DISABLE_SECURITY_PLUGIN: "true"
+          OPENSEARCH_JAVA_OPTS: -Xms512m -Xmx512m
+        ports: ["9200:9200"]
+        options: >-
+          --health-cmd "curl -s http://localhost:9200/_cluster/health | grep -q green"
+          --health-interval 10s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          name: pg2osync
+          path: target/release
+      - run: chmod +x target/release/pg2osync
+      - name: Create the replication user
+        # 8.4 dropped mysql_native_password from the default plugins, so this
+        # is also the cell that proves the caching_sha2_password handshake.
+        run: |
+          docker exec mysql-test mysql -uroot -pmysqlpw -e "
+            CREATE USER 'repl'@'%' IDENTIFIED WITH caching_sha2_password BY 'replpw';
+            GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'repl'@'%';"
+      - name: Turn GTIDs on, so the checkpoint's GTID position is exercised
+        # A service container takes no server flags, and the image starts with
+        # gtid_mode = OFF, which would have the suite skip that section
+        # entirely. This is MySQL's own online procedure for enabling them.
+        run: |
+          docker exec mysql-test mysql -uroot -pmysqlpw -e "
+            SET @@GLOBAL.ENFORCE_GTID_CONSISTENCY = WARN;
+            SET @@GLOBAL.ENFORCE_GTID_CONSISTENCY = ON;
+            SET @@GLOBAL.GTID_MODE = OFF_PERMISSIVE;
+            SET @@GLOBAL.GTID_MODE = ON_PERMISSIVE;"
+          # every anonymous transaction has to finish before the last step
+          for _ in $(seq 1 30); do
+            count=$(docker exec mysql-test mysql -uroot -pmysqlpw -N -B -e \
+              "SELECT COUNT(*) FROM performance_schema.global_status \
+               WHERE VARIABLE_NAME = 'ONGOING_ANONYMOUS_TRANSACTION_COUNT' \
+                 AND VARIABLE_VALUE <> '0';")
+            [ "$count" = "0" ] && break
+            sleep 1
+          done
+          docker exec mysql-test mysql -uroot -pmysqlpw -e "SET @@GLOBAL.GTID_MODE = ON;"
+          docker exec mysql-test mysql -uroot -pmysqlpw -N -B -e "SELECT @@GLOBAL.gtid_mode;"
+      - run: docker exec -i mysql-test mysql -uroot -pmysqlpw sourcedb < dev/mysql-seed.sql
+      - run: ./dev/e2e-mysql-test.sh
+
+  compat-mariadb:
+    name: ${{ matrix.name }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: MariaDB 10.6 to OpenSearch 2.19.6
+            image: mariadb:10.6
+          - name: MariaDB 11.8 to OpenSearch 2.19.6
+            image: mariadb:11.8
+    services:
+      opensearch:
+        image: opensearchproject/opensearch:2.19.6
+        env:
+          discovery.type: single-node
+          DISABLE_SECURITY_PLUGIN: "true"
+          OPENSEARCH_JAVA_OPTS: -Xms512m -Xmx512m
+        ports: ["9200:9200"]
+        options: >-
+          --health-cmd "curl -s http://localhost:9200/_cluster/health | grep -q green"
+          --health-interval 10s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          name: pg2osync
+          path: target/release
+      - run: chmod +x target/release/pg2osync
+      # MariaDB writes no binlog unless it is told to, and a service container
+      # takes no server flags, so this one is started by hand.
+      - name: Start MariaDB
+        run: |
+          docker run -d --name mysql-test -p 13306:3306 \
+            -e MARIADB_ROOT_PASSWORD=mysqlpw -e MARIADB_DATABASE=sourcedb \
+            ${{ matrix.image }} \
+            --log-bin --binlog-format=ROW --binlog-row-image=FULL --server-id=1
+          for _ in $(seq 1 60); do
+            docker exec mysql-test mariadb-admin ping -h 127.0.0.1 -uroot -pmysqlpw && break
+            sleep 2
+          done
+      - name: Create the replication user
+        run: |
+          docker exec mysql-test mariadb -uroot -pmysqlpw -e "
+            CREATE USER 'repl'@'%' IDENTIFIED BY 'replpw';
+            GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'repl'@'%';"
+      - run: docker exec -i mysql-test mariadb -uroot -pmysqlpw sourcedb < dev/mysql-seed.sql
+      # MariaDB has no GTID position the suite can assert on; the script knows
+      - run: ./dev/e2e-mysql-test.sh
+        env:
+          MYSQL_CLIENT: mariadb
+
+  report:
+    name: file a nightly failure
+    needs: [build, compat-postgres, compat-elasticsearch, compat-meilisearch, compat-mysql, compat-mariadb]
+    # A pull request already reports itself on the pull request; only the
+    # scheduled run has nobody watching it.
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write
+      actions: read
+    steps:
+      # One issue for the matrix, refreshed with a comment while it stays
+      # open: a new issue every night would bury the first one, which is the
+      # one carrying the diagnosis.
+      - name: Open or refresh the nightly-compat issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          failed=$(gh run view "${{ github.run_id }}" --repo "$REPO" --json jobs \
+            --jq '.jobs[] | select(.conclusion == "failure") | "- " + .name')
+          body=$(printf 'The nightly compatibility matrix failed.\n\n%s\n\n%s\n' "$failed" "$RUN_URL")
+          open=$(gh issue list --repo "$REPO" --label nightly-compat --state open \
+            --limit 1 --json number --jq '.[0].number')
+          if [ -n "$open" ]; then
+            gh issue comment "$open" --repo "$REPO" --body "$body"
+          else
+            gh issue create --repo "$REPO" --label nightly-compat \
+              --title "The nightly compatibility matrix is failing" --body "$body"
+          fi
