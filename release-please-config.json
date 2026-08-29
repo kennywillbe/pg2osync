@@ -4,6 +4,7 @@
   "bootstrap-sha": "66f780cfc2ee21b586a2e910678c4aff9f8ba763",
   "include-component-in-tag": false,
   "separate-pull-requests": false,
+  "always-update": true,
   "packages": {
     "crates/bin": {
       "component": "pg2osync"
