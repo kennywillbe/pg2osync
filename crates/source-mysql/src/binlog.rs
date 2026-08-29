@@ -143,8 +143,12 @@ pub const T_MARIA_WRITE_ROWS_V2: u8 = 23;
 pub const T_MARIA_UPDATE_ROWS_V2: u8 = 24;
 pub const T_MARIA_DELETE_ROWS_V2: u8 = 25;
 
+/// Size of the common event header (v4 binlog format), which every event
+/// starts with regardless of type.
+pub const HEADER_LEN: usize = 19;
+
 pub fn parse_header(ev: &[u8]) -> Option<EventHeader> {
-    if ev.len() < 19 {
+    if ev.len() < HEADER_LEN {
         return None;
     }
     Some(EventHeader {

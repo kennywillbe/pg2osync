@@ -212,7 +212,7 @@ impl MySqlSource {
             let Some(h) = binlog::parse_header(ev) else {
                 continue;
             };
-            let body = &ev[19..ev.len().saturating_sub(checksum_len)];
+            let body = event_body(ev, h.event_type, checksum_len)?;
             let end_pos = match h.event_type {
                 // Reports where the stream is without being part of it, and is
                 // not in the file at all — so its size must never be counted.
@@ -237,7 +237,7 @@ impl MySqlSource {
                     // handing it the stripped body reads a padding byte
                     // instead and settles on a length that then mangles the
                     // tail of every later event
-                    let (_, clen) = binlog::parse_fde(&ev[19..]);
+                    let (_, clen) = binlog::parse_fde(&ev[binlog::HEADER_LEN..]);
                     checksum_len = clen;
                 }
                 binlog::T_ROTATE => {
@@ -624,6 +624,22 @@ async fn flush_pending(
     Ok(())
 }
 
+/// The event between its 19-byte header and the checksum the server appends.
+///
+/// The header alone says nothing about the checksum, so an event can parse a
+/// header and still be too short to hold one; slicing it blindly would panic
+/// where a corrupt or truncated stream should surface as an error.
+fn event_body(ev: &[u8], event_type: u8, checksum_len: usize) -> Result<&[u8]> {
+    ev.get(binlog::HEADER_LEN..ev.len().saturating_sub(checksum_len))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "binlog event type {event_type} is {} bytes, too short for its header and \
+                 {checksum_len}-byte checksum",
+                ev.len()
+            )
+        })
+}
+
 async fn wait_shutdown(shutdown: &tokio::sync::watch::Receiver<bool>) {
     let mut rx = shutdown.clone();
     while !*rx.borrow() {
@@ -890,6 +906,26 @@ mod tests {
             before,
             &Some(json!({"id": 42, "total": "1.00"})),
             "a delete's only image is the row as it was"
+        );
+    }
+
+    #[test]
+    fn an_event_too_short_for_its_checksum_is_an_error_not_a_panic() {
+        let header_only = [0u8; binlog::HEADER_LEN];
+        let err = event_body(&header_only, binlog::T_QUERY, 4).expect_err("too short");
+        assert!(err.to_string().contains("too short"), "{err}");
+
+        let mut with_checksum = header_only.to_vec();
+        with_checksum.extend_from_slice(&[1, 2, 3, 4]);
+        assert!(
+            event_body(&with_checksum, binlog::T_QUERY, 4)
+                .expect("fits")
+                .is_empty()
+        );
+        assert!(
+            event_body(&header_only, binlog::T_QUERY, 0)
+                .expect("no checksum")
+                .is_empty()
         );
     }
 
