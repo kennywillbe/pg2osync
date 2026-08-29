@@ -31,7 +31,7 @@ use std::collections::HashMap;
 
 /// Fill in what the catalogue knows: the child's key, to order by.
 pub async fn resolve_order(spec: &mut ChildSpec, conn: &mut MySqlConnection) -> Result<()> {
-    let resolved = catalog::table_schema(conn, &spec.schema, &spec.table).await?;
+    let resolved = catalog::table_schema(conn, &spec.schema, &spec.table, false).await?;
     if resolved.pk_columns.is_empty() && spec.max_rows.is_some() {
         anyhow::bail!(
             "[[sync.*.children]] max_rows is set on {}, which has no primary key to order \
@@ -62,7 +62,7 @@ pub async fn fetch_many(
     if keys.is_empty() {
         return Ok(HashMap::new());
     }
-    let resolved = catalog::table_schema(conn, &spec.schema, &spec.table).await?;
+    let resolved = catalog::table_schema(conn, &spec.schema, &spec.table, false).await?;
     let sql = fetch_statement(spec, &resolved, keys);
     let mut rows = conn
         .text_query(&sql)
@@ -111,7 +111,7 @@ pub async fn refetch_parents(
     if keys.is_empty() {
         return Ok(HashMap::new());
     }
-    let resolved = catalog::table_schema(conn, schema, table).await?;
+    let resolved = catalog::table_schema(conn, schema, table, false).await?;
     let [pk_column] = resolved.pk_columns.as_slice() else {
         anyhow::bail!(
             "{schema}.{table} is a parent of a nested collection, so it needs a single-column \

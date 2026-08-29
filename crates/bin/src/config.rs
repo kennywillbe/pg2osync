@@ -221,6 +221,11 @@ pub struct TableSync {
     pub table: String,
     pub index: Option<String>,
     pub primary_key: Option<String>,
+    /// The table has no key the pipeline may address a row by: it is synced
+    /// insert-only, each row filed under a hash of its content unless `id`
+    /// says otherwise, and an UPDATE or DELETE on it halts the pipeline.
+    #[serde(default)]
+    pub append_only: bool,
     /// Derived document id: literals plus `{column}` placeholders, e.g.
     /// `tenant-{tenant_id}-{id}`. Unset keeps the primary key as the id.
     #[serde(default)]
@@ -786,6 +791,38 @@ impl AppConfig {
             }
             if tbl.columns.is_some() && !tbl.exclude_columns.is_empty() {
                 anyhow::bail!("[sync.{key}] columns and exclude_columns are mutually exclusive");
+            }
+            // append_only says there is no key; everything below addresses a
+            // row, an element or a parent by one
+            if tbl.append_only {
+                if tbl.primary_key.is_some() {
+                    anyhow::bail!("[sync.{key}] append_only and primary_key contradict each other");
+                }
+                if tbl.fan_out.is_some() {
+                    anyhow::bail!(
+                        "[sync.{key}] fan_out needs a key: the documents a row fans out into \
+                         are found again by the row's key, which an append-only table does \
+                         not have"
+                    );
+                }
+                if tbl.join.is_some() {
+                    anyhow::bail!(
+                        "[sync.{key}] join needs a key: a parent is routed to by its key and a \
+                         child names its parent by it, which an append-only table does not have"
+                    );
+                }
+                if !tbl.children.is_empty() {
+                    anyhow::bail!(
+                        "[sync.{key}] [[children]] needs a key: a child row names the parent \
+                         document to re-read by its key, which an append-only table does not have"
+                    );
+                }
+                if tbl.soft_delete.is_some() {
+                    anyhow::bail!(
+                        "[sync.{key}] soft_delete needs a key to delete by, which an append-only \
+                         table does not have"
+                    );
+                }
             }
             if tbl.columns.as_ref().is_some_and(|c| c.is_empty()) {
                 anyhow::bail!("[sync.{key}] columns must not be empty");
@@ -1892,6 +1929,60 @@ field = "relation"
 name = "order"
 parent = "customer_id"
 "#;
+
+    #[test]
+    fn an_append_only_section_loads_and_everything_needing_a_key_is_refused() {
+        let base = MINIMAL.replace("table = \"public.users\"", "table = \"public.events\"");
+        let ok = format!("{base}append_only = true\n");
+        let cfg = parse(&ok).expect("a keyless table is a valid section");
+        assert!(cfg.sync["users"].append_only);
+        parse(&format!(
+            "{ok}id = \"{{event_id}}\"\nindex = \"events-{{kind}}\"\nwhere = \"kind <> 'noise'\"\n\
+             [sync.users.fields]\nat = \"ts\"\n"
+        ))
+        .expect("an id, an index template, a filter and a rename address no row by key");
+
+        let message = refused(
+            &format!("{ok}primary_key = \"kind\"\n"),
+            "a key on a keyless table",
+        );
+        assert_eq!(
+            message,
+            "[sync.users] append_only and primary_key contradict each other"
+        );
+        let message = refused(
+            &format!("{ok}[sync.users.fan_out]\nfield = \"tags\"\nid = \"{{tag}}\"\n"),
+            "fan_out on a keyless table",
+        );
+        assert!(message.contains("fan_out needs a key"), "{message}");
+        let message = refused(
+            &format!("{ok}[sync.users.join]\nfield = \"rel\"\nname = \"event\"\n"),
+            "join on a keyless table",
+        );
+        assert!(message.contains("join needs a key"), "{message}");
+        let message = refused(
+            &format!(
+                "{ok}[[sync.users.children]]\ntable = \"public.notes\"\nfield = \"notes\"\n\
+                 foreign_key = \"event_id\"\n"
+            ),
+            "children on a keyless table",
+        );
+        assert!(message.contains("[[children]] needs a key"), "{message}");
+        let message = refused(
+            &format!(
+                "{}soft_delete = \"deleted_at IS NOT NULL\"\n",
+                ok.replace(
+                    "url = \"postgres://u:p@localhost/db\"",
+                    "url = \"postgres://u:p@localhost/db\"\nmode = \"poll\""
+                )
+            ),
+            "soft_delete on a keyless table",
+        );
+        assert!(
+            message.contains("soft_delete needs a key to delete by"),
+            "{message}"
+        );
+    }
 
     #[test]
     fn a_join_pair_validates_and_so_does_a_parent_on_its_own() {

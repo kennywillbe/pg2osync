@@ -77,7 +77,10 @@ the sync user can't run DDL and a DBA provisions the objects instead.
 
 - Documents are keyed by the table's **primary key** (`_id = pk`) unless the
   table configures `id`, which derives the id from the row's raw values.
-  Composite PKs are supported.
+  Composite PKs are supported. A table with no primary key syncs only when
+  declared `append_only`: its documents are keyed by a hash of the raw row,
+  and an `UPDATE` or `DELETE` on it halts the pipeline. See
+  [Append-only tables](../configuration.md#append-only-tables).
 - `UPDATE`/`DELETE` events only carry the old row if the table has
   `REPLICA IDENTITY FULL`. Default (`DEFAULT`) is enough as long as you don't
   change primary keys; if PKs can change, set:
@@ -175,9 +178,14 @@ CREATE INDEX ON public.orders (customer_id);
 writes still queued for the target, so a row written just before the truncate
 cannot survive it.
 
-`DELETE` needs the row's key, which the default replica identity provides. A
-table with `REPLICA IDENTITY NOTHING` cannot replicate updates or deletes at
-all; pg2osync fails with the exact `ALTER TABLE` to run.
+`DELETE` needs the row's key, which the default replica identity provides
+when the table has one. A table with `REPLICA IDENTITY NOTHING` cannot
+replicate updates or deletes at all; pg2osync fails with the exact
+`ALTER TABLE` to run. A table with no primary key keeps the default identity
+(`d`) but has no key for it to name, and once it is published PostgreSQL
+itself rejects an `UPDATE` or `DELETE` on it. Such a table syncs only as
+`append_only`; should a change reach the pipeline anyway (under
+`REPLICA IDENTITY FULL`), it halts rather than guess.
 
 ## Slot hygiene
 

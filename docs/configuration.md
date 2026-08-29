@@ -5,9 +5,9 @@ time, so a typo fails immediately instead of silently doing nothing.
 
 You do not have to write it from this page. `pg2osync init --table users` writes
 the smallest config that runs, qualifying the table name from the source's own
-catalogue and refusing a table with no primary key; this reference is for the
-options you add afterwards. Every command defaults to `pg2osync.toml`, which is
-what `init` writes.
+catalogue and declaring a table with no primary key `append_only`; this
+reference is for the options you add afterwards. Every command defaults to
+`pg2osync.toml`, which is what `init` writes.
 
 Full example: [examples/pg2osync.example.toml](https://github.com/kennywillbe/pg2osync/blob/main/examples/pg2osync.example.toml).
 
@@ -126,7 +126,8 @@ One section per table. `<key>` is the index name when `index` is omitted.
 |---|---|
 | `table` | **Required.** `schema.table` for PostgreSQL, `database.table` for MySQL |
 | `index` | Target index or collection; lowercase `[a-z0-9_-]`, not starting with `_` or `.`; several sections may name the same one, see [Sharing an index](#sharing-an-index); may contain `{column}` placeholders, see [Per-row indices](#per-row-indices) |
-| `primary_key` | Overrides key detection; also the join column for nested children |
+| `primary_key` | Overrides key detection; also the join column for nested children; contradicts `append_only` |
+| `append_only` | The table has no key and only ever gains rows; documents are filed under a content hash, see [Append-only tables](#append-only-tables) |
 | `id` | Derived document id, e.g. `tenant-{tenant_id}-{id}`; see [Document ids](#document-ids) |
 | `fan_out` | One row becomes one document per element of an array column; see [Fan-out](#fan-out) |
 | `join` | This table's place in a join field shared with another section: its relation name and, on the child, the parent column; see [Join fields](#join-fields) |
@@ -154,7 +155,9 @@ option names the column as the source knows it.
 
 By default a document's `_id` is its row's primary key, exactly as it always
 has been — configuring nothing changes nothing, and an existing index needs no
-rebuild. `id` overrides the shape:
+rebuild. A table with no key can still be synced insert-only, under a hash of
+the row, see [Append-only tables](#append-only-tables). `id` overrides the
+shape:
 
 ```toml
 [sync.orders]
@@ -174,6 +177,42 @@ booleans as text.
   its documents, so on PostgreSQL the table must be
   `REPLICA IDENTITY FULL`; `run` refuses to start otherwise. MySQL already
   guarantees it (`binlog_row_image = FULL`).
+
+### Append-only tables
+
+A table with no primary key can be synced as long as it only ever gains rows
+— an event log, an audit trail, a metrics table. Declare it:
+
+```toml
+[sync.events_log]
+table = "public.events_log"
+append_only = true
+```
+
+Without a key nothing can say which document a row is, so the document id is
+a **content hash**: sha256 of the row's raw values as canonical JSON, hex,
+32 characters. The same row hashes the same on the initial load, the stream
+and in poll mode, so a replay lands on the document it already wrote — and
+two identical rows are **one document**, which is the right answer for an
+append-only table. If the table carries a unique column such as an
+`event_id`, set `id` and the document is named from it instead.
+
+- An `UPDATE` or `DELETE` on the table **halts the pipeline**:
+  `public.events_log: an UPDATE arrived on an append-only table; nothing can
+  say which document it is`. There is no document to move or remove, so the
+  pipeline stops at that change rather than guess; an append-only table is
+  one on which it never arrives.
+- `where`, `columns`, `exclude_columns`, `transform`, `fields`, `constants`,
+  `index` templates and `pipeline` all work. A row that a `where` filter
+  excludes is deleted under its own hash, which is a no-op on the first pass.
+- `primary_key` contradicts the declaration and is refused; so are `fan_out`,
+  `join`, `[[children]]` and `soft_delete`, each of which needs a key to
+  address a document by.
+- `reconcile` refuses an append-only table — it pages the index by a key
+  column the table does not have. `resnapshot` works and writes the same
+  hashes.
+- `init` writes `append_only = true` for a table it finds without a primary
+  key, so the generated config runs unedited.
 
 ### Sharing an index
 

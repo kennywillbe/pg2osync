@@ -212,6 +212,7 @@ async fn mysql(
     let src_cfg = run::mysql_config_for(cfg, source_url)?;
     let tables = src_cfg.tables.clone();
     let mut children = src_cfg.children.clone();
+    let append_only = src_cfg.append_only.clone();
     let source = pg2osync_source_mysql::runner::MySqlSource::new(src_cfg);
     let mut conn = source.admin_connection().await?;
     run::resolve_mysql_child_order(&mut children, &mut conn).await?;
@@ -235,6 +236,7 @@ async fn mysql(
         scope,
         &children,
         version_base,
+        &append_only,
     )
     .await
 }

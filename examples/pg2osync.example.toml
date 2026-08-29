@@ -187,3 +187,14 @@ email = "redact"                     # "redact" -> "***", "hash" -> SHA-256 pref
 # table = "public.events"
 # index = "events-{tenant}"
 # mapping_file = "events-mapping.json"
+
+# A table with no primary key syncs as insert-only. Nothing can say which
+# document a row is, so the id is a hash of the row's raw values (set `id`
+# instead if the table carries a unique column); two identical rows are one
+# document. An UPDATE or DELETE on the table halts the pipeline, and
+# primary_key, fan_out, join, children and soft_delete are refused with it.
+# `init` writes the flag itself for a table it finds without a key.
+# [sync.events_log]
+# table = "public.events_log"
+# index = "events_log"
+# append_only = true
