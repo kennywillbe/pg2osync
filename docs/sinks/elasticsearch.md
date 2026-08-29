@@ -26,6 +26,14 @@ Differences from OpenSearch are limited to REST dialect details (error
 response shapes, refresh semantics) that the sink abstracts away — config and
 operational behavior are the same.
 
+## Retention
+
+Deleting old indices is the cluster's job, not pg2osync's: name an ILM policy
+in `mapping_file`'s `settings` block as `index.lifecycle.name` and every index
+created from that mapping — including one a `{column}` template renders on
+demand — is managed from creation. See
+[Retention](../configuration.md#retention).
+
 ## Version targeting
 
 Verified end to end against Elasticsearch 8.15 with security disabled. The sink

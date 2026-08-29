@@ -109,6 +109,13 @@ mapping cannot invent a join field, so an index a join pair writes to has to
 be created by pg2osync from the parent's `mapping_file`, or by an index
 template that declares the join, before the first document lands.
 
+## Retention
+
+Deleting old indices is the cluster's job, not pg2osync's: an ISM policy whose
+`ism_template` matches the index names attaches itself to every index created
+after it, a `{column}` template's indices included, with nothing to configure
+here. See [Retention](../configuration.md#retention).
+
 ## Ingest pipelines
 
 Semantic and hybrid search on OpenSearch go through the neural-search plugin:
