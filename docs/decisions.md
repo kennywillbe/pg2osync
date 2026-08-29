@@ -80,6 +80,28 @@ external version and would have to act as a barrier, breaking
 refuse fanned tables for now — both page by key, and one row is no longer one
 document.
 
+**Parent-child can be a join field, not only an embedded array.** (`join`, #60.)
+An embedded array is one document and one write, and the right answer nearly
+always; a join field is for children that are many, change far more often than
+the parent, or must be searched in their own right — re-fetching a 50,000-row
+collection because one child changed is the cost it avoids. What it costs: the
+two tables share an index and a shard, so routing rides on every operation that
+touches a child — bulk actions, the `_mget` behind TOAST completion, reconcile's
+deletes, a quarantined document's replay — and a parent delete cascades through
+a search, refreshed first, rather than an id list the engine could have built,
+because the engine does not know which children the target holds. A join child
+needs `REPLICA IDENTITY FULL` unless its parent column is part of its key:
+routing comes from the same place identity does. Exactly one parent, one shared
+field, no fan-out on a join table, and a parent id naming anything outside its
+key is refused at config load — the child holds one column and computes the
+parent's id from it alone. Ids must be unique across the shared index, which
+config cannot see, and `TRUNCATE` on either table empties it. Two tables in one
+index remain otherwise refused (#61). A table that is both an embedded child
+and a section of its own is warned about at startup rather than refused — a
+load-once index is a legitimate thing to want — because the runner reads its
+rows only as a re-fetch of the owner, so its own index receives the initial
+load and no streamed change.
+
 **A column can be renamed in the target; the rename is the last step.**
 (`fields`, #66.) The source name is the one namespace the operator already
 knows, and the one every other check — projection, `transform`, `id`,

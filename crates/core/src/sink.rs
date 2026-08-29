@@ -22,6 +22,10 @@ pub enum DocumentOp {
     Upsert {
         index: String,
         id: String,
+        /// Which shard holds this document. `None` is the target's own rule,
+        /// the document's id — which is what every document that is not a
+        /// join child uses, so nothing about an ordinary pipeline changes.
+        routing: Option<String>,
         doc: Value,
         /// Source position this version of the row became visible at, used as
         /// the target's external document version. `None` where the source has
@@ -36,6 +40,26 @@ pub enum DocumentOp {
     Delete {
         index: String,
         id: String,
+        routing: Option<String>,
+        version: Option<u64>,
+    },
+    /// Every child document of one parent, removed at the parent's own
+    /// position, after the parent itself.
+    ///
+    /// Not a bulk action: the children have to be found before they can be
+    /// deleted, which is why this is an operation of its own rather than a
+    /// list of ids the engine could have built — the engine does not know
+    /// which children the target holds.
+    DeleteChildren {
+        index: String,
+        /// The join field the relation is declared in.
+        field: String,
+        /// The *parent's* relation name. The children are identified through
+        /// it rather than by naming each child type, because one parent may
+        /// have several and the sink is told about none of them.
+        parent_name: String,
+        /// The parent document's id, which is also the routing.
+        parent_id: String,
         version: Option<u64>,
     },
 }
@@ -112,12 +136,14 @@ pub trait Sink: Send + Sync {
     /// Create/verify indices, mappings, aliases. Called once before backfill.
     async fn ensure_ready(&self, tables: &[IndexSpec]) -> Result<(), CoreError>;
 
-    /// Fetch current documents by id. Used by the engine to complete documents
-    /// containing unchanged-TOAST markers.
+    /// Fetch current documents by `(id, routing)`. Used by the engine to
+    /// complete documents containing unchanged-TOAST markers. A join child
+    /// lives on its parent's shard, so reading it back needs the routing the
+    /// write used.
     async fn get_documents(
         &self,
         index: &str,
-        ids: &[String],
+        ids: &[(String, Option<String>)],
     ) -> Result<Vec<Option<Value>>, CoreError>;
 
     /// Write a batch. On success the ack reports the highest LSN in the batch;
@@ -155,8 +181,12 @@ pub trait Sink: Send + Sync {
         Ok(())
     }
 
-    /// One page of `(document id, key value)` from an index, ordered by
-    /// `key_field`, starting after `after`.
+    /// One page of `(document id, key value, routing)` from an index, ordered
+    /// by `key_field`, starting after `after`. `only` narrows the page to
+    /// documents whose `field` equals `value` — how one table's documents are
+    /// picked out of an index two tables share. Kept as a field/value pair
+    /// rather than a query so the caller never writes the target's query
+    /// language.
     ///
     /// Used to walk an index against its source. Targets that cannot page an
     /// index in key order say so rather than returning a partial answer, since
@@ -165,9 +195,10 @@ pub trait Sink: Send + Sync {
         &self,
         _index: &str,
         _key_field: &str,
+        _only: Option<(&str, &str)>,
         _after: Option<&Value>,
         _size: usize,
-    ) -> Result<Vec<(String, Value)>, CoreError> {
+    ) -> Result<Vec<(String, Value, Option<String>)>, CoreError> {
         Err(CoreError::Sink(
             "this target cannot page an index in key order".into(),
         ))

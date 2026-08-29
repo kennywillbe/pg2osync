@@ -88,6 +88,20 @@ fn walk(want: &Map<String, Value>, have: &Map<String, Value>, path: &str, out: &
                 render(wanted),
                 render(actual)
             )),
+            // A join with the right type but the wrong relations is the worse
+            // mismatch: every document is accepted, and none can be queried
+            // as parent or child of the other.
+            (Some(wanted), Some(_)) if wanted == "join" => {
+                let want = relations(spec);
+                let have = relations(live);
+                if want != have {
+                    out.conflicting.push(format!(
+                        "{field} is a join with relations {} but the index has {}",
+                        Value::Object(want),
+                        Value::Object(have)
+                    ));
+                }
+            }
             // a container maps to "object" implicitly, so a declared type where
             // the index has none is only a conflict if the index made it a leaf
             (Some(wanted), None) if !live.contains_key("properties") => {
@@ -100,6 +114,26 @@ fn walk(want: &Map<String, Value>, have: &Map<String, Value>, path: &str, out: &
         }
         walk(spec, live, &field, out);
     }
+}
+
+/// A join field's `relations` as the target holds them: a parent mapped to a
+/// list of children, since a single child written as a string comes back
+/// normalised into a one-element list.
+fn relations(spec: &Map<String, Value>) -> Map<String, Value> {
+    spec.get("relations")
+        .and_then(Value::as_object)
+        .map(|rel| {
+            rel.iter()
+                .map(|(parent, children)| {
+                    let children = match children {
+                        Value::String(one) => Value::Array(vec![Value::String(one.clone())]),
+                        other => other.clone(),
+                    };
+                    (parent.clone(), children)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn render(v: &Value) -> String {
@@ -178,6 +212,38 @@ mod tests {
         let live = json!({"mappings": {"properties": {
             "order": {"type": "object", "properties": {"id": {"type": "long"}}}
         }}});
+        assert!(compare(&want, &live).is_empty());
+    }
+
+    #[test]
+    fn a_join_whose_relations_disagree_is_a_conflict() {
+        let want = json!({"properties": {"relation": {
+            "type": "join", "relations": {"customer": ["order"]}
+        }}});
+        let live = json!({"mappings": {"properties": {"relation": {
+            "type": "join", "relations": {"customer": ["invoice"]}
+        }}}});
+        let report = compare(&want, &live);
+        assert!(report.missing.is_empty());
+        assert_eq!(
+            report.conflicting,
+            vec![
+                "relation is a join with relations {\"customer\":[\"order\"]} \
+                 but the index has {\"customer\":[\"invoice\"]}"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_single_child_written_as_a_string_matches_its_normalised_form() {
+        // the target turns `"customer": "order"` into `"customer": ["order"]`
+        let want = json!({"properties": {"relation": {
+            "type": "join", "relations": {"customer": "order"}
+        }}});
+        let live = json!({"mappings": {"properties": {"relation": {
+            "type": "join", "eager_global_ordinals": true,
+            "relations": {"customer": ["order"]}
+        }}}});
         assert!(compare(&want, &live).is_empty());
     }
 

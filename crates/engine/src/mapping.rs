@@ -658,6 +658,136 @@ pub fn fan_out_docs(
     Ok(out)
 }
 
+/// Per-table join rules from `[sync.x.join]`: the join field a table's
+/// documents are filed under and, for a child, the parent that holds them.
+#[derive(Debug, Clone, Default)]
+pub struct Joins {
+    map: HashMap<(String, String), JoinRule>,
+}
+
+/// One table's place in a join field.
+#[derive(Debug, Clone)]
+pub struct JoinRule {
+    /// The join field's name in the target document.
+    pub field: String,
+    /// This table's relation name inside it.
+    pub name: String,
+    /// Unset on the parent, whose documents keep the target's own routing.
+    pub parent: Option<JoinParent>,
+}
+
+/// Where a child's parent is found: the column that names it, and how that
+/// value becomes the parent's document id — which is also the child's routing.
+#[derive(Debug, Clone)]
+pub struct JoinParent {
+    /// Column on this (child) table holding the parent's key.
+    pub column: String,
+    /// The parent table's relation name; the cascade is scoped by it.
+    pub name: String,
+    /// The parent section's id rule, applied to `column`'s value. It has to
+    /// be the parent's own rule and nothing else, or the two documents never
+    /// meet.
+    pub id: ParentId,
+    /// Whether `column` is part of this table's configured key, and so
+    /// readable from a key-only delete event. The same declaration
+    /// `IdTemplate::pk_only` makes, and the same startup check makes it true.
+    pub key_column: bool,
+}
+
+/// How a foreign-key value becomes the parent's document id.
+#[derive(Debug, Clone)]
+pub enum ParentId {
+    /// The parent configures no `id`; its documents are filed under `pk_to_id`.
+    Key,
+    /// A key-only `id` template. One naming anything else is refused at config
+    /// load: the child carries one column and could not render it.
+    Template(IdTemplate),
+}
+
+impl ParentId {
+    pub fn render(&self, key: &serde_json::Value) -> Result<String, String> {
+        match self {
+            Self::Key => Ok(pk_to_id(key)),
+            Self::Template(template) => template.render_from_pk(key),
+        }
+    }
+}
+
+impl Joins {
+    pub fn from_pairs(pairs: impl IntoIterator<Item = ((String, String), JoinRule)>) -> Self {
+        Self {
+            map: pairs.into_iter().collect(),
+        }
+    }
+
+    pub fn for_table(&self, schema: &str, table: &str) -> Option<&JoinRule> {
+        self.map.get(&(schema.to_string(), table.to_string()))
+    }
+}
+
+impl JoinRule {
+    /// The value the join field takes in this row's document, and the routing
+    /// the document is written under. A parent is its bare relation name and
+    /// keeps the target's own routing; a child names its parent, and lives on
+    /// the parent's shard.
+    ///
+    /// Reads the RAW row, like identity does: a projection must not be able
+    /// to move a document to another shard.
+    pub fn routing_for_doc(
+        &self,
+        raw: &serde_json::Value,
+    ) -> Result<(serde_json::Value, Option<String>), String> {
+        let Some(parent) = &self.parent else {
+            return Ok((serde_json::Value::String(self.name.clone()), None));
+        };
+        let map = raw
+            .as_object()
+            .ok_or("a join child needs a row document, not a bare value")?;
+        let parent_id = match map.get(&parent.column) {
+            None => {
+                return Err(format!("column {} is missing from the row", parent.column));
+            }
+            Some(serde_json::Value::Null) => {
+                return Err(format!(
+                    "column {} is NULL, so the parent document has no name",
+                    parent.column
+                ));
+            }
+            Some(key) => parent.id.render(key)?,
+        };
+        let value = serde_json::json!({ "name": self.name, "parent": parent_id });
+        Ok((value, Some(parent_id)))
+    }
+
+    /// The routing a key-only event's document is filed under. The same order
+    /// and the same reasoning as a derived id: the before-image is the row
+    /// exactly as the target last saw it; without one the key has to carry the
+    /// parent column, either as a member of a composite key or as the key
+    /// itself, which `key_column` is the startup check's promise of.
+    pub fn routing_for_key(
+        &self,
+        before: Option<&serde_json::Value>,
+        pk: &serde_json::Value,
+    ) -> Result<Option<String>, String> {
+        let Some(parent) = &self.parent else {
+            return Ok(None);
+        };
+        if let Some(before) = before {
+            return self.routing_for_doc(before).map(|(_, routing)| routing);
+        }
+        if let Some(key) = pk.as_object().and_then(|map| map.get(&parent.column)) {
+            return parent.id.render(key).map(Some);
+        }
+        if parent.key_column && !pk.is_object() {
+            return parent.id.render(pk).map(Some);
+        }
+        Err(format!(
+            "a join child's delete needs its {}, but this event carries no before-image;              the table needs REPLICA IDENTITY FULL",
+            parent.column
+        ))
+    }
+}
+
 /// Maps `(schema, table)` to the target index name, from `[sync.*]` config.
 #[derive(Debug, Clone, Default)]
 pub struct TableMapping {
@@ -1175,5 +1305,111 @@ mod tests {
         };
         let err = fan_out_docs(&rule, "t-1", &json!({"id": 1, "tags": "a,b"})).unwrap_err();
         assert!(err.contains("tags"), "{err}");
+    }
+
+    fn parent_rule() -> JoinRule {
+        JoinRule {
+            field: "relation".into(),
+            name: "customer".into(),
+            parent: None,
+        }
+    }
+
+    fn child_rule(id: ParentId, key_column: bool) -> JoinRule {
+        JoinRule {
+            field: "relation".into(),
+            name: "order".into(),
+            parent: Some(JoinParent {
+                column: "customer_id".into(),
+                name: "customer".into(),
+                id,
+                key_column,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_join_parent_is_its_bare_name_and_keeps_the_targets_routing() {
+        let rule = parent_rule();
+        let (value, routing) = rule
+            .routing_for_doc(&json!({"id": 1, "name": "acme"}))
+            .expect("parent");
+        assert_eq!(value, json!("customer"));
+        assert_eq!(routing, None);
+        assert_eq!(rule.routing_for_key(None, &json!(1)).expect("parent"), None);
+    }
+
+    #[test]
+    fn a_join_child_names_its_parent_and_is_routed_to_it() {
+        let rule = child_rule(ParentId::Key, false);
+        let (value, routing) = rule
+            .routing_for_doc(&json!({"id": 7, "customer_id": 1}))
+            .expect("child");
+        assert_eq!(value, json!({"name": "order", "parent": "1"}));
+        assert_eq!(routing.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn a_parent_id_renders_with_the_parents_own_rule() {
+        // the child holds one value; it has to land on the id the parent's
+        // section renders for itself, or the two documents never meet
+        assert_eq!(ParentId::Key.render(&json!(1)).expect("key"), "1");
+        let template = ParentId::Template(pk("customer-{id}", &["id"]));
+        assert_eq!(template.render(&json!(1)).expect("template"), "customer-1");
+        let (value, routing) = child_rule(template, false)
+            .routing_for_doc(&json!({"id": 7, "customer_id": 1}))
+            .expect("child");
+        assert_eq!(value["parent"], json!("customer-1"));
+        assert_eq!(routing.as_deref(), Some("customer-1"));
+    }
+
+    #[test]
+    fn a_null_or_missing_parent_column_names_the_column() {
+        let rule = child_rule(ParentId::Key, false);
+        let null = rule
+            .routing_for_doc(&json!({"id": 7, "customer_id": null}))
+            .unwrap_err();
+        assert!(
+            null.contains("customer_id") && null.contains("NULL"),
+            "{null}"
+        );
+        let missing = rule.routing_for_doc(&json!({"id": 7})).unwrap_err();
+        assert!(
+            missing.contains("customer_id") && missing.contains("missing"),
+            "{missing}"
+        );
+    }
+
+    #[test]
+    fn a_key_only_event_routes_from_the_before_image_or_the_key() {
+        let rule = child_rule(ParentId::Template(pk("customer-{id}", &["id"])), false);
+        assert_eq!(
+            rule.routing_for_key(Some(&json!({"id": 7, "customer_id": 1})), &json!(7))
+                .expect("before-image"),
+            Some("customer-1".into()),
+            "the before-image is the row as the target last saw it"
+        );
+        assert_eq!(
+            rule.routing_for_key(None, &json!({"customer_id": 2, "seq": 3}))
+                .expect("composite key"),
+            Some("customer-2".into()),
+            "a composite key carrying the parent column needs nothing else"
+        );
+        let keyed = child_rule(ParentId::Key, true);
+        assert_eq!(
+            keyed.routing_for_key(None, &json!(5)).expect("bare key"),
+            Some("5".into()),
+            "a bare key binds to the parent column when that column is the key"
+        );
+    }
+
+    #[test]
+    fn a_key_only_event_outside_the_key_needs_a_before_image() {
+        let rule = child_rule(ParentId::Key, false);
+        let err = rule.routing_for_key(None, &json!(7)).unwrap_err();
+        assert!(
+            err.contains("customer_id") && err.contains("REPLICA IDENTITY FULL"),
+            "{err}"
+        );
     }
 }

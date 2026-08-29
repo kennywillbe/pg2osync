@@ -21,6 +21,10 @@ pub struct Table {
     pub qualified: String,
     pub index: String,
     pub key_column: String,
+    /// The join field and this table's relation name in it, when the index is
+    /// shared: the scan is narrowed to this table's documents, or the other
+    /// table's would all read as orphans of this one.
+    pub scope: Option<(String, String)>,
     pub soft_delete: Option<String>,
     /// The table's row filter: a row that no longer matches it still exists,
     /// and must still count as gone — the index is not supposed to hold it.
@@ -29,7 +33,9 @@ pub struct Table {
 
 pub struct Report {
     pub scanned: usize,
-    pub orphaned: Vec<String>,
+    /// Each orphan's id with the routing the index holds it under, which is
+    /// what its delete has to name to reach the same shard.
+    pub orphaned: Vec<(String, Option<String>)>,
 }
 
 /// Compare one index against one table.
@@ -50,22 +56,26 @@ pub async fn table(
     };
     let mut after: Option<Value> = None;
 
+    let only = table
+        .scope
+        .as_ref()
+        .map(|(field, name)| (field.as_str(), name.as_str()));
     loop {
         let page = sink
-            .scan_keys(&table.index, &table.key_column, after.as_ref(), PAGE)
+            .scan_keys(&table.index, &table.key_column, only, after.as_ref(), PAGE)
             .await
             .with_context(|| format!("cannot page index {}", table.index))?;
         if page.is_empty() {
             break;
         }
-        after = page.last().map(|(_, key)| key.clone());
+        after = page.last().map(|(_, key, _)| key.clone());
         report.scanned += page.len();
 
-        let keys: Vec<String> = page.iter().map(|(_, key)| render_key(key)).collect();
+        let keys: Vec<String> = page.iter().map(|(_, key, _)| render_key(key)).collect();
         let live = existing_keys(client, table, &keys).await?;
-        for (id, key) in &page {
+        for (id, key, routing) in &page {
             if !live.contains(&render_key(key)) {
-                report.orphaned.push(id.clone());
+                report.orphaned.push((id.clone(), routing.clone()));
             }
         }
     }
@@ -74,13 +84,14 @@ pub async fn table(
         let ops: Vec<LsnOp> = report
             .orphaned
             .iter()
-            .map(|id| LsnOp {
+            .map(|(id, routing)| LsnOp {
                 // reconciliation has no source position of its own, and must
                 // never move the checkpoint
                 lsn: pg2osync_core::lsn::Lsn(0),
                 op: DocumentOp::Delete {
                     index: table.index.clone(),
                     id: id.clone(),
+                    routing: routing.clone(),
                     // unversioned on purpose: the row is gone from the source,
                     // so there is no position that says when it went, and a
                     // guessed version could lose to a stale document

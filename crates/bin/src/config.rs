@@ -228,6 +228,10 @@ pub struct TableSync {
     /// per element.
     #[serde(default)]
     pub fan_out: Option<FanOut>,
+    /// This table's place in a join field shared with another section of the
+    /// same index.
+    #[serde(default)]
+    pub join: Option<JoinSpec>,
     #[serde(default)]
     pub columns: Option<Vec<String>>,
     #[serde(default)]
@@ -472,6 +476,21 @@ pub struct FanOut {
     pub id: String,
 }
 
+/// This section's place in a join field: its relation name, and — for a
+/// child — the column holding its parent's key.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JoinSpec {
+    /// The join field, as the parent's mapping declares it.
+    pub field: String,
+    /// This section's relation name inside that field.
+    pub name: String,
+    /// Column on THIS table holding the parent's key. Its presence is what
+    /// makes this section a child; its absence makes it the parent.
+    #[serde(default)]
+    pub parent: Option<String>,
+}
+
 /// A child table joined into the parent document.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -554,8 +573,6 @@ impl AppConfig {
     /// Structural validation. Connection checks happen in `validate` command;
     /// this function never touches the network.
     pub fn validate(&self) -> Result<()> {
-        use std::collections::HashSet;
-
         const SOURCE_FLAVORS: [&str; 3] = ["postgres", "postgresql", "mysql"];
         const TARGET_FLAVORS: [&str; 3] = ["opensearch", "elasticsearch", "meilisearch"];
         const SOURCE_MODES: [&str; 2] = ["wal", "poll"];
@@ -587,7 +604,10 @@ impl AppConfig {
                 "[source] mode = \"poll\" is PostgreSQL-only; MySQL always reads the binlog"
             );
         }
-        let mut seen_indexes: HashSet<String> = HashSet::new();
+        // Two sections may share an index only as a join pair, and whether
+        // they are one is a question about the group, not about either
+        // section, so the groups are checked after every section has been.
+        let mut by_index: BTreeMap<String, Vec<(&str, &TableSync)>> = BTreeMap::new();
         if self.sync.is_empty() {
             anyhow::bail!("no [sync.*] sections: nothing to synchronize");
         }
@@ -613,10 +633,61 @@ impl AppConfig {
             if index.starts_with('_') || index.starts_with('.') {
                 anyhow::bail!("[sync.{key}] index {index:?} must not start with '_' or '.'");
             }
-            if !seen_indexes.insert(index.clone()) {
-                anyhow::bail!(
-                    "[sync.{key}] two tables map to the same index {index:?}; document identity would be ambiguous"
-                );
+            by_index
+                .entry(index.clone())
+                .or_default()
+                .push((key.as_str(), tbl));
+            if let Some(join) = &tbl.join {
+                if join.field.is_empty() {
+                    anyhow::bail!("[sync.{key}.join] field must not be empty");
+                }
+                if join.name.is_empty() {
+                    anyhow::bail!("[sync.{key}.join] name must not be empty");
+                }
+                if join.parent.as_deref() == Some("") {
+                    anyhow::bail!("[sync.{key}.join] parent must not be empty");
+                }
+                if tbl.fan_out.is_some() {
+                    anyhow::bail!(
+                        "[sync.{key}] fan_out and join cannot be combined: every element of a \
+                         fanned row would need its own routing, and they would all be filed \
+                         under one parent"
+                    );
+                }
+                if join.parent.is_some() && tbl.mapping_file.is_some() {
+                    anyhow::bail!(
+                        "[sync.{key}] a join child must not set mapping_file: the parent's \
+                         mapping creates index {index}, and it is the one that declares the \
+                         join field"
+                    );
+                }
+                if self.target.flavor == "meilisearch" {
+                    anyhow::bail!(
+                        "[sync.{key}] join is an OpenSearch and Elasticsearch data model, which \
+                         Meilisearch has no equivalent for; remove join for this target"
+                    );
+                }
+                if tbl
+                    .columns
+                    .as_ref()
+                    .is_some_and(|cols| cols.contains(&join.field))
+                {
+                    anyhow::bail!(
+                        "[sync.{key}] columns lists {}, which is the join field, not a column",
+                        join.field
+                    );
+                }
+                if let Some(child) = tbl
+                    .children
+                    .iter()
+                    .find(|child| child.claimed_fields().contains(&join.field))
+                {
+                    anyhow::bail!(
+                        "[sync.{key}] {} is the join field and also the field of child {}",
+                        join.field,
+                        child.table
+                    );
+                }
             }
             if tbl.columns.is_some() && !tbl.exclude_columns.is_empty() {
                 anyhow::bail!("[sync.{key}] columns and exclude_columns are mutually exclusive");
@@ -718,6 +789,17 @@ impl AppConfig {
                     );
                 }
             }
+            // the join field is not a column either: a rename onto it would be
+            // buried, and a rename of it would name a column the target sees
+            // under the join field's shape, not the row's
+            if let Some(name) = tbl.join.as_ref().map(|join| &join.field)
+                && (tbl.fields.contains_key(name) || tbl.fields.values().any(|t| t == name))
+            {
+                anyhow::bail!(
+                    "[sync.{key}.fields] {name:?} is the join field; the join field is \
+                     written last and would bury the renamed column"
+                );
+            }
             for child in &tbl.children {
                 // the child's field is not a column, so a parent rename that
                 // names it would either do nothing or bury the array
@@ -776,6 +858,9 @@ impl AppConfig {
                          lands under that name and the constant would bury it"
                     );
                 }
+                if tbl.join.as_ref().is_some_and(|join| &join.field == name) {
+                    anyhow::bail!("[sync.{key}.constants] {name} is the join field");
+                }
             }
             // an excluded column silently dropped from the key would produce
             // colliding document ids
@@ -792,6 +877,9 @@ impl AppConfig {
                     );
                 }
             }
+        }
+        for (index, members) in &by_index {
+            check_index_group(index, members)?;
         }
         for (key, table) in &self.sync {
             // the predicate is evaluated by the database inside the poll query;
@@ -880,6 +968,98 @@ impl SourceConfig {
 fn is_qualified_table(name: &str) -> bool {
     let parts: Vec<&str> = name.split('.').collect();
     parts.len() == 2 && parts.iter().all(|p| !p.is_empty())
+}
+
+/// Whether the sections writing one index are a join pair: every one of them
+/// declares the same join field, exactly one is the parent, and each has a
+/// relation name of its own. A section alone in its index is only refused
+/// when it is a child, whose parent then exists nowhere.
+fn check_index_group(index: &str, members: &[(&str, &TableSync)]) -> Result<()> {
+    let [(key, single)] = members else {
+        return check_shared_index(index, members);
+    };
+    if let Some(column) = single.join.as_ref().and_then(|join| join.parent.as_deref()) {
+        anyhow::bail!(
+            "[sync.{key}] join names a parent through {column}, but no other [sync.*] section \
+             writes index {index:?} as its parent"
+        );
+    }
+    Ok(())
+}
+
+fn check_shared_index(index: &str, members: &[(&str, &TableSync)]) -> Result<()> {
+    let mut joined = Vec::with_capacity(members.len());
+    for (key, tbl) in members {
+        let Some(join) = &tbl.join else {
+            anyhow::bail!(
+                "[sync.{key}] two tables map to the same index {index:?}; document identity \
+                 would be ambiguous. Two tables may only share an index as a join pair, where \
+                 every section declares [sync.*.join] with the same field and exactly one \
+                 omits parent"
+            );
+        };
+        joined.push((*key, *tbl, join));
+    }
+    // the slice is non-empty: a group exists because a section put itself in it
+    let Some((first_key, _, first)) = joined.first() else {
+        return Ok(());
+    };
+    for (key, _, join) in &joined {
+        if join.field != first.field {
+            anyhow::bail!(
+                "[sync.{key}.join] field {:?} disagrees with [sync.{first_key}.join] field {:?}; \
+                 every section writing to index {index:?} must name the same join field",
+                join.field,
+                first.field
+            );
+        }
+    }
+    let parents: Vec<(&str, &TableSync)> = joined
+        .iter()
+        .filter(|(_, _, join)| join.parent.is_none())
+        .map(|(key, tbl, _)| (*key, *tbl))
+        .collect();
+    let (parent_key, parent) = match parents.as_slice() {
+        [] => anyhow::bail!(
+            "index {index:?} has no join parent: every section writing to it names a parent \
+             column, so nothing writes the parent documents. Remove parent from the section \
+             that holds them"
+        ),
+        [(a, _), (b, _), ..] => anyhow::bail!(
+            "[sync.{a}] and [sync.{b}] are both the join parent of index {index:?}; exactly one \
+             section may omit parent"
+        ),
+        [one] => *one,
+    };
+    for (i, (a, _, join)) in joined.iter().enumerate() {
+        if let Some((b, _, _)) = joined[i + 1..].iter().find(|(_, _, o)| o.name == join.name) {
+            anyhow::bail!(
+                "[sync.{a}] and [sync.{b}] both use the join name {:?}; each section of index \
+                 {index:?} needs its own relation name",
+                join.name
+            );
+        }
+    }
+    // the child holds one column and renders the parent's id from it alone,
+    // so the parent's id may name nothing but the key
+    if let Some(spec) = &parent.id {
+        let pk = vec![parent.primary_key.clone().unwrap_or_else(|| "id".into())];
+        let template = pg2osync_engine::mapping::IdTemplate::parse(spec, &pk).map_err(|e| {
+            anyhow::anyhow!("[sync.{parent_key}] id {spec:?} is not a usable id: {e}")
+        })?;
+        if !template.is_pk_only()
+            && let Some(column) = joined
+                .iter()
+                .find_map(|(_, _, join)| join.parent.as_deref())
+        {
+            anyhow::bail!(
+                "[sync.{parent_key}] id {spec:?} names a column outside the primary key, so a \
+                 join child cannot compute the parent's document id from its own {column} \
+                 column. Give the parent an id that names only its key"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The shape checks a rename map needs regardless of what it applies to.
@@ -1275,6 +1455,156 @@ id = "user-{id}-{tag}"
         );
         let bad_id = format!("{MINIMAL}[sync.users.fan_out]\nfield = \"tags\"\nid = \"user-{{\"\n");
         assert!(parse(&bad_id).is_err(), "the element id is grammar-checked");
+    }
+
+    /// A well-formed join pair; each refusal below is one edit away from it.
+    const PAIR: &str = r#"
+[source]
+url = "postgres://u:p@localhost/db"
+[target]
+url = "http://localhost:9200"
+[sync.customers]
+table = "public.customers"
+index = "shop"
+id = "customer-{id}"
+[sync.customers.join]
+field = "relation"
+name = "customer"
+[sync.orders]
+table = "public.orders"
+index = "shop"
+id = "order-{id}"
+[sync.orders.join]
+field = "relation"
+name = "order"
+parent = "customer_id"
+"#;
+
+    #[test]
+    fn a_join_pair_validates_and_so_does_a_parent_on_its_own() {
+        let cfg = parse(PAIR).expect("a well-formed pair loads");
+        assert_eq!(
+            cfg.sync["orders"]
+                .join
+                .as_ref()
+                .and_then(|j| j.parent.as_deref()),
+            Some("customer_id")
+        );
+        assert!(
+            cfg.sync["customers"]
+                .join
+                .as_ref()
+                .is_some_and(|j| j.parent.is_none())
+        );
+        let parent_only = PAIR.split("[sync.orders]").next().expect("the parent half");
+        parse(parent_only).expect("a parent whose children are configured later is not an error");
+        parse(&PAIR.replace(
+            "parent = \"customer_id\"",
+            "parent = \"customer_id\"\n[[sync.orders.children]]\ntable = \"public.lines\"\nfield = \"lines\"\nforeign_key = \"order_id\"\n",
+        ))
+        .expect("embedding an array on a join child is unrelated to filing it under a parent");
+    }
+
+    #[test]
+    fn a_join_pair_is_refused_when_it_is_not_one() {
+        let refused = [
+            (
+                PAIR.replace("[sync.orders.join]\nfield = \"relation\"\nname = \"order\"\nparent = \"customer_id\"\n", ""),
+                "may only share an index as a join pair",
+                "a section on the shared index without join",
+            ),
+            (
+                PAIR.replace("field = \"relation\"\nname = \"order\"", "field = \"rel\"\nname = \"order\""),
+                "disagrees with [sync.customers.join] field \"relation\"",
+                "two sections naming different join fields",
+            ),
+            (
+                PAIR.replace("name = \"customer\"", "name = \"customer\"\nparent = \"account_id\""),
+                "has no join parent",
+                "every section naming a parent column",
+            ),
+            (
+                PAIR.replace("\nparent = \"customer_id\"", ""),
+                "are both the join parent",
+                "two sections omitting parent",
+            ),
+            (
+                PAIR.replace("name = \"order\"", "name = \"customer\""),
+                "both use the join name \"customer\"",
+                "two sections sharing a relation name",
+            ),
+            (
+                PAIR.replace("id = \"customer-{id}\"", "id = \"customer-{tenant}-{id}\""),
+                "names a column outside the primary key",
+                "a parent id the child cannot render from one column",
+            ),
+            (
+                PAIR.split("[sync.customers]").next().expect("the preamble").to_string()
+                    + PAIR.split("[sync.orders]").nth(1).map(|s| format!("[sync.orders]{s}")).expect("the child half").as_str(),
+                "no other [sync.*] section writes index \"shop\" as its parent",
+                "a child alone in its index",
+            ),
+            (
+                PAIR.replace("id = \"order-{id}\"", "id = \"order-{id}\"\nmapping_file = \"orders.json\""),
+                "a join child must not set mapping_file",
+                "the mapping belongs to the parent",
+            ),
+            (
+                PAIR.replace("[sync.orders.join]", "[sync.orders.fan_out]\nfield = \"lines\"\nid = \"order-{id}-{line}\"\n[sync.orders.join]"),
+                "fan_out and join cannot be combined",
+                "a fanned row has no single parent",
+            ),
+            (
+                PAIR.replace("[target]", "[target]\nflavor = \"meilisearch\""),
+                "Meilisearch has no equivalent",
+                "a target without a parent-child model",
+            ),
+            (
+                PAIR.replace("field = \"relation\"\nname = \"customer\"", "field = \"\"\nname = \"customer\""),
+                "[sync.customers.join] field must not be empty",
+                "an empty field",
+            ),
+            (
+                PAIR.replace("name = \"order\"", "name = \"\""),
+                "[sync.orders.join] name must not be empty",
+                "an empty name",
+            ),
+            (
+                PAIR.replace("parent = \"customer_id\"", "parent = \"\""),
+                "[sync.orders.join] parent must not be empty",
+                "an empty parent",
+            ),
+            (
+                PAIR.replace("id = \"order-{id}\"", "id = \"order-{id}\"\n[sync.orders.fields]\nrel = \"relation\""),
+                "[sync.orders.fields] \"relation\" is the join field",
+                "a rename onto the join field",
+            ),
+            (
+                PAIR.replace("id = \"order-{id}\"", "id = \"order-{id}\"\n[sync.orders.fields]\nrelation = \"rel\""),
+                "[sync.orders.fields] \"relation\" is the join field",
+                "a rename of the join field",
+            ),
+            (
+                PAIR.replace("id = \"order-{id}\"", "id = \"order-{id}\"\n[sync.orders.constants]\nrelation = \"x\""),
+                "[sync.orders.constants] relation is the join field",
+                "a constant named like the join field",
+            ),
+            (
+                PAIR.replace("id = \"order-{id}\"", "id = \"order-{id}\"\ncolumns = [\"id\", \"relation\"]"),
+                "columns lists relation, which is the join field",
+                "a projection naming the join field",
+            ),
+            (
+                PAIR.replace("name = \"customer\"", "name = \"customer\"\n[[sync.customers.children]]\ntable = \"public.notes\"\nfield = \"relation\"\nforeign_key = \"customer_id\""),
+                "relation is the join field and also the field of child public.notes",
+                "an embedded child under the join field's name",
+            ),
+        ];
+        for (toml_text, expected, why) in refused {
+            let err = parse(&toml_text).expect_err(why);
+            let text = format!("{err:#}");
+            assert!(text.contains(expected), "{why}: {text}");
+        }
     }
 
     #[test]
