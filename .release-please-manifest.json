@@ -1,7 +1,7 @@
 {
-  "crates/bin": "1.1.0",
+  "crates/bin": "1.2.0",
   "crates/core": "1.1.0",
-  "crates/engine": "1.1.0",
+  "crates/engine": "1.2.0",
   "crates/sink": "1.0.1",
   "crates/source": "1.1.0",
   "crates/source-mysql": "1.1.0",
