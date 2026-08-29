@@ -12,7 +12,9 @@ release PR. It bumps every crate in the workspace to the same version and writes
 the entry into `crates/bin/CHANGELOG.md`, the binary's changelog. The file lives
 inside the crate rather than at the repository root because release-please
 writes only within the package it releases from — a `changelog-path` that
-climbs out with `../` is refused.
+climbs out with `../` is refused. The library crates are linked to the
+binary's version but skip their own changelog and GitHub release: there is one
+tag and one release per version, and the crates are not published separately.
 
 ```
 merge a feature PR   →  release PR updated. Nothing released.
