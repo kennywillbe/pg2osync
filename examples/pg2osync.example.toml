@@ -89,6 +89,10 @@ exclude_columns = ["password_hash"]
 # Ingest pipeline the target runs on every document of this section. This is
 # how a knn_vector field gets filled: the target holds the model, not pg2osync.
 # pipeline = "embed-products"
+# Column whose value decides the shard, so one tenant's documents share one.
+# A column outside the key needs REPLICA IDENTITY FULL on PostgreSQL; a NULL,
+# a missing or an empty value halts the pipeline.
+# routing = "tenant_id"
 # Pushed into the initial load and evaluated again on every streamed row, so a
 # row that leaves the filter is deleted from the index and one that enters it
 # is written. A restricted SQL subset; see docs/configuration.md#row-filters.

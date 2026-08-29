@@ -410,6 +410,105 @@ impl Pipelines {
     }
 }
 
+/// Per-table routing columns from `[sync.x] routing`.
+///
+/// Keyed by table for the same reason pipelines are: routing is the section's
+/// choice, and it rides on the operation, so the sink never has to know which
+/// section a document came from.
+#[derive(Debug, Clone, Default)]
+pub struct Routings {
+    map: HashMap<(String, String), RoutingColumn>,
+}
+
+/// The column whose value decides a document's shard.
+#[derive(Debug, Clone)]
+pub struct RoutingColumn {
+    /// Column on this table holding the routing value.
+    pub column: String,
+    /// Whether `column` is part of this table's configured key, and so
+    /// readable from a key-only delete event. The same declaration
+    /// `JoinParent::key_column` makes, and the same startup check makes it
+    /// true.
+    pub key_column: bool,
+}
+
+impl Routings {
+    pub fn from_pairs(pairs: impl IntoIterator<Item = ((String, String), RoutingColumn)>) -> Self {
+        Self {
+            map: pairs.into_iter().collect(),
+        }
+    }
+
+    pub fn for_table(&self, schema: &str, table: &str) -> Option<&RoutingColumn> {
+        self.map.get(&(schema.to_string(), table.to_string()))
+    }
+}
+
+impl RoutingColumn {
+    /// The routing this row's documents are written under.
+    ///
+    /// Reads the RAW row, like identity does: a projection must not be able to
+    /// move a document to another shard. An empty value is an error rather
+    /// than "no routing": the target rejects an empty routing outright, and
+    /// silently writing the document to its default shard would hide half a
+    /// tenant somewhere no routed query looks.
+    pub fn render(&self, raw: &serde_json::Value) -> Result<String, String> {
+        let map = raw
+            .as_object()
+            .ok_or("a routing column needs a row document, not a bare value")?;
+        match map.get(&self.column) {
+            None => Err(format!("column {} is missing from the row", self.column)),
+            Some(serde_json::Value::Null) => Err(format!(
+                "column {} is NULL, so the document has no routing",
+                self.column
+            )),
+            Some(value) => self.usable(scalar_display(value)),
+        }
+    }
+
+    /// The routing a key-only event's document is filed under. The same order
+    /// and the same reasoning as a derived id: the before-image is the row
+    /// exactly as the target last saw it; without one the key has to carry the
+    /// routing column, either as a member of a composite key or as the key
+    /// itself, which `key_column` is the startup check's promise of.
+    pub fn render_from_key(
+        &self,
+        before: Option<&serde_json::Value>,
+        pk: &serde_json::Value,
+    ) -> Result<String, String> {
+        if let Some(before) = before {
+            return self.render(before);
+        }
+        if let Some(value) = pk.as_object().and_then(|map| map.get(&self.column)) {
+            return match value {
+                serde_json::Value::Null => Err(format!(
+                    "column {} is NULL, so the document has no routing",
+                    self.column
+                )),
+                value => self.usable(scalar_display(value)),
+            };
+        }
+        if self.key_column && !pk.is_object() {
+            return self.usable(scalar_display(pk));
+        }
+        Err(format!(
+            "a routed row's delete needs its {}, but this event carries no before-image; \
+             the table needs REPLICA IDENTITY FULL",
+            self.column
+        ))
+    }
+
+    fn usable(&self, routing: String) -> Result<String, String> {
+        if routing.is_empty() {
+            return Err(format!(
+                "column {} is empty, so the document has no routing",
+                self.column
+            ));
+        }
+        Ok(routing)
+    }
+}
+
 /// Tables declared `[sync.x] append_only = true`: they have no key the
 /// pipeline may address a row by, so a row is only ever inserted and is filed
 /// under a hash of its content unless the section configures an id.
@@ -1790,6 +1889,82 @@ mod tests {
         let err = rule.routing_for_key(None, &json!(7)).unwrap_err();
         assert!(
             err.contains("customer_id") && err.contains("REPLICA IDENTITY FULL"),
+            "{err}"
+        );
+    }
+
+    fn routing_column(key_column: bool) -> RoutingColumn {
+        RoutingColumn {
+            column: "tenant".into(),
+            key_column,
+        }
+    }
+
+    #[test]
+    fn a_routing_column_renders_from_the_raw_row() {
+        let rule = routing_column(false);
+        assert_eq!(
+            rule.render(&json!({"id": 7, "tenant": "acme"}))
+                .expect("routing"),
+            "acme"
+        );
+        assert_eq!(
+            rule.render(&json!({"id": 7, "tenant": 42}))
+                .expect("scalar"),
+            "42",
+            "a non-string routing value is displayed like an id part"
+        );
+    }
+
+    #[test]
+    fn a_null_missing_or_empty_routing_column_halts() {
+        let rule = routing_column(false);
+        let null = rule.render(&json!({"id": 7, "tenant": null})).unwrap_err();
+        assert!(null.contains("tenant") && null.contains("NULL"), "{null}");
+        let missing = rule.render(&json!({"id": 7})).unwrap_err();
+        assert!(
+            missing.contains("tenant") && missing.contains("missing"),
+            "{missing}"
+        );
+        let empty = rule.render(&json!({"id": 7, "tenant": ""})).unwrap_err();
+        assert!(
+            empty.contains("tenant") && empty.contains("empty"),
+            "{empty}"
+        );
+    }
+
+    #[test]
+    fn a_key_only_event_takes_its_routing_from_the_before_image_or_the_key() {
+        let rule = routing_column(false);
+        assert_eq!(
+            rule.render_from_key(Some(&json!({"id": 7, "tenant": "acme"})), &json!(7))
+                .expect("before-image"),
+            "acme",
+            "the before-image is the row as the target last saw it"
+        );
+        assert_eq!(
+            rule.render_from_key(None, &json!({"tenant": "globex", "seq": 3}))
+                .expect("composite key"),
+            "globex",
+            "a composite key carrying the routing column needs nothing else"
+        );
+        let keyed = routing_column(true);
+        assert_eq!(
+            keyed
+                .render_from_key(None, &json!("acme"))
+                .expect("bare key"),
+            "acme",
+            "a bare key binds to the routing column when that column is the key"
+        );
+    }
+
+    #[test]
+    fn a_key_only_event_outside_the_key_needs_a_before_image_for_its_routing() {
+        let err = routing_column(false)
+            .render_from_key(None, &json!(7))
+            .unwrap_err();
+        assert!(
+            err.contains("tenant") && err.contains("REPLICA IDENTITY FULL"),
             "{err}"
         );
     }

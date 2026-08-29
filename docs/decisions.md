@@ -102,6 +102,29 @@ load-once index is a legitimate thing to want — because the runner reads its
 rows only as a re-fetch of the owner, so its own index receives the initial
 load and no streamed change.
 
+**A column can route a document; the rule is the id rule.** (`routing`, #109.)
+Shard co-location arrived as a by-product of `join`, where a child has to live
+on its parent's shard. It is worth having on its own: hundreds of small tenants
+in one index, each query reading one shard. An index per tenant is the
+alternative, and it is the wrong one at that shape — every index costs shards,
+and shards cost memory whether they hold ten documents or ten million. A bare
+column name, not a template: a routing value has no grammar to check, nothing
+downstream parses it, and a composite routing key is a use case nobody has.
+The value is read from the raw row, before projection and transforms, because
+a projection must not be able to move a document to another shard — and NULL,
+missing or empty halts, since the target rejects an empty routing and a silent
+fallback to the default shard would hide the document from every routed query.
+A routing column can change, which makes it identity's twin: the document is
+written under the new routing and deleted under the old, through the same
+comparison a changed `id` or a changed index template goes through, and a
+non-key routing column therefore needs `REPLICA IDENTITY FULL` for the same
+reason a non-key `id` does. Refused together with `join`, which already owns
+the child's shard; refused on Meilisearch, which ignores routing. `reconcile`
+is not refused: it never derives a routing, it reads each hit's `_routing`, so
+the only thing it cannot see is a duplicate left under a stale routing — and
+that document's row is still there, which is precisely what reconcile does not
+collect.
+
 **Several tables can feed one index once each declares its identity.** (#61.)
 An index built before pg2osync is usually a union of several tables, and what
 the old refusal protected against was never the union: it was `_id` inherited

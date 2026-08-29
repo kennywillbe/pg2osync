@@ -986,6 +986,22 @@ fn check_configured_columns(
             );
         }
     }
+    // routing decides which shard a document lives on, so a missing column
+    // could never render one and a nullable one is a halt waiting to happen
+    if let Some(column) = &table.routing {
+        if !live.iter().any(|c| c.eq_ignore_ascii_case(column)) {
+            bail!(
+                "table {} has no column {column} to route its documents by",
+                table.table
+            );
+        }
+        if nullable.iter().any(|c| c.eq_ignore_ascii_case(column)) {
+            println!(
+                "! routing column {column} on {} is nullable; a NULL in it halts the pipeline",
+                table.table
+            );
+        }
+    }
     // a rename onto a column that still reaches the target would bury that
     // column under the renamed value; the config check could only see this
     // with an explicit `columns` list, the catalogue always can
