@@ -7,7 +7,7 @@
 use anyhow::{Context as _, Result};
 use tokio_postgres::Client;
 
-pub use pg2osync_tls::{SslMode, TlsSettings};
+pub use pg2osync_tls::{ConfiguredTls, SslMode, TlsSettings};
 
 /// Connect and spawn the connection task, with or without TLS.
 pub async fn connect(tls: &TlsSettings, url: &str) -> Result<Client> {
@@ -29,12 +29,38 @@ pub async fn connect(tls: &TlsSettings, url: &str) -> Result<Client> {
     });
 
     let connector = tokio_postgres_rustls::MakeRustlsConnect::new(tls.client_config()?);
-    let (client, connection) = config
-        .connect(connector)
-        .await
-        .with_context(|| format!("connection failed (sslmode={})", tls.mode.as_str()))?;
+    let (client, connection) = match config.connect(connector).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            let mut err = anyhow::Error::new(e);
+            if let Some(hint) = client_certificate_hint(tls, &format!("{:#}", err)) {
+                err = err.context(hint);
+            }
+            return Err(err)
+                .with_context(|| format!("connection failed (sslmode={})", tls.mode.as_str()));
+        }
+    };
     spawn_connection_task(connection);
     Ok(client)
+}
+
+/// What to try next when the server rejected us over a client certificate.
+///
+/// PostgreSQL says `connection requires a valid client certificate` both when
+/// none was sent and when the one sent did not satisfy `clientcert=verify-full`,
+/// so the advice has to turn on what we actually presented.
+fn client_certificate_hint(tls: &TlsSettings, message: &str) -> Option<String> {
+    let lower = message.to_ascii_lowercase();
+    if !lower.contains("client certificate") && !lower.contains("certificate authentication") {
+        return None;
+    }
+    Some(if tls.presents_client_certificate() {
+        "the client certificate was presented and rejected: check that it chains to the CA \
+         in the server's ssl_ca_file and that its CN matches the database user"
+            .into()
+    } else {
+        "the server requires a client certificate; set [source] sslcert and sslkey".into()
+    })
 }
 
 /// The equivalent configuration for the replication transport.
@@ -50,8 +76,8 @@ pub fn replication_config(tls: &TlsSettings) -> pgwire_replication::TlsConfig {
         },
         ca_pem_path: tls.root_cert.clone(),
         sni_hostname: None,
-        client_cert_pem_path: None,
-        client_key_pem_path: None,
+        client_cert_pem_path: tls.client_cert.clone(),
+        client_key_pem_path: tls.client_key.clone(),
     }
 }
 
@@ -71,12 +97,59 @@ where
 mod tests {
     use super::*;
 
+    fn fixture(name: &str) -> String {
+        format!(
+            "{}/../tls/tests/fixtures/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    }
+
     #[test]
     fn replication_config_mirrors_the_mode() {
-        let tls = TlsSettings::resolve("postgres://u:p@h/db", Some("require"), None).unwrap();
+        let tls = TlsSettings::resolve(
+            "postgres://u:p@h/db",
+            ConfiguredTls {
+                sslmode: Some("require"),
+                ..ConfiguredTls::default()
+            },
+        )
+        .unwrap();
         assert_eq!(
             replication_config(&tls).mode,
             pgwire_replication::SslMode::Require
+        );
+        assert!(!replication_config(&tls).is_mtls());
+    }
+
+    #[test]
+    fn the_replication_stream_carries_the_client_identity() {
+        let cert = fixture("client.crt");
+        let key = fixture("pkcs8.key");
+        let tls = TlsSettings::resolve(
+            "postgres://u:p@h/db",
+            ConfiguredTls {
+                sslmode: Some("require"),
+                sslcert: Some(&cert),
+                sslkey: Some(&key),
+                ..ConfiguredTls::default()
+            },
+        )
+        .unwrap();
+        assert!(replication_config(&tls).is_mtls());
+    }
+
+    #[test]
+    fn the_hint_names_the_missing_options_only_when_none_was_sent() {
+        let none = TlsSettings::default();
+        let hint = client_certificate_hint(
+            &none,
+            "FATAL: connection requires a valid client certificate",
+        )
+        .expect("must hint");
+        assert!(hint.contains("sslcert"), "{hint}");
+        assert!(
+            client_certificate_hint(&none, "password authentication failed").is_none(),
+            "an unrelated failure must not mention certificates"
         );
     }
 }

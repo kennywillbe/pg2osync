@@ -65,10 +65,30 @@ MySQL's auto-generated certificates are issued to
 hostname, so `verify-full` rejects them by design. Use `verify-ca` with the
 server's own `ca.pem`, or install certificates issued for the real hostname.
 
+### Client certificates
+
+The option names are libpq's here too, so one spelling covers both sources:
+
+| pg2osync | MySQL client option |
+|---|---|
+| `sslrootcert` | `ssl-ca` |
+| `sslcert` | `ssl-cert` |
+| `sslkey` | `ssl-key` |
+
+```toml
+[source]
+sslcert = "/etc/mysql/client-cert.pem"
+sslkey = "/etc/mysql/client-key.pem"
+```
+
+Both are required together, and the key must be unencrypted.
+
 ### Authentication
 
 `caching_sha2_password` (the MySQL 8 default) and `mysql_native_password` are
-both supported.
+both supported. Accounts created `REQUIRE X509` or `REQUIRE SUBJECT` work once
+`sslcert` and `sslkey` are set; without them the server answers a plain access
+denied, which pg2osync annotates with that possibility.
 
 The first authentication of an account needs *full* authentication, because the
 server has nothing cached yet. pg2osync handles both routes:

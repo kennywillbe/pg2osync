@@ -27,7 +27,10 @@ async fn main() -> Result<()> {
     let table = args.next().expect("qualified table name required");
 
     let cfg_url = url::Url::parse(&url)?;
-    let tls = pg2osync_source::tls::TlsSettings::resolve(&url, None, None)?;
+    let tls = pg2osync_source::tls::TlsSettings::resolve(
+        &url,
+        pg2osync_source::tls::ConfiguredTls::default(),
+    )?;
     let cfg = WalSourceConfig {
         tls: tls.clone(),
         host: cfg_url.host_str().unwrap_or("localhost").to_string(),
@@ -58,7 +61,10 @@ async fn main() -> Result<()> {
 
     WalSource::new(cfg.clone()).bootstrap(&admin).await?;
     let start_lsn = pg2osync_source::catalog::confirmed_flush_lsn(&admin, &cfg.slot_name).await?;
-    let tls = pg2osync_source::tls::TlsSettings::resolve(&url, None, None)?;
+    let tls = pg2osync_source::tls::TlsSettings::resolve(
+        &url,
+        pg2osync_source::tls::ConfiguredTls::default(),
+    )?;
     let cfg = WalSourceConfig {
         tls: tls.clone(),
         start_lsn,

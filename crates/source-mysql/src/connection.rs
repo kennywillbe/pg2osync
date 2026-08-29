@@ -144,7 +144,7 @@ impl MySqlConnection {
             seq = packet.seq;
             match packet.payload.first() {
                 Some(0x00) | None => return Ok(()),
-                Some(0xFF) => return Err(auth_error(&packet.payload)),
+                Some(0xFF) => return Err(auth_error(&packet.payload, cfg)),
                 Some(0xFE) => {
                     let (plugin, new_nonce) = parse_auth_switch(&packet.payload);
                     nonce = new_nonce;
@@ -443,10 +443,18 @@ async fn upgrade_to_tls(stream: Box<dyn Stream>, cfg: &MySqlConfig) -> Result<Bo
     Ok(Box::new(tls))
 }
 
-fn auth_error(payload: &[u8]) -> anyhow::Error {
+fn auth_error(payload: &[u8], cfg: &MySqlConfig) -> anyhow::Error {
     let msg = String::from_utf8_lossy(payload.get(9..).unwrap_or(&[])).into_owned();
     let code = u16::from_le_bytes([*payload.get(1).unwrap_or(&0), *payload.get(2).unwrap_or(&0)]);
-    anyhow::anyhow!("auth failed ({code}): {msg}")
+    let err = anyhow::anyhow!("auth failed ({code}): {msg}");
+    // ER_ACCESS_DENIED_ERROR is also what a REQUIRE X509 account answers when
+    // the client offered no certificate, with nothing in the message to say so
+    if code == 1045 && cfg.tls.mode.requires_tls() && !cfg.tls.presents_client_certificate() {
+        return err.context(
+            "if the account is REQUIRE X509 or REQUIRE SUBJECT, set [source] sslcert and sslkey",
+        );
+    }
+    err
 }
 
 impl MySqlConnection {

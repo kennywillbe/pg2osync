@@ -53,6 +53,12 @@ pub struct SourceConfig {
     /// PEM bundle of trusted roots for the verifying modes.
     #[serde(default)]
     pub sslrootcert: Option<String>,
+    /// PEM client certificate chain presented to the server (mTLS).
+    #[serde(default)]
+    pub sslcert: Option<String>,
+    /// PEM private key for `sslcert`; PKCS#8, RSA (PKCS#1) or EC (SEC1).
+    #[serde(default)]
+    pub sslkey: Option<String>,
     /// Nested-child queries use a dedicated connection; defaults to url.
     #[serde(default)]
     pub admin_url_env: Option<String>,
@@ -693,6 +699,17 @@ impl AppConfig {
             pg2osync_source::tls::SslMode::parse(sslmode)
                 .context("[source] sslmode is not a libpq ssl mode")?;
         }
+        // the pairing is checked here as well as in `resolve` so a config
+        // review catches it without a filesystem the reviewer may not have
+        match (&self.source.sslcert, &self.source.sslkey) {
+            (Some(_), None) => {
+                anyhow::bail!("[source] sslcert needs sslkey; set both or neither")
+            }
+            (None, Some(_)) => {
+                anyhow::bail!("[source] sslkey needs sslcert; set both or neither")
+            }
+            _ => {}
+        }
         if self.source.flavor == "mysql" && self.source.mode == "poll" {
             anyhow::bail!(
                 "[source] mode = \"poll\" is PostgreSQL-only; MySQL always reads the binlog"
@@ -1097,8 +1114,12 @@ impl AppConfig {
     pub fn tls_settings(&self, source_url: &str) -> Result<pg2osync_source::tls::TlsSettings> {
         pg2osync_source::tls::TlsSettings::resolve(
             source_url,
-            self.source.sslmode.as_deref(),
-            self.source.sslrootcert.as_deref(),
+            pg2osync_source::tls::ConfiguredTls {
+                sslmode: self.source.sslmode.as_deref(),
+                sslrootcert: self.source.sslrootcert.as_deref(),
+                sslcert: self.source.sslcert.as_deref(),
+                sslkey: self.source.sslkey.as_deref(),
+            },
         )
     }
 }
@@ -1337,6 +1358,43 @@ table = "public.users"
                 .is_err(),
             "poll mode is PostgreSQL-only"
         );
+    }
+
+    #[test]
+    fn a_client_certificate_needs_both_halves() {
+        let fixtures = format!("{}/../tls/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
+        assert!(
+            parse(&MINIMAL.replace(
+                "[source]",
+                &format!("[source]\nsslcert = \"{fixtures}/client.crt\"")
+            ))
+            .is_err(),
+            "sslcert alone must be refused"
+        );
+        assert!(
+            parse(&MINIMAL.replace(
+                "[source]",
+                &format!("[source]\nsslkey = \"{fixtures}/pkcs8.key\"")
+            ))
+            .is_err(),
+            "sslkey alone must be refused"
+        );
+
+        let cfg = parse(&MINIMAL.replace(
+            "[source]",
+            &format!(
+                "[source]\nsslcert = \"{fixtures}/client.crt\"\nsslkey = \"{fixtures}/pkcs8.key\""
+            ),
+        ))
+        .expect("both halves are valid");
+        let tls = cfg
+            .tls_settings("postgres://u:p@localhost/db")
+            .expect("resolves");
+        assert_eq!(
+            tls.client_cert,
+            Some(format!("{fixtures}/client.crt").into())
+        );
+        assert_eq!(tls.client_key, Some(format!("{fixtures}/pkcs8.key").into()));
     }
 
     #[test]

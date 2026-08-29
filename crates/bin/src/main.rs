@@ -335,7 +335,10 @@ struct SourceTable {
 async fn eligible_tables(source_url: &str, mysql: bool) -> Result<Vec<SourceTable>> {
     if mysql {
         let url = url::Url::parse(source_url).context("source url is not a valid URL")?;
-        let tls = pg2osync_source::tls::TlsSettings::resolve(source_url, None, None)?;
+        let tls = pg2osync_source::tls::TlsSettings::resolve(
+            source_url,
+            pg2osync_source::tls::ConfiguredTls::default(),
+        )?;
         let mut conn = pg2osync_source_mysql::connection::MySqlConnection::connect(
             &pg2osync_source_mysql::connection::MySqlConfig {
                 host: url.host_str().unwrap_or("localhost").into(),
@@ -376,7 +379,10 @@ async fn eligible_tables(source_url: &str, mysql: bool) -> Result<Vec<SourceTabl
             .collect());
     }
     // Resolved from the URL alone: there is no config yet, which is the point.
-    let tls = pg2osync_source::tls::TlsSettings::resolve(source_url, None, None)?;
+    let tls = pg2osync_source::tls::TlsSettings::resolve(
+        source_url,
+        pg2osync_source::tls::ConfiguredTls::default(),
+    )?;
     let client = pg2osync_source::tls::connect(&tls, source_url)
         .await
         .context("cannot connect to the source")?;
@@ -1046,12 +1052,39 @@ fn check_configured_columns(
     Ok(())
 }
 
+/// Say what the client sent and what the server made of it.
+///
+/// `pg_stat_ssl` is the only place the answer is authoritative: the server
+/// decides whether to ask for a certificate at all, so a successful connection
+/// proves nothing on its own. A failure to read it is not a validation failure.
+async fn report_client_certificate(
+    client: &tokio_postgres::Client,
+    tls: &pg2osync_source::tls::TlsSettings,
+) {
+    let Some(path) = &tls.client_cert else {
+        return;
+    };
+    println!("✓ client certificate presented ({})", path.display());
+    let Ok(row) = client
+        .query_opt(
+            "SELECT client_dn FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
+            &[],
+        )
+        .await
+    else {
+        return;
+    };
+    match row.as_ref().and_then(|r| r.get::<_, Option<String>>(0)) {
+        Some(dn) => println!("✓ server accepted the client certificate (DN={dn})"),
+        None => println!("! the server did not ask for a client certificate"),
+    }
+}
+
 async fn validate_postgres(cfg: &config::AppConfig, source_url: &str) -> Result<()> {
     let client = connect_pg(cfg, source_url).await?;
-    println!(
-        "✓ connected to PostgreSQL (sslmode={})",
-        cfg.tls_settings(source_url)?.mode.as_str()
-    );
+    let tls = cfg.tls_settings(source_url)?;
+    println!("✓ connected to PostgreSQL (sslmode={})", tls.mode.as_str());
+    report_client_certificate(&client, &tls).await;
 
     if cfg.source.mode == "wal" {
         pg2osync_source::catalog::check_wal_level(&client).await?;
@@ -1209,6 +1242,11 @@ async fn validate_mysql(cfg: &config::AppConfig, source_url: &str) -> Result<()>
     let source = mysql_source(cfg, source_url)?;
     let mut admin = source.admin_connection().await?;
     println!("✓ connected to MySQL");
+    // a REQUIRE X509 account refuses the handshake outright, so reaching this
+    // line with a certificate configured is itself the server's acceptance
+    if let Some(path) = &cfg.tls_settings(source_url)?.client_cert {
+        println!("✓ client certificate presented ({})", path.display());
+    }
     pg2osync_source_mysql::catalog::check_prerequisites(&mut admin).await?;
     println!("✓ log_bin, binlog_format = ROW, binlog_row_image = FULL");
     source.bootstrap(&mut admin).await?;

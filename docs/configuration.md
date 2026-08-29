@@ -39,6 +39,8 @@ startup. Secrets never appear in logs or error messages.
 | `url` | — | Inline URL; warns as deprecated |
 | `sslmode` | from the URL, else `prefer` | `disable`, `prefer`, `require`, `verify-ca`, `verify-full` |
 | `sslrootcert` | — | PEM bundle of trusted roots for the verifying modes |
+| `sslcert` | — | PEM client certificate chain presented to the server; requires `sslkey` |
+| `sslkey` | — | PEM private key for `sslcert`; PKCS#8, RSA or EC, unencrypted |
 | `admin_url_env` | falls back to the source URL | Separate connection for catalog and nested-child queries |
 | `reconnect_max` | `10` | Consecutive stream failures tolerated before exiting; `0` exits on the first |
 | `reconnect_backoff_ms` | `1000` | Initial reconnect delay, doubled per failure, capped at 30 s |
@@ -93,6 +95,20 @@ crossing a network you do not control wants `verify-full`.
 With `verify-ca` and `verify-full`, `sslrootcert` points at the CA bundle; when
 it is omitted the bundled Mozilla roots are used, which is what public managed
 providers chain to.
+
+`sslcert` and `sslkey` are the other direction: the certificate this process
+presents so the server knows who is connecting, for a PostgreSQL `pg_hba.conf`
+with `clientcert=verify-full` or a MySQL account declared `REQUIRE X509`. Set
+both or neither — half a client identity is refused before anything connects.
+The key must be unencrypted, in PKCS#8, RSA (PKCS#1) or EC (SEC1) form; one
+file holding both the chain and the key works for both options. They apply to
+every connection the process opens: the replication stream, the catalog and
+admin queries, and the initial load.
+
+This is orthogonal to `sslmode`. `require` plus a client certificate is a real
+combination — encrypt, prove who I am, do not check who you are — and is what a
+self-signed managed instance that still demands a client certificate needs. The
+URL may carry `sslcert=` and `sslkey=` as well; the config wins per option.
 
 ### Poll mode
 
