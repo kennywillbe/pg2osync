@@ -326,6 +326,128 @@ and the document is then in the old index.
 - **Bulk-load settings are not relaxed** for a templated index. An index
   created during the initial load takes the target's defaults.
 
+### Retention
+
+An index per month is only half of time-based retention: something still has
+to delete August once nothing searches it any more. pg2osync does not, and
+neither target needs it to — both have an index-lifecycle feature that acts on
+an index pg2osync created on demand without pg2osync knowing anything about
+it. The policy is one PUT the operator makes once; the target owns the
+lifecycle of its own indices, and a sync tool that also deleted them would be
+a second, weaker copy of a scheduler that is already there.
+
+**Elasticsearch: name an ILM policy in the mapping's `settings`.** The
+`mapping_file` is the index-creation body, `settings` included, and it is sent
+verbatim for every index the template renders — so the policy is attached to
+`events-2026-08` at the moment the first August row creates it, and to
+`events-2026-09` a month later, with no template to maintain:
+
+```json
+{
+  "settings": {
+    "index.lifecycle.name": "events-30d"
+  },
+  "mappings": {
+    "properties": {
+      "created_at": { "type": "date" }
+    }
+  }
+}
+```
+
+The policy itself is created once, by hand:
+
+```json
+PUT _ilm/policy/events-30d
+{
+  "policy": {
+    "phases": {
+      "delete": {
+        "min_age": "30d",
+        "actions": { "delete": {} }
+      }
+    }
+  }
+}
+```
+
+`index.lifecycle.name` is all that is needed here: `min_age` counts from the
+index's creation date for an index that never rolls over, which is exactly
+what a month bucket is. `index.lifecycle.rollover_alias` belongs to the
+`rollover` action — a write alias moving from one index to the next — and a
+row-chosen index has no such alias: the row's own column says where it goes.
+Setting it without a rollover action makes the policy fail on an index it
+cannot roll over. (See
+[ILM index settings](https://www.elastic.co/docs/reference/elasticsearch/configuration-reference/index-lifecycle-management-settings)
+and the [delete action](https://www.elastic.co/docs/reference/elasticsearch/index-lifecycle-actions/ilm-delete).)
+
+**OpenSearch: match the indices from an ISM policy.** ISM attaches itself. A
+policy carrying an `ism_template` is applied to every index created after it
+whose name matches one of the template's patterns, so nothing goes in
+`mapping_file` at all:
+
+```json
+PUT _plugins/_ism/policies/events-30d
+{
+  "policy": {
+    "description": "Delete an events index 30 days after it was created.",
+    "default_state": "hot",
+    "states": [
+      {
+        "name": "hot",
+        "actions": [],
+        "transitions": [
+          { "state_name": "delete", "conditions": { "min_index_age": "30d" } }
+        ]
+      },
+      {
+        "name": "delete",
+        "actions": [{ "delete": {} }],
+        "transitions": []
+      }
+    ],
+    "ism_template": [
+      { "index_patterns": ["events-*"], "priority": 100 }
+    ]
+  }
+}
+```
+
+The legacy way of attaching a policy — an index template setting named
+`plugins.index_state_management.policy_id` (`opendistro.` before that) — is
+deprecated in favour of `ism_template`. It still works on the 2.x line, but
+it needs an index template to carry the setting, which is the maintenance the
+`ism_template` field removes. (See
+[Index State Management](https://docs.opensearch.org/latest/im-plugin/ism/index/)
+and the [ISM API](https://docs.opensearch.org/latest/im-plugin/ism/api/).)
+
+Both mechanisms have the same two edges:
+
+- **The policy has to exist before the index does.** An ISM template is
+  consulted at index creation only, and an ES index created before the policy
+  existed carries no `index.lifecycle.name`. Indices already in the cluster
+  are attached by hand — `POST _plugins/_ism/add/events-2026-07` on
+  OpenSearch, `PUT /events-2026-07/_settings` with `index.lifecycle.name` on
+  Elasticsearch — and every index created from then on is covered.
+- **Nothing deletes on the stroke of the boundary.** ILM checks its indices
+  every `indices.lifecycle.poll_interval` (10 minutes by default), ISM on its
+  own job schedule; an index outlives its `min_age` by that much.
+
+Keep the pattern narrow enough to miss pg2osync's own state. `events-*` is
+fine; a policy matching `*` would also claim the hidden `.pg2osync_meta`
+checkpoint index and eventually delete the position the pipeline resumes
+from.
+
+**Data streams are not supported.** A data stream accepts only `create`
+actions in a bulk request, and pg2osync writes `index` actions: every document
+is keyed by its id and rewritten, because at-least-once delivery means a
+replayed change has to overwrite the document it already wrote rather than be
+rejected or duplicated. That holds even for an
+[`append_only`](#append-only-tables) table, whose content hash exists precisely
+so that a re-delivered row lands on the same document again. A time-bucketed
+index with a lifecycle policy is what a data stream would have given here
+anyway: whole indices dropped by age, never documents deleted one at a time.
+
 ### Fan-out
 
 One row whose array column holds N elements can become N documents:

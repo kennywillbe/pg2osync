@@ -80,7 +80,7 @@ not expressions) — if you need those, you want Kafka.
 | Nested child collections (one level) | ✅ PostgreSQL and MySQL/MariaDB; the parent document embeds child arrays, resolved once per collection per transaction |
 | Parent-child as a join field (`join`) | ✅ OpenSearch and Elasticsearch; shared index, per-document routing, parent delete cascades to its children |
 | One index fed by several tables | ✅ each section declares an explicit id; reconcile refuses it, a TRUNCATE is skipped and counted |
-| A row chooses its index (`index = "events-{tenant}"`) | ✅ created on demand with your mapping; TRUNCATE clears the pattern; reconcile refuses |
+| A row chooses its index (`index = "events-{tenant}"`) | ✅ created on demand with your mapping; TRUNCATE clears the pattern; reconcile refuses; old buckets expire through [ILM or ISM](docs/configuration.md#retention) |
 | Column projection (`columns` / `exclude_columns`) | ✅ |
 | Derived document ids (`id = "tenant-{tenant_id}-{id}"`) | ✅ default stays the primary key; non-key columns need `REPLICA IDENTITY FULL` |
 | One row to many documents (`fan_out` over a JSON-array column) | ✅ elements added, moved and removed as versioned writes |
