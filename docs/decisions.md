@@ -174,7 +174,9 @@ log and replays onto an idempotent write. Two conditions that argument rests on:
 whole-document upserts keyed by the row's primary key, and an update whose
 unchanged TOASTed columns arrive as markers is completed from the stored
 document — without that, a replayed update would erase a value a range read
-correctly.
+correctly. A completed value is copied as it is stored, already transformed,
+and is not put through the transforms again: a hash of a hash would drift from
+what a fresh write of the same row produces.
 
 **The table is cut the way the storage engine reads it.** PostgreSQL's heap
 order says nothing about the key, so ranges are sampled in advance and read

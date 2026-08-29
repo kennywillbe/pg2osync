@@ -1128,11 +1128,16 @@ fn materialize(
             Some(rule) => crate::mapping::fan_out_docs(rule, base, doc).map_err(halt),
         }
     };
-    let finish = |docs: Vec<(String, Value)>| -> Vec<LsnOp> {
+    // `shaped` names the columns completed from the stored document: they
+    // went through the transforms when they were first written, so they must
+    // not go through them again
+    let finish = |docs: Vec<(String, Value)>, shaped: &[String]| -> Vec<LsnOp> {
         docs.into_iter()
             .map(|(id, mut doc)| {
                 rules.projections.apply(table.0, table.1, &mut doc);
-                rules.transforms.apply(table.0, table.1, &mut doc);
+                rules
+                    .transforms
+                    .apply_except(table.0, table.1, &mut doc, shaped);
                 rules.renames.apply(table.0, table.1, &mut doc);
                 rules.constants.apply(table.0, table.1, &mut doc);
                 upsert(id, doc)
@@ -1142,7 +1147,7 @@ fn materialize(
     match kind {
         RowKind::Insert { pk, doc } => {
             let base = derived_id(table, pk, Some(doc), None, rules.id_templates)?;
-            Ok(finish(shape(&base, doc)?))
+            Ok(finish(shape(&base, doc)?, &[]))
         }
         RowKind::Update {
             pk,
@@ -1152,6 +1157,7 @@ fn materialize(
             before,
         } => {
             let mut doc = doc.clone();
+            let mut completed = Vec::new();
             if !unchanged_toast_columns.is_empty()
                 && let Some(Value::Object(prev_map)) = previous
                 && let Value::Object(doc_map) = &mut doc
@@ -1162,13 +1168,14 @@ fn materialize(
                     let stored = rules.renames.target_name(table.0, table.1, col);
                     if let Some(v) = prev_map.get(stored) {
                         doc_map.insert(col.clone(), v.clone());
+                        completed.push(col.clone());
                     }
                 }
             }
             let before = before.as_ref();
             let base = derived_id(table, pk, Some(&doc), before, rules.id_templates)?;
             let new_docs = shape(&base, &doc)?;
-            let mut ops = finish(new_docs.clone());
+            let mut ops = finish(new_docs.clone(), &completed);
             // write first, delete second: a crash between them leaves a
             // duplicate that the replay repairs, where the reverse order would
             // leave a gap that nothing repairs
@@ -2645,6 +2652,67 @@ mod pipeline_tests {
         .await
         .expect("engine ran");
         assert_eq!(sink.doc("7"), Some(json!({"id": 7, "entity": "user"})));
+    }
+
+    #[tokio::test]
+    async fn toast_completion_does_not_transform_the_stored_value_again() {
+        // the stored value is already a digest; hashing it once more would
+        // make the completed row disagree with a fresh write of the same row
+        let (events_tx, events_rx) = mpsc::channel(4);
+        let (copy_tx, copy_rx) = mpsc::channel(4);
+        drop(copy_tx);
+        let (ack_tx, _ack_rx) = watch::channel(None);
+        let (load_done_tx, _load_done_rx) = watch::channel(0u64);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sink = Arc::new(RecordingSink::default());
+        sink.store(json!({"bio": "already-a-digest"}));
+        let ctx = Arc::new(PipelineCtx {
+            sink: sink.clone(),
+            mapping: TableMapping::from_pairs([(
+                ("public".to_string(), "users".to_string()),
+                "users".to_string(),
+            )]),
+            projections: crate::mapping::Projections::default(),
+            transforms: crate::mapping::Transforms::from_pairs([(
+                ("public".to_string(), "users".to_string()),
+                std::collections::HashMap::from([(
+                    "bio".to_string(),
+                    crate::mapping::TransformOp::Hash,
+                )]),
+            )]),
+            renames: crate::mapping::Renames::default(),
+            constants: crate::mapping::Constants::default(),
+            id_templates: Default::default(),
+            fan_outs: Default::default(),
+            cfg: EngineConfig::default(),
+            ack_tx,
+            load_done_tx,
+            metrics: Arc::new(crate::metrics::Metrics::default()),
+        });
+        for event in [moved(1, 2, &["bio"]), commit(0x900)] {
+            events_tx.send(event).await.unwrap();
+        }
+        drop(events_tx);
+        run(
+            events_rx,
+            copy_rx,
+            ctx,
+            StreamId {
+                source: SOURCE_POSTGRES.into(),
+                stream: "slot".into(),
+                publication: "pub".into(),
+            },
+            Arc::new(|token| Lsn(token).to_string()),
+            crate::mapping::DurableLsn::default(),
+            shutdown_rx,
+        )
+        .await
+        .expect("engine ran");
+        assert_eq!(
+            sink.doc("2"),
+            Some(json!({"id": 2, "bio": "already-a-digest"})),
+            "a completed column keeps the digest it was stored with"
+        );
     }
 
     #[tokio::test]

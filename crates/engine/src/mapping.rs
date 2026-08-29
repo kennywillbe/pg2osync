@@ -97,6 +97,19 @@ impl Transforms {
 
     /// Apply configured transforms in place to a document.
     pub fn apply(&self, schema: &str, table: &str, doc: &mut serde_json::Value) {
+        self.apply_except(schema, table, doc, &[]);
+    }
+
+    /// The same, leaving `shaped` columns alone: a value completed from the
+    /// stored document was transformed when it was first written, and a hash
+    /// of a hash would never match what a fresh write of the row produces.
+    pub fn apply_except(
+        &self,
+        schema: &str,
+        table: &str,
+        doc: &mut serde_json::Value,
+        shaped: &[String],
+    ) {
         let Some(rules) = self.for_table(schema, table) else {
             return;
         };
@@ -104,6 +117,9 @@ impl Transforms {
             return;
         };
         for (col, op) in rules {
+            if shaped.contains(col) {
+                continue;
+            }
             if let Some(v) = doc_map.get_mut(col) {
                 if v.is_null() {
                     continue;
@@ -577,6 +593,17 @@ mod tests {
             "hash is truncated to a stable width"
         );
         assert!(doc["phone"].is_null(), "null carries no value to mask");
+    }
+
+    #[test]
+    fn a_column_already_shaped_is_left_alone() {
+        let t = Transforms::from_pairs([(
+            ("public".into(), "users".into()),
+            HashMap::from([("ssn".to_string(), TransformOp::Hash)]),
+        )]);
+        let mut doc = json!({"ssn": "already-a-digest"});
+        t.apply_except("public", "users", &mut doc, &["ssn".to_string()]);
+        assert_eq!(doc, json!({"ssn": "already-a-digest"}));
     }
 
     #[test]
