@@ -106,8 +106,12 @@ exclude_columns = ["password_hash", "internal_notes"]
 ```
 
 Projection applies to the initial load and to live streaming alike, so an
-excluded column never reaches the target. To store a column under another name
-see [Field names](../configuration.md#field-names); projection and transforms
+excluded column never reaches the target. The table's `where` predicate is
+pushed into the COPY statement and evaluated again on every WAL row, so a row
+that does not match is never read and one that stops matching is deleted; see
+[Row filters](../configuration.md#row-filters). To store a column under
+another name see [Field names](../configuration.md#field-names); projection
+and transforms
 still refer to the source name. `numeric` arrives as a string to keep its
 precision; `transform = "number"` converts it if you accept float precision
 (see [Transforms](../configuration.md#transforms)).

@@ -154,6 +154,8 @@ pub struct PipelineCtx {
     pub id_templates: crate::mapping::IdTemplates,
     /// Tables whose rows fan out into one document per array element.
     pub fan_outs: crate::mapping::FanOuts,
+    /// Row filters, judged on the raw row before anything else shapes it.
+    pub filters: crate::mapping::Filters,
     pub cfg: EngineConfig,
     /// Updated by the sink task after every successful flush.
     pub ack_tx: watch::Sender<Option<Lsn>>,
@@ -444,6 +446,7 @@ pub async fn run(
                     constants: &ctx.constants,
                     id_templates: &ctx.id_templates,
                     fan_outs: &ctx.fan_outs,
+                    filters: &ctx.filters,
                 };
                 let completions = match fetch_completions(
                     &rows,
@@ -1018,6 +1021,82 @@ pub struct Rules<'a> {
     pub constants: &'a crate::mapping::Constants,
     pub id_templates: &'a crate::mapping::IdTemplates,
     pub fan_outs: &'a crate::mapping::FanOuts,
+    pub filters: &'a crate::mapping::Filters,
+}
+
+/// Fill unchanged TOASTed columns from the document already in the target.
+///
+/// Hoisted out of the write path because the row filter has to read them: an
+/// unchanged TOASTed column arrives as null with its name listed, and a filter
+/// judging the row on that null would delete a document over a value the
+/// source never resent. Returns the completed document and the columns that
+/// came from the stored copy, which have already been through the transforms
+/// once and must not go through them again.
+fn complete_toast(
+    doc: &Value,
+    unchanged: &[String],
+    previous: Option<&Value>,
+    rules: &Rules<'_>,
+    table: (&str, &str),
+) -> (Value, Vec<String>) {
+    let mut doc = doc.clone();
+    let mut completed = Vec::new();
+    if let Some(Value::Object(prev_map)) = previous
+        && let Value::Object(doc_map) = &mut doc
+    {
+        for col in unchanged {
+            // the stored document carries the target name; the one being
+            // built is still in source names, renames run last
+            let stored = rules.renames.target_name(table.0, table.1, col);
+            if let Some(v) = prev_map.get(stored) {
+                doc_map.insert(col.clone(), v.clone());
+                completed.push(col.clone());
+            }
+        }
+    }
+    (doc, completed)
+}
+
+/// What the row really is once the table's filter has judged its new state.
+///
+/// A row that no longer matches is not "nothing to do": it is a document that
+/// has to leave the index, which is the same mechanism as a row whose id
+/// moved. Borrowed when the filter says yes — the common case owns nothing.
+fn filter_out<'a>(
+    kind: &'a RowKind,
+    completed: Option<&Value>,
+    filter: Option<&pg2osync_core::filter::Filter>,
+) -> std::borrow::Cow<'a, RowKind> {
+    use std::borrow::Cow;
+    let Some(filter) = filter else {
+        return Cow::Borrowed(kind);
+    };
+    match kind {
+        // Poll mode re-sends a changed row as an insert, so a row that has
+        // left the filter arrives here and must be deleted. On a WAL insert of
+        // a row that never matched this is one idempotent delete of a document
+        // that was never written, which the target answers with not-found.
+        RowKind::Insert { pk, doc } if !filter.matches(doc) => Cow::Owned(RowKind::Delete {
+            pk: pk.clone(),
+            before: Some(doc.clone()),
+        }),
+        // The *old* id is what has to go, and the before-image is the state
+        // the target was last told about — for a fanned row it names exactly
+        // the element documents that were written. Falling back to the new
+        // document only happens where the startup check already required a
+        // before-image, i.e. where the source broke its promise.
+        RowKind::Update {
+            pk,
+            previous_pk,
+            doc,
+            before,
+            ..
+        } if !filter.matches(completed.unwrap_or(doc)) => Cow::Owned(RowKind::Delete {
+            pk: previous_pk.clone().unwrap_or_else(|| pk.clone()),
+            before: before.clone().or_else(|| Some(doc.clone())),
+        }),
+        _ => Cow::Borrowed(kind),
+    }
 }
 
 /// The document id for the row state described by `doc`, or by `pk` alone
@@ -1175,6 +1254,28 @@ fn materialize(
             })
             .collect()
     };
+    // Completion first, then the filter: both read the row as it really is,
+    // and the filter's answer decides what kind of row this is at all.
+    let completion = match kind {
+        RowKind::Update {
+            doc,
+            unchanged_toast_columns,
+            ..
+        } if !unchanged_toast_columns.is_empty() => Some(complete_toast(
+            doc,
+            unchanged_toast_columns,
+            previous,
+            rules,
+            table,
+        )),
+        _ => None,
+    };
+    let filtered = filter_out(
+        kind,
+        completion.as_ref().map(|(doc, _)| doc),
+        rules.filters.for_table(table.0, table.1),
+    );
+    let kind = filtered.as_ref();
     match kind {
         RowKind::Insert { pk, doc } => {
             let base = derived_id(table, pk, Some(doc), None, rules.id_templates)?;
@@ -1184,25 +1285,13 @@ fn materialize(
             pk,
             previous_pk,
             doc,
-            unchanged_toast_columns,
             before,
+            ..
         } => {
-            let mut doc = doc.clone();
-            let mut completed = Vec::new();
-            if !unchanged_toast_columns.is_empty()
-                && let Some(Value::Object(prev_map)) = previous
-                && let Value::Object(doc_map) = &mut doc
-            {
-                for col in unchanged_toast_columns {
-                    // the stored document carries the target name; the one
-                    // being built is still in source names, renames run last
-                    let stored = rules.renames.target_name(table.0, table.1, col);
-                    if let Some(v) = prev_map.get(stored) {
-                        doc_map.insert(col.clone(), v.clone());
-                        completed.push(col.clone());
-                    }
-                }
-            }
+            let (doc, completed) = match completion {
+                Some(pair) => pair,
+                None => (doc.clone(), Vec::new()),
+            };
             let before = before.as_ref();
             let base = derived_id(table, pk, Some(&doc), before, rules.id_templates)?;
             let new_docs = shape(&base, &doc)?;
@@ -1593,6 +1682,7 @@ mod pipeline_tests {
             constants: crate::mapping::Constants::default(),
             id_templates: crate::mapping::IdTemplates::default(),
             fan_outs: crate::mapping::FanOuts::default(),
+            filters: crate::mapping::Filters::default(),
             cfg,
             ack_tx,
             load_done_tx,
@@ -2481,18 +2571,41 @@ mod pipeline_tests {
             fan,
             renames,
             constants,
+            crate::mapping::Filters::default(),
             Arc::new(RecordingSink::default()),
             script,
         )
         .await
     }
 
+    async fn drive_rules_filtered(
+        filters: crate::mapping::Filters,
+        ids: crate::mapping::IdTemplates,
+        fan: crate::mapping::FanOuts,
+        sink: Arc<RecordingSink>,
+        script: Vec<ChangeEvent>,
+    ) -> Arc<RecordingSink> {
+        drive_rules_at(
+            500,
+            ids,
+            fan,
+            crate::mapping::Renames::default(),
+            crate::mapping::Constants::default(),
+            filters,
+            sink,
+            script,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn drive_rules_at(
         batch_size: usize,
         ids: crate::mapping::IdTemplates,
         fan: crate::mapping::FanOuts,
         renames: crate::mapping::Renames,
         constants: crate::mapping::Constants,
+        filters: crate::mapping::Filters,
         sink: Arc<RecordingSink>,
         script: Vec<ChangeEvent>,
     ) -> Arc<RecordingSink> {
@@ -2514,6 +2627,7 @@ mod pipeline_tests {
             constants,
             id_templates: ids,
             fan_outs: fan,
+            filters,
             cfg: EngineConfig {
                 batch_size,
                 checkpoint_interval_ms: 100,
@@ -2658,6 +2772,7 @@ mod pipeline_tests {
             constants: users_constants(&[("entity", json!("user"))]),
             id_templates: Default::default(),
             fan_outs: Default::default(),
+            filters: Default::default(),
             cfg: EngineConfig::default(),
             ack_tx,
             load_done_tx,
@@ -2715,6 +2830,7 @@ mod pipeline_tests {
             constants: crate::mapping::Constants::default(),
             id_templates: Default::default(),
             fan_outs: Default::default(),
+            filters: Default::default(),
             cfg: EngineConfig::default(),
             ack_tx,
             load_done_tx,
@@ -2776,6 +2892,7 @@ mod pipeline_tests {
             constants: crate::mapping::Constants::default(),
             id_templates: Default::default(),
             fan_outs: Default::default(),
+            filters: Default::default(),
             cfg: EngineConfig::default(),
             ack_tx,
             load_done_tx,
@@ -2805,6 +2922,121 @@ mod pipeline_tests {
             Some(json!({"id": 2, "bio": "already-a-digest"})),
             "a completed column keeps the digest it was stored with"
         );
+    }
+
+    fn users_filter(spec: &str) -> crate::mapping::Filters {
+        crate::mapping::Filters::from_pairs([(
+            ("public".to_string(), "users".to_string()),
+            pg2osync_core::filter::Filter::parse(spec).expect("a valid predicate"),
+        )])
+    }
+
+    fn updated(id: i64, before: Value, doc: Value) -> ChangeEvent {
+        ChangeEvent::Row(RowChange {
+            schema: "public".into(),
+            table: "users".into(),
+            kind: RowKind::Update {
+                pk: json!(id),
+                previous_pk: None,
+                doc,
+                unchanged_toast_columns: vec![],
+                before: Some(before),
+            },
+            version: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_row_that_leaves_the_filter_is_deleted_and_one_that_enters_is_written() {
+        let sink = drive_rules_filtered(
+            users_filter("status = 'active'"),
+            Default::default(),
+            Default::default(),
+            Arc::new(RecordingSink::default()),
+            vec![
+                row_doc(7, json!({"id": 7, "status": "archived"})),
+                updated(
+                    8,
+                    json!({"id": 8, "status": "archived"}),
+                    json!({"id": 8, "status": "active"}),
+                ),
+                updated(
+                    9,
+                    json!({"id": 9, "status": "active"}),
+                    json!({"id": 9, "status": "archived"}),
+                ),
+                row_doc(10, json!({"id": 10, "status": "active"})),
+                commit(0x100),
+            ],
+        )
+        .await;
+        assert_eq!(
+            sink.events(),
+            vec!["write[delete:7 upsert:8 delete:9 upsert:10]"],
+            "a non-matching insert and an update out of the filter delete; \
+             an update into it and a matching insert write"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fanned_row_that_leaves_the_filter_loses_every_element_document() {
+        let sink = drive_rules_filtered(
+            users_filter("status = 'active'"),
+            users_ids("user-{id}", &["id"]),
+            users_fan("tags", "user-{id}-{tags}"),
+            Arc::new(RecordingSink::default()),
+            vec![
+                updated(
+                    7,
+                    json!({"id": 7, "tags": ["a", "b"], "status": "active"}),
+                    json!({"id": 7, "tags": ["a"], "status": "archived"}),
+                ),
+                commit(0x100),
+            ],
+        )
+        .await;
+        assert_eq!(
+            sink.events(),
+            vec!["write[delete:user-7-a delete:user-7-b]"],
+            "the before-image names what was written, not the new state"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_update_that_leaves_the_filter_deletes_the_id_it_used_to_own() {
+        let sink = drive_rules_filtered(
+            users_filter("status = 'active'"),
+            users_ids("{tenant}-u{id}", &["id"]),
+            Default::default(),
+            Arc::new(RecordingSink::default()),
+            vec![
+                updated(
+                    7,
+                    json!({"id": 7, "tenant": "acme", "status": "active"}),
+                    json!({"id": 7, "tenant": "globex", "status": "archived"}),
+                ),
+                commit(0x100),
+            ],
+        )
+        .await;
+        assert_eq!(sink.events(), vec!["write[delete:acme-u7]"]);
+    }
+
+    #[tokio::test]
+    async fn a_filter_reads_a_toasted_column_only_after_it_is_completed() {
+        // the source did not resend `status`; the stored document says it is
+        // active, and that — not the null marker — is what the filter sees
+        let sink = Arc::new(RecordingSink::default());
+        sink.store(json!({"status": "active"}));
+        let sink = drive_rules_filtered(
+            users_filter("status = 'active'"),
+            Default::default(),
+            Default::default(),
+            sink,
+            vec![moved(1, 2, &["status"]), commit(0x900)],
+        )
+        .await;
+        assert_eq!(sink.events(), vec!["read(1)", "write[upsert:2 delete:1]"]);
     }
 
     #[tokio::test]
@@ -2843,6 +3075,7 @@ mod pipeline_tests {
             crate::mapping::FanOuts::default(),
             users_renames(&[("bio", "about")]),
             crate::mapping::Constants::default(),
+            crate::mapping::Filters::default(),
             sink,
             vec![moved(1, 2, &["bio"]), commit(0x900)],
         )
@@ -2919,6 +3152,7 @@ mod pipeline_tests {
             constants: crate::mapping::Constants::default(),
             id_templates: users_ids("user-{tenant}", &["tenant"]),
             fan_outs: Default::default(),
+            filters: Default::default(),
             cfg: EngineConfig::default(),
             ack_tx,
             load_done_tx,

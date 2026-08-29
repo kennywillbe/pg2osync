@@ -7,6 +7,7 @@ pub mod checkpoint;
 pub mod children;
 pub mod error;
 pub mod event;
+pub mod filter;
 pub mod load;
 pub mod lsn;
 pub mod sink;

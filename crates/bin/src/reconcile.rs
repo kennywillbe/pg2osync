@@ -22,6 +22,9 @@ pub struct Table {
     pub index: String,
     pub key_column: String,
     pub soft_delete: Option<String>,
+    /// The table's row filter: a row that no longer matches it still exists,
+    /// and must still count as gone — the index is not supposed to hold it.
+    pub filter: Option<pg2osync_core::filter::Filter>,
 }
 
 pub struct Report {
@@ -102,10 +105,16 @@ async fn existing_keys(
     keys: &[String],
 ) -> Result<std::collections::HashSet<String>> {
     // a soft-deleted row still exists, and must still count as gone
-    let filter = match &table.soft_delete {
+    let mut filter = match &table.soft_delete {
         Some(predicate) => format!(" AND NOT ({predicate})"),
         None => String::new(),
     };
+    if let Some(row_filter) = &table.filter {
+        filter.push_str(&format!(
+            " AND ({})",
+            row_filter.to_sql(&crate::backfill::pg_dialect_bare())
+        ));
+    }
     let sql = format!(
         "SELECT {key}::text FROM {tbl} WHERE {key}::text = ANY($1){filter}",
         key = quote_ident(&table.key_column),

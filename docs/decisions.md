@@ -120,6 +120,23 @@ so every op is idempotent under at-least-once replay. `split` cannot feed
 row, as the id paragraph says. `chrono`, already in the build through the
 OpenSearch client, parses the dates: a strptime calendar is not protocol code.
 
+**A row filter is SQL the database also runs, evaluated once more in the
+engine.** (`where`, #64.) A subset, because a stream has no query to push a
+predicate into: the engine evaluates it on every WAL, binlog and polled row, and
+everything it accepts is valid on both sources, so the load pushes it down
+unchanged. Three-valued logic is SQL's — NULL is unknown, only TRUE matches — so
+the two evaluations agree. Strings compare byte-wise, exact for equality and for
+ASCII and ISO 8601 order, so `created_at >= '2024-01-01'` holds against a
+textual timestamp; a number against a string holding one compares numerically,
+because `numeric`/`DECIMAL` arrive as strings on purpose. A row that leaves the
+filter is deleted the way a moved id is, the before-image naming a fanned row's
+element documents. An insert that never matched still costs one idempotent
+not-found delete; the alternative is remembering what was written. Poll mode
+does not push the predicate down: a row that left the filter has to keep
+arriving to become the delete it now is. It travels the ordinary op path, so the
+guard against a load resurrecting a removed document holds. A filter selects
+rows and computes no values: no transformation language.
+
 **Never acknowledge a position before it is durable.** The value reported to the
 source is clamped to the persisted checkpoint. Acknowledging further lets the
 database recycle history for rows that are not indexed yet — the classic way a

@@ -518,6 +518,12 @@ async fn reconcile_cmd(path: &Path, delete: bool) -> Result<()> {
             index: table.index_name(key),
             key_column: table.primary_key.clone().unwrap_or_else(|| "id".into()),
             soft_delete: table.soft_delete.clone(),
+            filter: table
+                .filter
+                .as_deref()
+                .map(pg2osync_core::filter::Filter::parse)
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("where predicate of {}: {e}", table.table))?,
         };
         let report = reconcile::table(&client, &sink, &spec, delete).await?;
         total_orphans += report.orphaned.len();
@@ -816,6 +822,23 @@ fn check_configured_columns(
             }
         }
     }
+    // A predicate naming a column that is gone evaluates to unknown for every
+    // row, which empties the index — a data-loss failure, not the silent
+    // drift a stale `transform` entry causes. No nullable warning goes with
+    // it: NULL is an ordinary value in a predicate, `deleted_at IS NULL`
+    // depends on it.
+    if let Some(spec) = &table.filter {
+        let filter = pg2osync_core::filter::Filter::parse(spec)
+            .map_err(|e| anyhow::anyhow!("where {spec:?} of {}: {e}", table.table))?;
+        for col in filter.columns() {
+            if !live.iter().any(|c| c.eq_ignore_ascii_case(col)) {
+                bail!(
+                    "table {} has no column {col} for its `where` predicate",
+                    table.table
+                );
+            }
+        }
+    }
     if let Some(fan) = &table.fan_out
         && !live.iter().any(|c| c.eq_ignore_ascii_case(&fan.field))
     {
@@ -930,6 +953,24 @@ async fn validate_postgres(cfg: &config::AppConfig, source_url: &str) -> Result<
             .collect();
         check_configured_columns(table, &live, &info.pk_columns, &nullable)?;
         println!("✓ table {} exists ({} columns)", table.table, live.len());
+        // LIMIT 0 still parses, plans and type-checks the predicate — which
+        // the grammar cannot do — and reads nothing
+        if let Some(spec) = &table.filter {
+            let sql = pg2osync_core::filter::Filter::parse(spec)
+                .map_err(|e| anyhow::anyhow!("where {spec:?} of {}: {e}", table.table))?
+                .to_sql(&backfill::pg_dialect_bare());
+            let probe = format!("SELECT 1 FROM {} WHERE ({sql}) LIMIT 0", table.table);
+            client.query(&probe, &[]).await.with_context(|| {
+                format!(
+                    "the `where` predicate of {} is not valid SQL against that table",
+                    table.table
+                )
+            })?;
+            println!(
+                "✓ where predicate of {} runs against the table",
+                table.table
+            );
+        }
         tables.push(table.table.clone());
         for child in &table.children {
             tables.push(child.table.clone());
@@ -1022,6 +1063,29 @@ async fn validate_mysql(cfg: &config::AppConfig, source_url: &str) -> Result<()>
             table.table,
             names.len()
         );
+        // MySQL coerces where PostgreSQL errors, so this mostly catches a
+        // column the catalogue spelled differently — still cheap, still worth
+        // having before a load
+        if let Some(spec) = &table.filter {
+            let sql = pg2osync_core::filter::Filter::parse(spec)
+                .map_err(|e| anyhow::anyhow!("where {spec:?} of {}: {e}", table.table))?
+                .to_sql(&pg2osync_source_mysql::catalog::dialect());
+            let probe = format!(
+                "SELECT 1 FROM {}.{} WHERE ({sql}) LIMIT 0",
+                pg2osync_source_mysql::catalog::quote_ident(schema),
+                pg2osync_source_mysql::catalog::quote_ident(name)
+            );
+            admin.query_text_rows(&probe).await.with_context(|| {
+                format!(
+                    "the `where` predicate of {} is not valid SQL against that table",
+                    table.table
+                )
+            })?;
+            println!(
+                "✓ where predicate of {} runs against the table",
+                table.table
+            );
+        }
     }
     Ok(())
 }

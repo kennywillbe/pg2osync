@@ -106,8 +106,15 @@ pub async fn unfinished<'a>(
 pub struct LoadScope {
     /// Only this qualified table, or every configured one.
     pub only: Option<String>,
-    /// An extra SQL predicate ANDed into every chunk's read.
+    /// An extra SQL predicate ANDed into every chunk's read, from
+    /// `resnapshot --where`. Verbatim SQL: the operator typed it for this one
+    /// run and it is theirs to get right.
     pub filter: Option<String>,
+    /// The configured row filter of each table, by qualified name. Carried as
+    /// the parsed predicate rather than as rendered SQL because each source
+    /// spells identifiers and strings its own way, and the loader building
+    /// the statement is the only place that knows which.
+    pub table_filters: std::collections::HashMap<String, crate::filter::Filter>,
     /// Whether progress is recorded, so an interruption resumes instead of
     /// starting over.
     ///
@@ -125,6 +132,7 @@ impl LoadScope {
         Self {
             only: None,
             filter: None,
+            table_filters: Default::default(),
             resumable: true,
         }
     }
@@ -134,8 +142,23 @@ impl LoadScope {
         Self {
             only: Some(qualified_table.to_string()),
             filter,
+            table_filters: Default::default(),
             resumable: false,
         }
+    }
+
+    /// Builder form, so neither constructor grows an argument every caller
+    /// would have to pass.
+    pub fn with_table_filters(
+        mut self,
+        filters: std::collections::HashMap<String, crate::filter::Filter>,
+    ) -> Self {
+        self.table_filters = filters;
+        self
+    }
+
+    pub fn table_filter(&self, qualified_table: &str) -> Option<&crate::filter::Filter> {
+        self.table_filters.get(qualified_table)
     }
 
     /// Whether this run should read `qualified_table` at all.

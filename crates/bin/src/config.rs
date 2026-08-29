@@ -239,6 +239,12 @@ pub struct TableSync {
     /// Poll mode turns a matching row into a delete; the initial load skips it.
     #[serde(default)]
     pub soft_delete: Option<String>,
+    /// Restricted SQL predicate deciding which rows belong in the index, e.g.
+    /// `status = 'active' AND deleted_at IS NULL`. The initial load pushes it
+    /// into its query; the engine evaluates it again on every streamed row,
+    /// which is what makes a row that leaves the filter a delete.
+    #[serde(default, rename = "where")]
+    pub filter: Option<String>,
     /// Column transformations: `email = "redact"` for an operation without a
     /// parameter, `tags = { op = "split", by = "," }` for one with.
     #[serde(default)]
@@ -664,6 +670,14 @@ impl AppConfig {
                     )
                 })?;
             }
+            if let Some(spec) = &tbl.filter {
+                pg2osync_core::filter::Filter::parse(spec).map_err(|e| {
+                    anyhow::anyhow!(
+                        "[sync.{key}] where {spec:?}: {e}\n{}",
+                        pg2osync_core::filter::SUPPORTED
+                    )
+                })?;
+            }
             for (col, spec) in &tbl.transform {
                 spec.parse()
                     .map_err(|e| anyhow::anyhow!("[sync.{key}.transform] {col}: {e}"))?;
@@ -1007,6 +1021,30 @@ table = "public.users"
             .is_err(),
             "a transform on the fan_out field never reaches fan-out"
         );
+    }
+
+    #[test]
+    fn a_where_predicate_is_parsed_and_its_grammar_bounded() {
+        parse(&format!(
+            "{MINIMAL}where = \"status = 'active' AND tenant IN ('eu','us') AND deleted_at IS NULL\"\n"
+        ))
+        .expect("the supported subset loads");
+        let err = parse(&format!("{MINIMAL}where = \"status LIKE 'a%'\"\n"))
+            .expect_err("LIKE is outside the subset");
+        let text = format!("{err:#}");
+        assert!(text.contains("LIKE"), "names the operator: {text}");
+        assert!(
+            text.contains("supported:"),
+            "lists what is supported: {text}"
+        );
+        parse(&format!(
+            "{}where = \"tenant = 'eu'\"\nsoft_delete = \"deleted_at IS NOT NULL\"\n",
+            MINIMAL.replace(
+                "[source]",
+                "[source]\nmode = \"poll\"\npoll_column = \"updated_at\""
+            )
+        ))
+        .expect("where and soft_delete compose in poll mode");
     }
 
     #[test]

@@ -667,5 +667,69 @@ TOML
   rm -f "$GCONFIG"
 fi
 
+say "17. a row filter decides what is indexed, on the load and on the stream"
+# The MySQL loader renders the predicate into its own chunk statements, so the
+# pushdown is exercised here rather than assumed from PostgreSQL's COPY. `dec`
+# is a reserved word on purpose: it proves the renderer quotes identifiers.
+stop_sync
+WCONFIG=$(mktemp /tmp/pg2osync-mysql-where.XXXXXX)
+WSID=990005
+cat > "$WCONFIG" <<TOML
+[source]
+flavor = "mysql"
+url_env = "PG2OSYNC_MYSQL_URL"
+server_id = $WSID
+
+[target]
+url = "$OS"
+
+[metrics]
+bind = "127.0.0.1:9117"
+
+[sync.where_probe]
+table = "sourcedb.where_probe"
+index = "e2e_mysql_where"
+where = "status = 'active' AND dec > 10"
+TOML
+where_cleanup() {
+  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  my "DROP TABLE IF EXISTS where_probe;" > /dev/null 2>&1 || true
+  rm -f "$WCONFIG"
+}
+trap 'cleanup; resume_cleanup; types_cleanup; child_cleanup; where_cleanup' EXIT
+
+my "DROP TABLE IF EXISTS where_probe;"
+my "CREATE TABLE where_probe(id bigint primary key, status varchar(20), \`dec\` decimal(10,2));"
+# 10.00 against 10.01 is the numeric-string rule: a DECIMAL reaches the engine
+# as a string, and a byte-wise '10.00' > '10' would let row 3 through.
+my "INSERT INTO where_probe VALUES (1,'active',20.00),(2,'archived',20.00),(3,'active',10.00),(4,'active',10.01);"
+curl -s -XDELETE "$OS/e2e_mysql_where" > /dev/null
+nohup $BIN run -c "$WCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+await_count e2e_mysql_where 2
+check "the load indexed only the matching rows" "$(os_count e2e_mysql_where)" "2"
+check "a matching row is indexed" "$(os_status e2e_mysql_where 1)" "200"
+check "a numeric string above the bound is indexed" "$(os_status e2e_mysql_where 4)" "200"
+check "a row the status excludes was never read" "$(os_status e2e_mysql_where 2)" "404"
+check "a numeric string at the bound was never read" "$(os_status e2e_mysql_where 3)" "404"
+my "UPDATE where_probe SET status='archived' WHERE id = 1;"
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_status e2e_mysql_where 1)" = "404" ] && break
+  sleep 1
+done
+check "a row that leaves the filter is deleted" "$(os_status e2e_mysql_where 1)" "404"
+my "UPDATE where_probe SET status='active' WHERE id = 2;"
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_status e2e_mysql_where 2)" = "200" ] && break
+  sleep 1
+done
+check "a row that enters the filter is written" "$(os_status e2e_mysql_where 2)" "200"
+# --where narrows a re-snapshot; it never widens it past the table's own filter
+$BIN resnapshot -c "$WCONFIG" --table sourcedb.where_probe --where "id = 3" >> "$LOG" 2>&1
+refresh
+check "a re-snapshot ANDs its --where with the table's filter" "$(os_status e2e_mysql_where 3)" "404"
+stop_sync
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

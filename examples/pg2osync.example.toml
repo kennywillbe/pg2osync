@@ -82,6 +82,10 @@ exclude_columns = ["password_hash"]
 # Mapping to create the index with, resolved relative to this file. Applied
 # only when the index does not exist; an existing one is compared against it.
 # mapping_file = "users-mapping.json"
+# Pushed into the initial load and evaluated again on every streamed row, so a
+# row that leaves the filter is deleted from the index and one that enters it
+# is written. A restricted SQL subset; see docs/configuration.md#row-filters.
+# where = "status = 'active' AND deleted_at IS NULL"
 # Poll mode only: a row matching this becomes a delete instead of an upsert.
 # soft_delete = "deleted_at IS NOT NULL"
 

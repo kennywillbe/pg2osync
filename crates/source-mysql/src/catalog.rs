@@ -425,6 +425,15 @@ pub fn quote_str(value: &str) -> String {
     format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
 }
 
+/// How MySQL spells a filter: backticked identifiers, and strings that escape
+/// the backslash MySQL would otherwise read as an escape.
+pub fn dialect() -> pg2osync_core::filter::SqlDialect<'static> {
+    pg2osync_core::filter::SqlDialect {
+        quote_ident: &quote_ident,
+        quote_str: &quote_str,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

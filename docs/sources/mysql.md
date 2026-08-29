@@ -105,7 +105,10 @@ full initial load.
 2. **Initial load** in primary-key chunks, each one statement, with the binlog
    coordinate read *before* the first chunk and the stream running from it — so
    anything a chunk missed or read stale is replayed onto an idempotent write.
-   The load runs beside the stream, not before it.
+   The load runs beside the stream, not before it. The table's `where`
+   predicate is pushed into each chunk statement and evaluated again on every
+   binlog row, so a non-matching row is never read and one that stops matching
+   is deleted.
 3. **`COM_BINLOG_DUMP`** from that coordinate on a second connection, after
    `SET @master_binlog_checksum = @@global.binlog_checksum` so CRC32-checksummed
    events are usable.
