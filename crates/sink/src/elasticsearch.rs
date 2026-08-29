@@ -218,9 +218,7 @@ impl ElasticsearchSink {
         // a search only sees refreshed segments, so a child written moments
         // ago — in this very batch, even — would outlive the parent that
         // owns it
-        let _ = self
-            .send(reqwest::Method::POST, &format!("/{index}/_refresh"), None)
-            .await;
+        self.refresh_target(index).await?;
         let query = json!({"bool": {
             "filter": [{"term": {format!("{field}#{parent_name}"): parent_id}}],
             "must_not": [{"term": {field: parent_name}}]
@@ -433,6 +431,24 @@ impl ElasticsearchSink {
             .map_err(|e| CoreError::Sink(e.to_string()))?;
         let body = serde_json::from_str(&text).unwrap_or(Value::Null);
         Ok((status, body))
+    }
+
+    /// Make every write to `target` — an index, a glob, or a comma-separated
+    /// list — visible to the search that follows.
+    ///
+    /// A refused refresh is an error, not a warning: each caller runs a
+    /// search whose result is only right once the refresh has happened, and
+    /// acting on a stale one deletes too little or hands out budget twice.
+    async fn refresh_target(&self, target: &str) -> Result<(), CoreError> {
+        let (status, body) = self
+            .send(reqwest::Method::POST, &format!("/{target}/_refresh"), None)
+            .await?;
+        if !(200..300).contains(&status) {
+            return Err(CoreError::Sink(format!(
+                "refresh {target}: {status} {body}"
+            )));
+        }
+        Ok(())
     }
 
     /// One bulk request. Returns how far it got and, for each refused document,
@@ -717,9 +733,7 @@ impl Sink for ElasticsearchSink {
         // outlive the TRUNCATE that is supposed to remove it. `index` may be a
         // templated table's glob; _refresh and _delete_by_query expand one
         // themselves.
-        let _ = self
-            .send(reqwest::Method::POST, &format!("/{index}/_refresh"), None)
-            .await;
+        self.refresh_target(index).await?;
         // delete_by_query is internally versioned, so it leaves a tombstone
         // above the document's own version and a replayed write is then
         // rejected forever. A versioned bulk delete puts the tombstone at the
@@ -744,17 +758,7 @@ impl Sink for ElasticsearchSink {
         if indices.is_empty() {
             return Ok(());
         }
-        let (status, _) = self
-            .send(
-                reqwest::Method::POST,
-                &format!("/{}/_refresh", indices.join(",")),
-                None,
-            )
-            .await?;
-        if status != 200 {
-            return Err(CoreError::Sink(format!("refresh: {status}")));
-        }
-        Ok(())
+        self.refresh_target(&indices.join(",")).await
     }
 
     async fn begin_bulk_load(&self, indices: &[String]) -> Result<BulkLoadSettings, CoreError> {
@@ -838,21 +842,14 @@ impl Sink for ElasticsearchSink {
         // document is stored but never searched by its own fields, and indexing
         // it would let the very mapping conflict that refused it refuse it here
         // too.
-        let _ = self
-            .send(
-                reqwest::Method::PUT,
-                &format!("/{}", crate::REJECTS_INDEX),
-                Some(
-                    json!({
-                        "settings": {"index": {"hidden": true, "number_of_shards": 1}},
-                        "mappings": {"properties": {
-                            "document": {"type": "object", "enabled": false}
-                        }}
-                    })
-                    .to_string(),
-                ),
-            )
-            .await;
+        let body = json!({
+            "settings": {"index": {"hidden": true, "number_of_shards": 1}},
+            "mappings": {"properties": {
+                "document": {"type": "object", "enabled": false}
+            }}
+        });
+        self.create_index_if_absent(crate::REJECTS_INDEX, Some(&body))
+            .await?;
         for r in rejected {
             let id = crate::reject_doc_id(&r.index, &r.doc_id);
             let (status, _) = self
@@ -878,13 +875,23 @@ impl Sink for ElasticsearchSink {
     ) -> Result<(Vec<pg2osync_core::sink::StoredReject>, u64), CoreError> {
         // A search only sees refreshed segments, and this total is what bounds
         // the quarantine: reading it stale would hand back budget already spent.
-        let _ = self
+        let (status, body) = self
             .send(
                 reqwest::Method::POST,
                 &format!("/{}/_refresh", crate::REJECTS_INDEX),
                 None,
             )
-            .await;
+            .await?;
+        // nothing has ever been quarantined, which is not an error
+        if status == 404 {
+            return Ok((Vec::new(), 0));
+        }
+        if !(200..300).contains(&status) {
+            return Err(CoreError::Sink(format!(
+                "refresh {}: {status} {body}",
+                crate::REJECTS_INDEX
+            )));
+        }
         let (status, body) = self
             .send(
                 reqwest::Method::POST,
@@ -900,10 +907,6 @@ impl Sink for ElasticsearchSink {
                 ),
             )
             .await?;
-        // nothing has ever been quarantined, which is not an error
-        if status == 404 {
-            return Ok((Vec::new(), 0));
-        }
         if status != 200 {
             return Err(CoreError::Sink(format!("list rejects: {status}")));
         }
@@ -1040,6 +1043,8 @@ fn is_retryable(e: &CoreError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn lines(batch: &[LsnOp]) -> Vec<Value> {
         ndjson_body(batch)
@@ -1156,5 +1161,214 @@ mod tests {
             lines(&batch),
             vec![json!({"delete": {"_index": "users", "_id": "1"}})]
         );
+    }
+
+    /// A stand-in for Elasticsearch: `answer` maps each request line
+    /// (`"POST /orders/_refresh"`) to the status and body it replies with, and
+    /// `seen` records every request line in the order it arrived.
+    ///
+    /// Hand-rolled over the TCP listener tokio already ships rather than a
+    /// mocking crate: the sink speaks plain HTTP/1.1 through reqwest, and a
+    /// canned status per path is all a refresh test needs.
+    struct FakeTarget {
+        url: String,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FakeTarget {
+        async fn start(answer: fn(&str) -> (u16, &'static str)) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind a loopback port");
+            let url = format!("http://{}", listener.local_addr().expect("local address"));
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let record = Arc::clone(&seen);
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let record = Arc::clone(&record);
+                    tokio::spawn(async move {
+                        let Some(line) = read_request(&mut stream).await else {
+                            return;
+                        };
+                        crate::lock(&record).push(line.clone());
+                        let (status, body) = answer(&line);
+                        let response = format!(
+                            "HTTP/1.1 {status} Fake\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        let _ = stream.shutdown().await;
+                    });
+                }
+            });
+            Self { url, seen }
+        }
+
+        fn sink(&self) -> ElasticsearchSink {
+            ElasticsearchSink::new(ElasticsearchSinkConfig {
+                url: self.url.clone(),
+                username: None,
+                password: None,
+                api_key: None,
+                tls_verify: true,
+                retry: crate::RetryPolicy::default(),
+            })
+            .expect("a sink over plain http")
+        }
+
+        fn seen(&self) -> Vec<String> {
+            crate::lock(&self.seen).clone()
+        }
+    }
+
+    /// The request line of one HTTP/1.1 request, once the whole request —
+    /// headers and the body Content-Length announces — has been read, so the
+    /// reply never races the client's own write.
+    async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<String> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut chunk).await.ok()?;
+            if n == 0 {
+                return None;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+            let announced = head
+                .lines()
+                .find_map(|l| {
+                    l.split_once(':')
+                        .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                })
+                .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if buf.len() - end - 4 >= announced {
+                let mut words = head.lines().next().unwrap_or_default().split_whitespace();
+                return Some(format!(
+                    "{} {}",
+                    words.next().unwrap_or_default(),
+                    words.next().unwrap_or_default()
+                ));
+            }
+        }
+    }
+
+    fn refresh_is_refused(line: &str) -> (u16, &'static str) {
+        if line.ends_with("/_refresh") {
+            (503, r#"{"error":{"type":"unavailable_shards_exception"}}"#)
+        } else {
+            (200, r#"{"hits":{"hits":[],"total":{"value":0}}}"#)
+        }
+    }
+
+    fn assert_stopped_at_refresh(result: Result<(), CoreError>, seen: &[String]) {
+        match result {
+            Err(CoreError::Sink(msg)) => assert!(msg.contains("refresh"), "{msg}"),
+            other => panic!("a refused refresh was not an error: {other:?}"),
+        }
+        assert_eq!(
+            seen.iter().filter(|l| l.ends_with("/_refresh")).count(),
+            1,
+            "{seen:?}"
+        );
+        assert_eq!(seen.len(), 1, "a search ran on a stale index: {seen:?}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_refresh_stops_a_cascade_delete_before_it_searches() {
+        let target = FakeTarget::start(refresh_is_refused).await;
+        let result = target
+            .sink()
+            .delete_children("orders", "relation", "customer", "7", Some(42))
+            .await;
+        assert_stopped_at_refresh(result, &target.seen());
+    }
+
+    #[tokio::test]
+    async fn a_refused_refresh_stops_a_truncate_before_it_deletes() {
+        let target = FakeTarget::start(refresh_is_refused).await;
+        let result = target.sink().truncate_index("orders", None, None).await;
+        assert_stopped_at_refresh(result, &target.seen());
+    }
+
+    #[tokio::test]
+    async fn a_refused_refresh_stops_the_rejects_listing_before_it_counts() {
+        let target = FakeTarget::start(refresh_is_refused).await;
+        let result = target.sink().list_rejects(10).await.map(|_| ());
+        assert_stopped_at_refresh(result, &target.seen());
+    }
+
+    #[tokio::test]
+    async fn a_rejects_index_that_was_never_created_lists_nothing() {
+        let target = FakeTarget::start(|line| {
+            if line.ends_with("/_refresh") {
+                (404, r#"{"error":{"type":"index_not_found_exception"}}"#)
+            } else {
+                (200, "{}")
+            }
+        })
+        .await;
+        let listed = target
+            .sink()
+            .list_rejects(10)
+            .await
+            .expect("an empty quarantine");
+        assert_eq!(listed.1, 0);
+        assert!(listed.0.is_empty());
+        assert_eq!(target.seen().len(), 1, "{:?}", target.seen());
+    }
+
+    fn a_rejection() -> pg2osync_core::sink::Rejection {
+        pg2osync_core::sink::Rejection {
+            index: "orders".into(),
+            doc_id: "7".into(),
+            reason: "mapper_parsing_exception".into(),
+            lsn: Lsn(0x2A),
+            op: DocumentOp::Upsert {
+                index: "orders".into(),
+                id: "7".into(),
+                routing: None,
+                doc: json!({"amount": 3}),
+                version: Some(0x2A),
+                pipeline: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rejects_index_that_cannot_be_created_fails_the_quarantine() {
+        let target = FakeTarget::start(|line| match line {
+            "PUT /.pg2osync_rejects" => (500, r#"{"error":{"type":"illegal_state_exception"}}"#),
+            _ => (201, "{}"),
+        })
+        .await;
+        let result = target.sink().quarantine(&[a_rejection()]).await;
+        assert!(
+            matches!(result, Err(CoreError::Sink(_))),
+            "an index that was never created took a document: {result:?}"
+        );
+        assert_eq!(target.seen(), vec!["PUT /.pg2osync_rejects".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_rejects_index_that_already_exists_is_not_created_twice() {
+        let target = FakeTarget::start(|line| match line {
+            "PUT /.pg2osync_rejects" => (
+                400,
+                r#"{"error":{"type":"resource_already_exists_exception"}}"#,
+            ),
+            _ => (201, "{}"),
+        })
+        .await;
+        target
+            .sink()
+            .quarantine(&[a_rejection()])
+            .await
+            .expect("the existing index takes the document");
+        assert_eq!(target.seen().len(), 2, "{:?}", target.seen());
     }
 }
