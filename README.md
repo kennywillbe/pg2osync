@@ -97,7 +97,7 @@ not expressions) — if you need those, you want Kafka.
 | Re-snapshot one table (`resnapshot`) | ✅ on demand, `--where` to narrow it, safe beside the stream |
 | Survive one document the target refuses | ✅ opt-in quarantine with its position, bounded, replayable |
 | **Read-your-writes** (`/synced`) | ✅ wait for your own commit to be searchable |
-| Prometheus metrics | ✅ built-in endpoint |
+| Prometheus metrics | ✅ built-in endpoint, with a Grafana dashboard to import |
 
 ### Known limitations
 
@@ -299,7 +299,9 @@ needs no flag at all.
 
 **Metrics** — `GET http://127.0.0.1:9100/metrics`: events by type, batches
 flushed, sink errors, reconnects, commit-to-indexed latency quantiles, and the
-current/confirmed source position with the lag between them.
+current/confirmed source position with the lag between them. Import
+[deploy/grafana/pg2osync.json](deploy/grafana/pg2osync.json) for the dashboard
+built from those series.
 
 **Read-your-writes** — the pipeline is asynchronous, so a page that writes and
 then reads from search can race it. Enable `[api]` and call `GET /synced` after

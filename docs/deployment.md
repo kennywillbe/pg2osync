@@ -76,6 +76,7 @@ Key values:
 | `existingSecret` | `""` | Name of a Secret you manage; wins over `secrets` |
 | `persistence.enabled` | `false` | Enable for Meilisearch, whose checkpoint is a file |
 | `metrics.serviceMonitor.enabled` | `false` | Needs the Prometheus Operator CRDs |
+| `grafanaDashboard.enabled` | `false` | Ships `deploy/grafana/pg2osync.json` as a ConfigMap the Grafana sidecar picks up |
 | `probes.startup.failureThreshold` | `60` | 10 minutes of initial load headroom |
 
 `config.sync` is intentionally empty in the chart defaults: Helm merges maps, so

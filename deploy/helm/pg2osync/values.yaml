@@ -77,6 +77,20 @@ metrics:
     #   name: pg2osync-credentials
     #   key: PG2OSYNC_METRICS_TOKEN
 
+# deploy/grafana/pg2osync.json as a ConfigMap for the Grafana sidecar to pick
+# up. Off by default: a cluster without the sidecar just gets a ConfigMap
+# nothing reads.
+grafanaDashboard:
+  enabled: false
+  # The sidecar watches every namespace by default; set this when Grafana is
+  # configured to watch its own.
+  namespace: ""
+  label: grafana_dashboard
+  labelValue: "1"
+  labels: {}
+  # Rendered as the grafana_folder annotation when set.
+  folder: ""
+
 # The initial load of a large table happens before the endpoint answers, so the
 # startup probe must outlast it; liveness alone would restart the pod forever.
 probes:
