@@ -48,7 +48,13 @@ pub async fn run_for(
                 .join(", ")
         );
     };
+    // The spec as written is what the operator sees; the glob is what the
+    // target is asked about, and for a fixed index the two are the same name.
     let index = tbl.index_name(key);
+    let pattern = tbl
+        .index_target(key, &run::pk_columns_for(tbl))
+        .map_err(|e| anyhow::anyhow!("[sync.{key}] {e}"))?
+        .pattern();
     // A re-snapshot upserts rows; on a fanned table a row that shrank its
     // array would leave the dropped element documents behind, because the
     // delete half of fan-out comes from the WAL and a load has no log to
@@ -66,9 +72,9 @@ pub async fn run_for(
     // what the re-index recipe does before switching an alias onto it. The
     // mapping may belong to a different section feeding this index, so the
     // spec comes from the same place the pipeline's does.
-    let specs: Vec<IndexSpec> = run::index_specs(cfg)
+    let specs: Vec<IndexSpec> = run::index_specs(cfg)?
         .into_iter()
-        .filter(|spec| spec.name == index)
+        .filter(|spec| spec.name == pattern)
         .collect();
     sink.ensure_ready(&specs).await?;
 
@@ -147,8 +153,9 @@ pub async fn run_for(
     // `refresh_interval` is left alone throughout, unlike an initial load's:
     // this repairs an index that is in use, and hiding its ordinary writes for
     // the duration would be the wrong trade. One refresh at the end so whoever
-    // ran the command can see the result immediately.
-    if let Err(e) = sink.refresh(&[index]).await {
+    // ran the command can see the result immediately. A templated table's rows
+    // landed wherever they rendered, so the glob is what gets refreshed.
+    if let Err(e) = sink.refresh(&[pattern]).await {
         tracing::warn!(target: "pg2osync::resnapshot",
             "the re-snapshot is written, but the index could not be refreshed, so it \
              may not be searchable yet: {e}");

@@ -118,6 +118,23 @@ nothing the operator could change — but skipped, logged and counted, and the
 truncated table's documents stay until cleared by hand. A join pair escapes
 that: its relation name is exactly the set of documents to clear.
 
+**A row can choose its index; the rule is the id rule.** (#69.)
+`index = "events-{tenant}"` renders the index from a column, and a name
+derived from a column is the same problem as an id derived from one: the
+column can change, and the document is then in the old index. So it is the
+same template, rendered from the same raw row, through the same ladder — the
+row, else the before-image, else the bare key, else halt — and
+`(old index, old id) != (new index, new id)` is the move `id` already handles.
+The index is created on demand, at the first document that needs it, rather
+than ahead of time: pre-creating means enumerating a column's values, which
+nothing can do without querying the source for a search concern, and
+recording the glob and creating on first use keeps the mapping the operator
+configured. `reconcile` is refused because it pages one index by its key
+column, and a templated table's documents are spread over every index the
+template renders — there is no single index to page. And a template must
+carry a literal, because `TRUNCATE` clears what the template claims, and a
+claim of `*` is a claim on the cluster.
+
 **A column can be renamed in the target; the rename is the last step.**
 (`fields`, #66.) The source name is the one namespace the operator already
 knows, and the one every other check — projection, `transform`, `id`,

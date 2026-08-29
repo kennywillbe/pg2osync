@@ -161,8 +161,8 @@ email = "redact"                     # "redact" -> "***", "hash" -> SHA-256 pref
 # section declares an id, so their documents cannot collide by accident (the
 # templates are not compared; a collision between them is your declaration).
 # At most one section sets mapping_file. reconcile refuses a shared index, and
-# a TRUNCATE on any of its tables halts the pipeline: resnapshot that table
-# instead.
+# a TRUNCATE on any of its tables is skipped, logged and counted rather than
+# applied — clearing the index would wipe the other tables.
 # [sync.users]
 # table = "public.users"
 # index = "search"
@@ -172,3 +172,15 @@ email = "redact"                     # "redact" -> "***", "hash" -> SHA-256 pref
 # table = "public.orders"
 # index = "search"
 # id = "order-{id}"
+
+# A row chooses its index: {column} placeholders in `index`, the same grammar
+# as `id`, rendered from the raw row. A placeholder naming a column outside
+# the key needs REPLICA IDENTITY FULL (MySQL's binlog_row_image = FULL already
+# covers it). Each index is created the first time a row lands in it, with
+# mapping_file if set. A TRUNCATE clears every index the template can render
+# (events-*), which is why the template needs a literal part. reconcile and
+# switch-alias refuse a templated table; Meilisearch refuses the template.
+# [sync.events]
+# table = "public.events"
+# index = "events-{tenant}"
+# mapping_file = "events-mapping.json"

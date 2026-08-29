@@ -118,12 +118,45 @@ pub enum Health {
 /// Static description of one target index; passed before backfill starts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexSpec {
+    /// An index name, or — when `pattern` — the glob the rows of a templated
+    /// table render into.
     pub name: String,
     /// Mapping to create the index with, when the operator configured one.
     /// Never applied to an index that already exists: changing a mapping in
     /// place is refused by the target for anything that matters, and doing it
     /// implicitly would be a reindex nobody asked for.
     pub mapping: Option<Value>,
+    /// Whether `name` is a glob rather than an index. `ensure_ready` creates
+    /// nothing for one; it records the glob and the mapping so a name a row
+    /// renders can be created when the first document for it is written.
+    pub pattern: bool,
+}
+
+/// Whether `name` is one of the indices `pattern` claims. `*` stands for any
+/// run of characters; a pattern with no `*` matches only itself, so a fixed
+/// index is the same rule rather than a second branch.
+pub fn index_matches_pattern(pattern: &str, name: &str) -> bool {
+    let Some((head, tail)) = pattern.split_once('*') else {
+        return pattern == name;
+    };
+    let Some(mut rest) = name.strip_prefix(head) else {
+        return false;
+    };
+    // Each literal between two stars is matched at its leftmost occurrence:
+    // whatever a later, further-right match would leave for the star before
+    // it, the star after it can absorb instead, so nothing is lost by being
+    // greedy. The last literal has no star after it and must end the name.
+    let mut literals = tail.split('*').peekable();
+    while let Some(literal) = literals.next() {
+        if literals.peek().is_none() {
+            return rest.ends_with(literal);
+        }
+        let Some(at) = rest.find(literal) else {
+            return false;
+        };
+        rest = &rest[at + literal.len()..];
+    }
+    true
 }
 
 /// Index settings put aside while an initial load runs, so they can be put
@@ -161,6 +194,12 @@ pub trait Sink: Send + Sync {
     /// how one relation of a join pair is cleared without touching the other
     /// half of the index it shares. Kept as a field/value pair rather than a
     /// query so the caller never writes the target's query language.
+    ///
+    /// `index` may be a glob for a templated table — the `pattern` of its
+    /// `IndexSpec`, covering every index its rows rendered — since the source
+    /// truncated the table, not one of the indices. A target that cannot
+    /// resolve a glob refuses templated specs in `ensure_ready` instead of
+    /// clearing the wrong thing here.
     async fn truncate_index(
         &self,
         index: &str,
@@ -311,4 +350,60 @@ pub trait Sink: Send + Sync {
 
     /// Cheap health probe for /status and reconnect logic.
     async fn health(&self) -> Result<Health, CoreError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::index_matches_pattern;
+
+    #[test]
+    fn a_pattern_without_a_star_matches_only_itself() {
+        assert!(index_matches_pattern("events", "events"));
+        assert!(!index_matches_pattern("events", "events-1"));
+        assert!(!index_matches_pattern("events-1", "events"));
+    }
+
+    #[test]
+    fn a_trailing_star_claims_every_name_with_the_prefix() {
+        assert!(index_matches_pattern("events-*", "events-acme"));
+        assert!(index_matches_pattern("events-*", "events-"));
+        assert!(!index_matches_pattern("events-*", "orders-acme"));
+    }
+
+    #[test]
+    fn a_leading_star_claims_every_name_with_the_suffix() {
+        assert!(index_matches_pattern("*-events", "acme-events"));
+        assert!(!index_matches_pattern("*-events", "acme-orders"));
+    }
+
+    #[test]
+    fn a_star_in_the_middle_claims_a_prefix_and_a_suffix_at_once() {
+        assert!(index_matches_pattern(
+            "events-*-archive",
+            "events-2024-archive"
+        ));
+        assert!(index_matches_pattern("*-*-x", "a-b-c-x"));
+        assert!(!index_matches_pattern(
+            "events-*-archive",
+            "events-2024-live"
+        ));
+        assert!(!index_matches_pattern(
+            "events-*-archive",
+            "orders-2024-archive"
+        ));
+    }
+
+    #[test]
+    fn a_lone_star_claims_everything() {
+        assert!(index_matches_pattern("*", "anything"));
+        assert!(index_matches_pattern("*", ""));
+    }
+
+    #[test]
+    fn a_name_shorter_than_the_literals_is_not_claimed() {
+        assert!(!index_matches_pattern("events-*", "event"));
+        assert!(!index_matches_pattern("events-*-archive", "events-"));
+        // the two literals may not share the one character the name has
+        assert!(!index_matches_pattern("a*a", "a"));
+    }
 }

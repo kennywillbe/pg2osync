@@ -79,6 +79,7 @@ not expressions) — if you need those, you want Kafka.
 | Nested child collections (one level) | ✅ PostgreSQL and MySQL/MariaDB; the parent document embeds child arrays, resolved once per collection per transaction |
 | Parent-child as a join field (`join`) | ✅ OpenSearch and Elasticsearch; shared index, per-document routing, parent delete cascades to its children |
 | One index fed by several tables | ✅ each section declares an explicit id; reconcile refuses it, a TRUNCATE is skipped and counted |
+| A row chooses its index (`index = "events-{tenant}"`) | ✅ created on demand with your mapping; TRUNCATE clears the pattern; reconcile refuses |
 | Column projection (`columns` / `exclude_columns`) | ✅ |
 | Derived document ids (`id = "tenant-{tenant_id}-{id}"`) | ✅ default stays the primary key; non-key columns need `REPLICA IDENTITY FULL` |
 | One row to many documents (`fan_out` over a JSON-array column) | ✅ elements added, moved and removed as versioned writes |
@@ -118,6 +119,10 @@ Stated up front, because finding these out in production is expensive:
   `order-{id}`, not the bare key. `reconcile` refuses a shared index, and a
   `TRUNCATE` on one of its tables is skipped and logged rather than applied
   (a join pair clears its own relation).
+- **A per-row index (`index = "events-{tenant}"`) cannot be reconciled or
+  aliased.** `reconcile` and `switch-alias` refuse a templated table, and
+  Meilisearch refuses the template at startup: it has no mappings to create
+  an index with.
 - **MySQL needs `binlog_row_image = FULL`**, and refuses
   `binlog_row_value_options = PARTIAL_JSON`.
 - Ordering is guaranteed per row, not across tables.

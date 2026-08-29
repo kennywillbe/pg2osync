@@ -62,9 +62,26 @@ Enforced at config load (fails fast):
 - must start with a lowercase letter
 - must not start with `_` or `.` (reserved)
 
-Two tables may not map to the same index — document identity would be
-ambiguous — except as a join pair, where every document carries its own
-routing (see [Join fields](../configuration.md#join-fields)).
+Two tables may map to the same index as a join pair, where every document
+carries its own routing (see [Join fields](../configuration.md#join-fields)),
+or once every section feeding it declares an `id` (see
+[Sharing an index](../configuration.md#sharing-an-index)).
+
+`index` may also carry `{column}` placeholders — `events-{tenant}`, see
+[Per-row indices](../configuration.md#per-row-indices) — and the rules above
+then apply to the rendered name: a row that renders an uppercase letter, an
+empty value or a NULL halts the pipeline. Two things are different on this
+side of a templated table:
+
+- An index a row chooses is created on demand, when the first document for
+  it is written, with the section's `mapping_file` if one is set — the same
+  mapping a fixed index gets at startup, applied later because the name is
+  not known until the row is.
+- A `TRUNCATE` of a templated table clears the glob the template claims
+  (`events-*` for `events-{tenant}`): one search over the pattern, then one
+  versioned bulk delete per hit under the hit's own `_index`, so a row
+  committed after the truncate survives it. That is why a template must have
+  a literal part: `{tenant}` alone would claim `*`.
 
 ## Health & monitoring
 

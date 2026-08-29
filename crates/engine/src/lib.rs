@@ -13,7 +13,7 @@ pub mod http;
 pub mod mapping;
 pub mod metrics;
 
-use crate::mapping::TableMapping;
+use crate::mapping::{IdTemplate, IndexTarget, TableMapping};
 use pg2osync_core::checkpoint::{Checkpoint, StreamId};
 use pg2osync_core::error::CoreError;
 use pg2osync_core::event::{ChangeEvent, RowKind, TransactionBoundary};
@@ -471,18 +471,19 @@ pub async fn run(
                     // drops what it cannot map, and a panic in a worker thread
                     // is the worst way to find out it missed something — it
                     // takes the process down and every reconnect repeats it.
-                    let Some(index) = ctx.mapping.opt_index_for(&row.schema, &row.table) else {
+                    let Some(target) = ctx.mapping.target_for(&row.schema, &row.table) else {
                         tracing::error!(target: "pg2osync::engine",
                             "no index is configured for {}.{}; its rows are being dropped",
                             row.schema, row.table);
                         continue;
                     };
-                    let previous = completion_id(&row.kind, &rules, (&row.schema, &row.table))
-                        .and_then(|(id, _)| completions.get(&(index.to_string(), id)))
-                        .and_then(Option::as_ref);
+                    let previous =
+                        completion_key(&row.kind, &rules, &ctx.mapping, (&row.schema, &row.table))
+                            .and_then(|(key, _)| completions.get(&key))
+                            .and_then(Option::as_ref);
                     let mut left_as_is = Vec::new();
                     let ops = match materialize(
-                        index,
+                        target,
                         (&row.schema, &row.table),
                         &row.kind,
                         &rules,
@@ -533,13 +534,21 @@ pub async fn run(
                                 version: Some(version),
                                 ..
                             } => {
-                                // the empty check comes first so an ordinary row
-                                // never pays for building a lookup key
+                                // the empty checks come first so an ordinary row
+                                // never pays for building a lookup key; a clear
+                                // is keyed by what the TRUNCATE named, which
+                                // for a templated table is the pattern
                                 let dead = (!superseded.is_empty()
                                     && superseded
                                         .get(&(index.clone(), id.clone()))
                                         .is_some_and(|removed| removed > version))
-                                    || cleared.get(index.as_str()).is_some_and(|at| at > version);
+                                    || (!cleared.is_empty()
+                                        && cleared.iter().any(|(pattern, at)| {
+                                            at > version
+                                                && pg2osync_core::sink::index_matches_pattern(
+                                                    pattern, index,
+                                                )
+                                        }));
                                 if dead {
                                     ctx.metrics.incr_event("superseded");
                                     tracing::debug!(target: "pg2osync::engine",
@@ -610,10 +619,11 @@ pub async fn run(
                 version,
             } => {
                 ctx.metrics.incr_event("truncate");
-                let Some(index) = ctx.mapping.opt_index_for(&schema, &table) else {
+                let Some(target) = ctx.mapping.target_for(&schema, &table) else {
                     continue;
                 };
-                let index = index.to_string();
+                // every index the table's rows could have rendered into
+                let index = target.pattern();
                 // Clearing an index other tables feed would wipe rows the
                 // source never truncated, and nothing would put them back. A
                 // join member is cleared by its relation name, which is its
@@ -811,7 +821,7 @@ async fn sink_loop(
                 match sink.truncate_index(&index, version, only).await {
                     Ok(()) => {
                         tracing::info!(target: "pg2osync::sink",
-                        "index {index} cleared after TRUNCATE");
+                        "{index} cleared after TRUNCATE");
                         Ok(None)
                     }
                     Err(e) => Err(e),
@@ -1022,13 +1032,12 @@ async fn fetch_completions(
 ) -> Result<HashMap<(String, String), Option<Value>>, CoreError> {
     let mut wanted: HashMap<String, Vec<(String, Option<String>)>> = HashMap::new();
     for row in rows {
-        let Some((id, routing)) = completion_id(&row.kind, rules, (&row.schema, &row.table)) else {
+        let Some(((index, id), routing)) =
+            completion_key(&row.kind, rules, mapping, (&row.schema, &row.table))
+        else {
             continue;
         };
-        let Some(index) = mapping.opt_index_for(&row.schema, &row.table) else {
-            continue;
-        };
-        let ids = wanted.entry(index.to_string()).or_default();
+        let ids = wanted.entry(index).or_default();
         // the same row updated twice in one group needs one read, not two
         if !ids.iter().any(|(wanted, _)| *wanted == id) {
             ids.push((id, routing));
@@ -1145,27 +1154,60 @@ fn filter_out<'a>(
     }
 }
 
-/// The document id for the row state described by `doc`, or by `pk` alone
-/// for a delete. Identity renders from the RAW values — before projections
-/// and before transforms — and a missing or NULL column is an error naming
-/// the table and column: an id that quietly changed would strand the
-/// documents the row already owns.
-fn derived_id(
+/// What the render ladder needs of a template. The id template and the index
+/// target both go through it, so identity and index cannot drift: one place
+/// decides which state of the row a name renders from.
+trait RowTemplate {
+    fn render(&self, doc: &Value) -> Result<String, String>;
+    fn render_from_pk(&self, pk: &Value) -> Result<String, String>;
+    fn is_pk_only(&self) -> bool;
+}
+
+impl RowTemplate for IdTemplate {
+    fn render(&self, doc: &Value) -> Result<String, String> {
+        IdTemplate::render(self, doc)
+    }
+    fn render_from_pk(&self, pk: &Value) -> Result<String, String> {
+        IdTemplate::render_from_pk(self, pk)
+    }
+    fn is_pk_only(&self) -> bool {
+        IdTemplate::is_pk_only(self)
+    }
+}
+
+impl RowTemplate for IndexTarget {
+    fn render(&self, doc: &Value) -> Result<String, String> {
+        IndexTarget::render(self, doc)
+    }
+    fn render_from_pk(&self, pk: &Value) -> Result<String, String> {
+        IndexTarget::render_from_pk(self, pk)
+    }
+    fn is_pk_only(&self) -> bool {
+        IndexTarget::is_pk_only(self)
+    }
+}
+
+/// The value a template renders for one row state: from the row when there
+/// is one, from the before-image for a key-only event, from the bare key when
+/// the template names only key columns. Everything renders from the RAW
+/// values — before projections and before transforms — and a missing or NULL
+/// column is an error naming the table and column: a name that quietly
+/// changed would strand the documents the row already owns. `what` is "id" or
+/// "index", so the halt says which option it came from.
+fn render_for_row(
+    what: &str,
     table: (&str, &str),
+    template: &impl RowTemplate,
     pk: &Value,
     doc: Option<&Value>,
     before: Option<&Value>,
-    templates: &crate::mapping::IdTemplates,
 ) -> Result<String, CoreError> {
     let halt = |e: String| CoreError::Other(format!("{}.{}: {e}", table.0, table.1));
-    let Some(template) = templates.for_table(table.0, table.1) else {
-        return Ok(pk_to_id(pk));
-    };
     if let Some(doc) = doc {
         return template.render(doc).map_err(halt);
     }
     // A key-only event. The before-image, when the source carries one, is
-    // the row exactly as the target last saw it, so it renders the id the
+    // the row exactly as the target last saw it, so it renders the name the
     // current document is filed under. Without it the key alone has to be
     // enough: `is_pk_only` is decided from the *configured* key, which can
     // claim a single column where the real key is composite, so it is used
@@ -1177,33 +1219,62 @@ fn derived_id(
     if template.is_pk_only() || pk.is_object() {
         return template.render_from_pk(pk).map_err(halt);
     }
-    Err(halt(
-        "the configured id needs columns outside the primary key, but this event \
+    Err(halt(format!(
+        "the configured {what} needs columns outside the primary key, but this event \
          carries no before-image; the table needs REPLICA IDENTITY FULL"
-            .into(),
-    ))
+    )))
 }
 
-/// The document id whose stored copy completes this change, and the routing
+/// The document id for the row state described by `doc`, or by `pk` alone
+/// for a delete.
+fn derived_id(
+    table: (&str, &str),
+    pk: &Value,
+    doc: Option<&Value>,
+    before: Option<&Value>,
+    templates: &crate::mapping::IdTemplates,
+) -> Result<String, CoreError> {
+    let Some(template) = templates.for_table(table.0, table.1) else {
+        return Ok(pk_to_id(pk));
+    };
+    render_for_row("id", table, template, pk, doc, before)
+}
+
+/// The index for the row state described by `doc`, or by `pk` alone for a
+/// delete — the same ladder as the id, because a per-row index is the same
+/// problem. A fixed index renders itself whatever the row is.
+fn rendered_index(
+    target: &IndexTarget,
+    table: (&str, &str),
+    pk: &Value,
+    doc: Option<&Value>,
+    before: Option<&Value>,
+) -> Result<String, CoreError> {
+    render_for_row("index", table, target, pk, doc, before)
+}
+
+/// The `(index, id)` whose stored copy completes this change, and the routing
 /// it is stored under, if one is needed.
 ///
-/// A row whose key changed is still filed under the old id, so completing from
-/// the new one would write the unchanged columns as null. The old id is what
-/// the template rendered for the row's previous state: for a key-only
-/// template that is the previous key, otherwise the before-image. The routing
-/// follows the same rule: a re-parented child is still on its old parent's
-/// shard, which is where the read has to go.
-fn completion_id(
+/// Every part describes the row's *previous* state: a row whose id or index
+/// moved is still filed where it was, so completing from the new one would
+/// write the unchanged columns as null. The old name is what the template
+/// rendered for that state: for a key-only template the previous key,
+/// otherwise the before-image. The routing follows the same rule: a
+/// re-parented child is still on its old parent's shard, which is where the
+/// read has to go.
+fn completion_key(
     kind: &RowKind,
     rules: &Rules<'_>,
+    mapping: &TableMapping,
     table: (&str, &str),
-) -> Option<(String, Option<String>)> {
+) -> Option<((String, String), Option<String>)> {
     let RowKind::Update {
         pk,
         previous_pk,
+        doc,
         unchanged_toast_columns,
         before,
-        ..
     } = kind
     else {
         return None;
@@ -1211,12 +1282,19 @@ fn completion_id(
     if unchanged_toast_columns.is_empty() {
         return None;
     }
-    // a routing that cannot be derived is left to the write path, which
-    // halts naming the table and the column
+    let old_pk = previous_pk.as_ref().unwrap_or(pk);
+    // a name or routing that cannot be derived is left to the write path,
+    // which halts naming the table and the column
+    let target = mapping.target_for(table.0, table.1)?;
+    let index = match before {
+        Some(before) => target.render(before).ok()?,
+        None if target.is_pk_only() => target.render_from_pk(old_pk).ok()?,
+        None => target.render(doc).ok()?,
+    };
     let routing = rules
         .joins
         .for_table(table.0, table.1)
-        .map(|join| join.routing_for_key(before.as_ref(), previous_pk.as_ref().unwrap_or(pk)))
+        .map(|join| join.routing_for_key(before.as_ref(), old_pk))
         .transpose()
         .ok()?
         .flatten();
@@ -1227,13 +1305,13 @@ fn completion_id(
             Some(previous) if previous != id => previous,
             _ => id,
         };
-        return Some((id, routing));
+        return Some(((index, id), routing));
     };
     if template.is_pk_only() {
         return template
-            .render_from_pk(previous_pk.as_ref().unwrap_or(pk))
+            .render_from_pk(old_pk)
             .ok()
-            .map(|id| (id, routing));
+            .map(|id| ((index, id), routing));
     }
     // the row's previous document carries the before-image's id, when there
     // is one; without it there is nothing to complete against and the write
@@ -1242,19 +1320,19 @@ fn completion_id(
         .as_ref()
         .and_then(|b| template.render(b).ok())
         .or_else(|| template.render_from_pk(pk).ok())
-        .map(|id| (id, routing))
+        .map(|id| ((index, id), routing))
 }
 
 /// Convert one row change into document operations, completing unchanged-TOAST
 /// columns from the previously indexed document when needed.
 ///
 /// `previous` is the document already in the target, which the caller fetches
-/// when `completion_id` asked for one. Doing it here would mean one round-trip
+/// when `completion_key` asked for one. Doing it here would mean one round-trip
 /// per row in the middle of the pipeline; measured on 20k updates to a table
 /// with an 8 kB TOASTed column, that was the difference between 1,800 and
 /// 4,400 rows per second.
 fn materialize(
-    index: &str,
+    target: &IndexTarget,
     table: (&str, &str),
     kind: &RowKind,
     rules: &Rules<'_>,
@@ -1271,7 +1349,7 @@ fn materialize(
         lsn: PENDING_LSN,
         op,
     };
-    let upsert = |id: String, routing: Option<String>, doc: Value| {
+    let upsert = |index: &str, id: String, routing: Option<String>, doc: Value| {
         mk(DocumentOp::Upsert {
             index: index.into(),
             id,
@@ -1280,7 +1358,7 @@ fn materialize(
             version,
         })
     };
-    let delete = |id: String, routing: Option<String>| {
+    let delete = |index: &str, id: String, routing: Option<String>| {
         mk(DocumentOp::Delete {
             index: index.into(),
             id,
@@ -1289,10 +1367,11 @@ fn materialize(
         })
     };
     let halt = |e: String| CoreError::Other(format!("{}.{}: {e}", table.0, table.1));
-    // Identity renders from the row's RAW values, so every derivation below
-    // reads the document before projections and transforms touch it; renames
-    // run after those, so nothing but the target ever sees the new names, and
-    // constants after that: they are not columns, a projection would strip them.
+    // Identity — and the index, which is identity's twin — renders from the
+    // row's RAW values, so every derivation below reads the document before
+    // projections and transforms touch it; renames run after those, so
+    // nothing but the target ever sees the new names, and constants after
+    // that: they are not columns, a projection would strip them.
     let fan = rules.fan_outs.for_table(table.0, table.1);
     let join = rules.joins.for_table(table.0, table.1);
     let shape = |base: &str, doc: &Value| -> Result<Vec<(String, Value)>, CoreError> {
@@ -1312,7 +1391,8 @@ fn materialize(
     // `shaped` names the columns completed from the stored document: they
     // went through the transforms when they were first written, so they must
     // not go through them again
-    let finish = |docs: Vec<(String, Value)>,
+    let finish = |index: &str,
+                  docs: Vec<(String, Value)>,
                   filed: Option<(Value, Option<String>)>,
                   shaped: &[String],
                   left: &mut Vec<String>| {
@@ -1340,7 +1420,7 @@ fn materialize(
                     }
                     _ => None,
                 };
-                upsert(id, routing, doc)
+                upsert(index, id, routing, doc)
             })
             .collect()
     };
@@ -1369,8 +1449,9 @@ fn materialize(
     match kind {
         RowKind::Insert { pk, doc } => {
             let base = derived_id(table, pk, Some(doc), None, rules.id_templates)?;
+            let index = rendered_index(target, table, pk, Some(doc), None)?;
             let filed = file(doc)?;
-            Ok(finish(shape(&base, doc)?, filed, &[], left_as_is))
+            Ok(finish(&index, shape(&base, doc)?, filed, &[], left_as_is))
         }
         RowKind::Update {
             pk,
@@ -1384,11 +1465,15 @@ fn materialize(
                 None => (doc.clone(), Vec::new()),
             };
             let before = before.as_ref();
+            let old_pk = previous_pk.as_ref().unwrap_or(pk);
+            // the completed document is what identity renders from, so the
+            // index sees the same row and the two cannot disagree
             let base = derived_id(table, pk, Some(&doc), before, rules.id_templates)?;
+            let index = rendered_index(target, table, pk, Some(&doc), before)?;
             let filed = file(&doc)?;
             let routing = filed.as_ref().and_then(|(_, routing)| routing.clone());
             let new_docs = shape(&base, &doc)?;
-            let mut ops = finish(new_docs.clone(), filed, &completed, left_as_is);
+            let mut ops = finish(&index, new_docs.clone(), filed, &completed, left_as_is);
             // write first, delete second: a crash between them leaves a
             // duplicate that the replay repairs, where the reverse order would
             // leave a gap that nothing repairs
@@ -1400,29 +1485,32 @@ fn materialize(
                 // than a delete nobody asked for; lingering stale documents
                 // are the reconcile tool's to find.
                 if let Some(before) = before {
-                    let old_base = derived_id(
-                        table,
-                        previous_pk.as_ref().unwrap_or(pk),
-                        None,
-                        Some(before),
-                        rules.id_templates,
-                    )?;
-                    let held: std::collections::HashSet<&str> =
-                        new_docs.iter().map(|(id, _)| id.as_str()).collect();
+                    let old_base =
+                        derived_id(table, old_pk, None, Some(before), rules.id_templates)?;
+                    let old_index = rendered_index(target, table, old_pk, None, Some(before))?;
+                    // One row, one index: every element document went where
+                    // the row did, so when the row moved index nothing in the
+                    // old one is held any more, whatever its id.
+                    let held: std::collections::HashSet<&str> = if old_index == index {
+                        new_docs.iter().map(|(id, _)| id.as_str()).collect()
+                    } else {
+                        std::collections::HashSet::new()
+                    };
                     for (id, _) in crate::mapping::fan_out_docs(rule, &old_base, before)
                         .map_err(|e| halt(format!("before-image of a fanned row: {e}")))?
                     {
                         if !held.contains(id.as_str()) {
-                            ops.push(delete(id, None));
+                            ops.push(delete(&old_index, id, None));
                         }
                     }
                 }
             } else {
                 // A changed key means the row moved to a different document,
-                // and a changed parent means it moved to a different shard,
-                // where the target will not overwrite the old copy. Either
-                // way the old one still holds the previous version and has to
-                // be removed, or nothing will ever collect it. An old id that
+                // a changed index column that it moved to a different index,
+                // and a changed parent that it moved to a different shard;
+                // in every case the target will not overwrite the old copy,
+                // which still holds the previous version and has to be
+                // removed, or nothing will ever collect it. An old name that
                 // cannot be told is taken to be the current one, which is
                 // what leaving it alone has always meant.
                 let old_id = match rules.id_templates.for_table(table.0, table.1) {
@@ -1433,13 +1521,19 @@ fn materialize(
                     Some(t) => before.and_then(|b| t.render(b).ok()),
                 }
                 .unwrap_or_else(|| base.clone());
+                let old_index = match before {
+                    Some(b) => target.render(b).ok(),
+                    None if target.is_pk_only() => target.render_from_pk(old_pk).ok(),
+                    None => None,
+                }
+                .unwrap_or_else(|| index.clone());
                 let old_routing = join
-                    .map(|rule| rule.routing_for_key(before, previous_pk.as_ref().unwrap_or(pk)))
+                    .map(|rule| rule.routing_for_key(before, old_pk))
                     .transpose()
                     .map_err(halt)?
                     .flatten();
-                if (&old_id, &old_routing) != (&base, &routing) {
-                    ops.push(delete(old_id, old_routing));
+                if (&old_index, &old_id, &old_routing) != (&index, &base, &routing) {
+                    ops.push(delete(&old_index, old_id, old_routing));
                 }
             }
             Ok(ops)
@@ -1447,6 +1541,9 @@ fn materialize(
         RowKind::Delete { pk, before } => {
             let before = before.as_ref();
             let base = derived_id(table, pk, None, before, rules.id_templates)?;
+            // the before-image names the index the document is in; a
+            // template it cannot satisfy halts, as the startup check promised
+            let index = rendered_index(target, table, pk, None, before)?;
             match fan {
                 None => {
                     let routing = join
@@ -1454,7 +1551,7 @@ fn materialize(
                         .transpose()
                         .map_err(halt)?
                         .flatten();
-                    let mut ops = vec![delete(base.clone(), routing)];
+                    let mut ops = vec![delete(&index, base.clone(), routing)];
                     // A parent's children live on its shard and know nothing
                     // of its deletion; they go after the parent, at the same
                     // position, so a child written later still survives.
@@ -1462,7 +1559,7 @@ fn materialize(
                         && rule.parent.is_none()
                     {
                         ops.push(mk(DocumentOp::DeleteChildren {
-                            index: index.into(),
+                            index,
                             field: rule.field.clone(),
                             parent_name: rule.name.clone(),
                             parent_id: base,
@@ -1482,7 +1579,7 @@ fn materialize(
                     Ok(crate::mapping::fan_out_docs(rule, &base, row)
                         .map_err(halt)?
                         .into_iter()
-                        .map(|(id, _)| delete(id, None))
+                        .map(|(id, _)| delete(&index, id, None))
                         .collect())
                 }
             }
@@ -1554,6 +1651,10 @@ mod pipeline_tests {
         /// What a read-back returns beyond the id; unset keeps the fixed
         /// `bio: stored` shape the older tests rely on.
         stored: Mutex<Option<Value>>,
+        /// Render every document as `index/id` — opted into by the tests
+        /// about which index a row landed in, so the expectations of every
+        /// other test stay byte-identical.
+        show_index: bool,
     }
 
     impl RecordingSink {
@@ -1572,6 +1673,13 @@ mod pipeline_tests {
         fn store(&self, doc: Value) {
             *self.stored.lock().expect("not poisoned") = Some(doc);
         }
+        fn placed(&self, index: &str, id: &str) -> String {
+            if self.show_index {
+                format!("{index}/{id}")
+            } else {
+                id.to_string()
+            }
+        }
         fn last_checkpoint(&self) -> Option<Checkpoint> {
             self.checkpoints
                 .lock()
@@ -1589,16 +1697,19 @@ mod pipeline_tests {
 
         async fn get_documents(
             &self,
-            _index: &str,
+            index: &str,
             ids: &[(String, Option<String>)],
         ) -> Result<Vec<Option<Value>>, CoreError> {
             // rendered as `id` or `id->routing`, so the older expectations
             // stay byte-identical while a routed read-back is still visible
             let asked: Vec<String> = ids
                 .iter()
-                .map(|(id, routing)| match routing {
-                    Some(r) => format!("{id}->{r}"),
-                    None => id.clone(),
+                .map(|(id, routing)| {
+                    let id = self.placed(index, id);
+                    match routing {
+                        Some(r) => format!("{id}->{r}"),
+                        None => id,
+                    }
                 })
                 .collect();
             self.events
@@ -1654,24 +1765,30 @@ mod pipeline_tests {
                 }));
             // `->routing` only when there is one, so the expectations of every
             // test about an unrouted table stay byte-identical
-            let target = |id: &str, routing: &Option<String>| match routing {
-                Some(r) => format!("{id}->{r}"),
-                None => id.to_string(),
+            let target = |index: &str, id: &str, routing: &Option<String>| {
+                let id = self.placed(index, id);
+                match routing {
+                    Some(r) => format!("{id}->{r}"),
+                    None => id,
+                }
             };
             let rendered: Vec<String> = batch
                 .iter()
                 .map(|op| match &op.op {
                     DocumentOp::Upsert {
+                        index,
                         id,
                         routing,
                         version,
                         ..
                     } => match version {
-                        Some(v) => format!("upsert:{}@{v}", target(id, routing)),
-                        None => format!("upsert:{}", target(id, routing)),
+                        Some(v) => format!("upsert:{}@{v}", target(index, id, routing)),
+                        None => format!("upsert:{}", target(index, id, routing)),
                     },
-                    DocumentOp::Delete { id, routing, .. } => {
-                        format!("delete:{}", target(id, routing))
+                    DocumentOp::Delete {
+                        index, id, routing, ..
+                    } => {
+                        format!("delete:{}", target(index, id, routing))
                     }
                     DocumentOp::DeleteChildren {
                         field,
@@ -3651,6 +3768,302 @@ mod pipeline_tests {
         )
         .await;
         assert_eq!(sink.events(), vec!["write[delete:user-7-a]"]);
+    }
+
+    /// `public.users` filed under the index its row renders from `spec`, with
+    /// the sink showing where each document went. Reports how the engine
+    /// ended, for the tests that are about a halt.
+    async fn drive_indexed(
+        spec: &str,
+        ids: crate::mapping::IdTemplates,
+        fan: crate::mapping::FanOuts,
+        filters: crate::mapping::Filters,
+        sink: Arc<RecordingSink>,
+        script: Vec<ChangeEvent>,
+    ) -> Result<(), CoreError> {
+        let (events_tx, events_rx) = mpsc::channel(1024);
+        let (copy_tx, copy_rx) = mpsc::channel(1024);
+        drop(copy_tx);
+        let (ack_tx, _ack_rx) = watch::channel(None);
+        let (load_done_tx, _load_done_rx) = watch::channel(0u64);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let target = IndexTarget::Template {
+            spec: spec.into(),
+            template: crate::mapping::IdTemplate::parse(spec, &["id".to_string()])
+                .expect("valid template"),
+        };
+        let ctx = Arc::new(PipelineCtx {
+            sink,
+            mapping: TableMapping::from_pairs([(
+                ("public".to_string(), "users".to_string()),
+                target,
+            )]),
+            projections: crate::mapping::Projections::default(),
+            transforms: crate::mapping::Transforms::default(),
+            renames: crate::mapping::Renames::default(),
+            constants: crate::mapping::Constants::default(),
+            id_templates: ids,
+            fan_outs: fan,
+            joins: crate::mapping::Joins::default(),
+            filters,
+            cfg: EngineConfig {
+                batch_size: 500,
+                checkpoint_interval_ms: 100,
+                ..EngineConfig::default()
+            },
+            ack_tx,
+            load_done_tx,
+            metrics: Arc::new(crate::metrics::Metrics::default()),
+        });
+        for event in script {
+            events_tx.send(event).await.expect("channel has room");
+        }
+        drop(events_tx);
+        run(
+            events_rx,
+            copy_rx,
+            ctx,
+            StreamId {
+                source: SOURCE_POSTGRES.into(),
+                stream: "slot".into(),
+                publication: "pub".into(),
+            },
+            Arc::new(|token| Lsn(token).to_string()),
+            crate::mapping::DurableLsn::default(),
+            shutdown_rx,
+        )
+        .await
+    }
+
+    fn placing_sink() -> Arc<RecordingSink> {
+        Arc::new(RecordingSink {
+            show_index: true,
+            ..RecordingSink::default()
+        })
+    }
+
+    fn tenant_moved(id: i64, from: &str, to: &str, version: u64) -> ChangeEvent {
+        ChangeEvent::Row(RowChange {
+            schema: "public".into(),
+            table: "users".into(),
+            kind: RowKind::Update {
+                pk: json!(id),
+                previous_pk: None,
+                doc: json!({"id": id, "tenant": to}),
+                unchanged_toast_columns: vec![],
+                before: Some(json!({"id": id, "tenant": from})),
+            },
+            version: Some(version),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_row_that_changes_its_index_is_written_in_the_new_one_and_deleted_from_the_old() {
+        // the index column changed, so the old index still holds the row and
+        // nothing about the write to the new one touches it
+        let sink = placing_sink();
+        drive_indexed(
+            "events-{tenant}",
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            sink.clone(),
+            vec![tenant_moved(1, "acme", "globex", 0x200), commit(0x200)],
+        )
+        .await
+        .expect("engine ran");
+        assert_eq!(
+            sink.events(),
+            vec!["write[upsert:events-globex/1@512 delete:events-acme/1]"],
+            "write in the new index first, remove from the old one second"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fanned_row_keeps_every_document_in_the_index_its_row_chose() {
+        let update = |id: i64, from: &str, to: &str, before_tags: Value, tags: Value| {
+            ChangeEvent::Row(RowChange {
+                schema: "public".into(),
+                table: "users".into(),
+                kind: RowKind::Update {
+                    pk: json!(id),
+                    previous_pk: None,
+                    doc: json!({"id": id, "tenant": to, "tags": tags}),
+                    unchanged_toast_columns: vec![],
+                    before: Some(json!({"id": id, "tenant": from, "tags": before_tags})),
+                },
+                version: Some(0x200),
+            })
+        };
+        let sink = placing_sink();
+        drive_indexed(
+            "events-{tenant}",
+            users_ids("user-{id}", &["id"]),
+            users_fan("tags", "user-{id}-{tags}"),
+            Default::default(),
+            sink.clone(),
+            vec![
+                // row 7 moves index: every element goes with it, and every
+                // old element document is removed where it was, even the
+                // ones whose id survived
+                update(7, "acme", "globex", json!(["a", "b"]), json!(["a", "c"])),
+                // row 8 stays: only the dropped element is removed
+                update(8, "acme", "acme", json!(["a", "b"]), json!(["a", "c"])),
+                commit(0x200),
+            ],
+        )
+        .await
+        .expect("engine ran");
+        assert_eq!(
+            sink.events(),
+            vec![
+                "write[upsert:events-globex/user-7-a@512 upsert:events-globex/user-7-c@512 \
+                 delete:events-acme/user-7-a delete:events-acme/user-7-b \
+                 upsert:events-acme/user-8-a@512 upsert:events-acme/user-8-c@512 \
+                 delete:events-acme/user-8-b]"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_row_that_leaves_the_filter_is_deleted_from_the_index_it_was_in() {
+        // the filter turns the update into a delete carrying the before-image,
+        // and the before-image is what says which index the document is in
+        let sink = placing_sink();
+        drive_indexed(
+            "events-{tenant}",
+            Default::default(),
+            Default::default(),
+            users_filter("status = 'active'"),
+            sink.clone(),
+            vec![
+                updated(
+                    7,
+                    json!({"id": 7, "tenant": "acme", "status": "active"}),
+                    json!({"id": 7, "tenant": "globex", "status": "archived"}),
+                ),
+                commit(0x100),
+            ],
+        )
+        .await
+        .expect("engine ran");
+        assert_eq!(sink.events(), vec!["write[delete:events-acme/7]"]);
+    }
+
+    #[tokio::test]
+    async fn a_truncate_of_a_templated_table_clears_the_pattern() {
+        let sink = placing_sink();
+        drive_indexed(
+            "events-{tenant}",
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            sink.clone(),
+            vec![ChangeEvent::TableTruncated {
+                schema: "public".into(),
+                table: "users".into(),
+                version: Some(0x100),
+            }],
+        )
+        .await
+        .expect("engine ran");
+        assert_eq!(
+            sink.events(),
+            vec!["truncate(events-*)"],
+            "every index the template could have rendered is cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_index_column_that_renders_an_illegal_name_halts() {
+        let error = drive_indexed(
+            "events-{tenant}",
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            placing_sink(),
+            vec![
+                row_doc(7, json!({"id": 7, "tenant": "ACME"})),
+                commit(0x100),
+            ],
+        )
+        .await
+        .expect_err("a name the target would refuse must stop the pipeline");
+        let message = error.to_string();
+        assert!(
+            message.contains("public.users")
+                && message.contains("events-{tenant}")
+                && message.contains("events-ACME")
+                && message.contains("tenant")
+                && message.contains("lowercase"),
+            "the halt must name the table, the template, the column and what it rendered: \
+             {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_null_in_an_index_column_halts() {
+        let error = drive_indexed(
+            "events-{tenant}",
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            placing_sink(),
+            vec![row_doc(7, json!({"id": 7, "tenant": null})), commit(0x100)],
+        )
+        .await
+        .expect_err("a NULL where an index needs a value must stop the pipeline");
+        let message = error.to_string();
+        assert!(
+            message.contains("public.users")
+                && message.contains("tenant")
+                && message.contains("NULL"),
+            "the halt must name the table and the column: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_toast_completion_reads_the_index_the_document_was_in() {
+        // the stored document is in the old index until this update moves
+        // it, so that is where the read has to go
+        let sink = placing_sink();
+        sink.store(json!({"bio": "stored"}));
+        drive_indexed(
+            "events-{tenant}",
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            sink.clone(),
+            vec![
+                ChangeEvent::Row(RowChange {
+                    schema: "public".into(),
+                    table: "users".into(),
+                    kind: RowKind::Update {
+                        pk: json!(1),
+                        previous_pk: None,
+                        doc: json!({"id": 1, "tenant": "globex", "bio": null}),
+                        unchanged_toast_columns: vec!["bio".into()],
+                        before: Some(json!({"id": 1, "tenant": "acme"})),
+                    },
+                    version: Some(0x200),
+                }),
+                commit(0x200),
+            ],
+        )
+        .await
+        .expect("engine ran");
+        assert_eq!(
+            sink.events(),
+            vec![
+                "read(events-acme/1)",
+                "write[upsert:events-globex/1@512 delete:events-acme/1]"
+            ]
+        );
+        assert_eq!(
+            sink.doc("1").and_then(|d| d.get("bio").cloned()),
+            Some(json!("stored")),
+            "the unchanged column was completed from the old index's copy"
+        );
     }
 
     /// A customer/order pair sharing the `shop` index under the `relation`
