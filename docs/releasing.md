@@ -42,6 +42,9 @@ consider zero commits and propose nothing.
 Watch the **Release** workflow afterwards. It builds static binaries for Linux
 and macOS on x86-64 and arm64, attaches them with checksums, and pushes
 `ghcr.io/kennywillbe/pg2osync` tagged with the version and with `major.minor`.
+The release body starts as the changelog entry release-please wrote; once the
+binaries are attached, the workflow appends GitHub's "What's Changed" pull
+request list under it, once.
 
 ## The one thing to set up
 

@@ -47,9 +47,9 @@ document in the same change and say why.
 - Async everywhere with tokio; never block the runtime.
 - Secrets never appear in logs, errors, or fixtures.
 - English for all code, comments, commits and documentation.
-- No changelog file. Release notes are generated from commits and pull requests
-  on GitHub at release time, so the commit message is where a change explains
-  itself.
+- Never edit `crates/bin/CHANGELOG.md` by hand: release-please writes it from
+  the commit subjects at release time, so the commit message is where a change
+  explains itself.
 
 ## Definition of done
 
