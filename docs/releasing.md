@@ -8,15 +8,14 @@ automatically: the version, the changelog and the tag are each an explicit act.
 Every push to `main` runs [release-please](https://github.com/googleapis/release-please),
 which reads the [Conventional Commits](https://www.conventionalcommits.org/)
 since the last release and keeps **one open pull request** up to date — the
-release PR. Every crate that changed takes the release version — a crate
-nothing touched keeps the version it had, which is why the workspace shows
-mixed versions and why that is not a fault — and the entry is written into
-`crates/bin/CHANGELOG.md`, the binary's changelog. The file lives inside the
-crate rather than at the repository root because release-please writes only
-within the package it releases from — a `changelog-path` that climbs out with
-`../` is refused. The library crates skip their own changelog and GitHub
-release: there is one tag and one release per version, and the crates are not
-published separately.
+release PR. The binary crate is the one thing release-please versions: it
+bumps `crates/bin/Cargo.toml`, keeps `Cargo.lock` in step, and writes the entry
+into `crates/bin/CHANGELOG.md`. The file lives inside the crate rather than at
+the repository root because release-please writes only within the package it
+releases from — a `changelog-path` that climbs out with `../` is refused. The
+library crates are internal to the workspace and are not published, so their
+versions are not tracked at all: one package, one tag, one release, one
+changelog.
 
 ```
 merge a feature PR   →  release PR updated. Nothing released.
