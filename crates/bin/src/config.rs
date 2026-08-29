@@ -245,6 +245,11 @@ pub struct TableSync {
     /// rule, so the rest of this section keeps naming source columns.
     #[serde(default)]
     pub fields: std::collections::HashMap<String, String>,
+    /// Fields that come from no column: literal values added last, after
+    /// projection, transforms and renames. `{schema}`/`{table}` in a string
+    /// render once at startup.
+    #[serde(default)]
+    pub constants: std::collections::HashMap<String, Constant>,
     /// One-to-many children embedded as JSON arrays (single level, 0.3).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<ChildJoin>,
@@ -257,6 +262,89 @@ pub struct TableSync {
     /// or malformed file fails before anything connects.
     #[serde(skip)]
     pub mapping: Option<serde_json::Value>,
+}
+
+/// A value for a field that comes from no column. Scalars only: an object or
+/// an array as a constant is a document shape nobody asked for, and a TOML
+/// datetime has no unambiguous target type.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Constant {
+    Str(String),
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+}
+
+/// Hand-written rather than `#[serde(untagged)]`: the untagged form reports
+/// "did not match any variant" without naming the key, and a datetime reaches
+/// it as a map with a private marker, which reads as nonsense. A visitor lets
+/// serde say which key held what, and what was expected instead.
+impl<'de> Deserialize<'de> for Constant {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Scalar;
+        impl serde::de::Visitor<'_> for Scalar {
+            type Value = Constant;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a string, integer, float or boolean")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Constant, E> {
+                Ok(Constant::Str(v.to_owned()))
+            }
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Constant, E> {
+                Ok(Constant::Str(v))
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Constant, E> {
+                Ok(Constant::Int(v))
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Constant, E> {
+                i64::try_from(v)
+                    .map(Constant::Int)
+                    .map_err(|_| E::custom("integer is too large for an i64"))
+            }
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Constant, E> {
+                Ok(Constant::Float(v))
+            }
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Constant, E> {
+                Ok(Constant::Bool(v))
+            }
+        }
+        deserializer.deserialize_any(Scalar)
+    }
+}
+
+impl Constant {
+    /// The JSON the document carries. `{schema}` and `{table}` are the only
+    /// placeholders, rendered here from the section's table so the engine
+    /// never sees a template. A string without a brace is taken verbatim,
+    /// which is what keeps `note = ""` a value rather than a grammar error.
+    pub fn render(
+        &self,
+        schema: &str,
+        table: &str,
+    ) -> std::result::Result<serde_json::Value, String> {
+        use pg2osync_engine::mapping::IdTemplate;
+        match self {
+            Self::Int(v) => Ok(serde_json::json!(v)),
+            Self::Float(v) => Ok(serde_json::json!(v)),
+            Self::Bool(v) => Ok(serde_json::json!(v)),
+            Self::Str(s) if !s.contains('{') => Ok(serde_json::json!(s)),
+            Self::Str(s) => {
+                let template = IdTemplate::parse(s, &[]).map_err(|e| e.to_string())?;
+                if let Some(name) = template
+                    .columns()
+                    .into_iter()
+                    .find(|c| *c != "schema" && *c != "table")
+                {
+                    return Err(format!(
+                        "placeholder {{{name}}} is not one of {{schema}}/{{table}}"
+                    ));
+                }
+                template
+                    .render(&serde_json::json!({ "schema": schema, "table": table }))
+                    .map(serde_json::Value::String)
+            }
+        }
+    }
 }
 
 /// One array column fanned out into one document per element. `id` is the
@@ -293,6 +381,18 @@ pub struct ChildJoin {
     /// Target field names inside the embedded array, child column → field.
     #[serde(default)]
     pub fields: std::collections::HashMap<String, String>,
+}
+
+impl ChildJoin {
+    /// Every name this child writes on the parent document: the array, and
+    /// the two fields a capped array reports itself with.
+    fn claimed_fields(&self) -> [String; 3] {
+        [
+            self.field.clone(),
+            format!("{}_truncated", self.field),
+            format!("{}_total", self.field),
+        ]
+    }
 }
 
 impl TableSync {
@@ -493,12 +593,7 @@ impl AppConfig {
             for child in &tbl.children {
                 // the child's field is not a column, so a parent rename that
                 // names it would either do nothing or bury the array
-                let claimed = [
-                    child.field.clone(),
-                    format!("{}_truncated", child.field),
-                    format!("{}_total", child.field),
-                ];
-                for name in &claimed {
+                for name in &child.claimed_fields() {
                     if tbl.fields.contains_key(name) || tbl.fields.values().any(|t| t == name) {
                         anyhow::bail!(
                             "[sync.{key}.fields] {name:?} is the field of child {}; \
@@ -511,6 +606,48 @@ impl AppConfig {
                     &format!("sync.{key}.children({}).fields", child.table),
                     &child.fields,
                 )?;
+            }
+            // qualification was checked at the top of this loop
+            let (schema, table) = tbl.table.split_once('.').unwrap_or((&tbl.table, ""));
+            let mut names: Vec<&String> = tbl.constants.keys().collect();
+            names.sort();
+            for name in names {
+                if name.is_empty() {
+                    anyhow::bail!("[sync.{key}.constants] a constant name must not be empty");
+                }
+                tbl.constants[name]
+                    .render(schema, table)
+                    .map_err(|e| anyhow::anyhow!("[sync.{key}.constants] {name}: {e}"))?;
+                // a constant is written last, so any name that still reaches
+                // the target would be buried by it; a rename *key* is fine,
+                // that column leaves the document before constants run
+                if tbl.fields.values().any(|t| t == name) {
+                    anyhow::bail!(
+                        "[sync.{key}.constants] {name} is also the target of a rename; \
+                         the constant would bury the renamed column"
+                    );
+                }
+                if tbl.columns.as_ref().is_some_and(|cols| cols.contains(name))
+                    && !tbl.fields.contains_key(name)
+                {
+                    anyhow::bail!("[sync.{key}.constants] {name} would overwrite column {name}");
+                }
+                if let Some(child) = tbl
+                    .children
+                    .iter()
+                    .find(|child| child.claimed_fields().contains(name))
+                {
+                    anyhow::bail!(
+                        "[sync.{key}.constants] {name} is the field of child {}",
+                        child.table
+                    );
+                }
+                if tbl.fan_out.as_ref().is_some_and(|fan| &fan.field == name) {
+                    anyhow::bail!(
+                        "[sync.{key}.constants] {name} is the fan_out field; a scalar element \
+                         lands under that name and the constant would bury it"
+                    );
+                }
             }
             // an excluded column silently dropped from the key would produce
             // colliding document ids
@@ -781,6 +918,95 @@ table = "public.users"
             cfg.sync["users"].children[0].fields["total"], "amount",
             "the child's fields attach to that child"
         );
+    }
+
+    #[test]
+    fn constants_are_scalar_and_checked_against_the_document_shape() {
+        const CHILD: &str = "[[sync.users.children]]\ntable = \"public.orders\"\nfield = \"orders\"\nforeign_key = \"user_id\"\n";
+        let refused = [
+            ("[sync.users.constants]\n\"\" = \"x\"\n", "empty name"),
+            (
+                "[sync.users.constants]\ntags = [\"a\"]\n",
+                "an array is not a scalar",
+            ),
+            (
+                "[sync.users.constants]\nnested = { a = 1 }\n",
+                "a table is not a scalar",
+            ),
+            (
+                "[sync.users.constants]\nwhen = 2026-08-29\n",
+                "a datetime is not a scalar",
+            ),
+            (
+                "[sync.users.constants]\norigin = \"{nope}\"\n",
+                "an unknown placeholder",
+            ),
+            (
+                "[sync.users.constants]\norigin = \"{\"\n",
+                "a malformed template",
+            ),
+            (
+                "[sync.users.fields]\nname = \"x\"\n[sync.users.constants]\nx = \"v\"\n",
+                "a rename target",
+            ),
+            (
+                "columns = [\"id\", \"name\"]\n[sync.users.constants]\nname = \"v\"\n",
+                "a surviving column",
+            ),
+            (
+                &format!("{CHILD}[sync.users.constants]\norders = \"v\"\n"),
+                "a child field",
+            ),
+            (
+                &format!("{CHILD}[sync.users.constants]\norders_total = \"v\"\n"),
+                "a child's cap field",
+            ),
+            (
+                "[sync.users.fan_out]\nfield = \"tags\"\nid = \"u-{id}-{tags}\"\n[sync.users.constants]\ntags = \"v\"\n",
+                "the fan_out field",
+            ),
+        ];
+        for (extra, why) in refused {
+            assert!(parse(&format!("{MINIMAL}{extra}")).is_err(), "{why}");
+        }
+
+        let cfg = parse(&format!(
+            "{MINIMAL}[sync.users.constants]\nentity = \"user\"\norigin = \"{{schema}}.{{table}}\"\nrank = 3\nactive = true\nnote = \"\"\n"
+        ))
+        .expect("scalars and the two placeholders load");
+        let constants = &cfg.sync["users"].constants;
+        assert_eq!(constants["rank"], Constant::Int(3));
+        assert_eq!(constants["active"], Constant::Bool(true));
+        assert_eq!(
+            constants["origin"],
+            Constant::Str("{schema}.{table}".into()),
+            "rendering is the run's job, the config keeps the template"
+        );
+        parse(&format!(
+            "{MINIMAL}[sync.users.fields]\nname = \"n\"\n[sync.users.constants]\nname = \"v\"\n"
+        ))
+        .expect("a renamed column leaves its name free");
+    }
+
+    #[test]
+    fn placeholders_render_from_the_section_table() {
+        assert_eq!(
+            Constant::Str("{schema}.{table}".into()).render("public", "users"),
+            Ok(serde_json::json!("public.users"))
+        );
+        assert_eq!(
+            Constant::Int(3).render("public", "users"),
+            Ok(serde_json::json!(3))
+        );
+        assert_eq!(
+            Constant::Str("".into()).render("public", "users"),
+            Ok(serde_json::json!("")),
+            "an empty constant is a value, not a template"
+        );
+        let err = Constant::Str("{nope}".into())
+            .render("public", "users")
+            .expect_err("only schema and table render");
+        assert!(err.contains("nope"), "{err}");
     }
 
     #[test]

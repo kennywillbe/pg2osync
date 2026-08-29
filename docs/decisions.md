@@ -92,6 +92,19 @@ another surviving column already has is refused wherever it can be seen — at
 config load and by `validate` against the live catalogue; at write time the
 renamed value wins.
 
+**A document can carry fields that come from no column.** (`constants`, #67.)
+The alternative is a generated column: DDL on someone else's production table
+for a search concern, the same objection this project raises against event
+triggers and signal tables. Constants only, no expressions: the README promises
+no transformation language, and a language is a parser, an evaluator and a
+null semantics to own forever, where an entity tag or a `{schema}.{table}`
+origin marker is the whole of what was asked. The two placeholders render once
+at startup, so the engine inserts literal JSON and stays source-agnostic.
+Constants are added last because `columns` would otherwise strip a field that
+is not a column; written last, a constant wins a collision — so every collision
+the configuration can see is refused at load, and the one only the catalogue
+can see is refused by `validate`.
+
 **Never acknowledge a position before it is durable.** The value reported to the
 source is clamped to the persisted checkpoint. Acknowledging further lets the
 database recycle history for rows that are not indexed yet — the classic way a

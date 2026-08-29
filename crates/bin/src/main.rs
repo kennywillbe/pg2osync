@@ -828,18 +828,31 @@ fn check_configured_columns(
     // a rename onto a column that still reaches the target would bury that
     // column under the renamed value; the config check could only see this
     // with an explicit `columns` list, the catalogue always can
+    let survives = |c: &String| {
+        !table.fields.contains_key(c)
+            && !table.exclude_columns.contains(c)
+            && table.columns.as_ref().is_none_or(|cols| cols.contains(c))
+    };
     for (col, target) in &table.fields {
-        let survives = |c: &String| {
-            !table.fields.contains_key(c)
-                && !table.exclude_columns.contains(c)
-                && table.columns.as_ref().is_none_or(|cols| cols.contains(c))
-        };
         if let Some(c) = live
             .iter()
             .find(|c| c.eq_ignore_ascii_case(target) && survives(c))
         {
             bail!(
                 "table {} has a column {c}; renaming {col} to it would overwrite that column",
+                table.table
+            );
+        }
+    }
+    // the same for a constant, which is written last; nothing here goes stale,
+    // a constant names nothing in the source
+    for name in table.constants.keys() {
+        if let Some(c) = live
+            .iter()
+            .find(|c| c.eq_ignore_ascii_case(name) && survives(c))
+        {
+            bail!(
+                "table {} has a column {c}; the constant {name} would overwrite it",
                 table.table
             );
         }
@@ -1219,6 +1232,38 @@ mod tests {
             &[],
         )
         .expect("an excluded column leaves its name free");
+    }
+
+    #[test]
+    fn a_constant_over_a_live_column_is_refused() {
+        let table = |extra: &str| -> config::TableSync {
+            toml::from_str(&format!("table = \"public.users\"\n{extra}")).expect("parses")
+        };
+        let live: Vec<String> = ["id", "name", "email"]
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        let pk = vec!["id".to_string()];
+
+        assert!(
+            check_configured_columns(&table("[constants]\nname = \"x\"\n"), &live, &pk, &[])
+                .is_err(),
+            "name still reaches the target, so the constant would bury it"
+        );
+        check_configured_columns(
+            &table("exclude_columns = [\"name\"]\n[constants]\nname = \"x\"\n"),
+            &live,
+            &pk,
+            &[],
+        )
+        .expect("an excluded column leaves its name free");
+        check_configured_columns(
+            &table("[fields]\nname = \"n\"\n[constants]\nname = \"x\"\n"),
+            &live,
+            &pk,
+            &[],
+        )
+        .expect("a renamed column leaves its name free");
     }
 
     #[test]

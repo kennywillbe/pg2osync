@@ -84,6 +84,9 @@ email = "redact"
 
 [sync.shop_users.fields]
 balance = "credit"
+
+[sync.shop_users.constants]
+origin = "{schema}.{table}"
 TOML
 
 say "0. Reset state"
@@ -111,6 +114,7 @@ check "the load indexed all rows" "$(os_count e2e_mysql_users)" "3"
 check "named columns, not ordinals" "$(os_field e2e_mysql_users 1 name)" "alice"
 check "decimal keeps precision" "$(os_field e2e_mysql_users 3 credit)" "99.99"
 check "the source name is gone after the rename" "$(os_has e2e_mysql_users 3 balance)" "False"
+check "the origin placeholder is rendered" "$(os_field e2e_mysql_users 1 origin)" "sourcedb.shop_users"
 check "excluded column absent" "$(os_has e2e_mysql_users 1 password_hash)" "False"
 check "transform applied" "$(os_field e2e_mysql_users 1 email)" "***"
 

@@ -9,7 +9,8 @@ use pg2osync_core::event::ChangeEvent;
 use pg2osync_core::lsn::Lsn;
 use pg2osync_core::sink::{IndexSpec, Sink};
 use pg2osync_engine::mapping::{
-    DurableLsn, Projection, Projections, Rename, Renames, TableMapping, TransformOp, Transforms,
+    Constants, DurableLsn, Projection, Projections, Rename, Renames, TableMapping, TransformOp,
+    Transforms,
 };
 use pg2osync_engine::metrics::SharedMetrics;
 use pg2osync_engine::{PipelineCtx, PositionRenderer};
@@ -228,6 +229,28 @@ fn renames(cfg: &AppConfig) -> Renames {
     }))
 }
 
+/// Rendered once here, so the engine inserts literals and never sees a
+/// template. `validate` already refused a bad one, but `run` does not go
+/// through `validate`, so the error is mapped rather than assumed away.
+fn constants(cfg: &AppConfig) -> Result<Constants> {
+    let mut pairs = Vec::new();
+    for (key, tbl) in &cfg.sync {
+        if tbl.constants.is_empty() {
+            continue;
+        }
+        let (schema, table) = split_qualified(&tbl.table);
+        let mut fields = HashMap::new();
+        for (name, value) in &tbl.constants {
+            let rendered = value
+                .render(schema, table)
+                .map_err(|e| anyhow::anyhow!("[sync.{key}.constants] {name}: {e}"))?;
+            fields.insert(name.clone(), rendered);
+        }
+        pairs.push(((schema.to_string(), table.to_string()), fields));
+    }
+    Ok(Constants::from_pairs(pairs))
+}
+
 /// The key columns a table's id may be rendered from without a before-image,
 /// as far as the engine can tell: it has no catalog, and the WAL path takes
 /// the key from the replica identity rather than from configuration. The
@@ -392,6 +415,7 @@ pub fn pipeline_ctx(
         projections: projections(cfg),
         transforms: transforms(cfg)?,
         renames: renames(cfg),
+        constants: constants(cfg)?,
         id_templates: id_templates(cfg)?,
         fan_outs: fan_outs(cfg)?,
         cfg: cfg.engine.clone(),
