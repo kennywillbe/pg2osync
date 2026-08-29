@@ -155,11 +155,16 @@ pub fn parse_array_literal(lit: &str) -> Result<Vec<Option<String>>, TypeError> 
     loop {
         let mut cur = String::new();
         let mut in_quotes = false;
-        let quoted = false;
+        // Remembered past the closing quote: `{"NULL"}` is the string, `{NULL}`
+        // the SQL null, and by the time the element ends both look identical.
+        let mut quoted = false;
         loop {
             match chars.next() {
                 None => return Err(TypeError::BadArray(lit.into())),
-                Some('"') if !in_quotes => in_quotes = true,
+                Some('"') if !in_quotes => {
+                    in_quotes = true;
+                    quoted = true;
+                }
                 Some('"') if in_quotes => {
                     if chars.peek() == Some(&'"') {
                         cur.push('"');
@@ -285,5 +290,35 @@ mod tests {
             Vec::<Option<String>>::new()
         );
         assert!(parse_array_literal("{unterminated").is_err());
+    }
+
+    #[test]
+    fn quoted_null_is_the_string_not_sql_null() {
+        assert_eq!(parse_array_literal("{NULL}").unwrap(), vec![None]);
+        assert_eq!(
+            parse_array_literal(r#"{"NULL"}"#).unwrap(),
+            vec![Some("NULL".into())]
+        );
+        assert_eq!(
+            parse_array_literal(r#"{a,NULL,"NULL",""}"#).unwrap(),
+            vec![
+                Some("a".into()),
+                None,
+                Some("NULL".into()),
+                Some(String::new())
+            ]
+        );
+        assert_eq!(
+            conv_str(oid::TEXT_ARRAY, r#"{NULL,"NULL"}"#),
+            json!([null, "NULL"])
+        );
+    }
+
+    #[test]
+    fn quoted_element_with_escaped_quote_round_trips() {
+        assert_eq!(
+            parse_array_literal(r#"{"say \"hi\"","NU\"LL"}"#).unwrap(),
+            vec![Some("say \"hi\"".into()), Some("NU\"LL".into())]
+        );
     }
 }
