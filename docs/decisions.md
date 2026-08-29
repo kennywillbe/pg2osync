@@ -59,7 +59,7 @@ make that safe, and they are the reason the feature was slow to arrive:
 identity renders from the row's **raw** values — before projections and
 before transforms, because identity is a property of the row, not of the
 projected document; exactly one place mints ids (`materialize` and
-`completion_id` in the engine), so the stream, the load, the re-snapshot and
+`completion_key` in the engine), so the stream, the load, the re-snapshot and
 poll can never disagree; and a NULL in any column an id names halts the
 pipeline rather than inventing a name. An id that references columns outside
 the key additionally needs the row's before-image to delete and move its

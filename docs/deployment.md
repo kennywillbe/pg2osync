@@ -15,7 +15,7 @@ docker run --rm \
   -e PG2OSYNC_TARGET_PASSWORD="…" \
   -v "$PWD/pg2osync.toml:/etc/pg2osync/pg2osync.toml:ro" \
   -p 9100:9100 \
-  ghcr.io/kennywillbe/pg2osync:1.0.0
+  ghcr.io/kennywillbe/pg2osync:1.3.0
 ```
 
 The image runs as UID 10001 with a read-only root filesystem and no
@@ -23,7 +23,7 @@ capabilities. The default command is `run -c /etc/pg2osync/pg2osync.toml`;
 override it to use another subcommand:
 
 ```sh
-docker run --rm … ghcr.io/kennywillbe/pg2osync:1.0.0 \
+docker run --rm … ghcr.io/kennywillbe/pg2osync:1.3.0 \
   validate -c /etc/pg2osync/pg2osync.toml
 ```
 
