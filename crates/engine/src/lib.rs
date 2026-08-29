@@ -145,6 +145,8 @@ pub struct PipelineCtx {
     pub mapping: TableMapping,
     pub projections: crate::mapping::Projections,
     pub transforms: crate::mapping::Transforms,
+    /// Target field names; applied after everything else has shaped the document.
+    pub renames: crate::mapping::Renames,
     /// Configured document ids; a table with no entry keeps `pk_to_id`.
     pub id_templates: crate::mapping::IdTemplates,
     /// Tables whose rows fan out into one document per array element.
@@ -432,6 +434,7 @@ pub async fn run(
                 let rules = Rules {
                     projections: &ctx.projections,
                     transforms: &ctx.transforms,
+                    renames: &ctx.renames,
                     id_templates: &ctx.id_templates,
                     fan_outs: &ctx.fan_outs,
                 };
@@ -978,11 +981,13 @@ async fn fetch_completions(
 const COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// The per-table rules that decide what a row becomes in the target:
-/// projection, transforms, the document id, and whether one row fans out
-/// into many documents. Everything that mints an `_id` goes through here.
+/// projection, transforms, field renames, the document id, and whether one
+/// row fans out into many documents. Everything that mints an `_id` goes
+/// through here.
 pub struct Rules<'a> {
     pub projections: &'a crate::mapping::Projections,
     pub transforms: &'a crate::mapping::Transforms,
+    pub renames: &'a crate::mapping::Renames,
     pub id_templates: &'a crate::mapping::IdTemplates,
     pub fan_outs: &'a crate::mapping::FanOuts,
 }
@@ -1108,7 +1113,8 @@ fn materialize(
     };
     let halt = |e: String| CoreError::Other(format!("{}.{}: {e}", table.0, table.1));
     // Identity renders from the row's RAW values, so every derivation below
-    // reads the document before projections and transforms touch it.
+    // reads the document before projections and transforms touch it; renames
+    // run last of all, so nothing but the target ever sees the new names.
     let fan = rules.fan_outs.for_table(table.0, table.1);
     let shape = |base: &str, doc: &Value| -> Result<Vec<(String, Value)>, CoreError> {
         match fan {
@@ -1121,6 +1127,7 @@ fn materialize(
             .map(|(id, mut doc)| {
                 rules.projections.apply(table.0, table.1, &mut doc);
                 rules.transforms.apply(table.0, table.1, &mut doc);
+                rules.renames.apply(table.0, table.1, &mut doc);
                 upsert(id, doc)
             })
             .collect()
@@ -1143,7 +1150,10 @@ fn materialize(
                 && let Value::Object(doc_map) = &mut doc
             {
                 for col in unchanged_toast_columns {
-                    if let Some(v) = prev_map.get(col) {
+                    // the stored document carries the target name; the one
+                    // being built is still in source names, renames run last
+                    let stored = rules.renames.target_name(table.0, table.1, col);
+                    if let Some(v) = prev_map.get(stored) {
                         doc_map.insert(col.clone(), v.clone());
                     }
                 }
@@ -1280,11 +1290,29 @@ mod pipeline_tests {
         quarantine_fails: bool,
         /// What the store already held before this run.
         held: u64,
+        /// Every upserted document, so a test can look at what was written
+        /// and not only at which ids the event log names.
+        docs: Mutex<Vec<(String, Value)>>,
+        /// What a read-back returns beyond the id; unset keeps the fixed
+        /// `bio: stored` shape the older tests rely on.
+        stored: Mutex<Option<Value>>,
     }
 
     impl RecordingSink {
         fn events(&self) -> Vec<String> {
             self.events.lock().expect("not poisoned").clone()
+        }
+        fn doc(&self, id: &str) -> Option<Value> {
+            self.docs
+                .lock()
+                .expect("not poisoned")
+                .iter()
+                .rev()
+                .find(|(written, _)| written == id)
+                .map(|(_, doc)| doc.clone())
+        }
+        fn store(&self, doc: Value) {
+            *self.stored.lock().expect("not poisoned") = Some(doc);
         }
         fn last_checkpoint(&self) -> Option<Checkpoint> {
             self.checkpoints
@@ -1310,9 +1338,14 @@ mod pipeline_tests {
                 .lock()
                 .expect("not poisoned")
                 .push(format!("read({})", ids.join(",")));
+            let stored = self.stored.lock().expect("not poisoned").clone();
             Ok(ids
                 .iter()
-                .map(|id| Some(json!({"id": id, "bio": "stored"})))
+                .map(|id| {
+                    let mut doc = stored.clone().unwrap_or_else(|| json!({"bio": "stored"}));
+                    doc["id"] = json!(id);
+                    Some(doc)
+                })
                 .collect())
         }
 
@@ -1341,6 +1374,13 @@ mod pipeline_tests {
                     }
                 })
                 .collect();
+            self.docs
+                .lock()
+                .expect("not poisoned")
+                .extend(batch.iter().filter_map(|op| match &op.op {
+                    DocumentOp::Upsert { id, doc, .. } => Some((id.clone(), doc.clone())),
+                    DocumentOp::Delete { .. } => None,
+                }));
             let rendered: Vec<String> = batch
                 .iter()
                 .map(|op| match &op.op {
@@ -1504,6 +1544,7 @@ mod pipeline_tests {
             )]),
             projections: crate::mapping::Projections::default(),
             transforms: crate::mapping::Transforms::default(),
+            renames: crate::mapping::Renames::default(),
             id_templates: crate::mapping::IdTemplates::default(),
             fan_outs: crate::mapping::FanOuts::default(),
             cfg,
@@ -2362,13 +2403,32 @@ mod pipeline_tests {
         fan: crate::mapping::FanOuts,
         script: Vec<ChangeEvent>,
     ) -> Arc<RecordingSink> {
-        drive_rules_at(500, ids, fan, script).await
+        drive_rules_with(ids, fan, crate::mapping::Renames::default(), script).await
+    }
+
+    async fn drive_rules_with(
+        ids: crate::mapping::IdTemplates,
+        fan: crate::mapping::FanOuts,
+        renames: crate::mapping::Renames,
+        script: Vec<ChangeEvent>,
+    ) -> Arc<RecordingSink> {
+        drive_rules_at(
+            500,
+            ids,
+            fan,
+            renames,
+            Arc::new(RecordingSink::default()),
+            script,
+        )
+        .await
     }
 
     async fn drive_rules_at(
         batch_size: usize,
         ids: crate::mapping::IdTemplates,
         fan: crate::mapping::FanOuts,
+        renames: crate::mapping::Renames,
+        sink: Arc<RecordingSink>,
         script: Vec<ChangeEvent>,
     ) -> Arc<RecordingSink> {
         let (events_tx, events_rx) = mpsc::channel(1024);
@@ -2377,7 +2437,6 @@ mod pipeline_tests {
         let (ack_tx, _ack_rx) = watch::channel(None);
         let (load_done_tx, _load_done_rx) = watch::channel(0u64);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-        let sink = Arc::new(RecordingSink::default());
         let ctx = Arc::new(PipelineCtx {
             sink: sink.clone(),
             mapping: TableMapping::from_pairs([(
@@ -2386,6 +2445,7 @@ mod pipeline_tests {
             )]),
             projections: crate::mapping::Projections::default(),
             transforms: crate::mapping::Transforms::default(),
+            renames,
             id_templates: ids,
             fan_outs: fan,
             cfg: EngineConfig {
@@ -2447,6 +2507,83 @@ mod pipeline_tests {
         })
     }
 
+    fn users_renames(pairs: &[(&str, &str)]) -> crate::mapping::Renames {
+        crate::mapping::Renames::from_pairs([(
+            ("public".to_string(), "users".to_string()),
+            crate::mapping::Rename {
+                columns: pairs
+                    .iter()
+                    .map(|(from, to)| (from.to_string(), to.to_string()))
+                    .collect(),
+                nested: Default::default(),
+            },
+        )])
+    }
+
+    #[tokio::test]
+    async fn a_renamed_field_is_written_under_its_target_name() {
+        let sink = drive_rules_with(
+            users_ids("user-{id}", &["id"]),
+            crate::mapping::FanOuts::default(),
+            users_renames(&[("email", "contact")]),
+            vec![
+                row_doc(7, json!({"id": 7, "email": "a@x.io"})),
+                commit(0x100),
+            ],
+        )
+        .await;
+        assert_eq!(
+            sink.events(),
+            vec!["write[upsert:user-7]"],
+            "identity is untouched"
+        );
+        assert_eq!(
+            sink.doc("user-7"),
+            Some(json!({"id": 7, "contact": "a@x.io"})),
+            "the document carries the target name and not the source one"
+        );
+    }
+
+    #[tokio::test]
+    async fn toast_completion_reads_the_stored_document_by_its_target_name() {
+        // the target holds the column under its renamed key; a completion that
+        // looked it up by the source name would find nothing and write null
+        let sink = Arc::new(RecordingSink::default());
+        sink.store(json!({"about": "stored"}));
+        let sink = drive_rules_at(
+            500,
+            crate::mapping::IdTemplates::default(),
+            crate::mapping::FanOuts::default(),
+            users_renames(&[("bio", "about")]),
+            sink,
+            vec![moved(1, 2, &["bio"]), commit(0x900)],
+        )
+        .await;
+        assert_eq!(sink.events(), vec!["read(1)", "write[upsert:2 delete:1]"]);
+        assert_eq!(
+            sink.doc("2"),
+            Some(json!({"id": 2, "about": "stored"})),
+            "the unchanged column is completed and stored under its target name again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scalar_fan_out_element_can_be_renamed_too() {
+        let sink = drive_rules_with(
+            users_ids("user-{id}", &["id"]),
+            users_fan("tags", "user-{id}-{tags}"),
+            users_renames(&[("tags", "tag")]),
+            vec![row_doc(7, json!({"id": 7, "tags": ["a"]})), commit(0x100)],
+        )
+        .await;
+        assert_eq!(sink.events(), vec!["write[upsert:user-7-a]"]);
+        assert_eq!(
+            sink.doc("user-7-a"),
+            Some(json!({"id": 7, "tag": "a"})),
+            "fan-out lands the element under the source name, the rename moves it after"
+        );
+    }
+
     #[tokio::test]
     async fn a_configured_id_is_rendered_from_the_row_before_projection() {
         let sink = drive_rules(
@@ -2490,6 +2627,7 @@ mod pipeline_tests {
             )]),
             projections: crate::mapping::Projections::default(),
             transforms: crate::mapping::Transforms::default(),
+            renames: crate::mapping::Renames::default(),
             id_templates: users_ids("user-{tenant}", &["tenant"]),
             fan_outs: Default::default(),
             cfg: EngineConfig::default(),

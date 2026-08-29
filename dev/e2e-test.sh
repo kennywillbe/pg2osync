@@ -73,6 +73,10 @@ mapping_file = "pg2osync-e2e-mapping.json"
 [sync.users.transform]
 email = "redact"
 
+[sync.users.fields]
+metadata = "meta"
+email = "contact"
+
 [sync.customers]
 table = "public.customers"
 index = "e2e_customers"
@@ -81,6 +85,9 @@ index = "e2e_customers"
 table = "public.orders"
 field = "orders"
 foreign_key = "customer_id"
+
+[sync.customers.children.fields]
+total = "amount"
 
 [[sync.customers.children]]
 table = "public.tickets"
@@ -116,6 +123,15 @@ if $BIN validate -c "$CONFIG" 2>&1 | grep -q "all checks passed"; then
 else
   bad "validate failed"
 fi
+# a rename of a column that projection drops can never take effect; refuse it
+# where it can still be fixed rather than let it pass silently
+sed 's/^metadata = "meta"/password_hash = "pw"/' "$CONFIG" > "${CONFIG}.bad"
+if $BIN validate -c "${CONFIG}.bad" > /dev/null 2>&1; then
+  bad "validate accepted a rename of an excluded column"
+else
+  ok "validate refuses renaming a column that is excluded"
+fi
+rm -f "${CONFIG}.bad"
 
 say "2. bootstrap creates objects without streaming"
 $BIN bootstrap -c "$CONFIG" > /dev/null
@@ -134,7 +150,11 @@ refresh
 check "users backfilled" "$(os_count e2e_users)" "3"
 check "customers backfilled" "$(os_count e2e_customers)" "3"
 check "excluded column absent" "$(os_has e2e_users 1 password_hash)" "False"
-check "transform applied on backfill" "$(os_field e2e_users 1 email)" "***"
+check "transform applied on backfill" "$(os_field e2e_users 1 contact)" "***"
+check "the source name is gone after the rename" "$(os_has e2e_users 1 email)" "False"
+check "a child column is renamed inside the array" \
+  "$(curl -s "$OS/e2e_customers/_doc/1" | jqf "sorted(k for k in d['_source']['orders'][0] if k in ('total','amount'))")" \
+  "['amount']"
 check "children attached during backfill" "$(os_len e2e_customers 1 orders)" "2"
 # a second collection exercises the multi-join path of the initial load
 check "second collection attached too" "$(os_len e2e_customers 1 tickets)" "1"
@@ -151,7 +171,7 @@ check "excluded column still absent" "$(os_has e2e_users 4 password_hash)" "Fals
 pg "UPDATE users SET name='dave-renamed', email='new@test.io' WHERE id=4;" > /dev/null
 sleep 2; refresh
 check "UPDATE propagated" "$(os_field e2e_users 4 name)" "dave-renamed"
-check "transform applied on update" "$(os_field e2e_users 4 email)" "***"
+check "transform applied on update" "$(os_field e2e_users 4 contact)" "***"
 
 # a wide, incompressible value is stored out of line, so an update that does
 # not touch it sends a marker instead of the value and the engine has to
@@ -159,11 +179,11 @@ check "transform applied on update" "$(os_field e2e_users 4 email)" "***"
 pg "UPDATE users SET metadata = (SELECT jsonb_build_object('blob', string_agg(md5(random()::text), ''))
                                  FROM generate_series(1, 400)) WHERE id = 4;" > /dev/null
 sleep 2; refresh
-toast_len=$(curl -s "$OS/e2e_users/_doc/4" | jqf "len(d['_source']['metadata']['blob'])")
+toast_len=$(curl -s "$OS/e2e_users/_doc/4" | jqf "len(d['_source']['meta']['blob'])")
 pg "UPDATE users SET name = 'dave-toast' WHERE id = 4;" > /dev/null
 sleep 2; refresh
 check "an update that leaves a TOASTed column alone keeps its value" \
-  "$(curl -s "$OS/e2e_users/_doc/4" | jqf "len(d['_source']['metadata']['blob'])")" "$toast_len"
+  "$(curl -s "$OS/e2e_users/_doc/4" | jqf "len(d['_source']['meta']['blob'])")" "$toast_len"
 check "the rest of that update still applied" "$(os_field e2e_users 4 name)" "dave-toast"
 
 pg "DELETE FROM users WHERE id=3;" > /dev/null

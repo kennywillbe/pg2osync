@@ -88,6 +88,11 @@ exclude_columns = ["password_hash"]
 [sync.users.transform]
 email = "redact"                     # "redact" -> "***", "hash" -> SHA-256 prefix
 
+# Store a column under another name. Applied last, so every other option
+# (columns, transform, id, ...) keeps naming the column as the source knows it.
+[sync.users.fields]
+# usr_nm = "username"
+
 # Nested children: embed a one-to-many relation as a JSON array (one level).
 # Child tables should have REPLICA IDENTITY FULL so deletes can find the parent.
 # [sync.customers]
@@ -99,6 +104,9 @@ email = "redact"                     # "redact" -> "***", "hash" -> SHA-256 pref
 # table = "public.orders"
 # field = "orders"
 # foreign_key = "customer_id"
+#
+# [sync.customers.children.fields]
+# order_dt = "ordered_at"
 
 # Fan-out: one document per element of an array column (PostgreSQL array or
 # jsonb holding one; needs REPLICA IDENTITY FULL). The element id renders from

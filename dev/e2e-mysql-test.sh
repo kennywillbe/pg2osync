@@ -81,6 +81,9 @@ exclude_columns = ["password_hash"]
 
 [sync.shop_users.transform]
 email = "redact"
+
+[sync.shop_users.fields]
+balance = "credit"
 TOML
 
 say "0. Reset state"
@@ -106,7 +109,8 @@ start_sync
 sleep 6; refresh
 check "the load indexed all rows" "$(os_count e2e_mysql_users)" "3"
 check "named columns, not ordinals" "$(os_field e2e_mysql_users 1 name)" "alice"
-check "decimal keeps precision" "$(os_field e2e_mysql_users 3 balance)" "99.99"
+check "decimal keeps precision" "$(os_field e2e_mysql_users 3 credit)" "99.99"
+check "the source name is gone after the rename" "$(os_has e2e_mysql_users 3 balance)" "False"
 check "excluded column absent" "$(os_has e2e_mysql_users 1 password_hash)" "False"
 check "transform applied" "$(os_field e2e_mysql_users 1 email)" "***"
 
@@ -119,7 +123,7 @@ check "insert uses named columns" "$(os_field e2e_mysql_users 4 name)" "dave"
 my "UPDATE shop_users SET name='dave-renamed', balance=8.50 WHERE id=4;"
 sleep 3; refresh
 check "UPDATE propagated" "$(os_field e2e_mysql_users 4 name)" "dave-renamed"
-check "UPDATE keeps decimals" "$(os_field e2e_mysql_users 4 balance)" "8.50"
+check "UPDATE keeps decimals" "$(os_field e2e_mysql_users 4 credit)" "8.50"
 
 my "INSERT INTO shop_users (id,name,metadata) VALUES (7,'jane','{\"tier\":\"gold\",\"tags\":[1,2]}');"
 synced

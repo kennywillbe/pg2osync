@@ -825,14 +825,34 @@ fn check_configured_columns(
             fan.field
         );
     }
-    // an exclusion or a transform for a column that is gone changes nothing,
-    // so it is stale configuration rather than a fault
+    // a rename onto a column that still reaches the target would bury that
+    // column under the renamed value; the config check could only see this
+    // with an explicit `columns` list, the catalogue always can
+    for (col, target) in &table.fields {
+        let survives = |c: &String| {
+            !table.fields.contains_key(c)
+                && !table.exclude_columns.contains(c)
+                && table.columns.as_ref().is_none_or(|cols| cols.contains(c))
+        };
+        if let Some(c) = live
+            .iter()
+            .find(|c| c.eq_ignore_ascii_case(target) && survives(c))
+        {
+            bail!(
+                "table {} has a column {c}; renaming {col} to it would overwrite that column",
+                table.table
+            );
+        }
+    }
+    // an exclusion, a transform or a rename for a column that is gone changes
+    // nothing, so it is stale configuration rather than a fault
     for (label, names) in [
         ("exclude_columns", table.exclude_columns.clone()),
         (
             "transform",
             table.transform.keys().cloned().collect::<Vec<_>>(),
         ),
+        ("fields", table.fields.keys().cloned().collect::<Vec<_>>()),
     ] {
         let gone = missing(&names);
         if !gone.is_empty() {
@@ -1172,6 +1192,33 @@ mod tests {
             "public.users".to_string(),
             "shop.users".to_string(),
         ]
+    }
+
+    #[test]
+    fn a_rename_onto_a_live_column_is_refused_and_a_stale_key_is_not() {
+        let table = |extra: &str| -> config::TableSync {
+            toml::from_str(&format!("table = \"public.users\"\n{extra}")).expect("parses")
+        };
+        let live: Vec<String> = ["id", "name", "email"]
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        let pk = vec!["id".to_string()];
+
+        assert!(
+            check_configured_columns(&table("[fields]\nname = \"email\"\n"), &live, &pk, &[])
+                .is_err(),
+            "email still reaches the target, so name would bury it"
+        );
+        check_configured_columns(&table("[fields]\ngone = \"x\"\n"), &live, &pk, &[])
+            .expect("a rename of a column that is not there is stale config, not a fault");
+        check_configured_columns(
+            &table("exclude_columns = [\"email\"]\n[fields]\nname = \"email\"\n"),
+            &live,
+            &pk,
+            &[],
+        )
+        .expect("an excluded column leaves its name free");
     }
 
     #[test]

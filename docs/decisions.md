@@ -80,6 +80,18 @@ external version and would have to act as a barrier, breaking
 refuse fanned tables for now — both page by key, and one row is no longer one
 document.
 
+**A column can be renamed in the target; the rename is the last step.**
+(`fields`, #66.) The source name is the one namespace the operator already
+knows, and the one every other check — projection, `transform`, `id`,
+`primary_key`, `soft_delete`, `poll_column` — is written against, so it stays
+the name those options use. Renaming last, after identity, projection and
+transforms, means none of them has to know a rename exists. The one place the
+target name leaks back in is TOAST completion, which reads the stored document
+and so translates the column through the same map. A rename onto a name
+another surviving column already has is refused wherever it can be seen — at
+config load and by `validate` against the live catalogue; at write time the
+renamed value wins.
+
 **Never acknowledge a position before it is durable.** The value reported to the
 source is clamped to the persisted checkpoint. Acknowledging further lets the
 database recycle history for rows that are not indexed yet — the classic way a
@@ -560,8 +572,11 @@ rather than the resulting shape starts to matter.
 **No relational sources beyond PostgreSQL and MySQL/MariaDB**, and no
 non-relational sources. The value is depth on these, not breadth.
 
-**Nested children stay one level deep.** Deeper denormalization belongs in a
-view or in the application.
+**Nested children stay one level deep.** Anything deeper is the application's
+to shape before it reaches the database, and there is no view route around
+that: only base tables are eligible (`relkind = 'r'` on PostgreSQL,
+`table_type = 'BASE TABLE'` on MySQL) because the WAL and the binlog carry
+base-table rows, and a view has none to stream.
 
 ## Implementation choices
 

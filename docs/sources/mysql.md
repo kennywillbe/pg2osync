@@ -240,7 +240,8 @@ with a clear error rather than writing shifted values. Restart it to
 resynchronize.
 
 Column renames and drops need a re-index: existing documents keep the old
-field names.
+field names. A `fields` entry in the config can absorb a source-side rename
+(`new_column = "old_field"`) so the index keeps its field name without one.
 
 ## Nested children
 

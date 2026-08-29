@@ -80,6 +80,7 @@ replay, and no transformation language — if you need those, you want Kafka.
 | Derived document ids (`id = "tenant-{tenant_id}-{id}"`) | ✅ default stays the primary key; non-key columns need `REPLICA IDENTITY FULL` |
 | One row to many documents (`fan_out` over a JSON-array column) | ✅ elements added, moved and removed as versioned writes |
 | Column transforms (`hash`, `redact`) | ✅ |
+| Field renames (`fields`) | ✅ source column to target field, on every path and inside child arrays |
 | TRUNCATE propagation | ✅ PostgreSQL and MySQL/MariaDB |
 | Polling fallback for managed databases without replication | ✅ upserts, plus deletes via `soft_delete` |
 | Index mappings you define (`mapping_file`) | ✅ applied at creation, compared at startup |
@@ -209,6 +210,9 @@ exclude_columns = ["password_hash"]     # never leaves the database
 
 [sync.customers.transform]
 email = "redact"                        # or "hash"
+
+[sync.customers.fields]
+signup_dt = "signed_up_at"              # stored under this name; every other option keeps the source name
 
 [[sync.customers.children]]
 table = "public.orders"
