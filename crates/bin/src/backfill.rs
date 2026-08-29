@@ -102,6 +102,7 @@ fn copy_statement(
     range: &KeyRange,
     pk_column: Option<&str>,
     filter: Option<&str>,
+    table_filter: Option<&pg2osync_core::filter::Filter>,
 ) -> String {
     let mut selected: Vec<String> = cols
         .iter()
@@ -142,6 +143,12 @@ fn copy_statement(
     // deleted again on the first poll cycle
     if let Some(predicate) = soft_delete {
         conditions.push(format!("NOT ({predicate})"));
+    }
+    // The table's own row filter, the same predicate the engine evaluates on
+    // every streamed row. Pushed down here so the load never reads, ships and
+    // indexes a row it would delete on arrival.
+    if let Some(filter) = table_filter {
+        conditions.push(format!("({})", filter.to_sql(&pg_dialect())));
     }
     // an operator's own predicate, parenthesised so it cannot rearrange the
     // conditions it is joined to
@@ -228,6 +235,9 @@ async fn key_bounds(
 ) -> Result<Vec<String>> {
     let whole: Vec<String> = Vec::new();
 
+    // Sampled over the whole table even when the load reads a filtered one:
+    // that yields uneven ranges, never wrong ones, and sampling under the
+    // predicate would cost a second scan to save nothing.
     // A composite key would need a row-constructor comparison, which is right
     // for PostgreSQL and pathological on MySQL; until that is worth branching
     // for, such a table is read in one piece as before.
@@ -440,6 +450,7 @@ pub async fn run(
             soft_delete: tbl.soft_delete.as_deref(),
             pk_column: pk_column.as_deref(),
             filter: scope.filter.as_deref(),
+            table_filter: scope.table_filter(&tbl.table),
         };
         // Ranges are read in waves, one per reader, with a barrier at the end of
         // each. A free-running pool would be faster by the width of the skew
@@ -517,6 +528,7 @@ struct RangePlan<'a> {
     soft_delete: Option<&'a str>,
     pk_column: Option<&'a str>,
     filter: Option<&'a str>,
+    table_filter: Option<&'a pg2osync_core::filter::Filter>,
 }
 
 /// Read one range on one connection, and return how many rows it produced.
@@ -546,6 +558,7 @@ async fn read_range(
         range,
         plan.pk_column,
         plan.filter,
+        plan.table_filter,
     );
     let copy_stream = reader.copy_out(&sql).await?;
     use futures::StreamExt;
@@ -788,6 +801,33 @@ fn qualify(qualified: &str) -> String {
     format!("{}.{}", quote_ident(s), quote_ident(t))
 }
 
+/// How the COPY statement spells a filter: the table is aliased `p` and child
+/// aggregates are joined beside it, so a bare column could be shadowed by a
+/// join's `k`, `agg` or `total`. Strings double their quotes and nothing else,
+/// which is PostgreSQL's rule under `standard_conforming_strings`.
+fn pg_dialect() -> pg2osync_core::filter::SqlDialect<'static> {
+    fn ident(name: &str) -> String {
+        format!("p.{}", quote_ident(name))
+    }
+    pg2osync_core::filter::SqlDialect {
+        quote_ident: &ident,
+        quote_str: &pg_quote_str,
+    }
+}
+
+/// The same for a statement with no alias, such as reconcile's key read or
+/// the startup probe.
+pub(crate) fn pg_dialect_bare() -> pg2osync_core::filter::SqlDialect<'static> {
+    pg2osync_core::filter::SqlDialect {
+        quote_ident: &quote_ident,
+        quote_str: &pg_quote_str,
+    }
+}
+
+fn pg_quote_str(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
@@ -869,6 +909,7 @@ mod tests {
             },
             Some("id"),
             None,
+            None,
         );
         assert!(sql.contains("p.\"id\" >= '1' AND p.\"id\" < '9'"), "{sql}");
         assert!(sql.contains("NOT (deleted_at IS NOT NULL)"), "{sql}");
@@ -883,7 +924,7 @@ mod tests {
         let mut b = col("b");
         a.is_pk = true;
         b.is_pk = true;
-        let sql = copy_statement("public.t", &[a, b], &[], None, &whole(), None, None);
+        let sql = copy_statement("public.t", &[a, b], &[], None, &whole(), None, None, None);
         assert!(!sql.contains("WHERE"), "{sql}");
     }
 
@@ -896,6 +937,32 @@ mod tests {
     }
 
     #[test]
+    fn a_table_filter_is_pushed_down_beside_the_range_and_the_soft_delete() {
+        let filter =
+            pg2osync_core::filter::Filter::parse("status = 'active' AND dec > 10").expect("valid");
+        let sql = copy_statement(
+            "public.t",
+            &[col("id")],
+            &[],
+            Some("deleted_at IS NOT NULL"),
+            &KeyRange {
+                from: Some("'5'".into()),
+                to: None,
+            },
+            Some("id"),
+            Some("tenant_id = 42"),
+            Some(&filter),
+        );
+        assert!(
+            sql.contains(
+                "WHERE p.\"id\" >= '5' AND NOT (deleted_at IS NOT NULL) \
+                 AND ((p.\"status\" = 'active' AND p.\"dec\" > 10)) AND (tenant_id = 42)"
+            ),
+            "one WHERE, every condition ANDed, the filter aliased and quoted: {sql}"
+        );
+    }
+
+    #[test]
     fn a_soft_deleted_row_is_not_loaded_only_to_be_deleted_later() {
         let sql = copy_statement(
             "public.users",
@@ -903,6 +970,7 @@ mod tests {
             &[],
             Some("deleted_at IS NOT NULL"),
             &whole(),
+            None,
             None,
             None,
         );
@@ -919,6 +987,7 @@ mod tests {
             &whole(),
             None,
             Some("tenant_id = 42"),
+            None,
         );
         assert!(
             sql.contains("WHERE NOT (deleted_at IS NOT NULL) AND (tenant_id = 42)"),
@@ -958,6 +1027,7 @@ mod tests {
             &whole(),
             None,
             None,
+            None,
         );
         assert_eq!(
             sql,
@@ -976,6 +1046,7 @@ mod tests {
             &[child("orders", "public.orders", "customer_id", "id")],
             None,
             &whole(),
+            None,
             None,
             None,
         );
@@ -1013,6 +1084,7 @@ mod tests {
             &whole(),
             None,
             None,
+            None,
         );
         assert!(
             sql.contains(&pg2osync_source::children::agg_subquery(&spec, None)),
@@ -1035,6 +1107,7 @@ mod tests {
             &whole(),
             None,
             None,
+            None,
         );
         assert!(sql.contains("c0.k = p.\"id\""), "{sql}");
         assert!(sql.contains("c1.k = p.\"id\""), "{sql}");
@@ -1050,6 +1123,7 @@ mod tests {
             &[child("kids", "public.ch\"ild", "fk\"y", "pk\"y")],
             None,
             &whole(),
+            None,
             None,
             None,
         );

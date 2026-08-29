@@ -1137,5 +1137,103 @@ else
 fi
 stop_sync
 
+echo -e "\n\033[1m== 23. a row filter decides what is indexed, on the load and on the stream ==\033[0m"
+# One SQL subset, pushed into the COPY and evaluated again on every WAL row
+# (#64). The load must never read a row that does not match; the stream must
+# turn a row that leaves the filter into a delete and one that enters it into
+# a write, and a non-matching insert must cost nothing but a not-found delete.
+RFCONFIG=$(mktemp /tmp/pg2osync-e2e-where.XXXXXX)
+RFSLOT=pg2osync_e2e_where
+cat > "$RFCONFIG" <<TOML
+[source]
+url_env = "PG2OSYNC_SOURCE_URL"
+slot_name = "$RFSLOT"
+publication = "${RFSLOT}_pub"
+
+[target]
+url = "http://localhost:9200"
+
+[metrics]
+bind = "127.0.0.1:9124"
+
+[sync.where_probe]
+table = "public.where_probe"
+index = "e2e_where"
+where = "status = 'active' AND price > 10 AND deleted_at IS NULL"
+TOML
+where_cleanup() {
+  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  pg "SELECT pg_drop_replication_slot('$RFSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$RFSLOT');" > /dev/null 2>&1 || true
+  pg "DROP PUBLICATION IF EXISTS ${RFSLOT}_pub; DROP TABLE IF EXISTS where_probe;" > /dev/null 2>&1 || true
+  rm -f "$RFCONFIG"
+}
+trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup; init_cleanup; fan_cleanup; bid_cleanup; shape_cleanup; where_cleanup' EXIT
+
+pg "DROP TABLE IF EXISTS where_probe; CREATE TABLE where_probe(id bigint primary key, status text, price numeric(10,2), deleted_at timestamptz);" > /dev/null 2>&1
+# 10.00 against 10.01 is the numeric-string rule: numeric arrives as a JSON
+# string in the WAL, and a byte-wise '10.00' > '10' would let row 3 through.
+pg "INSERT INTO where_probe VALUES (1,'active',20.00,NULL), (2,'archived',20.00,NULL), (3,'active',10.00,NULL), (4,'active',10.01,NULL), (5,'active',20.00,now());" > /dev/null
+pg "DROP PUBLICATION IF EXISTS ${RFSLOT}_pub; CREATE PUBLICATION ${RFSLOT}_pub FOR TABLE where_probe;" > /dev/null 2>&1
+curl -s -XDELETE "$OS/e2e_where" > /dev/null
+# outside the subset: refused by the grammar, where it can still be fixed
+sed "s/^where = .*/where = \"status LIKE 'a%'\"/" "$RFCONFIG" > "${RFCONFIG}.bad"
+if $BIN validate -c "${RFCONFIG}.bad" > /dev/null 2>&1; then
+  bad "validate accepted a LIKE the engine could not evaluate"
+else
+  ok "validate refuses a predicate outside the subset"
+fi
+rm -f "${RFCONFIG}.bad"
+# inside the subset but naming no column: only the live table can tell
+sed 's/^where = .*/where = "nope = 1"/' "$RFCONFIG" > "${RFCONFIG}.bad"
+if $BIN validate -c "${RFCONFIG}.bad" > /dev/null 2>&1; then
+  bad "validate accepted a predicate on a column the table does not have"
+else
+  ok "validate refuses a predicate naming a column the table does not have"
+fi
+rm -f "${RFCONFIG}.bad"
+nohup $BIN run -c "$RFCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_count e2e_where)" = "2" ] && break
+  sleep 1
+done
+check "the load indexed only the matching rows" "$(os_count e2e_where)" "2"
+check "a matching row is indexed" "$(os_status e2e_where 1)" "200"
+check "a numeric string above the bound is indexed" "$(os_status e2e_where 4)" "200"
+check "a row the status excludes was never read" "$(os_status e2e_where 2)" "404"
+check "a numeric string at the bound was never read" "$(os_status e2e_where 3)" "404"
+check "a row the NULL test excludes was never read" "$(os_status e2e_where 5)" "404"
+pg "UPDATE where_probe SET status='archived' WHERE id = 1;" > /dev/null
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_status e2e_where 1)" = "404" ] && break
+  sleep 1
+done
+check "a row that leaves the filter is deleted" "$(os_status e2e_where 1)" "404"
+pg "UPDATE where_probe SET status='active' WHERE id = 2;" > /dev/null
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_status e2e_where 2)" = "200" ] && break
+  sleep 1
+done
+check "a row that enters the filter is written" "$(os_status e2e_where 2)" "200"
+pg "INSERT INTO where_probe VALUES (6,'archived',30,NULL);" > /dev/null
+pg "INSERT INTO where_probe VALUES (7,'active',30,NULL);" > /dev/null
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_status e2e_where 7)" = "200" ] && break
+  sleep 1
+done
+check "a matching insert is indexed" "$(os_status e2e_where 7)" "200"
+check "a non-matching insert is not indexed and does not stop the pipeline" "$(os_status e2e_where 6)" "404"
+pg "UPDATE where_probe SET deleted_at=now() WHERE id = 4;" > /dev/null
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_status e2e_where 4)" = "404" ] && break
+  sleep 1
+done
+check "a NULL test decides too" "$(os_status e2e_where 4)" "404"
+stop_sync
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

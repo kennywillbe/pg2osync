@@ -92,6 +92,11 @@ impl PollSource {
             let mut sent_any = false;
             for t in &self.cfg.tables {
                 let last = watermarks.get(&t.qualified).cloned();
+                // The table's row filter is deliberately not here. A row that
+                // has left it has to keep arriving so the engine can turn it
+                // into the delete it now is; pushing the predicate in would
+                // simply stop reporting the row, which is the hole
+                // `soft_delete` exists to fill.
                 // strict greater-than: rows sharing the boundary timestamp
                 // replay as harmless duplicates under idempotent _id
                 let filter = match &last {

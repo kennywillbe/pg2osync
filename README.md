@@ -81,6 +81,7 @@ not expressions) — if you need those, you want Kafka.
 | Derived document ids (`id = "tenant-{tenant_id}-{id}"`) | ✅ default stays the primary key; non-key columns need `REPLICA IDENTITY FULL` |
 | One row to many documents (`fan_out` over a JSON-array column) | ✅ elements added, moved and removed as versioned writes |
 | Column transforms (`hash`, `redact`, `json`, `split`, `number`, `date`) | ✅ six named reshapes, no expression language; a value that will not convert is indexed as it is and counted |
+| Row filters (`where`) | ✅ a SQL subset the load pushes down and the stream evaluates; a row that leaves the filter is deleted |
 | Field renames (`fields`) | ✅ source column to target field, on every path and inside child arrays |
 | Fields that come from no column (`constants`) | ✅ literals plus `{schema}`/`{table}`, no expression language |
 | TRUNCATE propagation | ✅ PostgreSQL and MySQL/MariaDB |

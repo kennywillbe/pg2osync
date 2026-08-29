@@ -93,7 +93,8 @@ pub async fn run_for(
         shutdown_rx,
     );
 
-    let scope = LoadScope::resnapshot(qualified_table, filter);
+    let scope =
+        LoadScope::resnapshot(qualified_table, filter).with_table_filters(run::table_filters(cfg)?);
     println!(
         "re-reading {qualified_table} into {index}{}",
         scope

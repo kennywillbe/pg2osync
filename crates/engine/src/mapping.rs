@@ -360,6 +360,31 @@ impl Constants {
     }
 }
 
+/// Per-table row filters from `[sync.x] where`.
+///
+/// The same predicate the initial load pushed into its query, evaluated here
+/// for every streamed and polled row — a stream has no query to push it into,
+/// and a row that has left the filter has to become a delete rather than
+/// simply stop arriving.
+#[derive(Debug, Clone, Default)]
+pub struct Filters {
+    map: HashMap<(String, String), pg2osync_core::filter::Filter>,
+}
+
+impl Filters {
+    pub fn from_pairs(
+        pairs: impl IntoIterator<Item = ((String, String), pg2osync_core::filter::Filter)>,
+    ) -> Self {
+        Self {
+            map: pairs.into_iter().collect(),
+        }
+    }
+
+    pub fn for_table(&self, schema: &str, table: &str) -> Option<&pg2osync_core::filter::Filter> {
+        self.map.get(&(schema.to_string(), table.to_string()))
+    }
+}
+
 /// A configured document id: literals plus `{column}` placeholders, e.g.
 /// `tenant-{tenant_id}-{id}`.
 ///

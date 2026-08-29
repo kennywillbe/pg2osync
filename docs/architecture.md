@@ -51,7 +51,8 @@ nothing else. It:
    forces a batch, so without it a stream of single-row transactions costs one
    request each. The batch's highest position stays the last commit in it, so
    an ack can never run past a transaction that was not fully written;
-3. applies column projection, transforms, field renames and constants;
+3. filters rows against the table's `where` predicate on the raw row, then
+   applies column projection, transforms, field renames and constants;
 4. completes unchanged-TOAST columns by reading the previously indexed
    documents — for a whole group of rows in one request, not one round-trip
    per row;

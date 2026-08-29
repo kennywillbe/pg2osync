@@ -134,6 +134,7 @@ One section per table. `<key>` is the index name when `index` is omitted.
 | `transform` | Map of column to an operation, see [Transforms](#transforms) |
 | `fields` | Map of source column to target field name; applied last, see [Field names](#field-names) |
 | `constants` | Map of field name to a literal value added to every document; `{schema}`/`{table}` in a string render at startup, see [Constant fields](#constant-fields) |
+| `where` | Restricted SQL predicate deciding which rows are indexed, e.g. `status = 'active' AND deleted_at IS NULL`; see [Row filters](#row-filters) |
 | `poll_column` | Poll mode: overrides `[source] poll_column` for this table |
 | `soft_delete` | SQL predicate marking a row as deleted, e.g. `deleted_at IS NOT NULL` |
 | `mapping_file` | JSON mapping to create the index with, see below |
@@ -343,6 +344,64 @@ time the constant wins.
   gets whatever dynamic mapping infers from the first document; declare it
   there if the type matters.
 
+### Row filters
+
+Not every row of a table belongs in the index. `where` is a predicate in a
+restricted SQL subset that decides which rows do:
+
+```toml
+[sync.users]
+table = "public.users"
+where = "status = 'active' AND tenant IN ('eu', 'us') AND deleted_at IS NULL"
+```
+
+| form | example |
+|---|---|
+| comparison, the column always on the left | `status = 'active'`, `tier <> 'free'` (or `!=`), `price > 10`, `<`, `<=`, `>=` |
+| null test | `deleted_at IS NULL`, `parent_id IS NOT NULL` |
+| membership | `tenant IN ('eu', 'us')`, `kind NOT IN (1, 2)` |
+| connectives | `AND`, `OR`, `NOT`, parentheses |
+| literals | `'text'` (`''` for a quote), integers, decimals, `true`/`false` |
+
+Keywords are case-insensitive. There are no functions, no `LIKE` and no
+column-to-column comparison; anything outside the subset is refused at config
+load with a message listing what is supported.
+
+The initial load pushes the predicate into its query — the COPY on PostgreSQL,
+the chunk reads on MySQL — so a row that does not match is never read, shipped
+or indexed; `resnapshot --where` ANDs with it, and `reconcile` treats a row
+that no longer matches as gone. The engine then evaluates the same predicate
+on every streamed and polled row: one whose new state matches is written, one
+whose new state does not is deleted from the index — every element document of
+a fanned row, the id a moved row used to own. That is what makes a row that
+leaves the filter disappear and one that enters it appear. The predicate sees
+the **raw** row, before projection, so a column that `columns` excludes can
+still be filtered on.
+
+- NULL follows SQL: a comparison against NULL is unknown, `NOT` of unknown is
+  unknown, and a row matches only when the predicate is TRUE. `IS NULL` also
+  matches a column the source did not send.
+- Strings compare byte-wise. Equality is exact everywhere; ordering is exact
+  for ASCII and ISO 8601, which is what makes `created_at >= '2024-01-01'`
+  work against the textual timestamps the sources hand over.
+- A number compared against a string holding a number compares numerically:
+  `numeric`/`DECIMAL` reach the engine as strings to keep their precision, and
+  SQL would compare them as numbers, so `price > 10` matches `10.01`.
+- Nothing new is asked of the source: a key-only id renders its delete from
+  the key, and non-key ids and `fan_out` already required the before-image.
+- `validate` refuses a predicate naming a column the table does not have, and
+  runs `SELECT 1 FROM t WHERE (predicate) LIMIT 0` against the live table to
+  catch what the grammar cannot, such as a type error.
+- Poll mode does not push the predicate into its query, on purpose: a row that
+  has left the filter must keep arriving so the engine can turn it into the
+  delete it now is. See [Soft deletes](#soft-deletes) for how the two compose.
+- The cost, stated plainly: a WAL insert of a row that never matched still
+  produces one idempotent delete, which the target answers not-found, and a
+  non-matching parent of a child collection produces one such delete per
+  child change.
+- A filter selects rows; it computes no values. There is still no
+  transformation language.
+
 ### Soft deletes
 
 Poll mode has no replication log, so a row that is simply gone leaves nothing
@@ -356,15 +415,18 @@ soft_delete = "deleted_at IS NOT NULL"
 
 A row matching the predicate is removed from the index instead of upserted, and
 the initial load skips it rather than indexing it only to delete it on the
-first cycle. The predicate is evaluated by the database — it is the only party
-that knows the column's type — so any boolean expression over the row's own
-columns works, `status = 'archived'` as much as a timestamp check.
+first cycle. The predicate is evaluated by the database — poll mode has a query
+to put it in — so any boolean expression over the row's own columns works,
+`status = 'archived'` as much as a timestamp check.
 
 It is poll-mode only, and configuring it elsewhere is rejected rather than
-ignored. WAL mode sees a soft delete as the ordinary `UPDATE` it is, and
-turning that into a delete would mean evaluating the predicate here rather than
-in the database — which is where the column's type lives. Until that is worth
-building, a WAL-mode pipeline should filter on the column at query time.
+ignored. The general form is a [row filter](#row-filters):
+`where = "deleted_at IS NULL"` works in WAL, binlog and poll mode alike, and
+turns the `UPDATE` that marks a row deleted into the delete it means. What
+`soft_delete` keeps for poll mode is the database's evaluation, and with it
+any expression the grammar of `where` does not accept. The two compose —
+`soft_delete` deletes, `where` gates — and naming the same column in both is
+redundant rather than wrong.
 
 ### Index mappings
 
@@ -659,6 +721,7 @@ bind = "127.0.0.1:9100"
 table = "public.users"
 index = "users"
 exclude_columns = ["password_hash"]
+where = "deleted_at IS NULL"
 
 [sync.users.transform]
 email = "redact"

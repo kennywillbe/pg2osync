@@ -295,6 +295,28 @@ fn fan_outs(cfg: &AppConfig) -> Result<pg2osync_engine::mapping::FanOuts> {
     Ok(pg2osync_engine::mapping::FanOuts::from_pairs(pairs))
 }
 
+/// The configured row filters, keyed by qualified table for the loaders.
+pub fn table_filters(cfg: &AppConfig) -> Result<HashMap<String, pg2osync_core::filter::Filter>> {
+    let mut out = HashMap::new();
+    for (key, tbl) in &cfg.sync {
+        let Some(spec) = &tbl.filter else { continue };
+        let filter = pg2osync_core::filter::Filter::parse(spec)
+            .map_err(|e| anyhow::anyhow!("[sync.{key}] where {spec:?}: {e}"))?;
+        out.insert(tbl.table.clone(), filter);
+    }
+    Ok(out)
+}
+
+/// The same predicates keyed by (schema, table) for the engine.
+fn filters(cfg: &AppConfig) -> Result<pg2osync_engine::mapping::Filters> {
+    Ok(pg2osync_engine::mapping::Filters::from_pairs(
+        table_filters(cfg)?.into_iter().map(|(qualified, filter)| {
+            let (schema, table) = split_qualified(&qualified);
+            ((schema.to_string(), table.to_string()), filter)
+        }),
+    ))
+}
+
 /// Metrics outlive any one attempt: they are created once and the endpoint is
 /// served once, so a reconnect does not reset every counter or re-bind the port.
 fn start_metrics(cfg: &AppConfig) -> Result<SharedMetrics> {
@@ -417,6 +439,7 @@ pub fn pipeline_ctx(
         constants: constants(cfg)?,
         id_templates: id_templates(cfg)?,
         fan_outs: fan_outs(cfg)?,
+        filters: filters(cfg)?,
         cfg: cfg.engine.clone(),
         ack_tx,
         load_done_tx,
@@ -431,6 +454,9 @@ pub fn pipeline_ctx(
 /// whole old row arriving in the WAL — which only REPLICA IDENTITY FULL
 /// guarantees. Finding that out on the first delete, at 3am, is worse than
 /// naming the ALTER statement now, the same way child tables are checked.
+/// A row filter adds no requirement of its own: a key-only id renders the
+/// delete of a row that left the filter from the key, and the other cases are
+/// the two above.
 async fn check_derived_identity_requirements(
     cfg: &AppConfig,
     admin: &tokio_postgres::Client,
@@ -922,7 +948,8 @@ async fn attempt_postgres(
                     load_sink.as_ref(),
                     &load_stream_id,
                     load_done_rx,
-                    &pg2osync_core::load::LoadScope::initial_load(),
+                    &pg2osync_core::load::LoadScope::initial_load()
+                        .with_table_filters(table_filters(cfg)?),
                 )
                 .await
             })
@@ -1496,7 +1523,8 @@ async fn attempt_mysql(
                     load_sink.as_ref(),
                     &load_stream_id,
                     load_done_rx,
-                    &pg2osync_core::load::LoadScope::initial_load(),
+                    &pg2osync_core::load::LoadScope::initial_load()
+                        .with_table_filters(table_filters(cfg)?),
                     &load_children,
                     base,
                 )

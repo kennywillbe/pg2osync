@@ -145,6 +145,7 @@ pub async fn run(
                 cursor.as_deref(),
                 chunked.then_some(chunk_rows),
                 scope.filter.as_deref(),
+                scope.table_filter(&format!("{schema}.{table}")),
             );
 
             let mut rows = conn
@@ -309,6 +310,7 @@ fn chunk_statement(
     cursor: Option<&[String]>,
     limit: Option<u64>,
     filter: Option<&str>,
+    table_filter: Option<&pg2osync_core::filter::Filter>,
 ) -> String {
     let columns = resolved
         .columns
@@ -332,6 +334,11 @@ fn chunk_statement(
     let mut conditions: Vec<String> = Vec::new();
     if let Some(values) = cursor.filter(|v| v.len() == key.len()) {
         conditions.push(format!("({})", after_predicate(&key, values)));
+    }
+    // the table's own row filter, the same predicate the engine evaluates on
+    // every binlog row, so the load never ships a row it would delete
+    if let Some(table_filter) = table_filter {
+        conditions.push(format!("({})", table_filter.to_sql(&catalog::dialect())));
     }
     if let Some(predicate) = filter {
         conditions.push(format!("({predicate})"));
@@ -454,6 +461,28 @@ mod tests {
     }
 
     #[test]
+    fn a_table_filter_joins_the_cursor_in_key_order() {
+        let filter =
+            pg2osync_core::filter::Filter::parse("status = 'a\\b' AND dec > 10").expect("valid");
+        let sql = chunk_statement(
+            "shop",
+            "orders",
+            &schema(&["id", "tenant"]),
+            Some(&["5".into(), "'acme'".into()]),
+            Some(1000),
+            None,
+            Some(&filter),
+        );
+        assert!(
+            sql.contains(
+                "WHERE ((`id` > 5) OR (`id` = 5 AND `tenant` > 'acme')) \
+                 AND ((`status` = 'a\\\\b' AND `dec` > 10))"
+            ),
+            "the cursor stays parenthesised beside the quoted filter: {sql}"
+        );
+    }
+
+    #[test]
     fn a_composite_cursor_is_expanded_never_a_row_constructor() {
         let sql = chunk_statement(
             "shop",
@@ -461,6 +490,7 @@ mod tests {
             &schema(&["id", "tenant"]),
             Some(&["5".into(), "'acme'".into()]),
             Some(1000),
+            None,
             None,
         );
         assert!(
@@ -482,6 +512,7 @@ mod tests {
             Some(&["5".into(), "'acme'".into()]),
             Some(1000),
             Some("tenant = 'acme'"),
+            None,
         );
         assert!(
             sql.contains(
@@ -500,6 +531,7 @@ mod tests {
             None,
             Some(10),
             Some("id > 100"),
+            None,
         );
         assert!(
             sql.contains("WHERE (id > 100) ORDER BY `id` LIMIT 10"),
@@ -509,14 +541,22 @@ mod tests {
 
     #[test]
     fn the_first_chunk_has_no_cursor() {
-        let sql = chunk_statement("shop", "orders", &schema(&["id"]), None, Some(10), None);
+        let sql = chunk_statement(
+            "shop",
+            "orders",
+            &schema(&["id"]),
+            None,
+            Some(10),
+            None,
+            None,
+        );
         assert!(!sql.contains("WHERE"));
         assert!(sql.contains("FROM `shop`.`orders` ORDER BY `id` LIMIT 10"));
     }
 
     #[test]
     fn an_unchunkable_table_is_one_plain_statement() {
-        let sql = chunk_statement("shop", "orders", &schema(&["id"]), None, None, None);
+        let sql = chunk_statement("shop", "orders", &schema(&["id"]), None, None, None, None);
         assert!(!sql.contains("LIMIT"), "{sql}");
         assert!(!sql.contains("ORDER BY"), "ordering it would buy nothing");
     }
