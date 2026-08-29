@@ -143,6 +143,10 @@ every connection via `[source] sslmode` (libpq semantics, `prefer` by default).
 `mysql_native_password` work, and TLS is supported through the same
 `[source] sslmode` setting.
 
+**Network** — a direct connection for the stream: a pooler or query-routing
+proxy cannot carry a replication or binlog-dump connection. The SQL connection
+may be pooled but must reach the primary. See [docs/proxies.md](docs/proxies.md).
+
 **Target** — OpenSearch 2.x, Elasticsearch 8.x or Meilisearch 1.x.
 
 `pg2osync validate` checks all of this and tells you exactly what to fix.

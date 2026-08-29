@@ -64,6 +64,9 @@ works if you encode it.
 `admin_url_env` exists so the replication connection and ordinary queries can
 use different users — the replication role needs `REPLICATION`, the admin role
 needs `SELECT` on the synced tables.
+It is also the only one of the two that may sit behind a connection pooler;
+the stream cannot, and both must reach the primary — see
+[Proxies and connection poolers](proxies.md).
 
 ### TLS
 

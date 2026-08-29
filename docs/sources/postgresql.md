@@ -65,6 +65,10 @@ slot_name = "pg2osync"          # optional, this is the default
 publication = "pg2osync_pub"    # optional, this is the default
 ```
 
+The URL must reach PostgreSQL directly: the stream is a replication connection,
+and a pooler in transaction mode cannot carry one — see
+[Proxies and connection poolers](../proxies.md).
+
 What pg2osync creates automatically on first run:
 
 - `CREATE PUBLICATION pg2osync_pub FOR TABLE <your tables>`

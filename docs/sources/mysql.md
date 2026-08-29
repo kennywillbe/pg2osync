@@ -99,6 +99,10 @@ index = "users"
 same server, and it is what the checkpoint is keyed on — changing it forces a
 full initial load.
 
+The URL is also what the binlog dump connection uses, so it must reach the
+server directly: a query-routing proxy does not carry `COM_BINLOG_DUMP` — see
+[Proxies and connection poolers](../proxies.md).
+
 ## How it works
 
 1. **Prerequisite check** on a plain connection (`log_bin`, `binlog_format`,
