@@ -191,6 +191,13 @@ written by an older one. Rolling *back* across a format change is not
 supported — an older binary that cannot parse the checkpoint ignores it and
 starts a full initial load, which is safe but expensive.
 
+A stop — `SIGTERM` from `docker stop` or Kubernetes, `SIGINT` from a terminal —
+finishes the requests already sent to the target and writes a final checkpoint
+before exiting, which takes well under a second normally and at most one target
+request timeout (30 s) when the target has stopped answering; the Kubernetes
+default `terminationGracePeriodSeconds` of 30 s covers that, `docker stop`'s
+default of 10 s does not, so pass `-t 30` if the target may be unhealthy.
+
 Stopping for a while is safe as long as the source retains its history:
 PostgreSQL keeps WAL for an inactive slot (watch disk usage with
 `pg2osync status`), and MySQL keeps binlogs for `binlog_expire_logs_seconds`.

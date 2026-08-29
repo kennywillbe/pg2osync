@@ -109,10 +109,11 @@ impl WalSource {
     /// checkpoint position (see `durable`), so PG can never recycle WAL for
     /// rows that were not yet indexed.
     ///
-    /// NOTE: no tokio::select! around `client.recv()` — cancelling an in-flight
-    /// protocol read risks losing frames. Shutdown is cooperative: the loop
-    /// checks the watch flag between messages and the transport wakes the idle
-    /// read periodically.
+    /// Shutdown races `client.recv()` rather than waiting for it: the socket
+    /// belongs to the transport's worker task and `recv` only takes frames
+    /// from its channel, so cancelling the wait loses nothing — and on an idle
+    /// stream the next frame is a keepalive seconds away, which is longer than
+    /// `docker stop` gives a container.
     /// `admin` is an ordinary SQL connection for the child re-fetch queries.
     /// The replication connection cannot run them, which is unavoidable; a
     /// third connection of our own was not, since the caller already holds one.
@@ -164,18 +165,21 @@ impl WalSource {
         tracing::info!(target: "pg2osync::source", "stream loop starting");
 
         loop {
-            if *shutdown.borrow() {
-                tracing::info!(target: "pg2osync::source", "shutdown requested");
-                client.shutdown().await.ok();
-                return Ok(());
-            }
-            let ev = match client.recv().await {
-                Ok(Some(ev)) => ev,
-                Ok(None) => {
-                    tracing::warn!(target: "pg2osync::source", "stream ended normally");
+            let ev = tokio::select! {
+                biased;
+                _ = wait_shutdown(&shutdown) => {
+                    tracing::info!(target: "pg2osync::source", "shutdown requested");
+                    client.shutdown().await.ok();
                     return Ok(());
                 }
-                Err(e) => return Err(e).context("replication stream failed"),
+                received = client.recv() => match received {
+                    Ok(Some(ev)) => ev,
+                    Ok(None) => {
+                        tracing::warn!(target: "pg2osync::source", "stream ended normally");
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e).context("replication stream failed"),
+                },
             };
             tracing::trace!(target: "pg2osync::source", "raw event");
             match ev {
@@ -465,6 +469,15 @@ enum Classified {
         key: serde_json::Value,
     },
     Skip,
+}
+
+async fn wait_shutdown(shutdown: &tokio::sync::watch::Receiver<bool>) {
+    let mut rx = shutdown.clone();
+    while !*rx.borrow() {
+        if rx.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 /// Resolve everything held and emit it.

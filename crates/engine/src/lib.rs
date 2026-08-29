@@ -194,7 +194,7 @@ pub async fn run(
         batch_rx,
         ctx.sink.clone(),
         ctx.ack_tx.clone(),
-        ckpt_done_tx.clone(),
+        ckpt_done_tx,
         ctx.load_done_tx.clone(),
         ctx.metrics.clone(),
         ctx.cfg.on_permanent_rejection,
@@ -213,33 +213,41 @@ pub async fn run(
         let mut last_persisted: Option<Lsn> = None;
         let mut ckpt_done_rx = ckpt_done_rx;
         loop {
+            // The channel closes when the writer is done, and its last
+            // acknowledgement is then the final position: persisting it before
+            // leaving is what lets a stop resume where it left off instead of
+            // replaying up to an interval, and waiting the interval out first
+            // would only delay the exit.
+            let closed = tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(ckpt_interval)) => false,
+                _ = ckpt_done_rx.wait_for(|_| false) => true,
+            };
             // plain polling keeps every value cloned out of the guard before
             // any await point (watch guards are not Send across awaits)
-            tokio::time::sleep(std::time::Duration::from_millis(ckpt_interval)).await;
-            if ckpt_done_rx.has_changed().is_err() {
-                break;
-            }
             let new_lsn = *ckpt_done_rx.borrow_and_update();
-            if last_persisted == new_lsn {
-                continue;
+            if let Some(lsn) = new_lsn
+                && last_persisted != new_lsn
+            {
+                let checkpoint = Checkpoint {
+                    stream: ckpt_stream.clone(),
+                    token: lsn.0,
+                    position: ckpt_render(lsn.0),
+                };
+                match ckpt_sink.write_checkpoint(&checkpoint).await {
+                    Ok(()) => {
+                        // `durable` gates what the source may acknowledge, so it
+                        // must advance only after the checkpoint is persisted
+                        durable.store(lsn);
+                        ckpt_metrics.set_confirmed_position(lsn.0);
+                        last_persisted = new_lsn;
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "pg2osync::checkpoint", "checkpoint persist failed: {e}");
+                    }
+                }
             }
-            let Some(lsn) = new_lsn else { continue };
-            let checkpoint = Checkpoint {
-                stream: ckpt_stream.clone(),
-                token: lsn.0,
-                position: ckpt_render(lsn.0),
-            };
-            match ckpt_sink.write_checkpoint(&checkpoint).await {
-                Ok(()) => {
-                    // `durable` gates what the source may acknowledge, so it
-                    // must advance only after the checkpoint is persisted
-                    durable.store(lsn);
-                    ckpt_metrics.set_confirmed_position(lsn.0);
-                    last_persisted = new_lsn;
-                }
-                Err(e) => {
-                    tracing::warn!(target: "pg2osync::checkpoint", "checkpoint persist failed: {e}");
-                }
+            if closed {
+                break;
             }
         }
     });
@@ -687,7 +695,9 @@ pub async fn run(
 
     drop(batch_tx);
     let _ = sink_task.await;
-    ckpt_task.abort();
+    // the loop ends by itself once the writer is gone, after persisting the
+    // last acknowledgement; aborting it here would lose that write
+    let _ = ckpt_task.await;
     result
 }
 
