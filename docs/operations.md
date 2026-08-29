@@ -36,6 +36,24 @@ Probes use `/healthz`, which is never authenticated.
 | `pg2osync_slot_wal_status{slot,status}` | gauge | 1 for the server's own verdict: `reserved`, `extended`, `unreserved`, `lost` |
 | `pg2osync_slot_active{slot}` | gauge | 1 while something is streaming that slot |
 
+### Dashboard
+
+[`deploy/grafana/pg2osync.json`](https://github.com/kennywillbe/pg2osync/blob/main/deploy/grafana/pg2osync.json)
+is a Grafana dashboard built from the series above: Dashboards → New → Import,
+paste the file, pick a Prometheus data source. It asks for nothing else — the
+data source and the instance are dashboard variables.
+
+Five rows, in the order an incident is read: overview (connected, lag, the
+slot's `wal_status`, retained WAL against its safe size, reconnects), throughput,
+latency quantiles, target rejections, and source health. The thresholds are the
+alert values below, so a red tile and a firing alert mean the same thing.
+
+The Helm chart can ship it as a ConfigMap for the Grafana sidecar to pick up:
+
+```sh
+helm upgrade pg2osync deploy/helm/pg2osync --set grafanaDashboard.enabled=true
+```
+
 ### What to alert on
 
 ```promql
