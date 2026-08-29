@@ -125,7 +125,7 @@ One section per table. `<key>` is the index name when `index` is omitted.
 | Option | Description |
 |---|---|
 | `table` | **Required.** `schema.table` for PostgreSQL, `database.table` for MySQL |
-| `index` | Target index or collection; lowercase `[a-z0-9_-]`, not starting with `_` or `.`; several sections may name the same one, see [Sharing an index](#sharing-an-index) |
+| `index` | Target index or collection; lowercase `[a-z0-9_-]`, not starting with `_` or `.`; several sections may name the same one, see [Sharing an index](#sharing-an-index); may contain `{column}` placeholders, see [Per-row indices](#per-row-indices) |
 | `primary_key` | Overrides key detection; also the join column for nested children |
 | `id` | Derived document id, e.g. `tenant-{tenant_id}-{id}`; see [Document ids](#document-ids) |
 | `fan_out` | One row becomes one document per element of an array column; see [Fan-out](#fan-out) |
@@ -219,6 +219,69 @@ id = "order-{id}"
 A [join pair](#join-fields) is the other way two sections share an index:
 there the join field scopes every document to its relation, which is why
 `reconcile` can check either half of the pair against its own table.
+
+### Per-row indices
+
+`index` may carry `{column}` placeholders, so each row chooses the index it
+lands in. Two shapes cover most of what this is for. Time-based retention,
+where an old month is dropped as one index instead of deleted row by row:
+
+```toml
+[sync.events]
+table = "public.events"
+index = "events-{created_month}"    # a column holding e.g. 2026-08
+```
+
+And per-tenant isolation, where every tenant is searched, sized and secured
+on its own:
+
+```toml
+[sync.events]
+table = "public.events"
+index = "{tenant}-events"
+```
+
+The rules are the [`id`](#document-ids) rules, because a name derived from a
+column is the same problem as an id derived from one: the column can change,
+and the document is then in the old index.
+
+- **Same grammar, same row.** Literals plus `{column}` placeholders, rendered
+  from the row's raw values — before projections and transforms — exactly as
+  `id` is. Every placeholder must name a column of the table, and `validate`
+  checks that against the catalogue. A fanned row's element documents all go
+  where the row goes, so the template may not name the `fan_out` column.
+- **A rendered name that is not a legal index halts the pipeline.** An
+  uppercase letter, an empty value, a NULL in a named column: none of these
+  can become an index the target accepts, so the pipeline stops and names
+  the template, the column and the value it rendered. `validate` warns up
+  front for nullable columns.
+- **Non-key columns need the before-image.** A template naming only key
+  columns works everywhere. One naming a column outside the key needs the
+  old row to find the index a changed row was in, so on PostgreSQL the table
+  must be `REPLICA IDENTITY FULL`; `run` refuses to start otherwise. MySQL
+  already guarantees it (`binlog_row_image = FULL`).
+- **The index is created on demand,** at the first document that needs it,
+  with the section's `mapping_file` if one is set. Nothing is created at
+  startup, because the set of indices is not known until the rows are.
+- **A template must have a literal part,** and may not overlap another
+  section's index or be shared. Each placeholder stands for `*` in what a
+  `TRUNCATE` clears, so `index = "{tenant}"` — a claim on the whole cluster —
+  is refused at config load; so is a template whose pattern also matches an
+  index another section writes to, and a template two sections name.
+- **`TRUNCATE` clears the pattern.** Every index the template claims is
+  searched, and each hit is deleted under its own index as a versioned write,
+  so a row committed after the truncate is not swept away with it.
+- **A row that changes its index-choosing column moves.** It is written in
+  the new index and deleted from the old — the same move `id` makes for a row
+  whose id changed.
+- **`reconcile` and `switch-alias` refuse a templated table.** Reconcile
+  pages one index by its key column, and the table's documents are spread
+  over every index the template renders; an alias points at one index.
+  `resnapshot` works.
+- **Meilisearch refuses a template** at startup: it has no mappings to
+  create an index with.
+- **Bulk-load settings are not relaxed** for a templated index. An index
+  created during the initial load takes the target's defaults.
 
 ### Fan-out
 

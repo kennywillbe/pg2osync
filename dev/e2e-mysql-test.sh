@@ -731,5 +731,110 @@ refresh
 check "a re-snapshot ANDs its --where with the table's filter" "$(os_status e2e_mysql_where 3)" "404"
 stop_sync
 
+say "18. a row chooses the index it lands in"
+# The PostgreSQL suite's section 26 (#69) without the REPLICA IDENTITY step:
+# binlog_row_image = FULL is already a startup requirement, so the old row a
+# changed tenant needs is always in the event. reconcile is PostgreSQL-only,
+# so the refusal it would give a templated table is not observable here.
+stop_sync
+ECONFIG=$(mktemp /tmp/pg2osync-mysql-events.XXXXXX)
+EMAPPING=$(dirname "$ECONFIG")/pg2osync-mysql-events-mapping.json
+ESID=990006
+cat > "$ECONFIG" <<TOML
+[source]
+flavor = "mysql"
+url_env = "PG2OSYNC_MYSQL_URL"
+server_id = $ESID
+
+[target]
+url = "$OS"
+
+[metrics]
+bind = "127.0.0.1:9118"
+
+[sync.events]
+table = "sourcedb.events_probe"
+index = "e2e-mysql-events-{tenant}"
+mapping_file = "pg2osync-mysql-events-mapping.json"
+TOML
+cat > "$EMAPPING" <<'JSON'
+{"mappings":{"properties":{"tenant":{"type":"keyword"}}}}
+JSON
+events_cleanup() {
+  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  my "DROP TABLE IF EXISTS events_probe;" > /dev/null 2>&1 || true
+  curl -s -XDELETE "$OS/e2e-mysql-events-*?ignore_unavailable=true" > /dev/null 2>&1 || true
+  rm -f "$ECONFIG" "$EMAPPING"
+}
+trap 'cleanup; resume_cleanup; types_cleanup; child_cleanup; where_cleanup; events_cleanup' EXIT
+
+my "DROP TABLE IF EXISTS events_probe;"
+my "CREATE TABLE events_probe(id bigint primary key, tenant varchar(20), \`at\` datetime);"
+my "INSERT INTO events_probe VALUES (1,'acme',NOW());"
+curl -s -XDELETE "$OS/e2e-mysql-events-*?ignore_unavailable=true" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/mysql-$ESID" > /dev/null
+# a template with no literal part claims `*`, and a TRUNCATE of the table
+# would then clear the cluster: refused where it can still be fixed. Captured
+# first: a refusal exits non-zero, which under pipefail would hide a grep
+# that matched.
+sed 's/^index = "e2e-mysql-events-{tenant}"$/index = "{tenant}"/' "$ECONFIG" > "${ECONFIG}.bad"
+out=$($BIN validate -c "${ECONFIG}.bad" 2>&1 || true)
+if grep -q "is all placeholders" <<< "$out"; then
+  ok "validate refuses an index template with no literal part"
+else
+  bad "validate accepted an index template that would claim every index"
+fi
+rm -f "${ECONFIG}.bad"
+nohup $BIN run -c "$ECONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+await_count e2e-mysql-events-acme 1
+check "the row lands in the index its tenant column names" "$(os_status e2e-mysql-events-acme 1)" "200"
+# the index did not exist before the row did, so a keyword here says the
+# on-demand creation used the section's mapping rather than dynamic mapping
+check "the index was created on demand with the configured mapping" \
+  "$(curl -s "$OS/e2e-mysql-events-acme/_mapping" | jqf "d.get('e2e-mysql-events-acme',{}).get('mappings',{}).get('properties',{}).get('tenant',{}).get('type','<missing>')")" "keyword"
+my "UPDATE events_probe SET tenant='globex' WHERE id = 1;"
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_status e2e-mysql-events-globex 1)" = "200" ] && break
+  sleep 1
+done
+check "an update that changes the index writes the document there" "$(os_status e2e-mysql-events-globex 1)" "200"
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_status e2e-mysql-events-acme 1)" = "404" ] && break
+  sleep 1
+done
+check "and removes it from the index it was in" "$(os_status e2e-mysql-events-acme 1)" "404"
+my "DELETE FROM events_probe WHERE id = 1;"
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_status e2e-mysql-events-globex 1)" = "404" ] && break
+  sleep 1
+done
+check "the delete finds the document in the index the old row names" "$(os_status e2e-mysql-events-globex 1)" "404"
+check "exactly the indices the rows named exist" "$(curl -s "$OS/_cat/indices/e2e-mysql-events-*?h=index" | wc -l | tr -d ' ')" "2"
+# an uppercase letter cannot become an index, and inventing a name would
+# file the row where nothing looks for it: the pipeline halts, naming the
+# template, the column and the value it rendered. The log is cumulative
+# across sections, so only a new line counts.
+halts_before=$(grep -c "not a usable index name" "$LOG" || true)
+my "INSERT INTO events_probe VALUES (2,'ACME',NOW());"
+for _ in $(seq 1 60); do
+  [ "$(grep -c 'not a usable index name' "$LOG" || true)" -gt "$halts_before" ] && break
+  sleep 1
+done
+if [ "$(grep -c 'not a usable index name' "$LOG" || true)" -gt "$halts_before" ]; then
+  ok "a rendered name that is not a legal index halts the pipeline"
+else
+  bad "the pipeline accepted an index name the target could not have created"
+fi
+if grep "not a usable index name" "$LOG" | tail -1 | grep -q "ACME"; then
+  ok "and the halt names the value it rendered"
+else
+  bad "the halt did not say which value was refused"
+fi
+check "no index was created for the refused name" "$(curl -s "$OS/_cat/indices/e2e-mysql-events-*?h=index" | wc -l | tr -d ' ')" "2"
+stop_sync
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

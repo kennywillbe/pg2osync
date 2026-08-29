@@ -130,6 +130,14 @@ impl Sink for MeilisearchSink {
 
     async fn ensure_ready(&self, tables: &[IndexSpec]) -> Result<(), CoreError> {
         for spec in tables {
+            // refused by config before it gets here; kept so a new caller
+            // cannot create an index literally named after a glob
+            if spec.pattern {
+                return Err(CoreError::Sink(format!(
+                    "index {:?} is chosen per row, which Meilisearch cannot create on demand",
+                    spec.name
+                )));
+            }
             if spec.mapping.is_some() {
                 // Meilisearch has no field types to declare; its equivalent is
                 // the settings API, which is a different feature than this one

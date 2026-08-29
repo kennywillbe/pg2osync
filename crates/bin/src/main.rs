@@ -527,6 +527,14 @@ async fn reconcile_cmd(path: &Path, delete: bool) -> Result<()> {
                 table.table
             );
         }
+        // and there is no single index to page when each row chose its own
+        if table.is_templated() {
+            bail!(
+                "[sync.{key}] index {index:?} is chosen per row: reconcile pages one index by \
+                 its key column, and this table's documents are spread across every index the \
+                 template renders"
+            );
+        }
         let spec = reconcile::Table {
             qualified: table.table.clone(),
             index: table.index_name(key),
@@ -575,7 +583,14 @@ async fn reconcile_cmd(path: &Path, delete: bool) -> Result<()> {
 /// exactly what the exercise was avoiding.
 async fn switch_alias(path: &Path, alias: &str) -> Result<()> {
     let cfg = config::AppConfig::load(path)?;
-    let indices = run::index_names(&cfg);
+    let indices = run::index_names(&cfg)?;
+    // an alias points at one index, and a template's glob is not one
+    if let Some((key, _)) = cfg.sync.iter().find(|(_, tbl)| tbl.is_templated()) {
+        bail!(
+            "switch-alias needs a config that writes to one fixed index; [sync.{key}] chooses \
+             its index per row"
+        );
+    }
     let [index] = indices.as_slice() else {
         bail!(
             "switch-alias needs a config that writes to exactly one index; this one writes to {}",
@@ -835,6 +850,29 @@ fn check_configured_columns(
             if nullable.iter().any(|c| c.eq_ignore_ascii_case(col)) {
                 println!(
                     "! id placeholder {{{col}}} on {} is nullable; a NULL in it \
+                     halts the pipeline",
+                    table.table
+                );
+            }
+        }
+    }
+    // the same rule for an index placeholder: a NULL index column halts
+    // exactly like a NULL id
+    if let Some(spec) = &table.index
+        && table.is_templated()
+    {
+        let template = pg2osync_engine::mapping::IdTemplate::parse(spec, pk_columns)
+            .map_err(|e| anyhow::anyhow!("index {spec:?} of {}: {e}", table.table))?;
+        for col in template.columns() {
+            if !live.iter().any(|c| c.eq_ignore_ascii_case(col)) {
+                bail!(
+                    "table {} has no column {col} to choose its index by",
+                    table.table
+                );
+            }
+            if nullable.iter().any(|c| c.eq_ignore_ascii_case(col)) {
+                println!(
+                    "! index placeholder {{{col}}} on {} is nullable; a NULL in it \
                      halts the pipeline",
                     table.table
                 );
@@ -1417,6 +1455,28 @@ mod tests {
             &[],
         )
         .expect("an excluded column leaves its name free");
+    }
+
+    #[test]
+    fn an_index_placeholder_must_name_a_live_column() {
+        let table = |extra: &str| -> config::TableSync {
+            toml::from_str(&format!("table = \"public.events\"\n{extra}")).expect("parses")
+        };
+        let live: Vec<String> = ["id", "tenant"].iter().map(|c| c.to_string()).collect();
+        let pk = vec!["id".to_string()];
+
+        check_configured_columns(&table("index = \"events-{tenant}\"\n"), &live, &pk, &[])
+            .expect("the placeholder names a column the table has");
+        let err =
+            check_configured_columns(&table("index = \"events-{region}\"\n"), &live, &pk, &[])
+                .expect_err("a column the table lacks could never choose an index");
+        assert!(
+            err.to_string()
+                .contains("table public.events has no column region to choose its index by"),
+            "{err}"
+        );
+        check_configured_columns(&table("index = \"events\"\n"), &live, &pk, &[])
+            .expect("a fixed index names no column");
     }
 
     #[test]

@@ -4,7 +4,8 @@
 //! plain-text secrets in the file are accepted but warn deprecated.
 
 use anyhow::{Context, Result};
-use pg2osync_engine::mapping::TransformOp;
+use pg2osync_core::sink::index_matches_pattern;
+use pg2osync_engine::mapping::{IdTemplate, IndexTarget, TransformOp, check_index_name};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -334,7 +335,6 @@ impl Constant {
         schema: &str,
         table: &str,
     ) -> std::result::Result<serde_json::Value, String> {
-        use pg2osync_engine::mapping::IdTemplate;
         match self {
             Self::Int(v) => Ok(serde_json::json!(v)),
             Self::Float(v) => Ok(serde_json::json!(v)),
@@ -529,8 +529,61 @@ impl ChildJoin {
 }
 
 impl TableSync {
+    /// The index as written: a name, or the template a row renders one from.
+    /// Every message names this rather than a rendered name, because the
+    /// spec is what the operator can find in the file.
     pub fn index_name(&self, key: &str) -> String {
         self.index.clone().unwrap_or_else(|| key.to_string())
+    }
+
+    /// Whether the index is chosen per row. Only `index` can be a template:
+    /// a section key with a brace is a name, and the grammar refuses it.
+    pub fn is_templated(&self) -> bool {
+        self.index.as_deref().is_some_and(|s| s.contains('{'))
+    }
+
+    /// The parsed target, grammar-checked. `pk_columns` decides whether a
+    /// delete's bare key can render it, exactly as for `id`.
+    ///
+    /// The grammar lives here rather than in `validate` because `run` does
+    /// not go through `validate`: the engine's table map is built from the
+    /// same call, so a bad template is refused on every path.
+    pub fn index_target(
+        &self,
+        key: &str,
+        pk_columns: &[String],
+    ) -> std::result::Result<IndexTarget, String> {
+        let spec = self.index_name(key);
+        if !self.is_templated() {
+            check_index_name(&spec).map_err(|e| format!("index {spec:?} {e}"))?;
+            return Ok(IndexTarget::Static(spec));
+        }
+        let template = IdTemplate::parse(&spec, pk_columns)
+            .map_err(|e| format!("index {spec:?} is not a usable index template: {e}"))?;
+        // A TRUNCATE clears every index the template can render, which for a
+        // template without a literal is every index there is.
+        if template.literals().is_empty() {
+            return Err(format!(
+                "index {spec:?} is all placeholders, so a TRUNCATE of {} could only be \
+                 applied by clearing every index; give the template a fixed prefix or suffix",
+                self.table
+            ));
+        }
+        // The literals are checked where a rendered name would carry them:
+        // each placeholder stands in with one legal character, so only the
+        // literals can fail, and a leading placeholder is left to the row —
+        // the first character of `{tenant}-events` is checked where it is
+        // rendered, and halts there.
+        let stand_in: serde_json::Map<String, serde_json::Value> = template
+            .columns()
+            .into_iter()
+            .map(|col| (col.to_string(), serde_json::Value::String("x".into())))
+            .collect();
+        let sample = template
+            .render(&serde_json::Value::Object(stand_in))
+            .map_err(|e| format!("index {spec:?} is not a usable index template: {e}"))?;
+        check_index_name(&sample).map_err(|e| format!("index {spec:?} {e}"))?;
+        Ok(IndexTarget::Template { spec, template })
     }
 }
 
@@ -638,6 +691,10 @@ impl AppConfig {
         // the group, not about either section, so the groups are checked after
         // every section has been.
         let mut by_index: BTreeMap<String, Vec<(&str, &TableSync)>> = BTreeMap::new();
+        // A template is a claim on a whole namespace, which is a question
+        // about every other section's index, so the targets are kept for a
+        // pass over the pairs.
+        let mut targets: Vec<(&str, IndexTarget)> = Vec::with_capacity(self.sync.len());
         if self.sync.is_empty() {
             anyhow::bail!("no [sync.*] sections: nothing to synchronize");
         }
@@ -649,20 +706,11 @@ impl AppConfig {
                 );
             }
             let index = tbl.index_name(key);
-            if !index.chars().next().is_some_and(|c| c.is_ascii_lowercase()) {
-                anyhow::bail!("[sync.{key}] index {index:?} must start with a lowercase letter");
-            }
-            if !index
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
-            {
-                anyhow::bail!("[sync.{key}] index {index:?} may only contain lowercase [a-z0-9_-]");
-            }
-            // OpenSearch rejects names starting with '_'; dot-prefix is reserved
-            // for system indices.
-            if index.starts_with('_') || index.starts_with('.') {
-                anyhow::bail!("[sync.{key}] index {index:?} must not start with '_' or '.'");
-            }
+            // the key columns do not matter to the grammar; whether a bare key
+            // can render the template is the startup check's question
+            let target = tbl
+                .index_target(key, &[])
+                .map_err(|e| anyhow::anyhow!("[sync.{key}] {e}"))?;
             by_index
                 .entry(index.clone())
                 .or_default()
@@ -747,6 +795,19 @@ impl AppConfig {
                 }
                 if fan.field.is_empty() {
                     anyhow::bail!("[sync.{key}.fan_out] field must not be empty");
+                }
+                // every document a row fans out into goes to one index, so the
+                // template renders from the row, where the array is a value
+                // no name can be made of
+                if let IndexTarget::Template { spec, template } = &target
+                    && template.columns().contains(&fan.field.as_str())
+                {
+                    anyhow::bail!(
+                        "[sync.{key}] index {spec:?} names the fan_out field {}; every document \
+                         a row produces goes to one index, so the index is chosen from the row \
+                         and not from an element",
+                        fan.field
+                    );
                 }
                 // identity must see the array raw: a projection that cuts it
                 // would leave fan-out with nothing to expand
@@ -907,7 +968,9 @@ impl AppConfig {
                     );
                 }
             }
+            targets.push((key.as_str(), target));
         }
+        check_template_claims(self, &targets)?;
         for (index, members) in &by_index {
             check_index_group(index, members)?;
         }
@@ -998,6 +1061,39 @@ impl SourceConfig {
 fn is_qualified_table(name: &str) -> bool {
     let parts: Vec<&str> = name.split('.').collect();
     parts.len() == 2 && parts.iter().all(|p| !p.is_empty())
+}
+
+/// A template is a claim on a whole namespace, so it cannot also be a shared
+/// index, and nothing else may sit inside what its TRUNCATE would clear.
+fn check_template_claims(cfg: &AppConfig, targets: &[(&str, IndexTarget)]) -> Result<()> {
+    for (key, target) in targets {
+        let IndexTarget::Template { spec, .. } = target else {
+            continue;
+        };
+        if let Some((other, _)) = targets
+            .iter()
+            .find(|(k, _)| k != key && cfg.sync[*k].index_name(k) == *spec)
+        {
+            anyhow::bail!(
+                "[sync.{key}] index {spec:?} is a template and is also fed by [sync.{other}]; a \
+                 template claims every index it can render, which is not something two tables \
+                 can share"
+            );
+        }
+        let pattern = target.pattern();
+        if let Some((other, _)) = targets
+            .iter()
+            .find(|(k, t)| k != key && index_matches_pattern(&pattern, &t.pattern()))
+        {
+            anyhow::bail!(
+                "[sync.{key}] index {spec:?} claims {pattern:?}, which also matches {:?} of \
+                 [sync.{other}]; a TRUNCATE of {} would clear that index too",
+                cfg.sync[*other].index_name(other),
+                cfg.sync[*key].table
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Whether the sections writing one index may share it: either as a join
@@ -1194,6 +1290,147 @@ table = "public.users"
         assert!(parse(&MINIMAL.replace("table = \"public.users\"", "table = \"users\"")).is_err());
         assert!(parse(&format!("{MINIMAL}index = \"_bad\"\n")).is_err());
         assert!(parse(&format!("{MINIMAL}index = \"Users\"\n")).is_err());
+    }
+
+    #[test]
+    fn a_fixed_index_is_a_static_target() {
+        let cfg = parse(&format!("{MINIMAL}index = \"users_v2\"\n")).expect("valid");
+        let tbl = &cfg.sync["users"];
+        assert!(!tbl.is_templated());
+        assert_eq!(
+            tbl.index_target("users", &[]),
+            Ok(IndexTarget::Static("users_v2".into()))
+        );
+        assert_eq!(
+            cfg.sync["users"].index_name("users"),
+            "users_v2",
+            "the name as written is what messages show"
+        );
+    }
+
+    #[test]
+    fn a_per_row_index_template_is_accepted() {
+        let cfg = parse(&format!("{MINIMAL}index = \"events-{{tenant}}\"\n")).expect("valid");
+        let tbl = &cfg.sync["users"];
+        assert!(tbl.is_templated());
+        let target = tbl
+            .index_target("users", &["id".to_string()])
+            .expect("a template with a literal prefix");
+        assert!(matches!(&target, IndexTarget::Template { spec, .. } if spec == "events-{tenant}"));
+        assert_eq!(target.pattern(), "events-*");
+        assert_eq!(
+            tbl.index_name("users"),
+            "events-{tenant}",
+            "index_name keeps the spec as written"
+        );
+        parse(&format!("{MINIMAL}index = \"{{tenant}}-events\"\n"))
+            .expect("a leading placeholder is checked where the row renders it");
+    }
+
+    #[test]
+    fn an_index_template_of_only_placeholders_is_refused() {
+        for spec in ["{tenant}", "{tenant}{region}"] {
+            let message = refused(
+                &format!("{MINIMAL}index = \"{spec}\"\n"),
+                "a template without a literal",
+            );
+            assert!(
+                message.contains("all placeholders") && message.contains("public.users"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_index_template_literal_follows_the_index_grammar() {
+        let message = refused(
+            &format!("{MINIMAL}index = \"Events-{{tenant}}\"\n"),
+            "an uppercase leading literal",
+        );
+        assert!(
+            message.contains(
+                "[sync.users] index \"Events-{tenant}\" must start with a lowercase letter"
+            ),
+            "{message}"
+        );
+        let message = refused(
+            &format!("{MINIMAL}index = \"{{tenant}}-Events\"\n"),
+            "an uppercase literal after a placeholder",
+        );
+        assert!(
+            message.contains("may only contain lowercase [a-z0-9_-]"),
+            "{message}"
+        );
+        let message = refused(
+            &format!("{MINIMAL}index = \"events-{{\"\n"),
+            "an unbalanced brace",
+        );
+        assert!(
+            message.contains("is not a usable index template"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn an_index_template_cannot_also_be_shared() {
+        let message = refused(
+            &UNION.replace("index = \"same\"", "index = \"events-{tenant}\""),
+            "two sections on one template",
+        );
+        assert!(
+            message.contains(
+                "[sync.orders] index \"events-{tenant}\" is a template and is also fed by \
+                 [sync.users]"
+            ),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn an_index_template_may_not_claim_another_sections_index() {
+        let toml_str = format!(
+            "{MINIMAL}index = \"events-{{tenant}}\"\n[sync.archive]\ntable = \"public.archive\"\n\
+             index = \"events-archive\"\n"
+        );
+        let message = refused(&toml_str, "a fixed index inside the template's pattern");
+        assert!(
+            message.contains(
+                "[sync.users] index \"events-{tenant}\" claims \"events-*\", which also matches \
+                 \"events-archive\" of [sync.archive]"
+            ) && message.contains("TRUNCATE of public.users"),
+            "{message}"
+        );
+        let toml_str = format!(
+            "{MINIMAL}index = \"events-{{tenant}}\"\n[sync.archive]\ntable = \"public.archive\"\n\
+             index = \"events-{{tenant}}-{{year}}\"\n"
+        );
+        let message = refused(&toml_str, "a template inside another template's pattern");
+        assert!(message.contains("claims \"events-*\""), "{message}");
+        parse(&format!(
+            "{MINIMAL}index = \"events-{{tenant}}\"\n[sync.archive]\ntable = \"public.archive\"\n\
+             index = \"archive\"\n"
+        ))
+        .expect("an index outside the pattern is untouched by the claim");
+    }
+
+    #[test]
+    fn an_index_template_may_not_name_the_fan_out_field() {
+        let message = refused(
+            &format!(
+                "{MINIMAL}index = \"u-{{tags}}\"\n[sync.users.fan_out]\nfield = \"tags\"\n\
+                 id = \"user-{{id}}-{{tag}}\"\n"
+            ),
+            "the index chosen from the array",
+        );
+        assert!(
+            message.contains("[sync.users] index \"u-{tags}\" names the fan_out field tags"),
+            "{message}"
+        );
+        parse(&format!(
+            "{MINIMAL}index = \"u-{{tenant}}\"\n[sync.users.fan_out]\nfield = \"tags\"\n\
+             id = \"user-{{id}}-{{tag}}\"\n"
+        ))
+        .expect("a template over a row column composes with fan-out");
     }
 
     /// Two plain sections into one index, each holding a place for its id.

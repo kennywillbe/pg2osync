@@ -474,6 +474,17 @@ impl IdTemplate {
         Self::column_names(&self.parts)
     }
 
+    /// Every literal between the placeholders, in order.
+    pub fn literals(&self) -> Vec<&str> {
+        self.parts
+            .iter()
+            .filter_map(|part| match part {
+                IdPart::Literal(s) => Some(s.as_str()),
+                IdPart::Column(_) => None,
+            })
+            .collect()
+    }
+
     pub fn is_pk_only(&self) -> bool {
         self.pk_only
     }
@@ -529,6 +540,127 @@ impl IdTemplate {
                 self.render(&doc)
             }
         }
+    }
+}
+
+/// The grammar an index name has to satisfy, in one place: config checks a
+/// fixed name at load, and a name a row rendered is checked where it is
+/// rendered — the only thing that can be done about a bad one there is halt.
+pub fn check_index_name(name: &str) -> Result<(), String> {
+    if !name.chars().next().is_some_and(|c| c.is_ascii_lowercase()) {
+        return Err("must start with a lowercase letter".into());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+    {
+        return Err("may only contain lowercase [a-z0-9_-]".into());
+    }
+    // OpenSearch rejects names starting with '_'; dot-prefix is reserved for
+    // system indices. Kept as its own rule so the reason is on record even
+    // though the first check already turns both away.
+    if name.starts_with('_') || name.starts_with('.') {
+        return Err("must not start with '_' or '.'".into());
+    }
+    Ok(())
+}
+
+/// Where one table's documents go: a fixed index, or one the row renders.
+///
+/// A per-row index is the identity problem again — a column that decides the
+/// name is a column that can change, and the document then lives in the old
+/// index — so it is the same template type, rendered from the same raw row.
+#[derive(Debug, Clone, PartialEq)]
+pub enum IndexTarget {
+    Static(String),
+    /// The spec as written is kept because a rendered name that is not a
+    /// legal index has to say which template produced it.
+    Template {
+        spec: String,
+        template: IdTemplate,
+    },
+}
+
+impl IndexTarget {
+    /// The index for the row `doc` describes. A rendered name is
+    /// grammar-checked here, so no caller can forget to.
+    pub fn render(&self, doc: &serde_json::Value) -> Result<String, String> {
+        match self {
+            Self::Static(name) => Ok(name.clone()),
+            Self::Template { spec, template } => {
+                Self::usable(spec, template, template.render(doc)?)
+            }
+        }
+    }
+
+    /// The index from a primary-key value alone, under the same rule
+    /// `IdTemplate::render_from_pk` applies.
+    pub fn render_from_pk(&self, pk: &serde_json::Value) -> Result<String, String> {
+        match self {
+            Self::Static(name) => Ok(name.clone()),
+            Self::Template { spec, template } => {
+                Self::usable(spec, template, template.render_from_pk(pk)?)
+            }
+        }
+    }
+
+    fn usable(spec: &str, template: &IdTemplate, name: String) -> Result<String, String> {
+        check_index_name(&name).map_err(|why| {
+            format!(
+                "the index template {spec:?} rendered {name:?} from {}, which is not a usable \
+                 index name: {why}",
+                template.columns().join(", ")
+            )
+        })?;
+        Ok(name)
+    }
+
+    /// Whether a bare key can render this. A fixed index needs nothing at all.
+    pub fn is_pk_only(&self) -> bool {
+        match self {
+            Self::Static(_) => true,
+            Self::Template { template, .. } => template.is_pk_only(),
+        }
+    }
+
+    /// The wildcard a TRUNCATE of this table has to clear: each placeholder
+    /// becomes `*`, adjacent stars collapse. `events-{tenant}` -> `events-*`.
+    /// A fixed index is its own pattern, so one rule serves both.
+    pub fn pattern(&self) -> String {
+        match self {
+            Self::Static(name) => name.clone(),
+            Self::Template { template, .. } => {
+                let mut out = String::new();
+                for part in &template.parts {
+                    match part {
+                        IdPart::Literal(s) => out.push_str(s),
+                        IdPart::Column(_) if out.ends_with('*') => {}
+                        IdPart::Column(_) => out.push('*'),
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    /// The index as the configuration wrote it.
+    pub fn spec(&self) -> &str {
+        match self {
+            Self::Static(name) => name,
+            Self::Template { spec, .. } => spec,
+        }
+    }
+}
+
+impl From<String> for IndexTarget {
+    fn from(name: String) -> Self {
+        Self::Static(name)
+    }
+}
+
+impl From<&str> for IndexTarget {
+    fn from(name: &str) -> Self {
+        Self::Static(name.to_string())
     }
 }
 
@@ -788,34 +920,38 @@ impl JoinRule {
     }
 }
 
-/// Maps `(schema, table)` to the target index name, from `[sync.*]` config.
+/// Maps `(schema, table)` to where its documents go, from `[sync.*]` config.
 #[derive(Debug, Clone, Default)]
 pub struct TableMapping {
-    map: HashMap<(String, String), String>,
+    map: HashMap<(String, String), IndexTarget>,
     /// Indices more than one table writes to. A TRUNCATE of one of them must
     /// not clear the index: the other tables' documents are in it, and nothing
-    /// in the source would ever put them back.
+    /// in the source would ever put them back. Only fixed names count: a
+    /// template claims a namespace of its own, which config refuses to share.
     shared: HashSet<String>,
 }
 
 impl TableMapping {
-    pub fn from_pairs(pairs: impl IntoIterator<Item = ((String, String), String)>) -> Self {
+    pub fn from_pairs<T: Into<IndexTarget>>(
+        pairs: impl IntoIterator<Item = ((String, String), T)>,
+    ) -> Self {
         let mut map = HashMap::new();
         let mut seen = HashSet::new();
         let mut shared = HashSet::new();
-        for (table, index) in pairs {
-            if !seen.insert(index.clone()) {
+        for (table, target) in pairs {
+            let target = target.into();
+            if let IndexTarget::Static(index) = &target
+                && !seen.insert(index.clone())
+            {
                 shared.insert(index.clone());
             }
-            map.insert(table, index);
+            map.insert(table, target);
         }
         Self { map, shared }
     }
 
-    pub fn opt_index_for(&self, schema: &str, table: &str) -> Option<&str> {
-        self.map
-            .get(&(schema.to_string(), table.to_string()))
-            .map(String::as_str)
+    pub fn target_for(&self, schema: &str, table: &str) -> Option<&IndexTarget> {
+        self.map.get(&(schema.to_string(), table.to_string()))
     }
 
     pub fn is_shared(&self, index: &str) -> bool {
@@ -1174,21 +1310,148 @@ mod tests {
 
     #[test]
     fn unmapped_tables_have_no_index() {
-        let m = TableMapping::from_pairs([(("public".into(), "users".into()), "users_v1".into())]);
-        assert_eq!(m.opt_index_for("public", "users"), Some("users_v1"));
-        assert_eq!(m.opt_index_for("public", "orders"), None);
+        let m = TableMapping::from_pairs([(("public".into(), "users".into()), "users_v1")]);
+        assert_eq!(
+            m.target_for("public", "users"),
+            Some(&IndexTarget::Static("users_v1".into()))
+        );
+        assert_eq!(m.target_for("public", "orders"), None);
     }
 
     #[test]
     fn a_mapping_knows_which_indices_more_than_one_table_feeds() {
         let m = TableMapping::from_pairs([
-            (("public".into(), "users".into()), "u".into()),
-            (("public".into(), "orders".into()), "u".into()),
-            (("public".into(), "carts".into()), "c".into()),
+            (("public".into(), "users".into()), "u"),
+            (("public".into(), "orders".into()), "u"),
+            (("public".into(), "carts".into()), "c"),
         ]);
         assert!(m.is_shared("u"));
         assert!(!m.is_shared("c"));
         assert!(!m.is_shared("nowhere"));
+    }
+
+    fn indexed(spec: &str, pk_columns: &[&str]) -> IndexTarget {
+        IndexTarget::Template {
+            spec: spec.into(),
+            template: pk(spec, pk_columns),
+        }
+    }
+
+    #[test]
+    fn a_template_is_never_a_shared_index() {
+        // two templates that happen to render the same name are refused at
+        // config; the mapping only ever counts what it can see, fixed names
+        let m = TableMapping::from_pairs([
+            (("public".into(), "events".into()), indexed("e-{t}", &[])),
+            (("public".into(), "audits".into()), indexed("e-{t}", &[])),
+        ]);
+        assert!(!m.is_shared("e-x"));
+        assert!(!m.is_shared("e-*"));
+    }
+
+    #[test]
+    fn a_static_target_renders_its_own_name() {
+        let t = IndexTarget::from("users");
+        assert_eq!(t.render(&json!({"id": 1})).expect("fixed"), "users");
+        assert_eq!(t.render_from_pk(&json!(1)).expect("fixed"), "users");
+        assert!(t.is_pk_only(), "a bare key is more than enough");
+        assert_eq!(t.spec(), "users");
+        assert_eq!(
+            IndexTarget::from("u".to_string()),
+            IndexTarget::Static("u".into())
+        );
+    }
+
+    #[test]
+    fn a_templated_target_renders_from_the_raw_row() {
+        let t = indexed("events-{tenant}", &["id"]);
+        assert!(!t.is_pk_only());
+        assert_eq!(
+            t.render(&json!({"id": 7, "tenant": "acme"}))
+                .expect("renders"),
+            "events-acme"
+        );
+        assert_eq!(t.spec(), "events-{tenant}");
+        let keyed = indexed("shard-{id}", &["id"]);
+        assert!(keyed.is_pk_only());
+        assert_eq!(
+            keyed.render_from_pk(&json!(7)).expect("bare key"),
+            "shard-7"
+        );
+    }
+
+    #[test]
+    fn a_rendered_name_that_is_not_a_usable_index_is_an_error() {
+        let t = indexed("events-{tenant}", &[]);
+        let err = t.render(&json!({"tenant": "ACME"})).unwrap_err();
+        assert!(
+            err.contains("events-{tenant}")
+                && err.contains("events-ACME")
+                && err.contains("tenant"),
+            "names the template, what it rendered and from which column: {err}"
+        );
+        assert!(err.contains("lowercase"), "{err}");
+        let leading = indexed("{tenant}-events", &[]);
+        assert!(leading.render(&json!({"tenant": "_x"})).is_err());
+        assert!(
+            leading.render(&json!({"tenant": ""})).is_err(),
+            "an empty value leaves a name that starts with '-'"
+        );
+        assert!(
+            leading.render_from_pk(&json!({"tenant": "X"})).is_err(),
+            "the key path is checked too"
+        );
+    }
+
+    #[test]
+    fn a_null_in_an_index_column_is_an_error() {
+        let t = indexed("events-{tenant}", &[]);
+        let err = t.render(&json!({"tenant": null})).unwrap_err();
+        assert!(err.contains("tenant") && err.contains("NULL"), "{err}");
+    }
+
+    #[test]
+    fn a_templates_pattern_replaces_every_placeholder_with_a_star() {
+        assert_eq!(indexed("events-{month}", &[]).pattern(), "events-*");
+        assert_eq!(indexed("{a}-{b}-x", &[]).pattern(), "*-*-x");
+        assert_eq!(
+            indexed("{a}{b}-x", &[]).pattern(),
+            "*-x",
+            "adjacent placeholders are one star"
+        );
+    }
+
+    #[test]
+    fn a_fixed_index_is_its_own_pattern() {
+        assert_eq!(IndexTarget::from("users").pattern(), "users");
+    }
+
+    #[test]
+    fn literals_are_reported_in_order() {
+        assert_eq!(pk("a-{x}-b{y}c", &[]).literals(), vec!["a-", "-b", "c"]);
+        assert!(pk("{x}{y}", &[]).literals().is_empty());
+        assert_eq!(pk("plain", &[]).literals(), vec!["plain"]);
+    }
+
+    #[test]
+    fn an_index_name_is_checked_against_one_grammar() {
+        let cases = [
+            ("users", None),
+            ("events-2024_01", None),
+            ("Users", Some("must start with a lowercase letter")),
+            ("", Some("must start with a lowercase letter")),
+            ("_hidden", Some("must start with a lowercase letter")),
+            (".system", Some("must start with a lowercase letter")),
+            ("events-ACME", Some("may only contain lowercase [a-z0-9_-]")),
+            ("a b", Some("may only contain lowercase [a-z0-9_-]")),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(
+                check_index_name(name).err().as_deref(),
+                expected,
+                "{name:?}"
+            );
+        }
     }
 
     fn pk(spec: &str, pk_columns: &[&str]) -> IdTemplate {

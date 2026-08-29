@@ -1524,5 +1524,140 @@ check "and the pipeline is still streaming after it" "$(os_status e2e_union user
 check "the skip is counted" "$(curl -s 127.0.0.1:9126/metrics | awk '/^pg2osync_events_total\{type="truncate_skipped"\} /{print $2}')" "1"
 stop_sync
 
+echo -e "\n\033[1m== 26. a row chooses the index it lands in ==\033[0m"
+# `index` with a placeholder is the id problem again (#69): the column can
+# change, and the document is then in the old index. So everything section
+# 21 holds for a derived id has to hold here — the before-image is required,
+# a change moves the document, an unusable name halts — plus what is new:
+# the index is created the first time a row needs it, with the configured
+# mapping, and nothing that pages one index can run against the table.
+ECONFIG=$(mktemp /tmp/pg2osync-e2e-events.XXXXXX)
+EMAPPING=$(dirname "$ECONFIG")/pg2osync-e2e-events-mapping.json
+ESLOT=pg2osync_e2e_events
+drop_idle_probe_slots
+cat > "$ECONFIG" <<TOML
+[source]
+url_env = "PG2OSYNC_SOURCE_URL"
+slot_name = "$ESLOT"
+publication = "${ESLOT}_pub"
+
+[target]
+url = "http://localhost:9200"
+
+[metrics]
+bind = "127.0.0.1:9127"
+
+[sync.events]
+table = "public.events_probe"
+index = "e2e-events-{tenant}"
+mapping_file = "pg2osync-e2e-events-mapping.json"
+TOML
+cat > "$EMAPPING" <<'JSON'
+{"mappings":{"properties":{"tenant":{"type":"keyword"}}}}
+JSON
+events_cleanup() {
+  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  pg "SELECT pg_drop_replication_slot('$ESLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$ESLOT');" > /dev/null 2>&1 || true
+  pg "DROP PUBLICATION IF EXISTS ${ESLOT}_pub; DROP TABLE IF EXISTS events_probe;" > /dev/null 2>&1 || true
+  curl -s -XDELETE "$OS/e2e-events-*?ignore_unavailable=true" > /dev/null 2>&1 || true
+  rm -f "$ECONFIG" "$EMAPPING"
+}
+trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup; init_cleanup; fan_cleanup; bid_cleanup; shape_cleanup; where_cleanup; join_cleanup; union_cleanup; events_cleanup' EXIT
+
+pg "DROP TABLE IF EXISTS events_probe; CREATE TABLE events_probe(id bigint primary key, tenant text, at timestamptz);" > /dev/null 2>&1
+pg "INSERT INTO events_probe VALUES (1,'acme',now());" > /dev/null
+pg "DROP PUBLICATION IF EXISTS ${ESLOT}_pub; CREATE PUBLICATION ${ESLOT}_pub FOR TABLE events_probe;" > /dev/null 2>&1
+curl -s -XDELETE "$OS/e2e-events-*?ignore_unavailable=true" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/postgres-$ESLOT" > /dev/null
+# a template with no literal part claims `*`, and a TRUNCATE of the table
+# would then clear the cluster: refused where it can still be fixed. Captured
+# first: a refusal exits non-zero, which under pipefail would hide a grep
+# that matched.
+sed 's/^index = "e2e-events-{tenant}"$/index = "{tenant}"/' "$ECONFIG" > "${ECONFIG}.bad"
+out=$($BIN validate -c "${ECONFIG}.bad" 2>&1 || true)
+if grep -q "is all placeholders" <<< "$out"; then
+  ok "validate refuses an index template with no literal part"
+else
+  bad "validate accepted an index template that would claim every index"
+fi
+rm -f "${ECONFIG}.bad"
+# without the old row the pipeline could not find the index a changed row
+# was in, so the tool refuses to start rather than strand the document. The
+# log is cumulative across sections, so only a new line counts.
+full_before=$(grep -c "REPLICA IDENTITY FULL" "$LOG" || true)
+nohup $BIN run -c "$ECONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+for _ in $(seq 1 30); do
+  [ "$(grep -c 'REPLICA IDENTITY FULL' "$LOG" || true)" -gt "$full_before" ] && break
+  sleep 1
+done
+if [ "$(grep -c 'REPLICA IDENTITY FULL' "$LOG" || true)" -gt "$full_before" ]; then
+  ok "a per-row index on a non-FULL table is refused with the ALTER to run"
+else
+  bad "the pipeline started despite an index it could not find the old document in"
+fi
+stop_sync
+pg "ALTER TABLE events_probe REPLICA IDENTITY FULL;" > /dev/null 2>&1
+nohup $BIN run -c "$ECONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_status e2e-events-acme 1)" = "200" ] && break
+  sleep 1
+done
+check "the row lands in the index its tenant column names" "$(os_status e2e-events-acme 1)" "200"
+# the index did not exist before the row did, so a keyword here says the
+# on-demand creation used the section's mapping rather than dynamic mapping
+check "the index was created on demand with the configured mapping" \
+  "$(curl -s "$OS/e2e-events-acme/_mapping" | jqf "d.get('e2e-events-acme',{}).get('mappings',{}).get('properties',{}).get('tenant',{}).get('type','<missing>')")" "keyword"
+pg "UPDATE events_probe SET tenant='globex' WHERE id = 1;" > /dev/null
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_status e2e-events-globex 1)" = "200" ] && break
+  sleep 1
+done
+check "an update that changes the index writes the document there" "$(os_status e2e-events-globex 1)" "200"
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_status e2e-events-acme 1)" = "404" ] && break
+  sleep 1
+done
+check "and removes it from the index it was in" "$(os_status e2e-events-acme 1)" "404"
+pg "DELETE FROM events_probe WHERE id = 1;" > /dev/null
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_status e2e-events-globex 1)" = "404" ] && break
+  sleep 1
+done
+check "the delete finds the document in the index the old row names" "$(os_status e2e-events-globex 1)" "404"
+check "exactly the indices the rows named exist" "$(curl -s "$OS/_cat/indices/e2e-events-*?h=index" | wc -l | tr -d ' ')" "2"
+# an uppercase letter cannot become an index, and inventing a name would
+# file the row where nothing looks for it: the pipeline halts, naming the
+# template, the column and the value it rendered. Only a new line counts.
+halts_before=$(grep -c "not a usable index name" "$LOG" || true)
+pg "INSERT INTO events_probe VALUES (2,'ACME',now());" > /dev/null
+for _ in $(seq 1 30); do
+  [ "$(grep -c 'not a usable index name' "$LOG" || true)" -gt "$halts_before" ] && break
+  sleep 1
+done
+if [ "$(grep -c 'not a usable index name' "$LOG" || true)" -gt "$halts_before" ]; then
+  ok "a rendered name that is not a legal index halts the pipeline"
+else
+  bad "the pipeline accepted an index name the target could not have created"
+fi
+if grep "not a usable index name" "$LOG" | tail -1 | grep -q "ACME"; then
+  ok "and the halt names the value it rendered"
+else
+  bad "the halt did not say which value was refused"
+fi
+check "no index was created for the refused name" "$(curl -s "$OS/_cat/indices/e2e-events-*?h=index" | wc -l | tr -d ' ')" "2"
+stop_sync
+# reconcile pages one index by its key column, and this table's documents
+# are spread over every index the template renders
+out=$($BIN reconcile -c "$ECONFIG" 2>&1 || true)
+if grep -q "chosen per row" <<< "$out"; then
+  ok "reconcile refuses a table whose index is chosen per row"
+else
+  bad "reconcile did not refuse the templated table"
+fi
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

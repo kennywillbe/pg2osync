@@ -8,15 +8,18 @@ use async_trait::async_trait;
 use opensearch::auth::Credentials;
 use opensearch::http::response::Response;
 use opensearch::http::transport::{SingleNodeConnectionPool, TransportBuilder};
-use opensearch::params::VersionType;
+use opensearch::params::{ExpandWildcards, VersionType};
 use opensearch::{BulkOperation, BulkParts, GetParts, IndexParts, OpenSearch};
 use pg2osync_core::checkpoint::Checkpoint;
 use pg2osync_core::error::CoreError;
 use pg2osync_core::lsn::Lsn;
 use pg2osync_core::sink::{
     BulkLoadSettings, DocumentOp, Health, IndexSpec, LsnOp, Rejection, Sink, SinkAck, StoredReject,
+    index_matches_pattern,
 };
 use serde_json::{Value, json};
+use std::collections::HashSet;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 pub const META_INDEX: &str = ".pg2osync_meta";
 /// Where documents the target refused are kept.
@@ -108,6 +111,12 @@ pub fn checkpoint_from_doc(src: &Value) -> Option<Checkpoint> {
 pub struct OpenSearchSink {
     client: OpenSearch,
     retry: RetryPolicy,
+    /// Globs recorded by `ensure_ready` for templated tables, with the mapping
+    /// an index they claim should be created with. Written once there and
+    /// only read afterwards; a mutex because `ensure_ready` takes `&self`.
+    templates: Mutex<Vec<(String, Option<Value>)>>,
+    /// Index names known to exist, so the ordinary batch costs no request.
+    known_indexes: Mutex<HashSet<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -173,6 +182,8 @@ impl OpenSearchSink {
         Ok(Self {
             client: OpenSearch::new(transport),
             retry: cfg.retry,
+            templates: Mutex::new(Vec::new()),
+            known_indexes: Mutex::new(HashSet::new()),
         })
     }
 
@@ -191,6 +202,9 @@ impl OpenSearchSink {
     /// version, so its delete is refused and it stays — and once every
     /// remaining document is one of those, the round deletes nothing and the
     /// loop is done.
+    ///
+    /// `index` may be the glob of a templated table. The search expands it,
+    /// and each hit is deleted from the index it was found in.
     async fn truncate_at_version(
         &self,
         index: &str,
@@ -199,23 +213,33 @@ impl OpenSearchSink {
     ) -> Result<(), CoreError> {
         const PAGE: usize = 1000;
         loop {
+            // a glob whose rows have not rendered a single index yet matches
+            // nothing, which is an empty table rather than a missing one
             let resp = self
                 .client
                 .search(opensearch::SearchParts::Index(&[index]))
+                .allow_no_indices(true)
+                .expand_wildcards(&[ExpandWildcards::Open])
                 .body(json!({"size": PAGE, "_source": false, "query": query}))
                 .send()
                 .await
                 .map_err(http_err)?;
             let body: Value = resp.json().await.map_err(http_err)?;
             // a join child lives on its parent's shard, and the delete has to
-            // name that shard the way the write did
-            let hits: Vec<(String, Option<String>)> = body["hits"]["hits"]
+            // name that shard the way the write did; a hit without an index
+            // is skipped rather than deleted from the glob, which would fail
+            let hits: Vec<(String, String, Option<String>)> = body["hits"]["hits"]
                 .as_array()
                 .map(|hits| {
                     hits.iter()
                         .filter_map(|hit| {
+                            let found_in = hit["_index"].as_str()?;
                             hit["_id"].as_str().map(|id| {
-                                (id.to_string(), hit["_routing"].as_str().map(str::to_string))
+                                (
+                                    found_in.to_string(),
+                                    id.to_string(),
+                                    hit["_routing"].as_str().map(str::to_string),
+                                )
                             })
                         })
                         .collect()
@@ -227,9 +251,9 @@ impl OpenSearchSink {
 
             let ops: Vec<BulkOperation<Value>> = hits
                 .iter()
-                .map(|(id, routing)| {
+                .map(|(found_in, id, routing)| {
                     let op = BulkOperation::delete(id.clone())
-                        .index(index.to_string())
+                        .index(found_in.clone())
                         .version(version)
                         .version_type(VersionType::ExternalGte);
                     match routing {
@@ -371,15 +395,14 @@ impl OpenSearchSink {
         }
     }
 
-    async fn warn_on_suspended_refresh(&self, tables: &[IndexSpec]) {
-        if tables.is_empty() {
+    async fn warn_on_suspended_refresh(&self, names: &[&str]) {
+        if names.is_empty() {
             return;
         }
-        let names: Vec<&str> = tables.iter().map(|s| s.name.as_str()).collect();
         let Ok(resp) = self
             .client
             .indices()
-            .get_settings(opensearch::indices::IndicesGetSettingsParts::Index(&names))
+            .get_settings(opensearch::indices::IndicesGetSettingsParts::Index(names))
             .send()
             .await
         else {
@@ -388,7 +411,7 @@ impl OpenSearchSink {
         let Ok(body) = resp.json::<Value>().await else {
             return;
         };
-        for name in names {
+        for name in names.iter().copied() {
             if body[name]["settings"]["index"]["refresh_interval"] == json!("-1") {
                 tracing::warn!(target: "pg2osync::sink",
                     "index {name} has refresh_interval = -1, so nothing written to it is \
@@ -410,6 +433,97 @@ impl OpenSearchSink {
             .await
             .map_err(http_err)?;
         check_status(resp, &format!("settings for {index}")).await
+    }
+
+    /// Create `name` with `mapping` unless it exists; whether this call made it.
+    ///
+    /// Losing a race to create it — two writers, or an operator — is the same
+    /// end state as finding it, so `resource_already_exists_exception` is not
+    /// an error here.
+    async fn create_index_if_absent(
+        &self,
+        name: &str,
+        mapping: Option<&Value>,
+    ) -> Result<bool, CoreError> {
+        let exists = self
+            .client
+            .indices()
+            .exists(opensearch::indices::IndicesExistsParts::Index(&[name]))
+            .send()
+            .await
+            .map_err(http_err)?;
+        if exists.status_code().is_success() {
+            return Ok(false);
+        }
+        // an empty body leaves the index to whatever the target infers, or to
+        // whatever index template the operator already manages
+        let body = mapping.map_or_else(|| json!({}), crate::mapping::create_body);
+        let resp = self
+            .client
+            .indices()
+            .create(opensearch::indices::IndicesCreateParts::Index(name))
+            .body(body)
+            .send()
+            .await
+            .map_err(http_err)?;
+        if resp.status_code().is_success() {
+            return Ok(true);
+        }
+        let status = resp.status_code();
+        let body: Value = resp.json().await.unwrap_or(Value::Null);
+        if body["error"]["type"] == "resource_already_exists_exception" {
+            return Ok(false);
+        }
+        Err(CoreError::Sink(format!(
+            "create index {name} failed: {status} {body}"
+        )))
+    }
+
+    /// Create any index this batch writes to that does not exist yet and that a
+    /// recorded template claims.
+    ///
+    /// Here rather than in `ensure_ready`, because the set of indices is not
+    /// known until the rows are: pre-creating every index a template *could*
+    /// render means enumerating a column's values, which nothing can do.
+    ///
+    /// Upserts only: creating an index to delete from it is work with no
+    /// document to show for it, and a delete against a missing index is
+    /// tolerated by the bulk triage instead.
+    async fn ensure_batch_indexes(&self, batch: &[LsnOp]) -> Result<(), CoreError> {
+        // neither guard is held across an await: the mutexes are std, and
+        // the creates below are the slow part
+        let unknown: HashSet<&str> = {
+            let known = lock(&self.known_indexes);
+            batch
+                .iter()
+                .filter_map(|op| match &op.op {
+                    DocumentOp::Upsert { index, .. } if !known.contains(index) => {
+                        Some(index.as_str())
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        if unknown.is_empty() {
+            return Ok(());
+        }
+        let claimed: Vec<(String, Option<Value>)> = {
+            let templates = lock(&self.templates);
+            unknown
+                .into_iter()
+                .filter_map(|name| {
+                    claiming_template(&templates, name).map(|m| (name.to_string(), m.clone()))
+                })
+                .collect()
+        };
+        for (name, mapping) in claimed {
+            if self.create_index_if_absent(&name, mapping.as_ref()).await? {
+                tracing::info!(target: "pg2osync::sink",
+                    "created index {name} for the first row that chose it");
+            }
+            lock(&self.known_indexes).insert(name);
+        }
+        Ok(())
     }
 
     pub async fn ensure_meta_index(&self) -> Result<(), CoreError> {
@@ -531,12 +645,13 @@ impl OpenSearchSink {
                     "version conflict on {} left the newer document in place: {}",
                     entry["_id"].as_str().unwrap_or("?"),
                     entry["error"]["reason"].as_str().unwrap_or("?"));
-            } else if entry["result"] == "not_found" {
+            } else if is_absent(&item) {
                 // A delete with nothing to delete, which is the desired end
                 // state and arrives 404. Delivery is at-least-once, so a replay
                 // after any restart re-sends deletes whose documents are already
                 // gone — counting those as refusals halted the pipeline on its
-                // own correctness.
+                // own correctness. The index a row's template chose may not
+                // exist at all, which is the same end state.
                 tracing::debug!(target: "pg2osync::sink",
                     "{} was already absent", entry["_id"].as_str().unwrap_or("?"));
             } else if !(200..300).contains(&item_status) {
@@ -656,6 +771,35 @@ async fn check_status(resp: Response, what: &str) -> Result<(), CoreError> {
         return Err(CoreError::Sink(format!("{what} failed: {status} {}", body)));
     }
     Ok(())
+}
+
+/// A guard on one of the sink's registries. A poisoned lock is still usable:
+/// nothing panics between taking a guard and finishing one insert, so the
+/// registry behind it is never half-written.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The mapping the first recorded glob that claims `name` was configured
+/// with, or `None` when no template claims it. Config refuses two templates
+/// that overlap, so "first" is the only one.
+pub(crate) fn claiming_template<'a>(
+    templates: &'a [(String, Option<Value>)],
+    name: &str,
+) -> Option<&'a Option<Value>> {
+    templates
+        .iter()
+        .find(|(pattern, _)| index_matches_pattern(pattern, name))
+        .map(|(_, mapping)| mapping)
+}
+
+/// Whether a bulk item is a delete that found nothing to delete: the document
+/// was already gone, or the index a row's template chose was never created —
+/// creation is on demand and only an upsert asks for it. Read off the `delete`
+/// action only, so an upsert into a missing index stays the rejection it is.
+pub(crate) fn is_absent(item: &Value) -> bool {
+    let entry = &item["delete"];
+    entry["result"] == "not_found" || entry["error"]["type"] == "index_not_found_exception"
 }
 
 fn chrono_now() -> u64 {
@@ -873,32 +1017,20 @@ fn report_mapping(index: &str, configured: &Value, live: &Value) -> Result<(), C
 impl Sink for OpenSearchSink {
     async fn ensure_ready(&self, tables: &[IndexSpec]) -> Result<(), CoreError> {
         self.ensure_meta_index().await?;
+        let mut fixed: Vec<&str> = Vec::new();
         for spec in tables {
-            let exists = self
-                .client
-                .indices()
-                .exists(opensearch::indices::IndicesExistsParts::Index(
-                    &[&spec.name],
-                ))
-                .send()
-                .await
-                .map_err(http_err)?;
-            if !exists.status_code().is_success() {
-                // an empty body leaves the index to whatever the target infers,
-                // or to whatever index template the operator already manages
-                let body = spec
-                    .mapping
-                    .as_ref()
-                    .map_or_else(|| json!({}), crate::mapping::create_body);
-                let resp = self
-                    .client
-                    .indices()
-                    .create(opensearch::indices::IndicesCreateParts::Index(&spec.name))
-                    .body(body)
-                    .send()
-                    .await
-                    .map_err(http_err)?;
-                check_status(resp, &format!("create index {}", spec.name)).await?;
+            if spec.pattern {
+                // nothing exists to create or compare yet: the names come from
+                // rows, and the first batch that writes one creates it
+                lock(&self.templates).push((spec.name.clone(), spec.mapping.clone()));
+                continue;
+            }
+            fixed.push(&spec.name);
+            let created = self
+                .create_index_if_absent(&spec.name, spec.mapping.as_ref())
+                .await?;
+            lock(&self.known_indexes).insert(spec.name.clone());
+            if created {
                 continue;
             }
             if let Some(mapping) = &spec.mapping {
@@ -915,7 +1047,9 @@ impl Sink for OpenSearchSink {
                 report_mapping(&spec.name, mapping, &body[&spec.name])?;
             }
         }
-        self.warn_on_suspended_refresh(tables).await;
+        // fixed names only: settings for a glob come back one body per index,
+        // and there is no index behind a glob yet anyway
+        self.warn_on_suspended_refresh(&fixed).await;
         Ok(())
     }
 
@@ -958,6 +1092,7 @@ impl Sink for OpenSearchSink {
                 "engine must never send empty batches".into(),
             ));
         }
+        self.ensure_batch_indexes(&batch).await?;
         // A cascade is not a bulk action, and it has to run after the parent's
         // own delete and before anything that follows it, so the batch is
         // written in the runs between cascades, in order.
@@ -1014,7 +1149,8 @@ impl Sink for OpenSearchSink {
         };
         // delete_by_query only removes documents a search can see, so writes
         // still sitting in the translog would survive the TRUNCATE and
-        // resurrect rows the source has already dropped
+        // resurrect rows the source has already dropped. `index` may be a
+        // templated table's glob; refresh expands one itself.
         let resp = self
             .client
             .indices()
@@ -1035,6 +1171,7 @@ impl Sink for OpenSearchSink {
             return self.truncate_at_version(index, version, &query).await;
         }
 
+        // a glob is expanded by delete_by_query itself
         let resp = self
             .client
             .delete_by_query(opensearch::DeleteByQueryParts::Index(&[index]))
@@ -1458,6 +1595,40 @@ mod tests {
 
     use super::*;
     use pg2osync_core::checkpoint::{SOURCE_MYSQL, SOURCE_POSTGRES, StreamId};
+
+    #[test]
+    fn the_first_template_claiming_a_name_lends_it_its_mapping() {
+        let events = Some(json!({"properties": {"at": {"type": "date"}}}));
+        let templates = vec![
+            ("events-*".to_string(), events.clone()),
+            ("*-archive".to_string(), None),
+        ];
+        assert_eq!(claiming_template(&templates, "events-acme"), Some(&events));
+        assert_eq!(claiming_template(&templates, "orders-archive"), Some(&None));
+        assert_eq!(claiming_template(&templates, "orders-live"), None);
+        assert_eq!(claiming_template(&[], "events-acme"), None);
+    }
+
+    #[test]
+    fn a_delete_that_found_nothing_is_absent_whether_the_document_or_the_index_was_missing() {
+        assert!(is_absent(
+            &json!({"delete": {"_id": "1", "status": 404, "result": "not_found"}})
+        ));
+        assert!(is_absent(&json!({"delete": {"_id": "1", "status": 404,
+            "error": {"type": "index_not_found_exception", "reason": "no such index [events-acme]"}}})));
+    }
+
+    #[test]
+    fn a_missing_index_on_an_upsert_is_not_absence() {
+        // an index action with nowhere to go is a refusal, not a no-op
+        assert!(!is_absent(&json!({"index": {"_id": "1", "status": 404,
+            "error": {"type": "index_not_found_exception", "reason": "no such index [events-acme]"}}})));
+        assert!(!is_absent(
+            &json!({"delete": {"_id": "1", "status": 200, "result": "deleted"}})
+        ));
+        assert!(!is_absent(&json!({"delete": {"_id": "1", "status": 400,
+            "error": {"type": "illegal_argument_exception", "reason": "bad"}}})));
+    }
 
     fn checkpoint() -> Checkpoint {
         Checkpoint {

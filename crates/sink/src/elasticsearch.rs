@@ -11,6 +11,8 @@ use pg2osync_core::error::CoreError;
 use pg2osync_core::lsn::Lsn;
 use pg2osync_core::sink::{BulkLoadSettings, DocumentOp, Health, IndexSpec, LsnOp, Sink, SinkAck};
 use serde_json::{Value, json};
+use std::collections::HashSet;
+use std::sync::Mutex;
 
 pub const META_INDEX: &str = ".pg2osync_meta";
 
@@ -18,6 +20,12 @@ pub struct ElasticsearchSink {
     http: reqwest::Client,
     base_url: String,
     retry: crate::RetryPolicy,
+    /// Globs recorded by `ensure_ready` for templated tables, with the mapping
+    /// an index they claim should be created with. Written once there and
+    /// only read afterwards; a mutex because `ensure_ready` takes `&self`.
+    templates: Mutex<Vec<(String, Option<Value>)>>,
+    /// Index names known to exist, so the ordinary batch costs no request.
+    known_indexes: Mutex<HashSet<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +99,9 @@ impl ElasticsearchSink {
     /// The loop stops when a round deletes nothing, which is also what makes it
     /// correct: a document written after the truncate carries a higher version,
     /// its delete is refused, and it survives.
+    ///
+    /// `index` may be the glob of a templated table. The search expands it,
+    /// and each hit is deleted from the index it was found in.
     async fn truncate_at_version(
         &self,
         index: &str,
@@ -99,22 +110,30 @@ impl ElasticsearchSink {
     ) -> Result<(), CoreError> {
         const PAGE: usize = 1000;
         loop {
+            // a glob whose rows have not rendered a single index yet matches
+            // nothing, which is an empty table rather than a missing one
             let (_, body) = self
                 .send(
                     reqwest::Method::POST,
-                    &format!("/{index}/_search"),
+                    &format!("/{index}/_search?allow_no_indices=true&expand_wildcards=open"),
                     Some(json!({"size": PAGE, "_source": false, "query": query}).to_string()),
                 )
                 .await?;
             // a join child lives on its parent's shard, and the delete has to
-            // name that shard the way the write did
-            let hits: Vec<(String, Option<String>)> = body["hits"]["hits"]
+            // name that shard the way the write did; a hit without an index
+            // is skipped rather than deleted from the glob, which would fail
+            let hits: Vec<(String, String, Option<String>)> = body["hits"]["hits"]
                 .as_array()
                 .map(|hits| {
                     hits.iter()
                         .filter_map(|hit| {
+                            let found_in = hit["_index"].as_str()?;
                             hit["_id"].as_str().map(|id| {
-                                (id.to_string(), hit["_routing"].as_str().map(str::to_string))
+                                (
+                                    found_in.to_string(),
+                                    id.to_string(),
+                                    hit["_routing"].as_str().map(str::to_string),
+                                )
                             })
                         })
                         .collect()
@@ -124,11 +143,11 @@ impl ElasticsearchSink {
                 return Ok(());
             }
             let mut ndjson = String::new();
-            for (id, routing) in &hits {
+            for (found_in, id, routing) in &hits {
                 ndjson.push_str(&format!(
                     "{{\"delete\":{{\"_index\":{},\"_id\":{}{},\"version\":{version},\
                      \"version_type\":\"external_gte\"}}}}\n",
-                    serde_json::to_string(index).unwrap_or_default(),
+                    serde_json::to_string(found_in).unwrap_or_default(),
                     serde_json::to_string(id).unwrap_or_default(),
                     routing_field(routing.as_deref()),
                 ));
@@ -288,7 +307,81 @@ impl ElasticsearchSink {
             http,
             base_url: cfg.url.trim_end_matches('/').to_string(),
             retry: cfg.retry,
+            templates: Mutex::new(Vec::new()),
+            known_indexes: Mutex::new(HashSet::new()),
         })
+    }
+
+    /// Create `name` with `mapping` unless it exists; whether this call made it.
+    ///
+    /// One PUT rather than an exists check first: Elasticsearch answers a
+    /// second create with `resource_already_exists_exception`, which is the
+    /// same end state as finding it — whoever won the race, the index is
+    /// there.
+    async fn create_index_if_absent(
+        &self,
+        name: &str,
+        mapping: Option<&Value>,
+    ) -> Result<bool, CoreError> {
+        // without a body the index takes whatever Elasticsearch infers, or
+        // whatever index template the operator already manages
+        let create = mapping.map(|m| crate::mapping::create_body(m).to_string());
+        let (status, body) = self
+            .send(reqwest::Method::PUT, &format!("/{name}"), create)
+            .await?;
+        let already = body["error"]["type"] == json!("resource_already_exists_exception");
+        if !(status == 200 || already) {
+            return Err(CoreError::Sink(format!("create index {name}: {status}")));
+        }
+        Ok(!already)
+    }
+
+    /// Create any index this batch writes to that does not exist yet and that a
+    /// recorded template claims.
+    ///
+    /// Here rather than in `ensure_ready`, because the set of indices is not
+    /// known until the rows are: pre-creating every index a template *could*
+    /// render means enumerating a column's values, which nothing can do.
+    ///
+    /// Upserts only: creating an index to delete from it is work with no
+    /// document to show for it, and a delete against a missing index is
+    /// tolerated by the bulk triage instead.
+    async fn ensure_batch_indexes(&self, batch: &[LsnOp]) -> Result<(), CoreError> {
+        // neither guard is held across an await: the mutexes are std, and
+        // the creates below are the slow part
+        let unknown: HashSet<&str> = {
+            let known = crate::lock(&self.known_indexes);
+            batch
+                .iter()
+                .filter_map(|op| match &op.op {
+                    DocumentOp::Upsert { index, .. } if !known.contains(index) => {
+                        Some(index.as_str())
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        if unknown.is_empty() {
+            return Ok(());
+        }
+        let claimed: Vec<(String, Option<Value>)> = {
+            let templates = crate::lock(&self.templates);
+            unknown
+                .into_iter()
+                .filter_map(|name| {
+                    crate::claiming_template(&templates, name)
+                        .map(|m| (name.to_string(), m.clone()))
+                })
+                .collect()
+        };
+        for (name, mapping) in claimed {
+            if self.create_index_if_absent(&name, mapping.as_ref()).await? {
+                tracing::info!(target: "pg2osync::sink",
+                    "created index {name} for the first row that chose it");
+            }
+            crate::lock(&self.known_indexes).insert(name);
+        }
+        Ok(())
     }
 
     async fn send(
@@ -366,9 +459,11 @@ impl ElasticsearchSink {
                 tracing::trace!(target: "pg2osync::sink",
                     "version conflict on {} left the newer document in place",
                     entry["_id"].as_str().unwrap_or("?"));
-            } else if entry["result"] == "not_found" {
+            } else if crate::is_absent(&item) {
                 // a delete with nothing to delete: the end state we wanted, and
-                // at-least-once delivery replays deletes after every restart
+                // at-least-once delivery replays deletes after every restart;
+                // an index a row's template chose may not exist at all, which
+                // is the same end state
                 tracing::trace!(target: "pg2osync::sink",
                     "{} was already absent", entry["_id"].as_str().unwrap_or("?"));
             } else if !(200..300).contains(&s) {
@@ -482,23 +577,17 @@ impl Sink for ElasticsearchSink {
             return Err(CoreError::Sink(format!("ensure meta index: {status}")));
         }
         for spec in tables {
-            // without a body the index takes whatever Elasticsearch infers, or
-            // whatever index template the operator already manages
-            let create = spec
-                .mapping
-                .as_ref()
-                .map(|m| crate::mapping::create_body(m).to_string());
-            let (status, body) = self
-                .send(reqwest::Method::PUT, &format!("/{}", spec.name), create)
-                .await?;
-            let already = body["error"]["type"] == json!("resource_already_exists_exception");
-            if !(status == 200 || already) {
-                return Err(CoreError::Sink(format!(
-                    "create index {}: {status}",
-                    spec.name
-                )));
+            if spec.pattern {
+                // nothing exists to create or compare yet: the names come from
+                // rows, and the first batch that writes one creates it
+                crate::lock(&self.templates).push((spec.name.clone(), spec.mapping.clone()));
+                continue;
             }
-            if already && let Some(mapping) = &spec.mapping {
+            let created = self
+                .create_index_if_absent(&spec.name, spec.mapping.as_ref())
+                .await?;
+            crate::lock(&self.known_indexes).insert(spec.name.clone());
+            if !created && let Some(mapping) = &spec.mapping {
                 let (_, live) = self
                     .send(
                         reqwest::Method::GET,
@@ -545,6 +634,7 @@ impl Sink for ElasticsearchSink {
                 "engine must never send empty batches".into(),
             ));
         }
+        self.ensure_batch_indexes(&batch).await?;
         // A cascade is not a bulk action, and it has to run after the parent's
         // own delete and before anything that follows it, so the batch is
         // written in the runs between cascades, in order.
@@ -594,7 +684,9 @@ impl Sink for ElasticsearchSink {
             None => json!({"match_all": {}}),
         };
         // an unrefreshed write is invisible to _delete_by_query and would
-        // outlive the TRUNCATE that is supposed to remove it
+        // outlive the TRUNCATE that is supposed to remove it. `index` may be a
+        // templated table's glob; _refresh and _delete_by_query expand one
+        // themselves.
         let _ = self
             .send(reqwest::Method::POST, &format!("/{index}/_refresh"), None)
             .await;

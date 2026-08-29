@@ -9,8 +9,8 @@ use pg2osync_core::event::ChangeEvent;
 use pg2osync_core::lsn::Lsn;
 use pg2osync_core::sink::{IndexSpec, Sink};
 use pg2osync_engine::mapping::{
-    Constants, DurableLsn, JoinParent, JoinRule, Joins, ParentId, Projection, Projections, Rename,
-    Renames, TableMapping, Transforms,
+    Constants, DurableLsn, IndexTarget, JoinParent, JoinRule, Joins, ParentId, Projection,
+    Projections, Rename, Renames, TableMapping, Transforms,
 };
 use pg2osync_engine::metrics::SharedMetrics;
 use pg2osync_engine::{PipelineCtx, PositionRenderer};
@@ -59,7 +59,7 @@ pub async fn run_pipeline(
     for note in embedded_children_with_own_section(&cfg) {
         tracing::warn!(target: "pg2osync::run", "{note}");
     }
-    let index_specs = index_specs(&cfg);
+    let index_specs = index_specs(&cfg)?;
 
     match cfg.source.flavor.as_str() {
         "mysql" => {
@@ -93,12 +93,6 @@ pub async fn run_pipeline(
 
 // ---------------------------------------------------------------- shared wiring
 
-/// Refuse a quarantine policy the target cannot honour, before the pipeline
-/// runs rather than at the first bad document.
-///
-/// Silently falling back to halting would be defensible; silently dropping the
-/// document would not, and the difference between the two is exactly what a
-/// permissive default here would blur.
 /// Tables that are both an embedded child of another section and a section
 /// of their own. The replication runner classifies such a table as somebody's
 /// child and reads its rows only as a re-fetch of the owner, so the table's
@@ -124,7 +118,28 @@ pub fn embedded_children_with_own_section(cfg: &AppConfig) -> Vec<String> {
     notes
 }
 
+/// Refuse a configuration the target cannot honour, before the pipeline runs
+/// rather than at the first document that finds out.
+///
+/// A quarantine policy on a target that cannot record a refused document:
+/// silently falling back to halting would be defensible; silently dropping
+/// the document would not, and the difference between the two is exactly what
+/// a permissive default here would blur. Concurrent writes on a target that
+/// keeps whichever landed last. And a per-row index on a target without
+/// mappings, where nothing could create the index a row chose with the shape
+/// it should have.
 pub fn check_rejection_policy(cfg: &AppConfig, sink: &dyn Sink) -> Result<()> {
+    if cfg.target.flavor == "meilisearch"
+        && let Some((key, tbl)) = cfg.sync.iter().find(|(_, t)| t.is_templated())
+    {
+        bail!(
+            "[sync.{key}] index {:?} chooses an index per row, which needs a target that can \
+             create one on demand with the mapping it should have, and {} has no mappings to \
+             create it with. Give this table a fixed index",
+            tbl.index_name(key),
+            cfg.target.flavor
+        );
+    }
     if cfg.engine.on_permanent_rejection == pg2osync_engine::RejectionPolicy::Quarantine
         && !sink.can_quarantine()
     {
@@ -194,11 +209,18 @@ pub fn build_sink(cfg: &AppConfig, target_password: Option<String>) -> Result<Ar
 ///
 /// Several sections may feed one index — a join pair, or tables that each
 /// declare their id — and `ensure_ready` creates it once, so the mapping is
-/// kept from whichever section set it: config allows at most one to.
-pub fn index_specs(cfg: &AppConfig) -> Vec<IndexSpec> {
+/// kept from whichever section set it: config allows at most one to. A
+/// templated section contributes the glob its rows render into, flagged as a
+/// pattern: nothing is created for it up front, and the mapping travels with
+/// the glob so the index a row chooses can be created with it.
+pub fn index_specs(cfg: &AppConfig) -> Result<Vec<IndexSpec>> {
     let mut specs: Vec<IndexSpec> = Vec::with_capacity(cfg.sync.len());
     for (key, tbl) in &cfg.sync {
-        let name = tbl.index_name(key);
+        let target = index_target(key, tbl)?;
+        let (name, pattern) = match &target {
+            IndexTarget::Static(name) => (name.clone(), false),
+            IndexTarget::Template { .. } => (target.pattern(), true),
+        };
         match specs.iter_mut().find(|spec| spec.name == name) {
             Some(spec) => {
                 if spec.mapping.is_none() {
@@ -208,24 +230,56 @@ pub fn index_specs(cfg: &AppConfig) -> Vec<IndexSpec> {
             None => specs.push(IndexSpec {
                 name,
                 mapping: tbl.mapping.clone(),
+                pattern,
             }),
         }
     }
-    specs
+    Ok(specs)
 }
 
-/// Every target index once, in section order. The per-index settings the
-/// initial load suspends would otherwise be saved and restored twice for a
-/// shared index, the second restore reading the already-suspended values.
-pub fn index_names(cfg: &AppConfig) -> Vec<String> {
-    index_specs(cfg).into_iter().map(|spec| spec.name).collect()
+/// Every target index once, in section order, a templated section standing
+/// for its glob. The per-index settings the initial load suspends would
+/// otherwise be saved and restored twice for a shared index, the second
+/// restore reading the already-suspended values.
+pub fn index_names(cfg: &AppConfig) -> Result<Vec<String>> {
+    Ok(index_specs(cfg)?
+        .into_iter()
+        .map(|spec| spec.name)
+        .collect())
 }
 
-fn table_mapping(cfg: &AppConfig) -> TableMapping {
-    TableMapping::from_pairs(cfg.sync.iter().map(|(key, tbl)| {
+/// The indices whose settings an initial load may relax: the fixed ones.
+///
+/// A templated section is left out because its glob is not an index:
+/// `get_settings` on a glob answers per index, which the lookup by name would
+/// miss, and `put_settings` on a glob that matches nothing yet is an error.
+/// An index created mid-load takes the target's defaults; relaxing refresh
+/// is an optimisation, not correctness.
+pub fn fixed_index_names(cfg: &AppConfig) -> Result<Vec<String>> {
+    Ok(index_specs(cfg)?
+        .into_iter()
+        .filter(|spec| !spec.pattern)
+        .map(|spec| spec.name)
+        .collect())
+}
+
+/// The section's target with the section named in the failure, since the
+/// grammar is checked here as well as in `validate`.
+fn index_target(key: &str, tbl: &crate::config::TableSync) -> Result<IndexTarget> {
+    tbl.index_target(key, &pk_columns_for(tbl))
+        .map_err(|e| anyhow::anyhow!("[sync.{key}] {e}"))
+}
+
+fn table_mapping(cfg: &AppConfig) -> Result<TableMapping> {
+    let mut pairs = Vec::with_capacity(cfg.sync.len());
+    for (key, tbl) in &cfg.sync {
         let (schema, table) = split_qualified(&tbl.table);
-        ((schema.to_string(), table.to_string()), tbl.index_name(key))
-    }))
+        pairs.push((
+            (schema.to_string(), table.to_string()),
+            index_target(key, tbl)?,
+        ));
+    }
+    Ok(TableMapping::from_pairs(pairs))
 }
 
 fn projections(cfg: &AppConfig) -> Projections {
@@ -303,14 +357,14 @@ fn constants(cfg: &AppConfig) -> Result<Constants> {
     Ok(Constants::from_pairs(pairs))
 }
 
-/// The key columns a table's id may be rendered from without a before-image,
-/// as far as the engine can tell: it has no catalog, and the WAL path takes
-/// the key from the replica identity rather than from configuration. The
-/// startup check beside it is what makes this declaration true — where the
-/// declared key and the database's own key disagree about a template, the
-/// table is required to be REPLICA IDENTITY FULL, so the before-image (which
-/// carries both) is what an id ever renders from.
-fn pk_columns_for(tbl: &crate::config::TableSync) -> Vec<String> {
+/// The key columns a table's id or index may be rendered from without a
+/// before-image, as far as the engine can tell: it has no catalog, and the
+/// WAL path takes the key from the replica identity rather than from
+/// configuration. The startup check beside it is what makes this declaration
+/// true — where the declared key and the database's own key disagree about a
+/// template, the table is required to be REPLICA IDENTITY FULL, so the
+/// before-image (which carries both) is what a template ever renders from.
+pub fn pk_columns_for(tbl: &crate::config::TableSync) -> Vec<String> {
     vec![tbl.primary_key.clone().unwrap_or_else(|| "id".to_string())]
 }
 
@@ -568,7 +622,7 @@ pub fn pipeline_ctx(
 ) -> Result<Arc<PipelineCtx>> {
     Ok(Arc::new(PipelineCtx {
         sink,
-        mapping: table_mapping(cfg),
+        mapping: table_mapping(cfg)?,
         projections: projections(cfg),
         transforms: transforms(cfg)?,
         renames: renames(cfg),
@@ -586,21 +640,33 @@ pub fn pipeline_ctx(
 
 /// Refuse to start a pipeline whose derived identity the source cannot supply.
 ///
-/// An `id` that references columns outside the key, and a `fan_out` whose
-/// deletes and update-diffs need the row's old values, both depend on the
-/// whole old row arriving in the WAL — which only REPLICA IDENTITY FULL
-/// guarantees. Finding that out on the first delete, at 3am, is worse than
-/// naming the ALTER statement now, the same way child tables are checked.
-/// A row filter adds no requirement of its own: a key-only id renders the
-/// delete of a row that left the filter from the key, and the other cases are
-/// the two above. A join child is the third: its delete has to name its
-/// parent's shard, and its routing comes from the same place its id does.
+/// An `id` or an `index` that references columns outside the key, and a
+/// `fan_out` whose deletes and update-diffs need the row's old values, all
+/// depend on the whole old row arriving in the WAL — which only REPLICA
+/// IDENTITY FULL guarantees. Finding that out on the first delete, at 3am, is
+/// worse than naming the ALTER statement now, the same way child tables are
+/// checked. A row filter adds no requirement of its own: a key-only template
+/// renders the delete of a row that left the filter from the key, and the
+/// other cases are the ones above. A join child is one more: its delete has
+/// to name its parent's shard, and its routing comes from the same place its
+/// id does.
 async fn check_derived_identity_requirements(
     cfg: &AppConfig,
     admin: &tokio_postgres::Client,
 ) -> Result<()> {
     for (key, tbl) in &cfg.sync {
-        if tbl.fan_out.is_none() && tbl.id.is_none() && tbl.join.is_none() {
+        // (option, what it is for, the template): the two templates are one
+        // rule, told apart only so the refusal can say which option needs it
+        let mut declared: Vec<(&str, &str, &String)> = Vec::new();
+        if let Some(spec) = &tbl.id {
+            declared.push(("id", "derived id", spec));
+        }
+        if let Some(spec) = &tbl.index
+            && tbl.is_templated()
+        {
+            declared.push(("index", "per-row index", spec));
+        }
+        if declared.is_empty() && tbl.fan_out.is_none() && tbl.join.is_none() {
             continue;
         }
         let (schema, table) = split_qualified(&tbl.table);
@@ -614,27 +680,25 @@ async fn check_derived_identity_requirements(
         // key could otherwise be bound to a placeholder naming a different
         // column; requiring FULL where the two views disagree is what makes
         // the before-image — already unavoidable for anything outside a key
-        // — the only thing an id is ever rendered from.
+        // — the only thing a template is ever rendered from.
         let in_both_keys = |column: &str| {
             info.pk_columns.iter().any(|k| k == column)
                 && pk_columns_for(tbl).iter().any(|k| k == column)
         };
-        let needs_full = if tbl.fan_out.is_some() {
-            true
-        } else {
-            match &tbl.id {
-                Some(spec) => {
-                    let from_catalog =
-                        pg2osync_engine::mapping::IdTemplate::parse(spec, &info.pk_columns)
-                            .map_err(|e| anyhow::anyhow!("[sync.{key}] id {spec:?}: {e}"))?;
-                    let from_config =
-                        pg2osync_engine::mapping::IdTemplate::parse(spec, &pk_columns_for(tbl))
-                            .map_err(|e| anyhow::anyhow!("[sync.{key}] id {spec:?}: {e}"))?;
-                    !(from_catalog.is_pk_only() && from_config.is_pk_only())
-                }
-                None => false,
+        let mut needs: Vec<&str> = Vec::new();
+        for (option, what, spec) in &declared {
+            let from_catalog = pg2osync_engine::mapping::IdTemplate::parse(spec, &info.pk_columns)
+                .map_err(|e| anyhow::anyhow!("[sync.{key}] {option} {spec:?}: {e}"))?;
+            let from_config =
+                pg2osync_engine::mapping::IdTemplate::parse(spec, &pk_columns_for(tbl))
+                    .map_err(|e| anyhow::anyhow!("[sync.{key}] {option} {spec:?}: {e}"))?;
+            if !(from_catalog.is_pk_only() && from_config.is_pk_only()) {
+                needs.push(what);
             }
-        };
+        }
+        if tbl.fan_out.is_some() {
+            needs.push("fan-out");
+        }
         if let Some(join) = &tbl.join {
             match join.parent.as_deref() {
                 // the child carries one column and renders the parent's id
@@ -666,16 +730,17 @@ async fn check_derived_identity_requirements(
                 Some(_) => {}
             }
         }
-        if !needs_full {
+        if needs.is_empty() {
             continue;
         }
         if info.relreplident != 'f' {
             bail!(
-                "[sync.{key}] {} has REPLICA IDENTITY '{}', but its derived identity needs \
-                 the whole old row: deletes and updates could not find the documents they \
-                 replace. Run: ALTER TABLE {} REPLICA IDENTITY FULL",
+                "[sync.{key}] {} has REPLICA IDENTITY '{}', but its {} needs the whole old \
+                 row: deletes and updates could not find the documents they replace. \
+                 Run: ALTER TABLE {} REPLICA IDENTITY FULL",
                 tbl.table,
                 info.relreplident,
+                needs.join(" and "),
                 tbl.table
             );
         }
@@ -747,10 +812,12 @@ fn start_api(
             "the endpoint is bound to {} without a token; anything that can \
              reach it can query the pipeline position", cfg.api.bind);
     }
+    // a templated section's glob is refreshed as one: OpenSearch and
+    // Elasticsearch take a wildcard, and Meilisearch never sees a template
     let api_cfg = pg2osync_engine::api::ApiConfig {
         bind: cfg.api.bind.clone(),
         token,
-        indices: index_names(cfg),
+        indices: index_names(cfg)?,
     };
     tokio::spawn(async move {
         pg2osync_engine::api::serve(
@@ -995,7 +1062,7 @@ async fn with_bulk_load_settings<F, T>(sink: &Arc<dyn Sink>, cfg: &AppConfig, lo
 where
     F: std::future::Future<Output = Result<T>>,
 {
-    let saved = sink.begin_bulk_load(&index_names(cfg)).await?;
+    let saved = sink.begin_bulk_load(&fixed_index_names(cfg)?).await?;
     let result = load.await;
     // the tail still in the event channel is written after this, which is a
     // batch or two out of millions
@@ -1146,8 +1213,14 @@ async fn attempt_postgres(
     // Either failing abandons the other: a stream error is a reconnect, and the
     // load picks up from its recorded progress on the next attempt.
     let result = futures::future::try_join(load, stream).await.map(|_| ());
-    // dropping both senders above is what lets the engine drain and exit
-    let _ = engine.await;
+    // dropping both senders above is what lets the engine drain and exit.
+    // An engine halt closes the change channel, which the source then
+    // reports as its own failure; the engine's reason is the one that
+    // matters, and the one an operator has to be able to read.
+    if let Ok(Err(e)) = engine.await {
+        tracing::error!(target: "pg2osync::engine", "engine stopped: {e}");
+        return Err(anyhow::Error::from(e).context("engine stopped"));
+    }
     result?;
 
     Ok(if *shutdown_rx.borrow() {
@@ -1716,8 +1789,14 @@ async fn attempt_mysql(
     // Either failing abandons the other: a stream error is a reconnect, and the
     // load picks up from its recorded progress on the next attempt.
     let result = futures::future::try_join(load, stream).await.map(|_| ());
-    // dropping both senders above is what lets the engine drain and exit
-    let _ = engine.await;
+    // dropping both senders above is what lets the engine drain and exit.
+    // An engine halt closes the change channel, which the source then
+    // reports as its own failure; the engine's reason is the one that
+    // matters, and the one an operator has to be able to read.
+    if let Ok(Err(e)) = engine.await {
+        tracing::error!(target: "pg2osync::engine", "engine stopped: {e}");
+        return Err(anyhow::Error::from(e).context("engine stopped"));
+    }
     result?;
 
     Ok(if *shutdown_rx.borrow() {
@@ -1872,11 +1951,63 @@ id = "user-{id}"
         cfg.sync.get_mut("users").expect("section").mapping =
             Some(serde_json::json!({"mappings": {}}));
 
-        let specs = index_specs(&cfg);
+        let specs = index_specs(&cfg).expect("fixed names");
         assert_eq!(specs.len(), 1, "two sections, one index");
         assert_eq!(specs[0].name, "search");
         assert!(specs[0].mapping.is_some());
-        assert_eq!(index_names(&cfg), ["search"]);
+        assert!(!specs[0].pattern);
+        assert_eq!(index_names(&cfg).expect("fixed names"), ["search"]);
+    }
+
+    #[test]
+    fn a_templated_section_is_listed_as_the_glob_its_rows_render_into() {
+        let mut cfg: AppConfig = toml::from_str(
+            r#"
+[source]
+url = "postgres://u:p@localhost/db"
+[target]
+url = "http://localhost:9200"
+[sync.events]
+table = "public.events"
+index = "events-{tenant}"
+[sync.users]
+table = "public.users"
+"#,
+        )
+        .expect("parses");
+        // the mapping is read from a file at load; the test stands in for it
+        cfg.sync.get_mut("events").expect("section").mapping =
+            Some(serde_json::json!({"mappings": {}}));
+
+        let specs = index_specs(&cfg).expect("a template with a literal prefix");
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].name, "events-*");
+        assert!(specs[0].pattern, "a glob, not an index to create");
+        assert!(
+            specs[0].mapping.is_some(),
+            "the mapping travels with the glob, for the index a row chooses"
+        );
+        assert_eq!(specs[1].name, "users");
+        assert!(!specs[1].pattern);
+        assert_eq!(
+            index_names(&cfg).expect("names"),
+            ["events-*", "users"],
+            "the glob stands for every index the template renders"
+        );
+        assert_eq!(
+            fixed_index_names(&cfg).expect("names"),
+            ["users"],
+            "bulk-load settings are only relaxed on an index that exists to relax"
+        );
+        let mapping = table_mapping(&cfg).expect("targets");
+        assert!(matches!(
+            mapping.target_for("public", "events"),
+            Some(IndexTarget::Template { spec, .. }) if spec == "events-{tenant}"
+        ));
+        assert_eq!(
+            mapping.target_for("public", "users"),
+            Some(&IndexTarget::Static("users".into()))
+        );
     }
 
     #[test]
@@ -1909,7 +2040,7 @@ table = "public.users"
         cfg.sync.get_mut("customers").expect("section").mapping =
             Some(serde_json::json!({"mappings": {}}));
 
-        let specs = index_specs(&cfg);
+        let specs = index_specs(&cfg).expect("fixed names");
         assert_eq!(
             specs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
             ["shop", "users"],
@@ -1919,7 +2050,7 @@ table = "public.users"
             specs[0].mapping.is_some(),
             "the parent's mapping survives the child's section, which has none"
         );
-        assert_eq!(index_names(&cfg), ["shop", "users"]);
+        assert_eq!(index_names(&cfg).expect("fixed names"), ["shop", "users"]);
 
         let joins = joins(&cfg).expect("resolves");
         let child = joins
