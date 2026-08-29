@@ -1659,5 +1659,81 @@ else
   bad "reconcile did not refuse the templated table"
 fi
 
+echo -e "\n\033[1m== 27. the target runs an ingest pipeline on every document of a section ==\033[0m"
+# The vector is the target's to compute (#68): the section names an ingest
+# pipeline, the bulk action carries it, and the target fills the field. A
+# `set` processor stands in for the embedding model — what has to hold is
+# that the load and the stream both go through the pipeline, and that a
+# pipeline the target does not have is refused where it can still be fixed.
+PCONFIG=$(mktemp /tmp/pg2osync-e2e-pipe.XXXXXX)
+PSLOT=pg2osync_e2e_pipe
+drop_idle_probe_slots
+cat > "$PCONFIG" <<TOML
+[source]
+url_env = "PG2OSYNC_SOURCE_URL"
+slot_name = "$PSLOT"
+publication = "${PSLOT}_pub"
+
+[target]
+url = "http://localhost:9200"
+
+[metrics]
+bind = "127.0.0.1:9128"
+
+[sync.pipe]
+table = "public.pipe_probe"
+index = "e2e_pipe"
+pipeline = "e2e-tag"
+TOML
+pipe_cleanup() {
+  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  pg "SELECT pg_drop_replication_slot('$PSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$PSLOT');" > /dev/null 2>&1 || true
+  pg "DROP PUBLICATION IF EXISTS ${PSLOT}_pub; DROP TABLE IF EXISTS pipe_probe;" > /dev/null 2>&1 || true
+  curl -s -XDELETE "$OS/_ingest/pipeline/e2e-tag" > /dev/null 2>&1 || true
+  curl -s -XDELETE "$OS/e2e_pipe?ignore_unavailable=true" > /dev/null 2>&1 || true
+  rm -f "$PCONFIG"
+}
+trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup; init_cleanup; fan_cleanup; bid_cleanup; shape_cleanup; where_cleanup; join_cleanup; union_cleanup; events_cleanup; pipe_cleanup' EXIT
+
+pg "DROP TABLE IF EXISTS pipe_probe; CREATE TABLE pipe_probe(id bigint primary key, name text);" > /dev/null 2>&1
+pg "INSERT INTO pipe_probe VALUES (1,'one');" > /dev/null
+pg "DROP PUBLICATION IF EXISTS ${PSLOT}_pub; CREATE PUBLICATION ${PSLOT}_pub FOR TABLE pipe_probe;" > /dev/null 2>&1
+curl -s -XDELETE "$OS/e2e_pipe?ignore_unavailable=true" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/postgres-$PSLOT" > /dev/null
+curl -s -XPUT "$OS/_ingest/pipeline/e2e-tag" -H 'Content-Type: application/json' -d '{"processors":[{"set":{"field":"tagged","value":"yes"}}]}' > /dev/null
+# a pipeline the target does not have would reject every document at the
+# first write, so validate asks for it by name and refuses. Captured first: a
+# refusal exits non-zero, which under pipefail would hide a grep that matched.
+sed 's/^pipeline = "e2e-tag"$/pipeline = "e2e-missing"/' "$PCONFIG" > "${PCONFIG}.bad"
+out=$($BIN validate -c "${PCONFIG}.bad" 2>&1 || true)
+if grep -q "does not exist on the target" <<< "$out"; then
+  ok "validate refuses a pipeline the target does not have"
+else
+  bad "validate accepted a pipeline the target does not have"
+fi
+rm -f "${PCONFIG}.bad"
+out=$($BIN validate -c "$PCONFIG" 2>&1 || true)
+if grep -q "ingest pipeline e2e-tag exists" <<< "$out"; then
+  ok "validate names the pipeline it found"
+else
+  bad "validate did not report the pipeline the target has"
+fi
+nohup $BIN run -c "$PCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_status e2e_pipe 1)" = "200" ] && break
+  sleep 1
+done
+# the field exists in no row: only the pipeline could have put it there
+check "the load goes through the pipeline" "$(os_field e2e_pipe 1 tagged)" "yes"
+pg "INSERT INTO pipe_probe VALUES (2,'two');" > /dev/null
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_status e2e_pipe 2)" = "200" ] && break
+  sleep 1
+done
+check "and so does a streamed row" "$(os_field e2e_pipe 2 tagged)" "yes"
+stop_sync
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

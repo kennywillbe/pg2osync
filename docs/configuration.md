@@ -139,6 +139,7 @@ One section per table. `<key>` is the index name when `index` is omitted.
 | `poll_column` | Poll mode: overrides `[source] poll_column` for this table |
 | `soft_delete` | SQL predicate marking a row as deleted, e.g. `deleted_at IS NOT NULL` |
 | `mapping_file` | JSON mapping to create the index with, see below |
+| `pipeline` | Ingest pipeline the target runs on every document of this section, e.g. `"embed-products"`; OpenSearch and Elasticsearch only, see [Ingest pipelines](#ingest-pipelines) |
 | `children` | Nested child collections, see below |
 
 Projection and transforms apply to every path — initial load, live streaming and
@@ -592,6 +593,66 @@ indices.
 
 Meilisearch has no field types to declare; `mapping_file` is refused for that
 target rather than ignored.
+
+### Ingest pipelines
+
+A vector field is the one thing a mapping can declare that no row can fill:
+the embedding has to be computed by something that holds the model. pg2osync
+does not; the target does. `pipeline` names an ingest pipeline on the target,
+and every document the section writes carries it on its bulk action, so the
+target runs the pipeline's processors on the way in:
+
+```toml
+[sync.products]
+table = "public.products"
+index = "products"
+mapping_file = "products-mapping.json"
+pipeline = "embed-products"
+```
+
+The pipeline is yours to create, before the first document lands. A
+`text_embedding` processor (OpenSearch's neural-search plugin; Elasticsearch
+has the `inference` processor) reads a text field and writes the vector into a
+field the mapping declares as `knn_vector`:
+
+```json
+{
+  "mappings": {
+    "properties": {
+      "name":        { "type": "text" },
+      "description": { "type": "text" },
+      "embedding":   { "type": "knn_vector", "dimension": 384 }
+    }
+  },
+  "settings": { "index.knn": true }
+}
+```
+
+`pipeline = "embed-products"` is the whole of pg2osync's part; the model, the
+processor and the `dimension` above belong to the pipeline and the mapping,
+and a `set` processor or any other works the same way.
+
+`validate` asks the target for the pipeline (`GET _ingest/pipeline/<name>`)
+and refuses a name it does not have, because every document would otherwise
+be rejected at the first write, with the pipeline named but the config already
+running. A pipeline that exists is reported by name, one line per section.
+
+Three things follow from the pipeline riding on the operation rather than on
+the index:
+
+- **It is per section, not per index.** Two tables feeding one index (see
+  [Sharing an index](#sharing-an-index)) may name different pipelines, so each
+  embeds its own columns; a section without `pipeline` writes to the same
+  index with none.
+- **A delete carries no pipeline.** Ingest pipelines run on index actions
+  only, which is also what the target does.
+- **A quarantined document is replayed through the pipeline again.** The
+  record kept by `on_permanent_rejection = "quarantine"` stores the pipeline
+  with the operation, so `pg2osync rejects --replay` submits it the way it
+  was first submitted, and the document does not land without its vector.
+
+Meilisearch has no ingest pipelines; `pipeline` is refused for that target at
+config load rather than ignored.
 
 ### Nested children
 

@@ -63,6 +63,30 @@ fn routing_field(routing: Option<&str>) -> String {
     }
 }
 
+/// The ingest pipeline field of a bulk action header, or nothing for a
+/// document the target indexes as it arrives.
+fn pipeline_field(pipeline: Option<&str>) -> String {
+    match pipeline {
+        Some(p) => format!(
+            ",\"pipeline\":{}",
+            serde_json::to_string(p).unwrap_or_default()
+        ),
+        None => String::new(),
+    }
+}
+
+/// `/_ingest/pipeline/<name>` with the name percent-encoded as a path
+/// segment, so a `/` or `?` in it cannot turn the lookup into another request.
+fn pipeline_path(name: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse("http://query.invalid/_ingest/pipeline") else {
+        return String::new();
+    };
+    if let Ok(mut segments) = url.path_segments_mut() {
+        segments.push(name);
+    }
+    url.path().to_string()
+}
+
 /// `key=value&…` with every value percent-encoded, so a parent id holding
 /// `&` or `#` cannot cut the query short.
 ///
@@ -83,13 +107,15 @@ fn action_header(
     id: &str,
     routing: Option<&str>,
     version: Option<u64>,
+    pipeline: Option<&str>,
 ) -> String {
     format!(
-        "{{\"{action}\":{{\"_index\":{},\"_id\":{}{}{}}}}}\n",
+        "{{\"{action}\":{{\"_index\":{},\"_id\":{}{}{}{}}}}}\n",
         serde_json::to_string(index).unwrap_or_default(),
         serde_json::to_string(id).unwrap_or_default(),
         routing_field(routing),
-        version_fields(version)
+        version_fields(version),
+        pipeline_field(pipeline)
     )
 }
 
@@ -232,6 +258,7 @@ impl ElasticsearchSink {
                     id,
                     Some(parent_id),
                     version,
+                    None,
                 ));
             }
             let (status, body) = self
@@ -518,6 +545,7 @@ fn ndjson_body(batch: &[LsnOp]) -> Result<String, CoreError> {
                 routing,
                 doc,
                 version,
+                pipeline,
             } => {
                 ndjson.push_str(&action_header(
                     "index",
@@ -525,6 +553,7 @@ fn ndjson_body(batch: &[LsnOp]) -> Result<String, CoreError> {
                     id,
                     routing.as_deref(),
                     *version,
+                    pipeline.as_deref(),
                 ));
                 ndjson.push_str(&serde_json::to_string(doc).unwrap_or_default());
                 ndjson.push('\n');
@@ -541,6 +570,7 @@ fn ndjson_body(batch: &[LsnOp]) -> Result<String, CoreError> {
                     id,
                     routing.as_deref(),
                     *version,
+                    None,
                 ));
             }
             DocumentOp::DeleteChildren {
@@ -988,6 +1018,19 @@ impl Sink for ElasticsearchSink {
             Ok(Health::Down(format!("status {status}")))
         }
     }
+
+    async fn has_pipeline(&self, name: &str) -> Result<bool, CoreError> {
+        let (status, _) = self
+            .send(reqwest::Method::GET, &pipeline_path(name), None)
+            .await?;
+        match status {
+            200 => Ok(true),
+            404 => Ok(false),
+            status => Err(CoreError::Sink(format!(
+                "ingest pipeline {name:?} lookup failed: status {status}"
+            ))),
+        }
+    }
 }
 
 fn is_retryable(e: &CoreError) -> bool {
@@ -1019,6 +1062,7 @@ mod tests {
                     routing: Some("7".into()),
                     doc: json!({"amount": 3}),
                     version: Some(0x2A),
+                    pipeline: None,
                 },
             },
             LsnOp {
@@ -1044,11 +1088,56 @@ mod tests {
     }
 
     #[test]
+    fn a_pipeline_name_is_encoded_before_it_reaches_the_url() {
+        assert_eq!(
+            pipeline_path("embed-products"),
+            "/_ingest/pipeline/embed-products"
+        );
+        assert_eq!(pipeline_path("a/b?c"), "/_ingest/pipeline/a%2Fb%3Fc");
+    }
+
+    #[test]
     fn a_parent_id_is_encoded_before_it_reaches_the_url() {
         assert_eq!(query_string(&[("routing", "a&b#c")]), "routing=a%26b%23c");
         assert_eq!(
             query_string(&[("routing", "customer-1")]),
             "routing=customer-1"
+        );
+    }
+
+    #[test]
+    fn an_upsert_names_its_pipeline_and_a_delete_does_not() {
+        let batch = vec![
+            LsnOp {
+                lsn: Lsn(0x2A),
+                op: DocumentOp::Upsert {
+                    index: "products".into(),
+                    id: "7".into(),
+                    routing: None,
+                    doc: json!({"name": "lamp"}),
+                    version: Some(0x2A),
+                    pipeline: Some("embed-products".into()),
+                },
+            },
+            LsnOp {
+                lsn: Lsn(0x2A),
+                op: DocumentOp::Delete {
+                    index: "products".into(),
+                    id: "8".into(),
+                    routing: None,
+                    version: Some(0x2A),
+                },
+            },
+        ];
+        assert_eq!(
+            lines(&batch),
+            vec![
+                json!({"index": {"_index": "products", "_id": "7", "version": 42,
+                                 "version_type": "external_gte", "pipeline": "embed-products"}}),
+                json!({"name": "lamp"}),
+                json!({"delete": {"_index": "products", "_id": "8", "version": 42,
+                                  "version_type": "external_gte"}}),
+            ]
         );
     }
 

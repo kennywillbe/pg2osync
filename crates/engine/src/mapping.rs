@@ -385,6 +385,31 @@ impl Filters {
     }
 }
 
+/// Per-table ingest pipelines from `[sync.x] pipeline`.
+///
+/// Keyed by table rather than by index because the pipeline is the section's
+/// choice: two sections writing one index may each name their own, and the
+/// name rides on the operation, so the sink never has to know which section a
+/// document came from.
+#[derive(Debug, Clone, Default)]
+pub struct Pipelines {
+    map: HashMap<(String, String), String>,
+}
+
+impl Pipelines {
+    pub fn from_pairs(pairs: impl IntoIterator<Item = ((String, String), String)>) -> Self {
+        Self {
+            map: pairs.into_iter().collect(),
+        }
+    }
+
+    pub fn for_table(&self, schema: &str, table: &str) -> Option<&str> {
+        self.map
+            .get(&(schema.to_string(), table.to_string()))
+            .map(String::as_str)
+    }
+}
+
 /// A configured document id: literals plus `{column}` placeholders, e.g.
 /// `tenant-{tenant_id}-{id}`.
 ///
@@ -1290,6 +1315,18 @@ mod tests {
         let mut other = json!({"id": 1});
         c.apply("public", "orders", &mut other);
         assert_eq!(other, json!({"id": 1}));
+    }
+
+    #[test]
+    fn a_pipeline_belongs_to_its_table_alone() {
+        let p = Pipelines::from_pairs([(
+            ("public".to_string(), "users".to_string()),
+            "embed-users".to_string(),
+        )]);
+        assert_eq!(p.for_table("public", "users"), Some("embed-users"));
+        assert_eq!(p.for_table("public", "orders"), None);
+        assert_eq!(p.for_table("other", "users"), None);
+        assert_eq!(Pipelines::default().for_table("public", "users"), None);
     }
 
     #[test]

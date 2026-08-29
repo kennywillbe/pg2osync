@@ -36,6 +36,12 @@ pub enum DocumentOp {
         /// position that may be acknowledged, and an initial-load row must
         /// never advance it while still needing a version.
         version: Option<u64>,
+        /// The target's ingest pipeline this document goes through, named by
+        /// the section that produced it. Carried on the operation rather than
+        /// looked up by index because two sections can share one index and
+        /// still want different pipelines — and because a quarantined
+        /// document has to be replayed through the same one.
+        pipeline: Option<String>,
     },
     Delete {
         index: String,
@@ -350,6 +356,16 @@ pub trait Sink: Send + Sync {
 
     /// Cheap health probe for /status and reconnect logic.
     async fn health(&self) -> Result<Health, CoreError>;
+
+    /// Whether the target has an ingest pipeline of this name, so `validate`
+    /// can refuse a configuration naming one that does not exist before the
+    /// first batch is refused for it.
+    ///
+    /// The default says yes: a target with no ingest pipelines never gets a
+    /// configured one past config load, so it is never asked.
+    async fn has_pipeline(&self, _name: &str) -> Result<bool, CoreError> {
+        Ok(true)
+    }
 }
 
 #[cfg(test)]

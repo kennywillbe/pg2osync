@@ -781,6 +781,22 @@ async fn validate(path: &Path) -> Result<()> {
         Health::Up => println!("✓ {} reachable at {}", cfg.target.flavor, cfg.target.url),
         Health::Down(reason) => bail!("{} is reachable but unhealthy: {reason}", cfg.target.flavor),
     }
+    // Checked here and not at startup: a pipeline that vanishes while the
+    // pipeline runs is the target refusing the batch, which quarantine or halt
+    // already report; what this catches is the typo before the first batch.
+    for (key, name) in cfg
+        .sync
+        .iter()
+        .filter_map(|(key, tbl)| tbl.pipeline.as_deref().map(|name| (key, name)))
+    {
+        if !sink.has_pipeline(name).await? {
+            bail!(
+                "ingest pipeline {name:?} of [sync.{key}] does not exist on the target; \
+                 create it first (PUT _ingest/pipeline/{name})"
+            );
+        }
+        println!("✓ ingest pipeline {name} exists for [sync.{key}]");
+    }
     run::check_rejection_policy(&cfg, sink.as_ref())?;
     for note in run::embedded_children_with_own_section(&cfg) {
         println!("! {note}");

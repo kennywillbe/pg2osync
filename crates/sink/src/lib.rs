@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use opensearch::auth::Credentials;
 use opensearch::http::response::Response;
 use opensearch::http::transport::{SingleNodeConnectionPool, TransportBuilder};
+use opensearch::ingest::IngestGetPipelineParts;
 use opensearch::params::{ExpandWildcards, VersionType};
 use opensearch::{BulkOperation, BulkParts, GetParts, IndexParts, OpenSearch};
 use pg2osync_core::checkpoint::Checkpoint;
@@ -711,12 +712,16 @@ fn bulk_action(op: &DocumentOp) -> Result<BulkOperation<Value>, CoreError> {
             routing,
             doc,
             version,
+            pipeline,
         } => {
             let mut action = BulkOperation::index(doc.clone())
                 .id(id.clone())
                 .index(index.clone());
             if let Some(routing) = routing {
                 action = action.routing(routing.clone());
+            }
+            if let Some(pipeline) = pipeline {
+                action = action.pipeline(pipeline.clone());
             }
             // external_gte, not external: a replay after a crash writes the
             // same position again, and `external` rejects an equal version
@@ -852,8 +857,15 @@ pub fn reject_doc(r: &Rejection) -> Value {
         "at_epoch": chrono_now(),
     });
     match &r.op {
-        DocumentOp::Upsert { routing, .. } | DocumentOp::Delete { routing, .. } => {
-            // a replay has to land on the shard the original write named
+        DocumentOp::Upsert {
+            routing, pipeline, ..
+        } => {
+            // a replay has to land on the shard the original write named,
+            // and go through the pipeline the section named
+            doc["routing"] = json!(routing);
+            doc["pipeline"] = json!(pipeline);
+        }
+        DocumentOp::Delete { routing, .. } => {
             doc["routing"] = json!(routing);
         }
         DocumentOp::DeleteChildren {
@@ -883,6 +895,7 @@ pub fn reject_from_doc(id: &str, src: &Value) -> Option<StoredReject> {
             routing,
             doc: src["document"].clone(),
             version,
+            pipeline: src["pipeline"].as_str().map(str::to_string),
         },
         "delete" => DocumentOp::Delete {
             index: index.clone(),
@@ -1569,6 +1582,23 @@ impl Sink for OpenSearchSink {
             Ok(Health::Down(format!("status {}", resp.status_code())))
         }
     }
+
+    async fn has_pipeline(&self, name: &str) -> Result<bool, CoreError> {
+        let resp = self
+            .client
+            .ingest()
+            .get_pipeline(IngestGetPipelineParts::Id(name))
+            .send()
+            .await
+            .map_err(|e| CoreError::Sink(format!("ingest pipeline {name:?} lookup failed: {e}")))?;
+        match resp.status_code().as_u16() {
+            200 => Ok(true),
+            404 => Ok(false),
+            status => Err(CoreError::Sink(format!(
+                "ingest pipeline {name:?} lookup failed: status {status}"
+            ))),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1721,6 +1751,7 @@ mod tests {
                 routing: None,
                 doc,
                 version: Some(0x100),
+                pipeline: None,
             },
         };
         let batch = vec![op("1", json!({"v": 1})), op("2", json!({"v": 2}))];
@@ -1773,6 +1804,7 @@ mod tests {
             routing: Some("customer-1".into()),
             doc: json!({"amount": "lots"}),
             version: Some(0x2A),
+            pipeline: None,
         });
         let doc = reject_doc(&upsert);
         assert_eq!(doc["routing"], "customer-1");
@@ -1823,6 +1855,7 @@ mod tests {
             routing: Some("customer-1".into()),
             doc: json!({"amount": 3}),
             version: Some(0x2A),
+            pipeline: None,
         });
         assert_eq!(
             lines[0],
@@ -1855,8 +1888,63 @@ mod tests {
             routing: None,
             doc: json!({"id": 1}),
             version: None,
+            pipeline: None,
         });
         assert_eq!(lines[0], json!({"index": {"_index": "users", "_id": "1"}}));
+    }
+
+    #[test]
+    fn an_upsert_names_its_pipeline_in_the_bulk_header_and_a_delete_does_not() {
+        let lines = action_lines(&DocumentOp::Upsert {
+            index: "products".into(),
+            id: "1".into(),
+            routing: None,
+            doc: json!({"id": 1}),
+            version: None,
+            pipeline: Some("embed-products".into()),
+        });
+        assert_eq!(
+            lines[0],
+            json!({"index": {"_index": "products", "_id": "1", "pipeline": "embed-products"}})
+        );
+        assert_eq!(lines[1], json!({"id": 1}));
+
+        // an ingest pipeline runs on index actions only, and the delete
+        // header has no field for one
+        let lines = action_lines(&DocumentOp::Delete {
+            index: "products".into(),
+            id: "1".into(),
+            routing: None,
+            version: None,
+        });
+        assert_eq!(
+            lines,
+            vec![json!({"delete": {"_index": "products", "_id": "1"}})]
+        );
+    }
+
+    #[test]
+    fn a_quarantined_document_keeps_its_pipeline() {
+        // a replay that forgot the pipeline would write the document without
+        // the fields the target was supposed to compute
+        let upsert = Rejection {
+            index: "products".into(),
+            doc_id: "7".into(),
+            reason: "mapper_parsing_exception: embedding".into(),
+            lsn: Lsn(0x2A),
+            op: DocumentOp::Upsert {
+                index: "products".into(),
+                id: "7".into(),
+                routing: None,
+                doc: json!({"name": "lamp"}),
+                version: Some(0x2A),
+                pipeline: Some("embed-products".into()),
+            },
+        };
+        let doc = reject_doc(&upsert);
+        assert_eq!(doc["pipeline"], "embed-products");
+        let stored = reject_from_doc("products-7", &doc).expect("readable");
+        assert_eq!(stored.rejection, upsert);
     }
 
     #[test]

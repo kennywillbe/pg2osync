@@ -82,6 +82,9 @@ exclude_columns = ["password_hash"]
 # Mapping to create the index with, resolved relative to this file. Applied
 # only when the index does not exist; an existing one is compared against it.
 # mapping_file = "users-mapping.json"
+# Ingest pipeline the target runs on every document of this section. This is
+# how a knn_vector field gets filled: the target holds the model, not pg2osync.
+# pipeline = "embed-products"
 # Pushed into the initial load and evaluated again on every streamed row, so a
 # row that leaves the filter is deleted from the index and one that enters it
 # is written. A restricted SQL subset; see docs/configuration.md#row-filters.
