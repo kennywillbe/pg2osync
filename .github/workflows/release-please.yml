@@ -31,9 +31,9 @@ jobs:
           exit 1
 
       # Collects every conventional commit since the last release into one pull
-      # request that bumps all seven crates and writes CHANGELOG.md. Merging that
-      # pull request is what tags and releases — and merging is restricted to the
-      # owner, so the release gate and the merge gate are the same gate.
+      # request that bumps the binary crate and writes its CHANGELOG.md. Merging
+      # that pull request is what tags and releases — and merging is restricted
+      # to the owner, so the release gate and the merge gate are the same gate.
       #
       # The token is a fine-grained PAT belonging to a repository admin, which is
       # what lets the tag through the `v*` rule and what makes the tag push
