@@ -434,6 +434,25 @@ fn filters(cfg: &AppConfig) -> Result<pg2osync_engine::mapping::Filters> {
     ))
 }
 
+/// Every synced table's primary key from the catalogue, for the decoder: under
+/// REPLICA IDENTITY FULL the WAL flags every column as identity, and the key
+/// the load filed a row under is the only thing a streamed change may address
+/// it by.
+async fn key_columns_for(
+    cfg: &AppConfig,
+    admin: &tokio_postgres::Client,
+) -> Result<HashMap<(String, String), Vec<String>>> {
+    let mut out = HashMap::new();
+    for tbl in cfg.sync.values() {
+        let (schema, table) = split_qualified(&tbl.table);
+        let info = pg2osync_source::catalog::table_info(admin, schema, table)
+            .await
+            .with_context(|| format!("cannot read the key of {}", tbl.table))?;
+        out.insert((schema.to_string(), table.to_string()), info.pk_columns);
+    }
+    Ok(out)
+}
+
 /// Metrics outlive any one attempt: they are created once and the endpoint is
 /// served once, so a reconnect does not reset every counter or re-bind the port.
 fn start_metrics(cfg: &AppConfig) -> Result<SharedMetrics> {
@@ -870,6 +889,10 @@ async fn run_postgres(
         &durable,
         &tls,
     )?;
+    let mut src_cfg = src_cfg;
+    if !polling {
+        src_cfg.key_columns = key_columns_for(&cfg, &admin).await?;
+    }
     let source = WalSource::new(src_cfg.clone());
 
     if !polling {
@@ -1213,6 +1236,7 @@ fn wal_config(
         children: children.clone(),
         child_parents,
         parent_pk_columns,
+        key_columns: HashMap::new(),
     })
 }
 

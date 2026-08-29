@@ -40,6 +40,10 @@ pub struct WalSourceConfig {
     pub child_parents: HashMap<(String, String), (String, String)>,
     /// Parent PK columns for refetch queries, keyed by parent (schema, table).
     pub parent_pk_columns: HashMap<(String, String), String>,
+    /// Each synced table's primary key, from the catalogue. Under REPLICA
+    /// IDENTITY FULL pgoutput flags every column as identity, and only this
+    /// says which of them a document is actually filed under.
+    pub key_columns: HashMap<(String, String), Vec<String>>,
     /// Highest durably-flushed position as reported by the engine's
     /// checkpoint task. Feedback to PostgreSQL is clamped to this: acking
     /// beyond it lets PG recycle WAL for events we have not indexed yet,
@@ -431,7 +435,11 @@ impl WalSource {
             return Ok(Classified::Skip);
         }
 
-        let change = super::docbuild::build_row_change(rel, incoming)?;
+        let change = super::docbuild::build_row_change(
+            rel,
+            incoming,
+            self.cfg.key_columns.get(&table).map(Vec::as_slice),
+        )?;
         if self.cfg.children.contains_key(&table) {
             Ok(Classified::ParentRow(table, change))
         } else {
@@ -554,6 +562,7 @@ mod tests {
             children: HashMap::new(),
             child_parents: HashMap::new(),
             parent_pk_columns: HashMap::new(),
+            key_columns: HashMap::new(),
             durable: None,
         })
     }

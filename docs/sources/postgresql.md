@@ -91,6 +91,11 @@ need the same thing for the opposite reason: removing or moving a document
 means knowing the id the row *had*, and only the old row says that. Those are
 refused at startup without `REPLICA IDENTITY FULL`, naming the `ALTER`.
 
+`FULL` changes what the WAL carries, not what identifies a document: pgoutput
+then flags every column as part of the identity, and pg2osync still files a
+row under its primary key, read from the catalogue at startup — the same key
+the initial load used.
+
 pg2osync reads the actual setting from `pg_class.relreplident` and warns at
 startup when a table cannot support what your configuration asks of it.
 

@@ -41,11 +41,28 @@ fn convert_column(
 
 /// Render the primary key as the document identity value:
 /// scalar when single-column, object keyed by column names when composite.
-fn extract_pk(rel: &Relation, tuple: &Tuple) -> Result<Value, BuildError> {
+///
+/// `key_columns` is the table's primary key as the catalogue reports it.
+/// Under REPLICA IDENTITY FULL pgoutput flags *every* column as part of the
+/// identity, so the flags alone would turn the whole row into the key — a
+/// document id that changes with any column, never matching what the initial
+/// load filed the row under. The flags are the fallback for a relation the
+/// caller knows no key for.
+fn extract_pk(
+    rel: &Relation,
+    tuple: &Tuple,
+    key_columns: Option<&[String]>,
+) -> Result<Value, BuildError> {
+    let is_key = |col: &crate::pgoutput::RelationColumn| match key_columns {
+        Some(keys) if rel.replica_identity == ReplicaIdentity::Full && !keys.is_empty() => {
+            keys.iter().any(|k| k == &col.name)
+        }
+        _ => col.in_replica_identity,
+    };
     let mut obj = Map::new();
     let mut scalar: Option<Value> = None;
     for (idx, col) in rel.columns.iter().enumerate() {
-        if !col.in_replica_identity {
+        if !is_key(col) {
             continue;
         }
         let v = match tuple.get(idx) {
@@ -135,7 +152,11 @@ impl Incoming {
     }
 }
 
-pub fn build_row_change(rel: &Relation, incoming: Incoming) -> Result<RowChange, BuildError> {
+pub fn build_row_change(
+    rel: &Relation,
+    incoming: Incoming,
+    key_columns: Option<&[String]>,
+) -> Result<RowChange, BuildError> {
     let change = |kind: RowKind| RowChange {
         schema: rel.schema.clone(),
         table: rel.name.clone(),
@@ -151,7 +172,7 @@ pub fn build_row_change(rel: &Relation, incoming: Incoming) -> Result<RowChange,
     }
     match incoming {
         Incoming::Insert(new) => {
-            let pk = extract_pk(rel, &new)?;
+            let pk = extract_pk(rel, &new, key_columns)?;
             let (doc, _) = build_doc(rel, &new, None)?;
             Ok(change(RowKind::Insert { pk, doc }))
         }
@@ -159,8 +180,10 @@ pub fn build_row_change(rel: &Relation, incoming: Incoming) -> Result<RowChange,
             // The key must come from the new tuple: it says where the row lives
             // now. The old key addresses the document the row used to occupy,
             // which the engine has to remove when the two differ.
-            let pk = extract_pk(rel, &new)?;
-            let previous_pk = old.as_ref().and_then(|prev| extract_pk(rel, prev).ok());
+            let pk = extract_pk(rel, &new, key_columns)?;
+            let previous_pk = old
+                .as_ref()
+                .and_then(|prev| extract_pk(rel, prev, key_columns).ok());
             let old_slices = old.as_ref().map(tuple_slices);
             let (doc, toast) = build_doc(rel, &new, old_slices.as_deref())?;
             // Only REPLICA IDENTITY FULL guarantees the old tuple carries the
@@ -179,7 +202,7 @@ pub fn build_row_change(rel: &Relation, incoming: Incoming) -> Result<RowChange,
             }))
         }
         Incoming::Delete(key) => {
-            let pk = extract_pk(rel, &key)?;
+            let pk = extract_pk(rel, &key, key_columns)?;
             let before = if rel.replica_identity == ReplicaIdentity::Full {
                 Some(build_doc(rel, &key, None)?.0)
             } else {
@@ -270,7 +293,7 @@ mod tests {
             TupleValue::Text(b"12345678901234567890.5".to_vec()),
             TupleValue::Null,
         ]);
-        let change = build_row_change(&rel, Incoming::Insert(t)).unwrap();
+        let change = build_row_change(&rel, Incoming::Insert(t), None).unwrap();
         assert_eq!(change.schema, "public");
         match change.kind {
             RowKind::Insert { pk, doc } => {
@@ -300,7 +323,7 @@ mod tests {
             TupleValue::Text(b"99.9".to_vec()),
             TupleValue::UnchangedToast,
         ]);
-        let change = build_row_change(&rel, Incoming::Update(Some(old), new)).unwrap();
+        let change = build_row_change(&rel, Incoming::Update(Some(old), new), None).unwrap();
         match change.kind {
             RowKind::Update {
                 pk,
@@ -334,7 +357,7 @@ mod tests {
             TupleValue::Null,
             TupleValue::Text(b"bio".to_vec()),
         ]);
-        let change = build_row_change(&rel, Incoming::Update(Some(old), new)).unwrap();
+        let change = build_row_change(&rel, Incoming::Update(Some(old), new), None).unwrap();
         match change.kind {
             RowKind::Update {
                 pk, previous_pk, ..
@@ -361,7 +384,7 @@ mod tests {
             TupleValue::Null,
             TupleValue::Text(b"bio".to_vec()),
         ]);
-        let change = build_row_change(&rel, Incoming::Update(Some(old), new)).unwrap();
+        let change = build_row_change(&rel, Incoming::Update(Some(old), new), None).unwrap();
         match change.kind {
             RowKind::Update {
                 pk, previous_pk, ..
@@ -383,7 +406,7 @@ mod tests {
             TupleValue::Null,
             TupleValue::UnchangedToast,
         ]);
-        let change = build_row_change(&rel, Incoming::Update(None, new)).unwrap();
+        let change = build_row_change(&rel, Incoming::Update(None, new), None).unwrap();
         match change.kind {
             RowKind::Update {
                 unchanged_toast_columns,
@@ -402,7 +425,7 @@ mod tests {
             TupleValue::Null,
             TupleValue::Null,
         ]);
-        let change = build_row_change(&rel, Incoming::Delete(key)).unwrap();
+        let change = build_row_change(&rel, Incoming::Delete(key), None).unwrap();
         assert!(matches!(change.kind, RowKind::Delete { pk, .. } if pk == serde_json::json!(42)));
     }
 
@@ -410,7 +433,7 @@ mod tests {
     fn replica_identity_nothing_is_rejected_upfront() {
         let rel = users_relation(pgoutput::ReplicaIdentity::None);
         let key = tuple(vec![TupleValue::Null; 4]);
-        assert!(build_row_change(&rel, Incoming::Delete(key)).is_err());
+        assert!(build_row_change(&rel, Incoming::Delete(key), None).is_err());
     }
 
     #[test]
@@ -429,7 +452,7 @@ mod tests {
             TupleValue::Null,
             TupleValue::Text(b"7".to_vec()),
         ]);
-        let change = build_row_change(&rel, Incoming::Delete(key)).unwrap();
+        let change = build_row_change(&rel, Incoming::Delete(key), None).unwrap();
         match change.kind {
             RowKind::Delete { pk, .. } => {
                 assert_eq!(pk, serde_json::json!({"id": 42, "tenant_id": 7}))
@@ -453,7 +476,7 @@ mod tests {
             TupleValue::Text(b"1".to_vec()),
             TupleValue::Text(b"bio".to_vec()),
         ]);
-        let change = build_row_change(&rel, Incoming::Update(Some(old), new)).unwrap();
+        let change = build_row_change(&rel, Incoming::Update(Some(old), new), None).unwrap();
         match change.kind {
             RowKind::Update { before, .. } => assert_eq!(
                 before,
@@ -481,7 +504,7 @@ mod tests {
             TupleValue::Text(b"1".to_vec()),
             TupleValue::Text(b"bio".to_vec()),
         ]);
-        let change = build_row_change(&rel, Incoming::Update(Some(old), new)).unwrap();
+        let change = build_row_change(&rel, Incoming::Update(Some(old), new), None).unwrap();
         match change.kind {
             RowKind::Update {
                 before,
@@ -504,12 +527,40 @@ mod tests {
             TupleValue::Text(b"7".to_vec()),
             TupleValue::Null,
         ]);
-        let change = build_row_change(&rel, Incoming::Delete(key)).unwrap();
+        let change = build_row_change(&rel, Incoming::Delete(key), None).unwrap();
         match change.kind {
             RowKind::Delete { before, .. } => assert_eq!(
                 before,
                 Some(serde_json::json!({"id": 42, "email": "a@x.io", "score": "7", "bio": null}))
             ),
+            other => panic!("unexpected kind {other:?}"),
+        }
+    }
+
+    #[test]
+    fn under_replica_identity_full_the_key_is_still_the_primary_key() {
+        // pgoutput flags every column as identity under FULL; the catalogue's
+        // key is what the load filed the row under, and what a document is
+        let mut rel = users_relation(pgoutput::ReplicaIdentity::Full);
+        for col in &mut rel.columns {
+            col.in_replica_identity = true;
+        }
+        let row = tuple(vec![
+            TupleValue::Text(b"42".to_vec()),
+            TupleValue::Text(b"a@x.io".to_vec()),
+            TupleValue::Text(b"7".to_vec()),
+            TupleValue::Null,
+        ]);
+        let keys = vec!["id".to_string()];
+        let change = build_row_change(&rel, Incoming::Insert(row.clone()), Some(&keys)).unwrap();
+        match change.kind {
+            RowKind::Insert { pk, .. } => assert_eq!(pk, serde_json::json!(42)),
+            other => panic!("unexpected kind {other:?}"),
+        }
+        // without a known key the flags are all there is
+        let change = build_row_change(&rel, Incoming::Delete(row), None).unwrap();
+        match change.kind {
+            RowKind::Delete { pk, .. } => assert!(pk.is_object(), "the whole row: {pk}"),
             other => panic!("unexpected kind {other:?}"),
         }
     }
@@ -523,7 +574,7 @@ mod tests {
             TupleValue::Null,
             TupleValue::Null,
         ]);
-        let change = build_row_change(&rel, Incoming::Delete(key)).unwrap();
+        let change = build_row_change(&rel, Incoming::Delete(key), None).unwrap();
         match change.kind {
             RowKind::Delete { before, .. } => assert_eq!(before, None),
             other => panic!("unexpected kind {other:?}"),
