@@ -16,6 +16,24 @@ What a major version promises here: the **configuration file** and the
 make an existing `pg2osync.toml` stop loading, or make a running pipeline
 re-read a table from the start, is a major version.
 
+## [1.3.0](https://github.com/kennywillbe/pg2osync/compare/v1.2.0...v1.3.0) (2026-08-29)
+
+
+### Features
+
+* a row chooses its index ([#91](https://github.com/kennywillbe/pg2osync/issues/91)) ([0939822](https://github.com/kennywillbe/pg2osync/commit/09398227e1c7343af93b4cd16fb0d1c7b794931b))
+* an ingest pipeline per section, so the target computes vector fields ([#92](https://github.com/kennywillbe/pg2osync/issues/92)) ([1da79dc](https://github.com/kennywillbe/pg2osync/commit/1da79dccf1510af7e12ac9c7da6dcccf2b51bbb5))
+* append-only tables without a primary key ([#93](https://github.com/kennywillbe/pg2osync/issues/93)) ([e6ab837](https://github.com/kennywillbe/pg2osync/commit/e6ab837964abc10fe17abc46b6c7c6558e02fe7e))
+* join field and per-document routing ([#88](https://github.com/kennywillbe/pg2osync/issues/88)) ([16d2b56](https://github.com/kennywillbe/pg2osync/commit/16d2b566555c0e9d7cea6a8139886cdfa07efe8b))
+* one index fed by several tables ([#89](https://github.com/kennywillbe/pg2osync/issues/89)) ([7efef40](https://github.com/kennywillbe/pg2osync/commit/7efef40a6da58897e58fb62abdf0b83e1dda2228))
+* parse, split, number and date transforms ([#85](https://github.com/kennywillbe/pg2osync/issues/85)) ([7a46aff](https://github.com/kennywillbe/pg2osync/commit/7a46aff54e44c237a006a6aa72e2505510124f4b))
+* row filters that the load pushes down and the stream evaluates ([#87](https://github.com/kennywillbe/pg2osync/issues/87)) ([c392efe](https://github.com/kennywillbe/pg2osync/commit/c392efe940dcd267a455c8b278deb9ec18d66756))
+
+
+### Bug Fixes
+
+* file a REPLICA IDENTITY FULL row under its primary key ([#90](https://github.com/kennywillbe/pg2osync/issues/90)) ([9eabc04](https://github.com/kennywillbe/pg2osync/commit/9eabc045ab87ae2ad1224b30a4fcfbb66e275c1a))
+
 ## [1.2.0](https://github.com/kennywillbe/pg2osync/compare/v1.1.0...v1.2.0) (2026-08-29)
 
 
