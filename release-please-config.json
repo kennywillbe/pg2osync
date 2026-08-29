@@ -9,28 +9,40 @@
       "component": "pg2osync"
     },
     "crates/core": {
-      "component": "pg2osync-core"
+      "component": "pg2osync-core",
+      "skip-changelog": true,
+      "skip-github-release": true
     },
     "crates/engine": {
-      "component": "pg2osync-engine"
+      "component": "pg2osync-engine",
+      "skip-changelog": true,
+      "skip-github-release": true
     },
     "crates/sink": {
-      "component": "pg2osync-sink"
+      "component": "pg2osync-sink",
+      "skip-changelog": true,
+      "skip-github-release": true
     },
     "crates/source": {
-      "component": "pg2osync-source"
+      "component": "pg2osync-source",
+      "skip-changelog": true,
+      "skip-github-release": true
     },
     "crates/source-mysql": {
-      "component": "pg2osync-source-mysql"
+      "component": "pg2osync-source-mysql",
+      "skip-changelog": true,
+      "skip-github-release": true
     },
     "crates/tls": {
-      "component": "pg2osync-tls"
+      "component": "pg2osync-tls",
+      "skip-changelog": true,
+      "skip-github-release": true
     }
   },
   "plugins": [
     {
       "type": "cargo-workspace",
-      "merge": true
+      "merge": false
     },
     {
       "type": "linked-versions",
