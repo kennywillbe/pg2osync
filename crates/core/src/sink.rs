@@ -156,7 +156,17 @@ pub trait Sink: Send + Sync {
     /// versions its documents must clear them *at* that position: anything
     /// written before it has to lose, and anything written after it has to
     /// survive, including a row re-inserted moments later.
-    async fn truncate_index(&self, index: &str, version: Option<u64>) -> Result<(), CoreError>;
+    ///
+    /// `only` narrows the clear to documents whose `field` equals `value` —
+    /// how one relation of a join pair is cleared without touching the other
+    /// half of the index it shares. Kept as a field/value pair rather than a
+    /// query so the caller never writes the target's query language.
+    async fn truncate_index(
+        &self,
+        index: &str,
+        version: Option<u64>,
+        only: Option<(&str, &str)>,
+    ) -> Result<(), CoreError>;
 
     /// Make everything written so far visible to search.
     ///

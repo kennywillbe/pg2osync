@@ -156,3 +156,19 @@ email = "redact"                     # "redact" -> "***", "hash" -> SHA-256 pref
 # field = "relation"
 # name = "order"
 # parent = "customer_id"               # column on the child holding the parent's key
+
+# Sharing an index without a join: any tables may feed one index once every
+# section declares an id, so their documents cannot collide by accident (the
+# templates are not compared; a collision between them is your declaration).
+# At most one section sets mapping_file. reconcile refuses a shared index, and
+# a TRUNCATE on any of its tables halts the pipeline: resnapshot that table
+# instead.
+# [sync.users]
+# table = "public.users"
+# index = "search"
+# id = "user-{id}"
+#
+# [sync.orders]
+# table = "public.orders"
+# index = "search"
+# id = "order-{id}"

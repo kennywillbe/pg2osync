@@ -125,7 +125,7 @@ One section per table. `<key>` is the index name when `index` is omitted.
 | Option | Description |
 |---|---|
 | `table` | **Required.** `schema.table` for PostgreSQL, `database.table` for MySQL |
-| `index` | Target index or collection; lowercase `[a-z0-9_-]`, not starting with `_` or `.` |
+| `index` | Target index or collection; lowercase `[a-z0-9_-]`, not starting with `_` or `.`; several sections may name the same one, see [Sharing an index](#sharing-an-index) |
 | `primary_key` | Overrides key detection; also the join column for nested children |
 | `id` | Derived document id, e.g. `tenant-{tenant_id}-{id}`; see [Document ids](#document-ids) |
 | `fan_out` | One row becomes one document per element of an array column; see [Fan-out](#fan-out) |
@@ -174,6 +174,52 @@ booleans as text.
   `REPLICA IDENTITY FULL`; `run` refuses to start otherwise. MySQL already
   guarantees it (`binlog_row_image = FULL`).
 
+### Sharing an index
+
+An index built before pg2osync is usually a union of several tables, and
+several sections may name the same index:
+
+```toml
+[sync.users]
+table = "public.users"
+index = "search"
+id = "user-{id}"
+
+[sync.orders]
+table = "public.orders"
+index = "search"
+id = "order-{id}"
+```
+
+- **Every section sharing the index declares an `id`.** The default id is the
+  row's key, and two tables that both have a row `1` would be one document by
+  accident; an explicit template on each section is the declaration that they
+  are not. A shared index with a section that omits `id` is refused at config
+  load. The templates themselves are not compared: `user-{id}` on both
+  sections collides, and that is the operator's own declaration — nothing
+  checks the values, because nothing can see them.
+- **At most one of the sections sets `mapping_file`.** An index is created
+  once; a second section describing it is refused.
+- **`reconcile` refuses a shared index.** It pages the index by one table's
+  key column and cannot tell one table's documents from another's, so every
+  other table's documents would be reported as orphans — and removed by
+  `--delete`.
+- **`TRUNCATE` on any of the tables is not applied.** Clearing the index
+  would wipe the tables the source never truncated, and halting would replay
+  the same `TRUNCATE` from the slot at every restart with nothing to change to
+  get past it — so the truncated table's documents are left in place, the
+  pipeline logs `TRUNCATE not applied to index search, which other tables also
+  feed; its documents are left in place` and counts a `truncate_skipped` event
+  in `pg2osync_events_total`. Clear them by hand, or give the table an index
+  of its own. A [join pair](#join-fields) is different: its halves are told
+  apart by the join field, so a truncate there clears one relation exactly.
+- **`resnapshot` works** on any one of the tables for the same reason: it
+  writes by id and touches nothing else in the index.
+
+A [join pair](#join-fields) is the other way two sections share an index:
+there the join field scopes every document to its relation, which is why
+`reconcile` can check either half of the pair against its own table.
+
 ### Fan-out
 
 One row whose array column holds N elements can become N documents:
@@ -208,8 +254,8 @@ and element fields alike.
   support fanned tables yet: both page by key, and one row now has many
   documents.
 
-Two tables may not map to the same index — document identity would be
-ambiguous — except as a [join pair](#join-fields).
+Two tables may map to the same index once each declares its `id`; see
+[Sharing an index](#sharing-an-index).
 
 ### Transforms
 
@@ -641,9 +687,12 @@ document to another shard. OpenSearch and Elasticsearch only.
   and it is the cost: one per deleted parent, which the batch waits for. Each
   batch that carries one counts a `join_cascade` event in
   `pg2osync_events_total`.
-- **`TRUNCATE` on either table empties the shared index.** A truncate clears
-  an index, and the index is the pair's; PostgreSQL makes you truncate tables
-  that reference each other together anyway.
+- **`TRUNCATE` on either table clears its relation only.** The join field
+  tells the halves apart, so a truncate of the orders removes every `order`
+  document — routed to its parent's shard — and leaves the customers, unlike
+  a [plain shared index](#sharing-an-index), where nothing can tell one
+  table's documents from another's. PostgreSQL makes you
+  truncate tables that reference each other together anyway, so usually both.
 - **A `where` filter is the operator's to keep consistent across the pair.**
   A child whose parent the parent section's `where` filters out is indexed
   with a `parent` that no document has.
@@ -654,7 +703,9 @@ document to another shard. OpenSearch and Elasticsearch only.
   the pair against its own table and routes the deletes it makes.
 
 Refused at config load: two sections on one index without `join` on every one
-of them; sections of one index naming different join fields; an index with no
+of them and without an `id` on every one of them (see
+[Sharing an index](#sharing-an-index)); sections of one index naming
+different join fields; an index with no
 parent, or with two; two sections sharing a relation name; a child that only
 names a parent no other section provides; a child with `mapping_file`;
 `fan_out` together with `join`; a parent `id` naming a column outside its key;

@@ -114,8 +114,9 @@ impl DurableLsn {
 enum SinkCommand {
     Write(Vec<LsnOp>),
     /// Clearing an index, carrying the position it happened at so a versioned
-    /// target can order it against the writes around it.
-    Truncate(String, Option<u64>),
+    /// target can order it against the writes around it, and — for one half of
+    /// a join pair — the relation the clear is scoped to.
+    Truncate(String, Option<u64>, Option<(String, String)>),
     /// Everything before this mark has been handed to the sink; the sink task
     /// publishes it once written, which is what the initial load waits on.
     LoadMark(u64),
@@ -613,6 +614,25 @@ pub async fn run(
                     continue;
                 };
                 let index = index.to_string();
+                // Clearing an index other tables feed would wipe rows the
+                // source never truncated, and nothing would put them back. A
+                // join member is cleared by its relation name, which is its
+                // own documents exactly; any other shared table is left as it
+                // is and said so — halting would replay the same TRUNCATE
+                // from the slot at every restart, with nothing the operator
+                // could change to get past it.
+                let only = ctx
+                    .joins
+                    .for_table(&schema, &table)
+                    .map(|join| (join.field.clone(), join.name.clone()));
+                if only.is_none() && ctx.mapping.is_shared(&index) {
+                    ctx.metrics.incr_event("truncate_skipped");
+                    tracing::error!(target: "pg2osync::engine",
+                        "{schema}.{table}: TRUNCATE not applied to index {index}, which other \
+                         tables also feed; its documents are left in place — clear them by \
+                         hand, or give this table an index of its own");
+                    continue;
+                }
                 // rows buffered before the TRUNCATE belong before it
                 if !txn_buffer.is_empty()
                     && batch_tx
@@ -626,12 +646,19 @@ pub async fn run(
                 // A truncate removes every key at once, so one floor per index
                 // says what a per-key entry would: anything copied from before
                 // it is gone. Its tombstones expire like any other delete's.
-                if copy_open && let Some(version) = version {
+                // A scoped clear sets no floor: the floor is per index, and it
+                // would drop the other half's copied rows too. The window that
+                // leaves — a copied row of the truncated relation landing after
+                // the clear — is one reconcile finds.
+                if copy_open
+                    && only.is_none()
+                    && let Some(version) = version
+                {
                     let at = cleared.entry(index.clone()).or_insert(version);
                     *at = (*at).max(version);
                 }
                 if batch_tx
-                    .send(SinkCommand::Truncate(index, version))
+                    .send(SinkCommand::Truncate(index, version, only))
                     .await
                     .is_err()
                 {
@@ -775,12 +802,13 @@ async fn sink_loop(
                 load_done_tx.send_replace(mark);
                 Ok(None)
             }
-            SinkCommand::Truncate(index, version) => {
+            SinkCommand::Truncate(index, version, only) => {
                 if !drain(&mut inflight, &mut acks).await {
                     halted = true;
                     break;
                 }
-                match sink.truncate_index(&index, version).await {
+                let only = only.as_ref().map(|(f, v)| (f.as_str(), v.as_str()));
+                match sink.truncate_index(&index, version, only).await {
                     Ok(()) => {
                         tracing::info!(target: "pg2osync::sink",
                         "index {index} cleared after TRUNCATE");
@@ -1698,11 +1726,13 @@ mod pipeline_tests {
             &self,
             index: &str,
             _version: Option<u64>,
+            only: Option<(&str, &str)>,
         ) -> Result<(), CoreError> {
+            let scope = only.map_or(String::new(), |(f, v)| format!(":{f}={v}"));
             self.events
                 .lock()
                 .expect("not poisoned")
-                .push(format!("truncate({index})"));
+                .push(format!("truncate({index}{scope})"));
             Ok(())
         }
 
@@ -2451,6 +2481,7 @@ mod pipeline_tests {
             &self,
             _index: &str,
             _version: Option<u64>,
+            _only: Option<(&str, &str)>,
         ) -> Result<(), CoreError> {
             Ok(())
         }
@@ -3320,6 +3351,110 @@ mod pipeline_tests {
             "the halt must name the table and the column: {message}"
         );
         drop(events_tx);
+    }
+
+    fn shared_ctx(
+        sink: Arc<RecordingSink>,
+        metrics: Arc<crate::metrics::Metrics>,
+        joins: crate::mapping::Joins,
+    ) -> (
+        Arc<PipelineCtx>,
+        watch::Sender<Option<Lsn>>,
+        watch::Sender<u64>,
+    ) {
+        let (ack_tx, _ack_rx) = watch::channel(None);
+        let (load_done_tx, _load_done_rx) = watch::channel(0u64);
+        let ctx = Arc::new(PipelineCtx {
+            sink,
+            mapping: TableMapping::from_pairs([
+                (
+                    ("public".to_string(), "users".to_string()),
+                    "shared".to_string(),
+                ),
+                (
+                    ("public".to_string(), "orders".to_string()),
+                    "shared".to_string(),
+                ),
+            ]),
+            projections: crate::mapping::Projections::default(),
+            transforms: crate::mapping::Transforms::default(),
+            renames: crate::mapping::Renames::default(),
+            constants: crate::mapping::Constants::default(),
+            id_templates: Default::default(),
+            fan_outs: Default::default(),
+            joins,
+            filters: Default::default(),
+            cfg: EngineConfig::default(),
+            ack_tx: ack_tx.clone(),
+            load_done_tx: load_done_tx.clone(),
+            metrics,
+        });
+        (ctx, ack_tx, load_done_tx)
+    }
+
+    async fn truncate_shared(joins: crate::mapping::Joins) -> (Arc<RecordingSink>, u64) {
+        let (events_tx, events_rx) = mpsc::channel(4);
+        let (copy_tx, copy_rx) = mpsc::channel(4);
+        drop(copy_tx);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sink = Arc::new(RecordingSink::default());
+        let metrics = Arc::new(crate::metrics::Metrics::default());
+        let (ctx, _ack, _done) = shared_ctx(sink.clone(), metrics.clone(), joins);
+        events_tx
+            .send(ChangeEvent::TableTruncated {
+                schema: "public".into(),
+                table: "users".into(),
+                version: Some(0x100),
+            })
+            .await
+            .unwrap();
+        drop(events_tx);
+        run(
+            events_rx,
+            copy_rx,
+            ctx,
+            StreamId {
+                source: SOURCE_POSTGRES.into(),
+                stream: "slot".into(),
+                publication: "pub".into(),
+            },
+            Arc::new(|token| Lsn(token).to_string()),
+            crate::mapping::DurableLsn::default(),
+            shutdown_rx,
+        )
+        .await
+        .expect("a truncate of a shared table never stops the pipeline");
+        let skipped = metrics
+            .events_total
+            .lock()
+            .expect("not poisoned")
+            .get("truncate_skipped")
+            .map_or(0, |n| n.load(Ordering::Relaxed));
+        (sink, skipped)
+    }
+
+    #[tokio::test]
+    async fn a_truncate_of_a_plain_shared_table_is_skipped_and_counted() {
+        // halting would replay the same TRUNCATE from the slot at every
+        // restart; leaving the documents and saying so is the honest limit
+        let (sink, skipped) = truncate_shared(Default::default()).await;
+        assert!(sink.events().is_empty(), "nothing was cleared");
+        assert_eq!(skipped, 1);
+    }
+
+    #[tokio::test]
+    async fn a_truncate_of_a_join_member_clears_its_relation_only() {
+        let joins = crate::mapping::Joins::from_pairs([(
+            ("public".to_string(), "users".to_string()),
+            crate::mapping::JoinRule {
+                field: "relation".into(),
+                name: "customer".into(),
+                parent: None,
+            },
+        )]);
+        let (sink, skipped) = truncate_shared(joins).await;
+        assert_eq!(sink.events(), vec!["truncate(shared:relation=customer)"]);
+        assert_eq!(skipped, 0);
     }
 
     #[tokio::test]

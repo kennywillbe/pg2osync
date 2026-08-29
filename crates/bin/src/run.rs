@@ -192,9 +192,9 @@ pub fn build_sink(cfg: &AppConfig, target_password: Option<String>) -> Result<Ar
 
 /// One spec per target index, in section order.
 ///
-/// A join pair is two sections and one index; `ensure_ready` creates it once,
-/// from the parent's mapping — the only section allowed to carry one — so the
-/// mapping is kept from whichever section set it.
+/// Several sections may feed one index — a join pair, or tables that each
+/// declare their id — and `ensure_ready` creates it once, so the mapping is
+/// kept from whichever section set it: config allows at most one to.
 pub fn index_specs(cfg: &AppConfig) -> Vec<IndexSpec> {
     let mut specs: Vec<IndexSpec> = Vec::with_capacity(cfg.sync.len());
     for (key, tbl) in &cfg.sync {
@@ -1822,6 +1822,37 @@ mod tests {
         assert_eq!(percent_decode("p%40ss%3Aword"), "p@ss:word");
         assert_eq!(percent_decode("plain"), "plain");
         assert_eq!(percent_decode("trailing%"), "trailing%");
+    }
+
+    #[test]
+    fn an_index_two_tables_feed_gets_one_spec_carrying_the_mapping() {
+        let mut cfg: AppConfig = toml::from_str(
+            r#"
+[source]
+url = "postgres://u:p@localhost/db"
+[target]
+url = "http://localhost:9200"
+[sync.orders]
+table = "public.orders"
+index = "search"
+id = "order-{id}"
+[sync.users]
+table = "public.users"
+index = "search"
+id = "user-{id}"
+"#,
+        )
+        .expect("parses");
+        // the mapping is read from a file at load; the test stands in for it,
+        // on the later section so an earlier one without cannot shadow it
+        cfg.sync.get_mut("users").expect("section").mapping =
+            Some(serde_json::json!({"mappings": {}}));
+
+        let specs = index_specs(&cfg);
+        assert_eq!(specs.len(), 1, "two sections, one index");
+        assert_eq!(specs[0].name, "search");
+        assert!(specs[0].mapping.is_some());
+        assert_eq!(index_names(&cfg), ["search"]);
     }
 
     #[test]

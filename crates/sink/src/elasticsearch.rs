@@ -91,37 +91,46 @@ impl ElasticsearchSink {
     /// The loop stops when a round deletes nothing, which is also what makes it
     /// correct: a document written after the truncate carries a higher version,
     /// its delete is refused, and it survives.
-    async fn truncate_at_version(&self, index: &str, version: i64) -> Result<(), CoreError> {
+    async fn truncate_at_version(
+        &self,
+        index: &str,
+        version: i64,
+        query: &Value,
+    ) -> Result<(), CoreError> {
         const PAGE: usize = 1000;
         loop {
             let (_, body) = self
                 .send(
                     reqwest::Method::POST,
                     &format!("/{index}/_search"),
-                    Some(
-                        json!({"size": PAGE, "_source": false, "query": {"match_all": {}}})
-                            .to_string(),
-                    ),
+                    Some(json!({"size": PAGE, "_source": false, "query": query}).to_string()),
                 )
                 .await?;
-            let ids: Vec<String> = body["hits"]["hits"]
+            // a join child lives on its parent's shard, and the delete has to
+            // name that shard the way the write did
+            let hits: Vec<(String, Option<String>)> = body["hits"]["hits"]
                 .as_array()
                 .map(|hits| {
                     hits.iter()
-                        .filter_map(|hit| hit["_id"].as_str().map(str::to_string))
+                        .filter_map(|hit| {
+                            hit["_id"].as_str().map(|id| {
+                                (id.to_string(), hit["_routing"].as_str().map(str::to_string))
+                            })
+                        })
                         .collect()
                 })
                 .unwrap_or_default();
-            if ids.is_empty() {
+            if hits.is_empty() {
                 return Ok(());
             }
             let mut ndjson = String::new();
-            for id in &ids {
+            for (id, routing) in &hits {
                 ndjson.push_str(&format!(
-                    "{{\"delete\":{{\"_index\":{},\"_id\":{},\"version\":{version},\
+                    "{{\"delete\":{{\"_index\":{},\"_id\":{}{},\"version\":{version},\
                      \"version_type\":\"external_gte\"}}}}\n",
-                    serde_json::to_string(index).unwrap(),
-                    serde_json::to_string(id).unwrap(),
+                    serde_json::to_string(index).unwrap_or_default(),
+                    serde_json::to_string(id).unwrap_or_default(),
+                    routing_field(routing.as_deref()),
                 ));
             }
             let (status, body) = self
@@ -574,7 +583,16 @@ impl Sink for ElasticsearchSink {
         })
     }
 
-    async fn truncate_index(&self, index: &str, version: Option<u64>) -> Result<(), CoreError> {
+    async fn truncate_index(
+        &self,
+        index: &str,
+        version: Option<u64>,
+        only: Option<(&str, &str)>,
+    ) -> Result<(), CoreError> {
+        let query = match only {
+            Some((field, value)) => json!({"term": {field: value}}),
+            None => json!({"match_all": {}}),
+        };
         // an unrefreshed write is invisible to _delete_by_query and would
         // outlive the TRUNCATE that is supposed to remove it
         let _ = self
@@ -585,13 +603,13 @@ impl Sink for ElasticsearchSink {
         // rejected forever. A versioned bulk delete puts the tombstone at the
         // truncate's position instead.
         if let Some(version) = crate::external_version(version) {
-            return self.truncate_at_version(index, version).await;
+            return self.truncate_at_version(index, version, &query).await;
         }
         let (status, _) = self
             .send(
                 reqwest::Method::POST,
                 &format!("/{index}/_delete_by_query?refresh=true&conflicts=proceed"),
-                Some(json!({"query": {"match_all": {}}}).to_string()),
+                Some(json!({"query": query}).to_string()),
             )
             .await?;
         if status != 200 {

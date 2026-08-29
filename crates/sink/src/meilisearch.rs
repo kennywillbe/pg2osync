@@ -266,7 +266,17 @@ impl Sink for MeilisearchSink {
         // Meilisearch has no document versions, so there is no ordering to
         // preserve and nothing to carry here
         _version: Option<u64>,
+        only: Option<(&str, &str)>,
     ) -> Result<(), CoreError> {
+        // a scoped clear only exists for a join pair, which is refused for
+        // this target at config load
+        if only.is_some() {
+            return Err(CoreError::Sink(
+                "a scoped truncate cannot be expressed in Meilisearch; this should have been \
+                 refused at startup"
+                    .into(),
+            ));
+        }
         let (status, body) = self
             .send(
                 reqwest::Method::DELETE,
