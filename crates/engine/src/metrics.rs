@@ -19,6 +19,11 @@ pub struct Metrics {
     /// Documents the target refused and that were recorded rather than written.
     /// Non-zero means data is in the quarantine store and not in the index.
     pub rejected_total: AtomicU64,
+    /// Values a configured transform could not convert, indexed as they
+    /// arrived. Non-zero means the index holds a shape the configuration did
+    /// not ask for — usually a wrong `date` format, or a column that is not
+    /// what it looks like.
+    pub transform_unconverted_total: AtomicU64,
     pub reconnects_total: AtomicU64,
     /// 1 while the source is streaming, 0 while it is being retried. The
     /// counter says how often it broke; this says whether it is broken now.
@@ -153,6 +158,15 @@ impl Metrics {
             "Documents the target refused that were quarantined instead of written",
             "counter",
             self.rejected_total.load(Ordering::Relaxed).to_string(),
+        );
+        push(
+            &mut out,
+            "pg2osync_transform_unconverted_total",
+            "Values a configured transform could not convert, indexed as they were",
+            "counter",
+            self.transform_unconverted_total
+                .load(Ordering::Relaxed)
+                .to_string(),
         );
         push(
             &mut out,

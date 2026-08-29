@@ -35,4 +35,8 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 async-trait = "0.1"
 tracing = "0.1"
+# `clock` is left off on purpose: nothing here may read a local time zone, or
+# the same value would normalize differently on two hosts. Feature unification
+# turns it on anyway through serde_with, so the flag states intent, not weight.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 

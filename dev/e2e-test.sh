@@ -1058,5 +1058,84 @@ check "the delete finds the document by its derived id" "$(os_status e2e_bid glo
 stop_sync
 bid_cleanup
 
+echo -e "\n\033[1m== 22. named transforms reshape a column, and leave alone what they cannot ==\033[0m"
+# Six named ops, no expression language (#63). Row 1 converts on every column;
+# row 2 converts on none of them and has to land exactly as it arrived, counted,
+# rather than halt the pipeline or be nulled.
+SCONFIG=$(mktemp /tmp/pg2osync-e2e-shape.XXXXXX)
+SMAPPING=$(dirname "$SCONFIG")/pg2osync-e2e-shape-mapping.json
+SSLOT=pg2osync_e2e_shape
+cat > "$SCONFIG" <<TOML
+[source]
+url_env = "PG2OSYNC_SOURCE_URL"
+slot_name = "$SSLOT"
+publication = "${SSLOT}_pub"
+
+[target]
+url = "http://localhost:9200"
+
+[metrics]
+bind = "127.0.0.1:9123"
+
+[sync.shape]
+table = "public.shape_probe"
+index = "e2e_shape"
+mapping_file = "pg2osync-e2e-shape-mapping.json"
+
+[sync.shape.transform]
+payload = "json"
+price = "number"
+tags = { op = "split", by = "," }
+born = { op = "date", from = "%d/%m/%Y" }
+TOML
+# Row 2 keeps `price` and `born` as the strings they arrived as, so under dynamic
+# mapping the second document would be a mapping rejection — the quarantine
+# path, not the policy under test — hence the fields are typed text up front.
+cat > "$SMAPPING" <<'JSON'
+{ "mappings": { "properties": { "price": { "type": "text" }, "born": { "type": "text" }, "tags": { "type": "keyword" } } } }
+JSON
+shape_cleanup() {
+  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  pg "SELECT pg_drop_replication_slot('$SSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$SSLOT');" > /dev/null 2>&1 || true
+  pg "DROP PUBLICATION IF EXISTS ${SSLOT}_pub; DROP TABLE IF EXISTS shape_probe;" > /dev/null 2>&1 || true
+  rm -f "$SCONFIG" "$SMAPPING"
+}
+trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup; init_cleanup; fan_cleanup; bid_cleanup; shape_cleanup' EXIT
+
+pg "DROP TABLE IF EXISTS shape_probe; CREATE TABLE shape_probe(id bigint primary key, tags text, price text, born text, payload text);" > /dev/null 2>&1
+pg "INSERT INTO shape_probe VALUES (1,'a, b ,c','19.99','01/03/2024','{\"k\":1}'), (2,'x','abc','not-a-date','{\"k\":2}');" > /dev/null
+pg "DROP PUBLICATION IF EXISTS ${SSLOT}_pub; CREATE PUBLICATION ${SSLOT}_pub FOR TABLE shape_probe;" > /dev/null 2>&1
+curl -s -XDELETE "$OS/e2e_shape" > /dev/null
+# a split with nothing to split by is a config mistake, refused where it can
+# still be fixed rather than on the first row of the load
+sed 's/by = ","/by = ""/' "$SCONFIG" > "${SCONFIG}.bad"
+if $BIN validate -c "${SCONFIG}.bad" > /dev/null 2>&1; then
+  bad "validate accepted a split with an empty delimiter"
+else
+  ok "validate refuses a split with nothing to split by"
+fi
+rm -f "${SCONFIG}.bad"
+nohup $BIN run -c "$SCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_count e2e_shape)" = "2" ] && break
+  sleep 1
+done
+check "a delimited string became an array" "$(os_field e2e_shape 1 tags)" "['a', 'b', 'c']"
+check "a numeric string became a number" "$(curl -s "$OS/e2e_shape/_doc/1" | jqf "type(d['_source']['price']).__name__")" "float"
+check "a formatted date became ISO 8601" "$(os_field e2e_shape 1 born)" "2024-03-01"
+check "a JSON string became an object" "$(curl -s "$OS/e2e_shape/_doc/1" | jqf "type(d['_source']['payload']).__name__")" "dict"
+check "an unconvertible value is indexed as it was" "$(os_field e2e_shape 2 price)" "abc"
+check "and so is an unparseable date" "$(os_field e2e_shape 2 born)" "not-a-date"
+# -ge rather than =: at-least-once delivery may hand row 2 over more than once,
+# and every pass counts what it left alone again
+left=$(curl -s 127.0.0.1:9123/metrics | awk '/^pg2osync_transform_unconverted_total /{print $2}')
+if [ "${left:-0}" -ge 2 ]; then
+  ok "the counter reports the values left as they were ($left)"
+else
+  bad "the counter reports ${left:-0} values left as they were, want at least 2"
+fi
+stop_sync
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

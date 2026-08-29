@@ -81,6 +81,7 @@ exclude_columns = ["password_hash"]
 
 [sync.shop_users.transform]
 email = "redact"
+balance = "number"
 
 [sync.shop_users.fields]
 balance = "credit"
@@ -112,7 +113,8 @@ start_sync
 sleep 6; refresh
 check "the load indexed all rows" "$(os_count e2e_mysql_users)" "3"
 check "named columns, not ordinals" "$(os_field e2e_mysql_users 1 name)" "alice"
-check "decimal keeps precision" "$(os_field e2e_mysql_users 3 credit)" "99.99"
+check "number turns the decimal into a JSON number" "$(curl -s "$OS/e2e_mysql_users/_doc/3" | jqf "type(d['_source']['credit']).__name__")" "float"
+check "and the value survives the conversion" "$(os_field e2e_mysql_users 3 credit)" "99.99"
 check "the source name is gone after the rename" "$(os_has e2e_mysql_users 3 balance)" "False"
 check "the origin placeholder is rendered" "$(os_field e2e_mysql_users 1 origin)" "sourcedb.shop_users"
 check "excluded column absent" "$(os_has e2e_mysql_users 1 password_hash)" "False"
@@ -127,7 +129,7 @@ check "insert uses named columns" "$(os_field e2e_mysql_users 4 name)" "dave"
 my "UPDATE shop_users SET name='dave-renamed', balance=8.50 WHERE id=4;"
 sleep 3; refresh
 check "UPDATE propagated" "$(os_field e2e_mysql_users 4 name)" "dave-renamed"
-check "UPDATE keeps decimals" "$(os_field e2e_mysql_users 4 credit)" "8.50"
+check "the stream converts the decimal too" "$(os_field e2e_mysql_users 4 credit)" "8.5"
 
 my "INSERT INTO shop_users (id,name,metadata) VALUES (7,'jane','{\"tier\":\"gold\",\"tags\":[1,2]}');"
 synced
@@ -368,8 +370,10 @@ trap 'cleanup; resume_cleanup; types_cleanup' EXIT
 
 # The row image says nothing about whether a string column holds characters or
 # bytes, and nothing about what an enum ordinal means, so these are exactly the
-# types the two readers used to disagree on. Row 1 arrives through the initial
-# load and row 2 through the binlog, from identical values.
+# types the two readers used to disagree on. The decimal is here because the
+# main config now converts one to a number, and the rule that a decimal keeps
+# its declared scale needs a column nothing transforms. Row 1 arrives through
+# the initial load and row 2 through the binlog, from identical values.
 my "DROP TABLE IF EXISTS types_probe;
     CREATE TABLE types_probe(
       id     bigint PRIMARY KEY,
@@ -378,8 +382,9 @@ my "DROP TABLE IF EXISTS types_probe;
       blb    blob,
       bits   bit(16),
       grade  enum('low','medium','high'),
-      tags   set('a','b','c'));"
-my "INSERT INTO types_probe VALUES (1,'hello',0x00FF10,0x0102,b'0000000011111111','medium','a,c');"
+      tags   set('a','b','c'),
+      amount decimal(10,2));"
+my "INSERT INTO types_probe VALUES (1,'hello',0x00FF10,0x0102,b'0000000011111111','medium','a,c',8.50);"
 curl -s -XDELETE "$OS/e2e_mysql_types" > /dev/null
 curl -s -XDELETE "$OS/.pg2osync_meta/_doc/checkpoint-mysql-990003" > /dev/null
 curl -s -XDELETE "$OS/.pg2osync_meta/_doc/load-mysql-990003-sourcedb_types_probe" > /dev/null
@@ -391,14 +396,14 @@ for _ in $(seq 1 60); do
   sleep 0.5
 done
 # same values again, this time reaching the target through the binlog
-my "INSERT INTO types_probe VALUES (2,'hello',0x00FF10,0x0102,b'0000000011111111','medium','a,c');"
+my "INSERT INTO types_probe VALUES (2,'hello',0x00FF10,0x0102,b'0000000011111111','medium','a,c',8.50);"
 for _ in $(seq 1 60); do
   refresh
   [ "$(os_count e2e_mysql_types)" = "2" ] && break
   sleep 0.5
 done
 check "both rows arrived" "$(os_count e2e_mysql_types)" "2"
-for col in txt bin blb bits grade tags; do
+for col in txt bin blb bits grade tags amount; do
   loaded=$(os_field e2e_mysql_types 1 $col)
   streamed=$(os_field e2e_mysql_types 2 $col)
   if [ "$loaded" = "$streamed" ]; then
@@ -414,6 +419,7 @@ check "blob is base64 of its bytes" "$(os_field e2e_mysql_types 1 blb)" "AQI="
 check "a two-byte bit is a number" "$(os_field e2e_mysql_types 1 bits)" "255"
 check "an enum is its label" "$(os_field e2e_mysql_types 1 grade)" "medium"
 check "a set is its labels" "$(os_field e2e_mysql_types 1 tags)" "['a', 'c']"
+check "a decimal keeps its declared scale" "$(os_field e2e_mysql_types 1 amount)" "8.50"
 stop_sync
 
 say "14. re-snapshot one table on demand"

@@ -9,8 +9,7 @@ use pg2osync_core::event::ChangeEvent;
 use pg2osync_core::lsn::Lsn;
 use pg2osync_core::sink::{IndexSpec, Sink};
 use pg2osync_engine::mapping::{
-    Constants, DurableLsn, Projection, Projections, Rename, Renames, TableMapping, TransformOp,
-    Transforms,
+    Constants, DurableLsn, Projection, Projections, Rename, Renames, TableMapping, Transforms,
 };
 use pg2osync_engine::metrics::SharedMetrics;
 use pg2osync_engine::{PipelineCtx, PositionRenderer};
@@ -196,10 +195,10 @@ fn transforms(cfg: &AppConfig) -> Result<Transforms> {
         }
         let (schema, table) = split_qualified(&tbl.table);
         let mut rules = HashMap::new();
-        for (col, op) in &tbl.transform {
-            let parsed = TransformOp::parse(op).with_context(|| {
-                format!("[sync.{key}.transform] {col} = {op:?} is not \"hash\" or \"redact\"")
-            })?;
+        for (col, spec) in &tbl.transform {
+            let parsed = spec
+                .parse()
+                .map_err(|e| anyhow::anyhow!("[sync.{key}.transform] {col}: {e}"))?;
             rules.insert(col.clone(), parsed);
         }
         pairs.push(((schema.to_string(), table.to_string()), rules));

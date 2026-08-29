@@ -1515,6 +1515,7 @@ name = "pg2osync-engine"
 version = "1.2.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "pg2osync-core",
  "serde",
  "serde_json",
