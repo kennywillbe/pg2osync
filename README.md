@@ -153,10 +153,32 @@ may be pooled but must reach the primary. See [docs/proxies.md](docs/proxies.md)
 
 ## Install
 
-**From source, which is the only path today.** There is no published binary or
-image yet — the release workflow builds both, and nothing has been tagged. A
-`docker pull` line lived here for a while and returned `denied` to anyone who
-tried it, which is worse than saying so.
+**From a release.** Every [release](https://github.com/kennywillbe/pg2osync/releases)
+ships a static binary for Linux and macOS on x86-64 and arm64, each as
+`pg2osync-<tag>-<target>.tar.gz` with a `.sha256` beside it. The archive holds
+the one `pg2osync` executable and nothing else:
+
+```sh
+v=v1.3.0 t=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl,
+                                       # x86_64-apple-darwin, aarch64-apple-darwin
+curl -fsSLO "https://github.com/kennywillbe/pg2osync/releases/download/$v/pg2osync-$v-$t.tar.gz"
+curl -fsSLO "https://github.com/kennywillbe/pg2osync/releases/download/$v/pg2osync-$v-$t.tar.gz.sha256"
+sha256sum -c "pg2osync-$v-$t.tar.gz.sha256"   # shasum -a 256 -c on macOS
+tar -xzf "pg2osync-$v-$t.tar.gz" && sudo install pg2osync /usr/local/bin/
+```
+
+The same release publishes a container image, tagged with the version and with
+`major.minor`:
+
+```sh
+docker run --rm \
+  -e PG2OSYNC_SOURCE_URL="postgres://user:pass@db:5432/appdb" \
+  -v "$PWD/pg2osync.toml:/etc/pg2osync/pg2osync.toml:ro" \
+  -p 9100:9100 \
+  ghcr.io/kennywillbe/pg2osync:1.3.0
+```
+
+**From source.**
 
 ```sh
 git clone https://github.com/kennywillbe/pg2osync && cd pg2osync
@@ -167,17 +189,6 @@ cargo install --path crates/bin
 
 Rust 1.98 or newer. The binary links no C libraries, so the build needs nothing
 but a toolchain.
-
-**From a release, once one exists.** Tagging `v*` publishes static binaries for
-Linux and macOS on x86-64 and arm64, plus a container image:
-
-```sh
-docker run --rm \
-  -e PG2OSYNC_SOURCE_URL="postgres://user:pass@db:5432/appdb" \
-  -v "$PWD/pg2osync.toml:/etc/pg2osync/pg2osync.toml:ro" \
-  -p 9100:9100 \
-  ghcr.io/kennywillbe/pg2osync:<version>
-```
 
 Kubernetes manifests are in [deploy/kubernetes](deploy/kubernetes)
 (`kubectl apply -k deploy/kubernetes`); see
