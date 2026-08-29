@@ -132,3 +132,27 @@ email = "redact"                     # "redact" -> "***", "hash" -> SHA-256 pref
 # [sync.tickets.fan_out]
 # field = "tags"
 # id = "ticket-{id}-{tags}"
+
+# Join field: the same two tables as the children example above, as the other
+# model — pick one. Both land in one index, every order on its customer's
+# shard, so has_child/has_parent queries work and a child change rewrites one
+# document instead of re-fetching the collection. The parent's mapping declares
+# the field; ids must be unique across both tables; the child needs REPLICA
+# IDENTITY FULL unless its parent column is part of its key.
+# [sync.customers]
+# table = "public.customers"
+# index = "shop"
+# id = "customer-{id}"
+# mapping_file = "shop-mapping.json"   # {"relation": {"type": "join", "relations": {"customer": ["order"]}}}
+# [sync.customers.join]
+# field = "relation"
+# name = "customer"
+#
+# [sync.orders]
+# table = "public.orders"
+# index = "shop"
+# id = "order-{id}"
+# [sync.orders.join]
+# field = "relation"
+# name = "order"
+# parent = "customer_id"               # column on the child holding the parent's key

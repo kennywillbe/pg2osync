@@ -154,6 +154,9 @@ pub struct PipelineCtx {
     pub id_templates: crate::mapping::IdTemplates,
     /// Tables whose rows fan out into one document per array element.
     pub fan_outs: crate::mapping::FanOuts,
+    /// Tables filed under a join field: the parent's, and the children whose
+    /// documents live on the parent's shard.
+    pub joins: crate::mapping::Joins,
     /// Row filters, judged on the raw row before anything else shapes it.
     pub filters: crate::mapping::Filters,
     pub cfg: EngineConfig,
@@ -446,6 +449,7 @@ pub async fn run(
                     constants: &ctx.constants,
                     id_templates: &ctx.id_templates,
                     fan_outs: &ctx.fan_outs,
+                    joins: &ctx.joins,
                     filters: &ctx.filters,
                 };
                 let completions = match fetch_completions(
@@ -473,7 +477,7 @@ pub async fn run(
                         continue;
                     };
                     let previous = completion_id(&row.kind, &rules, (&row.schema, &row.table))
-                        .and_then(|id| completions.get(&(index.to_string(), id)))
+                        .and_then(|(id, _)| completions.get(&(index.to_string(), id)))
                         .and_then(Option::as_ref);
                     let mut left_as_is = Vec::new();
                     let ops = match materialize(
@@ -546,6 +550,12 @@ pub async fn run(
                             _ => true,
                         })
                         .collect();
+                    if ops
+                        .iter()
+                        .any(|op| matches!(op.op, DocumentOp::DeleteChildren { .. }))
+                    {
+                        ctx.metrics.incr_event("join_cascade");
+                    }
                     // Remembered only while a load is running: with no copy
                     // row to outrank there is nothing for this to protect.
                     if copy_open {
@@ -554,6 +564,7 @@ pub async fn run(
                                 index,
                                 id,
                                 version: Some(version),
+                                ..
                             } = &op.op
                             {
                                 let entry = superseded
@@ -947,6 +958,12 @@ fn op_size(op: &LsnOp) -> usize {
             index.len() + id.len() + estimate_json(doc) + OVERHEAD
         }
         DocumentOp::Delete { index, id, .. } => index.len() + id.len() + OVERHEAD,
+        DocumentOp::DeleteChildren {
+            index,
+            field,
+            parent_id,
+            ..
+        } => index.len() + field.len() + parent_id.len() + OVERHEAD,
     }
 }
 
@@ -975,9 +992,9 @@ async fn fetch_completions(
     metrics: &crate::metrics::Metrics,
     rules: &Rules<'_>,
 ) -> Result<HashMap<(String, String), Option<Value>>, CoreError> {
-    let mut wanted: HashMap<String, Vec<String>> = HashMap::new();
+    let mut wanted: HashMap<String, Vec<(String, Option<String>)>> = HashMap::new();
     for row in rows {
-        let Some(id) = completion_id(&row.kind, rules, (&row.schema, &row.table)) else {
+        let Some((id, routing)) = completion_id(&row.kind, rules, (&row.schema, &row.table)) else {
             continue;
         };
         let Some(index) = mapping.opt_index_for(&row.schema, &row.table) else {
@@ -985,8 +1002,8 @@ async fn fetch_completions(
         };
         let ids = wanted.entry(index.to_string()).or_default();
         // the same row updated twice in one group needs one read, not two
-        if !ids.contains(&id) {
-            ids.push(id);
+        if !ids.iter().any(|(wanted, _)| *wanted == id) {
+            ids.push((id, routing));
         }
     }
     let mut out = HashMap::new();
@@ -995,7 +1012,7 @@ async fn fetch_completions(
             .toast_readbacks_total
             .fetch_add(ids.len() as u64, std::sync::atomic::Ordering::Relaxed);
         let docs = sink.get_documents(&index, &ids).await?;
-        for (id, doc) in ids.into_iter().zip(docs) {
+        for ((id, _), doc) in ids.into_iter().zip(docs) {
             out.insert((index.clone(), id), doc);
         }
     }
@@ -1011,9 +1028,9 @@ async fn fetch_completions(
 const COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// The per-table rules that decide what a row becomes in the target:
-/// projection, transforms, field renames, constants, the document id, and
-/// whether one row fans out into many documents. Everything that mints an
-/// `_id` goes through here.
+/// projection, transforms, field renames, constants, the document id,
+/// whether one row fans out into many documents, and which join field it is
+/// filed under. Everything that mints an `_id` or a routing goes through here.
 pub struct Rules<'a> {
     pub projections: &'a crate::mapping::Projections,
     pub transforms: &'a crate::mapping::Transforms,
@@ -1021,6 +1038,7 @@ pub struct Rules<'a> {
     pub constants: &'a crate::mapping::Constants,
     pub id_templates: &'a crate::mapping::IdTemplates,
     pub fan_outs: &'a crate::mapping::FanOuts,
+    pub joins: &'a crate::mapping::Joins,
     pub filters: &'a crate::mapping::Filters,
 }
 
@@ -1138,13 +1156,20 @@ fn derived_id(
     ))
 }
 
-/// The document id whose stored copy completes this change, if one is needed.
+/// The document id whose stored copy completes this change, and the routing
+/// it is stored under, if one is needed.
 ///
 /// A row whose key changed is still filed under the old id, so completing from
 /// the new one would write the unchanged columns as null. The old id is what
 /// the template rendered for the row's previous state: for a key-only
-/// template that is the previous key, otherwise the before-image.
-fn completion_id(kind: &RowKind, rules: &Rules<'_>, table: (&str, &str)) -> Option<String> {
+/// template that is the previous key, otherwise the before-image. The routing
+/// follows the same rule: a re-parented child is still on its old parent's
+/// shard, which is where the read has to go.
+fn completion_id(
+    kind: &RowKind,
+    rules: &Rules<'_>,
+    table: (&str, &str),
+) -> Option<(String, Option<String>)> {
     let RowKind::Update {
         pk,
         previous_pk,
@@ -1158,18 +1183,29 @@ fn completion_id(kind: &RowKind, rules: &Rules<'_>, table: (&str, &str)) -> Opti
     if unchanged_toast_columns.is_empty() {
         return None;
     }
+    // a routing that cannot be derived is left to the write path, which
+    // halts naming the table and the column
+    let routing = rules
+        .joins
+        .for_table(table.0, table.1)
+        .map(|join| join.routing_for_key(before.as_ref(), previous_pk.as_ref().unwrap_or(pk)))
+        .transpose()
+        .ok()?
+        .flatten();
     let template = rules.id_templates.for_table(table.0, table.1);
     let Some(template) = template else {
         let id = pk_to_id(pk);
-        return Some(match previous_pk.as_ref().map(pk_to_id) {
+        let id = match previous_pk.as_ref().map(pk_to_id) {
             Some(previous) if previous != id => previous,
             _ => id,
-        });
+        };
+        return Some((id, routing));
     };
     if template.is_pk_only() {
         return template
             .render_from_pk(previous_pk.as_ref().unwrap_or(pk))
-            .ok();
+            .ok()
+            .map(|id| (id, routing));
     }
     // the row's previous document carries the before-image's id, when there
     // is one; without it there is nothing to complete against and the write
@@ -1178,6 +1214,7 @@ fn completion_id(kind: &RowKind, rules: &Rules<'_>, table: (&str, &str)) -> Opti
         .as_ref()
         .and_then(|b| template.render(b).ok())
         .or_else(|| template.render_from_pk(pk).ok())
+        .map(|id| (id, routing))
 }
 
 /// Convert one row change into document operations, completing unchanged-TOAST
@@ -1206,18 +1243,20 @@ fn materialize(
         lsn: PENDING_LSN,
         op,
     };
-    let upsert = |id: String, doc: Value| {
+    let upsert = |id: String, routing: Option<String>, doc: Value| {
         mk(DocumentOp::Upsert {
             index: index.into(),
             id,
+            routing,
             doc,
             version,
         })
     };
-    let delete = |id: String| {
+    let delete = |id: String, routing: Option<String>| {
         mk(DocumentOp::Delete {
             index: index.into(),
             id,
+            routing,
             version,
         })
     };
@@ -1227,16 +1266,28 @@ fn materialize(
     // run after those, so nothing but the target ever sees the new names, and
     // constants after that: they are not columns, a projection would strip them.
     let fan = rules.fan_outs.for_table(table.0, table.1);
+    let join = rules.joins.for_table(table.0, table.1);
     let shape = |base: &str, doc: &Value| -> Result<Vec<(String, Value)>, CoreError> {
         match fan {
             None => Ok(vec![(base.to_string(), doc.clone())]),
             Some(rule) => crate::mapping::fan_out_docs(rule, base, doc).map_err(halt),
         }
     };
+    // The join field's value and the routing, from the RAW row for the same
+    // reason identity is: a projection must not be able to move a document to
+    // another shard.
+    let file = |raw: &Value| -> Result<Option<(Value, Option<String>)>, CoreError> {
+        join.map(|rule| rule.routing_for_doc(raw))
+            .transpose()
+            .map_err(halt)
+    };
     // `shaped` names the columns completed from the stored document: they
     // went through the transforms when they were first written, so they must
     // not go through them again
-    let finish = |docs: Vec<(String, Value)>, shaped: &[String], left: &mut Vec<String>| {
+    let finish = |docs: Vec<(String, Value)>,
+                  filed: Option<(Value, Option<String>)>,
+                  shaped: &[String],
+                  left: &mut Vec<String>| {
         docs.into_iter()
             .map(|(id, mut doc)| {
                 rules.projections.apply(table.0, table.1, &mut doc);
@@ -1250,7 +1301,18 @@ fn materialize(
                 );
                 rules.renames.apply(table.0, table.1, &mut doc);
                 rules.constants.apply(table.0, table.1, &mut doc);
-                upsert(id, doc)
+                // last, like a constant: the join field is not a column, and
+                // a projection must not be able to strip it
+                let routing = match (&filed, join) {
+                    (Some((value, routing)), Some(rule)) => {
+                        if let Value::Object(map) = &mut doc {
+                            map.insert(rule.field.clone(), value.clone());
+                        }
+                        routing.clone()
+                    }
+                    _ => None,
+                };
+                upsert(id, routing, doc)
             })
             .collect()
     };
@@ -1279,7 +1341,8 @@ fn materialize(
     match kind {
         RowKind::Insert { pk, doc } => {
             let base = derived_id(table, pk, Some(doc), None, rules.id_templates)?;
-            Ok(finish(shape(&base, doc)?, &[], left_as_is))
+            let filed = file(doc)?;
+            Ok(finish(shape(&base, doc)?, filed, &[], left_as_is))
         }
         RowKind::Update {
             pk,
@@ -1294,8 +1357,10 @@ fn materialize(
             };
             let before = before.as_ref();
             let base = derived_id(table, pk, Some(&doc), before, rules.id_templates)?;
+            let filed = file(&doc)?;
+            let routing = filed.as_ref().and_then(|(_, routing)| routing.clone());
             let new_docs = shape(&base, &doc)?;
-            let mut ops = finish(new_docs.clone(), &completed, left_as_is);
+            let mut ops = finish(new_docs.clone(), filed, &completed, left_as_is);
             // write first, delete second: a crash between them leaves a
             // duplicate that the replay repairs, where the reverse order would
             // leave a gap that nothing repairs
@@ -1320,24 +1385,33 @@ fn materialize(
                         .map_err(|e| halt(format!("before-image of a fanned row: {e}")))?
                     {
                         if !held.contains(id.as_str()) {
-                            ops.push(delete(id));
+                            ops.push(delete(id, None));
                         }
                     }
                 }
             } else {
-                // A changed key means the row moved to a different document.
-                // The old one still holds the previous version and has to be
-                // removed, or nothing will ever collect it.
-                let moved_from = match rules.id_templates.for_table(table.0, table.1) {
+                // A changed key means the row moved to a different document,
+                // and a changed parent means it moved to a different shard,
+                // where the target will not overwrite the old copy. Either
+                // way the old one still holds the previous version and has to
+                // be removed, or nothing will ever collect it. An old id that
+                // cannot be told is taken to be the current one, which is
+                // what leaving it alone has always meant.
+                let old_id = match rules.id_templates.for_table(table.0, table.1) {
                     None => previous_pk.as_ref().map(pk_to_id),
                     Some(t) if t.is_pk_only() => {
                         previous_pk.as_ref().and_then(|p| t.render_from_pk(p).ok())
                     }
                     Some(t) => before.and_then(|b| t.render(b).ok()),
                 }
-                .filter(|previous| previous != &base);
-                if let Some(previous) = moved_from {
-                    ops.push(delete(previous));
+                .unwrap_or_else(|| base.clone());
+                let old_routing = join
+                    .map(|rule| rule.routing_for_key(before, previous_pk.as_ref().unwrap_or(pk)))
+                    .transpose()
+                    .map_err(halt)?
+                    .flatten();
+                if (&old_id, &old_routing) != (&base, &routing) {
+                    ops.push(delete(old_id, old_routing));
                 }
             }
             Ok(ops)
@@ -1346,7 +1420,29 @@ fn materialize(
             let before = before.as_ref();
             let base = derived_id(table, pk, None, before, rules.id_templates)?;
             match fan {
-                None => Ok(vec![delete(base)]),
+                None => {
+                    let routing = join
+                        .map(|rule| rule.routing_for_key(before, pk))
+                        .transpose()
+                        .map_err(halt)?
+                        .flatten();
+                    let mut ops = vec![delete(base.clone(), routing)];
+                    // A parent's children live on its shard and know nothing
+                    // of its deletion; they go after the parent, at the same
+                    // position, so a child written later still survives.
+                    if let Some(rule) = join
+                        && rule.parent.is_none()
+                    {
+                        ops.push(mk(DocumentOp::DeleteChildren {
+                            index: index.into(),
+                            field: rule.field.clone(),
+                            parent_name: rule.name.clone(),
+                            parent_id: base,
+                            version,
+                        }));
+                    }
+                    Ok(ops)
+                }
                 Some(rule) => {
                     let row = before.ok_or_else(|| {
                         halt(
@@ -1358,7 +1454,7 @@ fn materialize(
                     Ok(crate::mapping::fan_out_docs(rule, &base, row)
                         .map_err(halt)?
                         .into_iter()
-                        .map(|(id, _)| delete(id))
+                        .map(|(id, _)| delete(id, None))
                         .collect())
                 }
             }
@@ -1466,16 +1562,25 @@ mod pipeline_tests {
         async fn get_documents(
             &self,
             _index: &str,
-            ids: &[String],
+            ids: &[(String, Option<String>)],
         ) -> Result<Vec<Option<Value>>, CoreError> {
+            // rendered as `id` or `id->routing`, so the older expectations
+            // stay byte-identical while a routed read-back is still visible
+            let asked: Vec<String> = ids
+                .iter()
+                .map(|(id, routing)| match routing {
+                    Some(r) => format!("{id}->{r}"),
+                    None => id.clone(),
+                })
+                .collect();
             self.events
                 .lock()
                 .expect("not poisoned")
-                .push(format!("read({})", ids.join(",")));
+                .push(format!("read({})", asked.join(",")));
             let stored = self.stored.lock().expect("not poisoned").clone();
             Ok(ids
                 .iter()
-                .map(|id| {
+                .map(|(id, _)| {
                     let mut doc = stored.clone().unwrap_or_else(|| json!({"bio": "stored"}));
                     doc["id"] = json!(id);
                     Some(doc)
@@ -1491,6 +1596,7 @@ mod pipeline_tests {
                 .filter(|op| {
                     let id = match &op.op {
                         DocumentOp::Upsert { id, .. } | DocumentOp::Delete { id, .. } => id,
+                        DocumentOp::DeleteChildren { parent_id, .. } => parent_id,
                     };
                     refuse.contains(id)
                 })
@@ -1498,6 +1604,9 @@ mod pipeline_tests {
                     let (index, doc_id) = match &op.op {
                         DocumentOp::Upsert { index, id, .. }
                         | DocumentOp::Delete { index, id, .. } => (index.clone(), id.clone()),
+                        DocumentOp::DeleteChildren {
+                            index, parent_id, ..
+                        } => (index.clone(), parent_id.clone()),
                     };
                     pg2osync_core::sink::Rejection {
                         index,
@@ -1513,16 +1622,35 @@ mod pipeline_tests {
                 .expect("not poisoned")
                 .extend(batch.iter().filter_map(|op| match &op.op {
                     DocumentOp::Upsert { id, doc, .. } => Some((id.clone(), doc.clone())),
-                    DocumentOp::Delete { .. } => None,
+                    DocumentOp::Delete { .. } | DocumentOp::DeleteChildren { .. } => None,
                 }));
+            // `->routing` only when there is one, so the expectations of every
+            // test about an unrouted table stay byte-identical
+            let target = |id: &str, routing: &Option<String>| match routing {
+                Some(r) => format!("{id}->{r}"),
+                None => id.to_string(),
+            };
             let rendered: Vec<String> = batch
                 .iter()
                 .map(|op| match &op.op {
-                    DocumentOp::Upsert { id, version, .. } => match version {
-                        Some(v) => format!("upsert:{id}@{v}"),
-                        None => format!("upsert:{id}"),
+                    DocumentOp::Upsert {
+                        id,
+                        routing,
+                        version,
+                        ..
+                    } => match version {
+                        Some(v) => format!("upsert:{}@{v}", target(id, routing)),
+                        None => format!("upsert:{}", target(id, routing)),
                     },
-                    DocumentOp::Delete { id, .. } => format!("delete:{id}"),
+                    DocumentOp::Delete { id, routing, .. } => {
+                        format!("delete:{}", target(id, routing))
+                    }
+                    DocumentOp::DeleteChildren {
+                        field,
+                        parent_name,
+                        parent_id,
+                        ..
+                    } => format!("children({field}#{parent_name}={parent_id})"),
                 })
                 .collect();
             self.events
@@ -1682,6 +1810,7 @@ mod pipeline_tests {
             constants: crate::mapping::Constants::default(),
             id_templates: crate::mapping::IdTemplates::default(),
             fan_outs: crate::mapping::FanOuts::default(),
+            joins: crate::mapping::Joins::default(),
             filters: crate::mapping::Filters::default(),
             cfg,
             ack_tx,
@@ -2290,7 +2419,7 @@ mod pipeline_tests {
         async fn get_documents(
             &self,
             _index: &str,
-            ids: &[String],
+            ids: &[(String, Option<String>)],
         ) -> Result<Vec<Option<Value>>, CoreError> {
             Ok(ids.iter().map(|_| None).collect())
         }
@@ -2350,6 +2479,7 @@ mod pipeline_tests {
             op: DocumentOp::Upsert {
                 index: "users".into(),
                 id: lsn.to_string(),
+                routing: None,
                 doc: json!({"id": lsn}),
                 version: Some(lsn),
             },
@@ -2627,6 +2757,7 @@ mod pipeline_tests {
             constants,
             id_templates: ids,
             fan_outs: fan,
+            joins: crate::mapping::Joins::default(),
             filters,
             cfg: EngineConfig {
                 batch_size,
@@ -2772,6 +2903,7 @@ mod pipeline_tests {
             constants: users_constants(&[("entity", json!("user"))]),
             id_templates: Default::default(),
             fan_outs: Default::default(),
+            joins: Default::default(),
             filters: Default::default(),
             cfg: EngineConfig::default(),
             ack_tx,
@@ -2830,6 +2962,7 @@ mod pipeline_tests {
             constants: crate::mapping::Constants::default(),
             id_templates: Default::default(),
             fan_outs: Default::default(),
+            joins: Default::default(),
             filters: Default::default(),
             cfg: EngineConfig::default(),
             ack_tx,
@@ -2892,6 +3025,7 @@ mod pipeline_tests {
             constants: crate::mapping::Constants::default(),
             id_templates: Default::default(),
             fan_outs: Default::default(),
+            joins: Default::default(),
             filters: Default::default(),
             cfg: EngineConfig::default(),
             ack_tx,
@@ -3152,6 +3286,7 @@ mod pipeline_tests {
             constants: crate::mapping::Constants::default(),
             id_templates: users_ids("user-{tenant}", &["tenant"]),
             fan_outs: Default::default(),
+            joins: Default::default(),
             filters: Default::default(),
             cfg: EngineConfig::default(),
             ack_tx,
@@ -3381,5 +3516,317 @@ mod pipeline_tests {
         )
         .await;
         assert_eq!(sink.events(), vec!["write[delete:user-7-a]"]);
+    }
+
+    /// A customer/order pair sharing the `shop` index under the `relation`
+    /// join field. `orders.customer_id` is not part of the orders key, so a
+    /// key-only event on a child has nothing to route by.
+    fn shop_joins() -> crate::mapping::Joins {
+        let customer_id = crate::mapping::IdTemplate::parse("customer-{id}", &["id".to_string()])
+            .expect("valid template");
+        crate::mapping::Joins::from_pairs([
+            (
+                ("public".to_string(), "customers".to_string()),
+                crate::mapping::JoinRule {
+                    field: "relation".into(),
+                    name: "customer".into(),
+                    parent: None,
+                },
+            ),
+            (
+                ("public".to_string(), "orders".to_string()),
+                crate::mapping::JoinRule {
+                    field: "relation".into(),
+                    name: "order".into(),
+                    parent: Some(crate::mapping::JoinParent {
+                        column: "customer_id".into(),
+                        name: "customer".into(),
+                        id: crate::mapping::ParentId::Template(customer_id),
+                        key_column: false,
+                    }),
+                },
+            ),
+        ])
+    }
+
+    fn shop_row(table: &str, kind: RowKind, version: u64) -> ChangeEvent {
+        ChangeEvent::Row(RowChange {
+            schema: "public".into(),
+            table: table.into(),
+            kind,
+            version: Some(version),
+        })
+    }
+
+    /// Drives the join pair over `script` and reports how the engine ended,
+    /// for the tests that are about a halt as much as about what was written.
+    async fn drive_join_result(
+        script: Vec<ChangeEvent>,
+        sink: Arc<RecordingSink>,
+    ) -> (Arc<crate::metrics::Metrics>, Result<(), CoreError>) {
+        let (events_tx, events_rx) = mpsc::channel(1024);
+        let (copy_tx, copy_rx) = mpsc::channel(1024);
+        drop(copy_tx);
+        let (ack_tx, _ack_rx) = watch::channel(None);
+        let (load_done_tx, _load_done_rx) = watch::channel(0u64);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let metrics = Arc::new(crate::metrics::Metrics::default());
+        let ids = |spec: &str| {
+            crate::mapping::IdTemplate::parse(spec, &["id".to_string()]).expect("valid template")
+        };
+        let ctx = Arc::new(PipelineCtx {
+            sink,
+            mapping: TableMapping::from_pairs([
+                (
+                    ("public".to_string(), "customers".to_string()),
+                    "shop".to_string(),
+                ),
+                (
+                    ("public".to_string(), "orders".to_string()),
+                    "shop".to_string(),
+                ),
+            ]),
+            projections: crate::mapping::Projections::default(),
+            transforms: crate::mapping::Transforms::default(),
+            renames: crate::mapping::Renames::default(),
+            constants: crate::mapping::Constants::default(),
+            id_templates: crate::mapping::IdTemplates::from_pairs([
+                (
+                    ("public".to_string(), "customers".to_string()),
+                    ids("customer-{id}"),
+                ),
+                (
+                    ("public".to_string(), "orders".to_string()),
+                    ids("order-{id}"),
+                ),
+            ]),
+            fan_outs: crate::mapping::FanOuts::default(),
+            joins: shop_joins(),
+            filters: crate::mapping::Filters::default(),
+            cfg: EngineConfig {
+                batch_size: 500,
+                checkpoint_interval_ms: 100,
+                ..EngineConfig::default()
+            },
+            ack_tx,
+            load_done_tx,
+            metrics: metrics.clone(),
+        });
+        let stream = StreamId {
+            source: SOURCE_POSTGRES.into(),
+            stream: "slot".into(),
+            publication: "pub".into(),
+        };
+        let render: PositionRenderer = Arc::new(|token| Lsn(token).to_string());
+        for event in script {
+            events_tx.send(event).await.expect("channel has room");
+        }
+        let engine = tokio::spawn(run(
+            events_rx,
+            copy_rx,
+            ctx,
+            stream,
+            render,
+            crate::mapping::DurableLsn::default(),
+            shutdown_rx,
+        ));
+        drop(events_tx);
+        (metrics, engine.await.expect("task joined"))
+    }
+
+    async fn drive_join(script: Vec<ChangeEvent>) -> Arc<RecordingSink> {
+        let sink = Arc::new(RecordingSink::default());
+        let (_, outcome) = drive_join_result(script, sink.clone()).await;
+        outcome.expect("engine ran");
+        sink
+    }
+
+    #[tokio::test]
+    async fn a_join_child_is_routed_to_its_parent_and_the_parent_is_not() {
+        let sink = drive_join(vec![
+            shop_row(
+                "customers",
+                RowKind::Insert {
+                    pk: json!(1),
+                    doc: json!({"id": 1, "name": "acme"}),
+                },
+                0x100,
+            ),
+            shop_row(
+                "orders",
+                RowKind::Insert {
+                    pk: json!(7),
+                    doc: json!({"id": 7, "customer_id": 1}),
+                },
+                0x100,
+            ),
+            commit(0x100),
+        ])
+        .await;
+        assert_eq!(
+            sink.events(),
+            vec!["write[upsert:customer-1@256 upsert:order-7->customer-1@256]"]
+        );
+        assert_eq!(
+            sink.doc("customer-1"),
+            Some(json!({"id": 1, "name": "acme", "relation": "customer"})),
+            "the parent carries its bare relation name"
+        );
+        assert_eq!(
+            sink.doc("order-7"),
+            Some(json!({
+                "id": 7,
+                "customer_id": 1,
+                "relation": {"name": "order", "parent": "customer-1"}
+            })),
+            "the child names its parent by the parent's own document id"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_parent_delete_removes_its_children_after_itself() {
+        let sink = Arc::new(RecordingSink::default());
+        let (metrics, outcome) = drive_join_result(
+            vec![
+                shop_row(
+                    "customers",
+                    RowKind::Delete {
+                        pk: json!(1),
+                        before: None,
+                    },
+                    0x300,
+                ),
+                commit(0x300),
+            ],
+            sink.clone(),
+        )
+        .await;
+        outcome.expect("engine ran");
+        assert_eq!(
+            sink.events(),
+            vec!["write[delete:customer-1 children(relation#customer=customer-1)]"],
+            "the parent first, its children second, in one batch"
+        );
+        let cascades = metrics
+            .events_total
+            .lock()
+            .expect("not poisoned")
+            .get("join_cascade")
+            .map(|n| n.load(Ordering::Relaxed));
+        assert_eq!(cascades, Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_re_parented_child_is_written_under_the_new_parent_and_removed_from_the_old() {
+        // same id, different shard: the target will not overwrite the old
+        // copy, so it has to be deleted where it is
+        let sink = drive_join(vec![
+            shop_row(
+                "orders",
+                RowKind::Update {
+                    pk: json!(7),
+                    previous_pk: None,
+                    doc: json!({"id": 7, "customer_id": 2}),
+                    unchanged_toast_columns: vec![],
+                    before: Some(json!({"id": 7, "customer_id": 1})),
+                },
+                0x200,
+            ),
+            commit(0x200),
+        ])
+        .await;
+        assert_eq!(
+            sink.events(),
+            vec!["write[upsert:order-7->customer-2@512 delete:order-7->customer-1]"],
+            "write at the new parent first, remove from the old one second"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_child_delete_is_routed_from_its_before_image() {
+        let sink = drive_join(vec![
+            shop_row(
+                "orders",
+                RowKind::Delete {
+                    pk: json!(7),
+                    before: Some(json!({"id": 7, "customer_id": 1})),
+                },
+                0x300,
+            ),
+            commit(0x300),
+        ])
+        .await;
+        assert_eq!(sink.events(), vec!["write[delete:order-7->customer-1]"]);
+    }
+
+    #[tokio::test]
+    async fn a_child_delete_without_a_before_image_halts_naming_replica_identity() {
+        let (_, outcome) = drive_join_result(
+            vec![
+                shop_row(
+                    "orders",
+                    RowKind::Delete {
+                        pk: json!(7),
+                        before: None,
+                    },
+                    0x300,
+                ),
+                commit(0x300),
+            ],
+            Arc::new(RecordingSink::default()),
+        )
+        .await;
+        let message = outcome
+            .expect_err("a delete that cannot be routed must stop the pipeline")
+            .to_string();
+        assert!(
+            message.contains("public.orders")
+                && message.contains("customer_id")
+                && message.contains("REPLICA IDENTITY FULL"),
+            "the halt must name the table, the column and the remedy: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn toast_completion_of_a_child_reads_back_at_its_old_parent() {
+        // the stored document is on the old parent's shard until this update
+        // moves it, so that is where the read has to go
+        let sink = Arc::new(RecordingSink::default());
+        sink.store(json!({"note": "stored"}));
+        let (_, outcome) = drive_join_result(
+            vec![
+                shop_row(
+                    "orders",
+                    RowKind::Update {
+                        pk: json!(7),
+                        previous_pk: None,
+                        doc: json!({"id": 7, "customer_id": 2, "note": null}),
+                        unchanged_toast_columns: vec!["note".into()],
+                        before: Some(json!({"id": 7, "customer_id": 1})),
+                    },
+                    0x200,
+                ),
+                commit(0x200),
+            ],
+            sink.clone(),
+        )
+        .await;
+        outcome.expect("engine ran");
+        assert_eq!(
+            sink.events(),
+            vec![
+                "read(order-7->customer-1)",
+                "write[upsert:order-7->customer-2@512 delete:order-7->customer-1]"
+            ]
+        );
+        assert_eq!(
+            sink.doc("order-7"),
+            Some(json!({
+                "id": 7,
+                "customer_id": 2,
+                "note": "stored",
+                "relation": {"name": "order", "parent": "customer-2"}
+            }))
+        );
     }
 }

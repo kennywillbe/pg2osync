@@ -171,10 +171,11 @@ impl Sink for MeilisearchSink {
     async fn get_documents(
         &self,
         index: &str,
-        ids: &[String],
+        // routing is ignored: an id-only document model has no shards
+        ids: &[(String, Option<String>)],
     ) -> Result<Vec<Option<Value>>, CoreError> {
         let mut out = Vec::with_capacity(ids.len());
-        for id in ids {
+        for (id, _) in ids {
             let (status, body) = self
                 .send(
                     reqwest::Method::GET,
@@ -196,16 +197,26 @@ impl Sink for MeilisearchSink {
         // group by index: meili endpoints are per-index
         let mut by_index: HashMap<String, (Vec<Value>, Vec<String>)> = HashMap::new();
         for op in &batch {
+            let index = match &op.op {
+                DocumentOp::Upsert { index, .. } | DocumentOp::Delete { index, .. } => index,
+                DocumentOp::DeleteChildren { .. } => {
+                    // an error and not a no-op: a cascade dropped here would be
+                    // indistinguishable from one that ran
+                    return Err(CoreError::Sink(
+                        "a join field's cascade cannot be expressed in Meilisearch, which \
+                         has no parent-child data model; this operation should have been \
+                         refused at startup"
+                            .into(),
+                    ));
+                }
+            };
             let entry = by_index
-                .entry(match &op.op {
-                    DocumentOp::Upsert { index, .. } | DocumentOp::Delete { index, .. } => {
-                        index.clone()
-                    }
-                })
+                .entry(index.clone())
                 .or_insert_with(|| (vec![], vec![]));
             match &op.op {
                 DocumentOp::Upsert { doc, .. } => entry.0.push(doc.clone()),
                 DocumentOp::Delete { id, .. } => entry.1.push(id.clone()),
+                DocumentOp::DeleteChildren { .. } => {}
             }
         }
         for (index, (docs, del_ids)) in by_index {

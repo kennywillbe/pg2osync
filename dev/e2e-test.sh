@@ -35,6 +35,9 @@ os_count()   { curl -s "$OS/$1/_count" | jqf "d.get('count', 0)"; }
 os_field()   { curl -s "$OS/$1/_doc/$2" | jqf "d.get('_source',{}).get('$3','<missing>')"; }
 os_has()     { curl -s "$OS/$1/_doc/$2" | jqf "'$3' in d.get('_source',{})"; }
 os_status()  { curl -s -o /dev/null -w "%{http_code}" "$OS/$1/_doc/$2"; }
+# a join child lives on its parent's shard, so reading it needs the routing
+os_routed()  { curl -s "$OS/$1/_doc/$2?routing=$3" | jqf "d.get('_source',{}).get('$4','<missing>')"; }
+os_rstatus() { curl -s -o /dev/null -w "%{http_code}" "$OS/$1/_doc/$2?routing=$3"; }
 os_len()     { curl -s "$OS/$1/_doc/$2" | jqf "len(d.get('_source',{}).get('$3',[]))"; }
 pg()         { docker exec "$PG_CONTAINER" psql -U postgres -d sourcedb -qtAc "$1"; }
 refresh()    { curl -s -XPOST "$OS/_refresh" > /dev/null; }
@@ -45,6 +48,11 @@ start_sync() {
 }
 stop_sync() { pkill -f "pg2osync run" 2> /dev/null || true; }
 drop_own_slot() { pg "SELECT pg_drop_replication_slot('pg2osync_e2e') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='pg2osync_e2e');" > /dev/null 2>&1 || true; }
+# Every probe section keeps its slot until the trap at exit, and the dev
+# database allows ten; a late section would otherwise start with "all
+# replication slots are in use". Only idle slots go — a running pipeline's is
+# in use and stays.
+drop_idle_probe_slots() { pg "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name LIKE 'pg2osync\\_e2e\\_%' AND NOT active;" > /dev/null 2>&1 || true; }
 cleanup()   { stop_sync; drop_own_slot; rm -f "$CONFIG" "$MAPPING"; }
 trap cleanup EXIT
 
@@ -1234,6 +1242,167 @@ for _ in $(seq 1 60); do
 done
 check "a NULL test decides too" "$(os_status e2e_where 4)" "404"
 stop_sync
+
+echo -e "\n\033[1m== 24. a parent and its children as a join field in one index ==\033[0m"
+# Two tables, one index, every child on its parent's shard (#60). Routing has
+# to ride on every write, a re-parented child has to change shard, and a
+# parent delete has to take its children with it — through a search, because
+# the engine does not know which children the target holds.
+JCONFIG=$(mktemp /tmp/pg2osync-e2e-join.XXXXXX)
+JMAPPING=$(dirname "$JCONFIG")/pg2osync-e2e-join-mapping.json
+JSLOT=pg2osync_e2e_join
+drop_idle_probe_slots
+cat > "$JCONFIG" <<TOML
+[source]
+url_env = "PG2OSYNC_SOURCE_URL"
+slot_name = "$JSLOT"
+publication = "${JSLOT}_pub"
+
+[target]
+url = "http://localhost:9200"
+
+[metrics]
+bind = "127.0.0.1:9125"
+
+[sync.jcust]
+table = "public.jcust"
+index = "e2e_shop"
+id = "customer-{id}"
+mapping_file = "pg2osync-e2e-join-mapping.json"
+
+[sync.jcust.join]
+field = "relation"
+name = "customer"
+
+[sync.jord]
+table = "public.jord"
+index = "e2e_shop"
+id = "order-{id}"
+
+[sync.jord.join]
+field = "relation"
+name = "order"
+parent = "customer_id"
+TOML
+# Three shards rather than the default one: on a single shard an unrouted GET
+# reaches a child by construction, and the routing assertions below would pass
+# with no routing at all. Measured on the dev stack, three is the smallest
+# count that puts customer-1, customer-2 and every order-N on separate shards.
+cat > "$JMAPPING" <<'JSON'
+{"settings":{"number_of_shards":3},"mappings":{"properties":{"relation":{"type":"join","relations":{"customer":["order"]}}}}}
+JSON
+join_cleanup() {
+  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  pg "SELECT pg_drop_replication_slot('$JSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$JSLOT');" > /dev/null 2>&1 || true
+  pg "DROP PUBLICATION IF EXISTS ${JSLOT}_pub; DROP TABLE IF EXISTS jord, jcust;" > /dev/null 2>&1 || true
+  rm -f "$JCONFIG" "$JMAPPING"
+}
+trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup; init_cleanup; fan_cleanup; bid_cleanup; shape_cleanup; where_cleanup; join_cleanup' EXIT
+
+pg "DROP TABLE IF EXISTS jord, jcust;" > /dev/null 2>&1
+pg "CREATE TABLE jcust(id bigint primary key, name text);" > /dev/null
+pg "CREATE TABLE jord(id bigint primary key, customer_id bigint, total numeric(10,2));" > /dev/null
+# a child's delete is routed by its parent column, which only the old row carries
+pg "ALTER TABLE jord REPLICA IDENTITY FULL;" > /dev/null 2>&1
+pg "INSERT INTO jcust VALUES (1,'acme'),(2,'globex');" > /dev/null
+pg "INSERT INTO jord VALUES (10,1,5.00),(11,1,7.00),(12,2,1.00);" > /dev/null
+pg "DROP PUBLICATION IF EXISTS ${JSLOT}_pub; CREATE PUBLICATION ${JSLOT}_pub FOR TABLE jcust, jord;" > /dev/null 2>&1
+curl -s -XDELETE "$OS/e2e_shop?ignore_unavailable=true" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/postgres-$JSLOT" > /dev/null
+# two sections on one index are only ever a join pair: the same file with the
+# join blocks removed has to be refused where it can still be fixed
+sed '/^\[sync\.[a-z]*\.join\]/,/^$/d' "$JCONFIG" > "${JCONFIG}.bad"
+if $BIN validate -c "${JCONFIG}.bad" > /dev/null 2>&1; then
+  bad "validate accepted two sections on one index without a join"
+else
+  ok "validate refuses two sections on one index without a join"
+fi
+rm -f "${JCONFIG}.bad"
+if $BIN validate -c "$JCONFIG" 2>&1 | grep -q "all checks passed"; then
+  ok "validate accepts the join pair"
+else
+  bad "validate refused the join pair"
+fi
+nohup $BIN run -c "$JCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_count e2e_shop)" = "5" ] && break
+  sleep 1
+done
+check "the load writes both tables into one index" "$(os_count e2e_shop)" "5"
+check "a parent is found without routing" "$(os_status e2e_shop customer-1)" "200"
+# a child lives on its parent's shard: only a GET routed there reaches it
+check "a child is found under its parent's routing" "$(os_rstatus e2e_shop order-10 customer-1)" "200"
+check "and not without it" "$(os_status e2e_shop order-10)" "404"
+check "the parent carries its relation name" "$(os_field e2e_shop customer-1 relation)" "customer"
+check "the child carries its name and its parent" \
+  "$(curl -s "$OS/e2e_shop/_doc/order-10?routing=customer-1" | jqf "json.dumps(d['_source']['relation'], sort_keys=True)")" \
+  '{"name": "order", "parent": "customer-1"}'
+# the acceptance test for the whole feature: the target can answer the
+# parent-child question at all
+check "has_child finds every parent with an order" \
+  "$(curl -s "$OS/e2e_shop/_search" -H 'Content-Type: application/json' \
+      -d '{"query":{"has_child":{"type":"order","query":{"match_all":{}}}}}' | jqf "d['hits']['total']['value']")" "2"
+
+pg "INSERT INTO jord VALUES (13,2,2.00);" > /dev/null
+for _ in $(seq 1 30); do
+  [ "$(os_rstatus e2e_shop order-13 customer-2)" = "200" ] && break
+  sleep 1
+done
+check "a streamed child lands under its parent's routing" "$(os_rstatus e2e_shop order-13 customer-2)" "200"
+check "with its own columns" "$(os_routed e2e_shop order-13 customer-2 total)" "2.00"
+
+# a child whose parent changes changes shard: the same id has to be written
+# under the new routing and removed under the old, or the index holds it twice
+pg "UPDATE jord SET customer_id=2 WHERE id=10;" > /dev/null
+for _ in $(seq 1 30); do
+  [ "$(os_rstatus e2e_shop order-10 customer-2)" = "200" ] && [ "$(os_rstatus e2e_shop order-10 customer-1)" = "404" ] && break
+  sleep 1
+done
+check "a re-parented child is found under its new parent" "$(os_rstatus e2e_shop order-10 customer-2)" "200"
+check "and is gone from the old one" "$(os_rstatus e2e_shop order-10 customer-1)" "404"
+
+# the cascade: the parent goes, and every child still filed under it goes with
+# it — found by a search on the join field's parent-id subfield, refreshed first
+pg "DELETE FROM jcust WHERE id=1;" > /dev/null
+for _ in $(seq 1 30); do
+  [ "$(os_status e2e_shop customer-1)" = "404" ] && [ "$(os_rstatus e2e_shop order-11 customer-1)" = "404" ] && break
+  sleep 1
+done
+check "a deleted parent is gone" "$(os_status e2e_shop customer-1)" "404"
+check "and so is the child it still had" "$(os_rstatus e2e_shop order-11 customer-1)" "404"
+check "the child that had moved to another parent is untouched" "$(os_rstatus e2e_shop order-10 customer-2)" "200"
+check "and so is the other parent" "$(os_status e2e_shop customer-2)" "200"
+if curl -s 127.0.0.1:9125/metrics | grep -qE '^pg2osync_events_total\{type="join_cascade"\} [1-9]'; then
+  ok "the cascade is counted"
+else
+  bad "pg2osync_events_total{type=\"join_cascade\"} did not move"
+fi
+
+# reconcile pages one relation at a time, so each half of the pair is checked
+# against its own table; nothing is an orphan yet — the cascade left none
+refresh
+out=$($BIN reconcile -c "$JCONFIG" 2>&1)
+if grep -q "Re-run with --delete" <<< "$out"; then
+  bad "reconcile found orphans in a consistent join index: $out"
+elif grep -q "0 found with no row in public.jcust" <<< "$out" && grep -q "0 found with no row in public.jord" <<< "$out"; then
+  ok "reconcile finds no orphan on either side of the pair"
+else
+  bad "reconcile did not report both tables: $out"
+fi
+# a row gone while nothing was watching: reconcile has to remove exactly that
+# child, routed to the shard that holds it
+stop_sync
+sleep 1
+pg "DELETE FROM jord WHERE id=12;" > /dev/null
+refresh
+out=$($BIN reconcile -c "$JCONFIG" --delete 2>&1)
+case "$out" in
+  *"1 removed with no row in public.jord"*) ok "reconcile --delete named the child whose row is gone" ;;
+  *) bad "reconcile --delete did not name exactly the missing child: $out" ;;
+esac
+check "and removed it under its parent's routing" "$(os_rstatus e2e_shop order-12 customer-2)" "404"
+check "leaving its sibling alone" "$(os_rstatus e2e_shop order-13 customer-2)" "200"
 
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

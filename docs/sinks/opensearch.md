@@ -63,7 +63,8 @@ Enforced at config load (fails fast):
 - must not start with `_` or `.` (reserved)
 
 Two tables may not map to the same index — document identity would be
-ambiguous.
+ambiguous — except as a join pair, where every document carries its own
+routing (see [Join fields](../configuration.md#join-fields)).
 
 ## Health & monitoring
 
@@ -82,3 +83,11 @@ creates what is missing and never modifies an existing mapping.
 
 A document that conflicts with an existing mapping is a permanent rejection and
 stops the pipeline, by design.
+
+A join field is compared like any other field at startup, `relations`
+included: an index whose relation names disagree with the `mapping_file` is
+reported as a conflict, because a wrong name produces documents no
+`has_child` query can find rather than documents the target refuses. Dynamic
+mapping cannot invent a join field, so an index a join pair writes to has to
+be created by pg2osync from the parent's `mapping_file`, or by an index
+template that declares the join, before the first document lands.

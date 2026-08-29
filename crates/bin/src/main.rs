@@ -517,6 +517,10 @@ async fn reconcile_cmd(path: &Path, delete: bool) -> Result<()> {
             qualified: table.table.clone(),
             index: table.index_name(key),
             key_column: table.primary_key.clone().unwrap_or_else(|| "id".into()),
+            scope: table
+                .join
+                .as_ref()
+                .map(|join| (join.field.clone(), join.name.clone())),
             soft_delete: table.soft_delete.clone(),
             filter: table
                 .filter
@@ -537,7 +541,7 @@ async fn reconcile_cmd(path: &Path, delete: bool) -> Result<()> {
         );
         // enough to investigate with, without pasting a whole index into a
         // terminal when something has gone badly wrong
-        for id in report.orphaned.iter().take(10) {
+        for (id, _) in report.orphaned.iter().take(10) {
             println!("  {id}");
         }
         if report.orphaned.len() > 10 {
@@ -557,9 +561,7 @@ async fn reconcile_cmd(path: &Path, delete: bool) -> Result<()> {
 /// exactly what the exercise was avoiding.
 async fn switch_alias(path: &Path, alias: &str) -> Result<()> {
     let cfg = config::AppConfig::load(path)?;
-    let mut indices: Vec<String> = cfg.sync.iter().map(|(k, t)| t.index_name(k)).collect();
-    indices.sort();
-    indices.dedup();
+    let indices = run::index_names(&cfg);
     let [index] = indices.as_slice() else {
         bail!(
             "switch-alias needs a config with exactly one table; this one has {}",
@@ -751,6 +753,9 @@ async fn validate(path: &Path) -> Result<()> {
         Health::Down(reason) => bail!("{} is reachable but unhealthy: {reason}", cfg.target.flavor),
     }
     run::check_rejection_policy(&cfg, sink.as_ref())?;
+    for note in run::embedded_children_with_own_section(&cfg) {
+        println!("! {note}");
+    }
     if cfg.engine.on_permanent_rejection == pg2osync_engine::RejectionPolicy::Quarantine {
         let (_, held) = sink.list_rejects(0).await.unwrap_or_default();
         println!(
@@ -848,6 +853,23 @@ fn check_configured_columns(
             fan.field
         );
     }
+    // the parent column is where a child's routing comes from, so like an id
+    // placeholder a missing one could never render and a nullable one is a
+    // halt waiting to happen
+    if let Some(column) = table.join.as_ref().and_then(|join| join.parent.as_deref()) {
+        if !live.iter().any(|c| c.eq_ignore_ascii_case(column)) {
+            bail!(
+                "table {} has no column {column} to find its join parent by",
+                table.table
+            );
+        }
+        if nullable.iter().any(|c| c.eq_ignore_ascii_case(column)) {
+            println!(
+                "! join parent column {column} on {} is nullable; a NULL in it halts the pipeline",
+                table.table
+            );
+        }
+    }
     // a rename onto a column that still reaches the target would bury that
     // column under the renamed value; the config check could only see this
     // with an explicit `columns` list, the catalogue always can
@@ -879,6 +901,18 @@ fn check_configured_columns(
                 table.table
             );
         }
+    }
+    // and for the join field, written after the constants
+    if let Some(join) = &table.join
+        && let Some(c) = live
+            .iter()
+            .find(|c| c.eq_ignore_ascii_case(&join.field) && survives(c))
+    {
+        bail!(
+            "table {} has a column {c}; the join field {} would overwrite it",
+            table.table,
+            join.field
+        );
     }
     // an exclusion, a transform or a rename for a column that is gone changes
     // nothing, so it is stale configuration rather than a fault
@@ -1328,6 +1362,47 @@ mod tests {
             &[],
         )
         .expect("a renamed column leaves its name free");
+    }
+
+    #[test]
+    fn a_join_child_needs_its_parent_column_and_the_join_field_needs_a_free_name() {
+        let table = |extra: &str| -> config::TableSync {
+            toml::from_str(&format!("table = \"public.orders\"\n{extra}")).expect("parses")
+        };
+        let live: Vec<String> = ["id", "customer_id", "relation"]
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        let pk = vec!["id".to_string()];
+        const CHILD: &str = "[join]\nfield = \"rel\"\nname = \"order\"\nparent = \"customer_id\"\n";
+
+        check_configured_columns(&table(CHILD), &live, &pk, &[]).expect("the parent column exists");
+        let err = check_configured_columns(
+            &table(&CHILD.replace("customer_id", "account_id")),
+            &live,
+            &pk,
+            &[],
+        )
+        .expect_err("a parent column the table lacks could never route a document");
+        assert!(err.to_string().contains("account_id"), "{err}");
+        let err = check_configured_columns(
+            &table(&CHILD.replace("field = \"rel\"", "field = \"relation\"")),
+            &live,
+            &pk,
+            &[],
+        )
+        .expect_err("a live column under the join field's name would be buried");
+        assert!(err.to_string().contains("join field relation"), "{err}");
+        check_configured_columns(
+            &table(&format!(
+                "exclude_columns = [\"relation\"]\n{}",
+                CHILD.replace("field = \"rel\"", "field = \"relation\"")
+            )),
+            &live,
+            &pk,
+            &[],
+        )
+        .expect("an excluded column leaves its name free");
     }
 
     #[test]

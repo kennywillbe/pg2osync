@@ -77,6 +77,7 @@ not expressions) — if you need those, you want Kafka.
 | Consistent initial load, then live streaming | ✅ |
 | Crash recovery with no data loss (`kill -9` safe) | ✅ verified by the e2e suite |
 | Nested child collections (one level) | ✅ PostgreSQL and MySQL/MariaDB; the parent document embeds child arrays, resolved once per collection per transaction |
+| Parent-child as a join field (`join`) | ✅ OpenSearch and Elasticsearch; shared index, per-document routing, parent delete cascades to its children |
 | Column projection (`columns` / `exclude_columns`) | ✅ |
 | Derived document ids (`id = "tenant-{tenant_id}-{id}"`) | ✅ default stays the primary key; non-key columns need `REPLICA IDENTITY FULL` |
 | One row to many documents (`fan_out` over a JSON-array column) | ✅ elements added, moved and removed as versioned writes |
@@ -110,6 +111,9 @@ Stated up front, because finding these out in production is expensive:
 - **Nested children are one level deep**, re-fetched once per collection per
   transaction rather than per changed row, ordered by the child's primary key.
   `max_rows` bounds a collection, and a document whose array was cut says so.
+- **Two tables share an index only as a join pair.** Anywhere else document
+  identity would be ambiguous, and even a join pair needs ids that are unique
+  across both tables — `customer-{id}` and `order-{id}`, not the bare key.
 - **MySQL needs `binlog_row_image = FULL`**, and refuses
   `binlog_row_value_options = PARTIAL_JSON`.
 - Ordering is guaranteed per row, not across tables.

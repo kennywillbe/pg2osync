@@ -43,6 +43,48 @@ fn version_fields(position: Option<u64>) -> String {
     }
 }
 
+/// The routing field of a bulk action header, or nothing for a document that
+/// lives on the shard its own id picks.
+fn routing_field(routing: Option<&str>) -> String {
+    match routing {
+        Some(r) => format!(
+            ",\"routing\":{}",
+            serde_json::to_string(r).unwrap_or_default()
+        ),
+        None => String::new(),
+    }
+}
+
+/// `key=value&…` with every value percent-encoded, so a parent id holding
+/// `&` or `#` cannot cut the query short.
+///
+/// Built on the URL type reqwest already ships rather than a dependency of
+/// its own; the host is a placeholder and only the query is kept.
+fn query_string(pairs: &[(&str, &str)]) -> String {
+    let Ok(mut url) = reqwest::Url::parse("http://query.invalid/") else {
+        return String::new();
+    };
+    url.query_pairs_mut().extend_pairs(pairs);
+    url.query().unwrap_or_default().to_string()
+}
+
+/// One bulk action header line: `{"<action>":{"_index":…,"_id":…,…}}`.
+fn action_header(
+    action: &str,
+    index: &str,
+    id: &str,
+    routing: Option<&str>,
+    version: Option<u64>,
+) -> String {
+    format!(
+        "{{\"{action}\":{{\"_index\":{},\"_id\":{}{}{}}}}}\n",
+        serde_json::to_string(index).unwrap_or_default(),
+        serde_json::to_string(id).unwrap_or_default(),
+        routing_field(routing),
+        version_fields(version)
+    )
+}
+
 impl ElasticsearchSink {
     /// Clear an index by deleting each document at the truncate's own position.
     ///
@@ -87,6 +129,90 @@ impl ElasticsearchSink {
                 .await?;
             if status != 200 {
                 return Err(CoreError::Sink(format!("truncate {index}: {status}")));
+            }
+            let deleted = body["items"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter(|item| {
+                            item["delete"]["status"]
+                                .as_u64()
+                                .is_some_and(|s| (200..300).contains(&s))
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            if deleted == 0 {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Remove every child of one parent, at the parent's own position; the
+    /// same loop as `truncate_at_version`, scoped by the join field's
+    /// parent-id subfield and routed to the parent's shard.
+    async fn delete_children(
+        &self,
+        index: &str,
+        field: &str,
+        parent_name: &str,
+        parent_id: &str,
+        version: Option<u64>,
+    ) -> Result<(), CoreError> {
+        const PAGE: usize = 1000;
+        // a search only sees refreshed segments, so a child written moments
+        // ago — in this very batch, even — would outlive the parent that
+        // owns it
+        let _ = self
+            .send(reqwest::Method::POST, &format!("/{index}/_refresh"), None)
+            .await;
+        let query = json!({"bool": {
+            "filter": [{"term": {format!("{field}#{parent_name}"): parent_id}}],
+            "must_not": [{"term": {field: parent_name}}]
+        }});
+        let routing = query_string(&[("routing", parent_id)]);
+        loop {
+            let (status, body) = self
+                .send(
+                    reqwest::Method::POST,
+                    &format!("/{index}/_search?{routing}"),
+                    Some(json!({"size": PAGE, "_source": false, "query": query}).to_string()),
+                )
+                .await?;
+            if status != 200 {
+                return Err(CoreError::Sink(format!(
+                    "find children of {index}/{parent_id}: {status} {body}"
+                )));
+            }
+            let ids: Vec<String> = body["hits"]["hits"]
+                .as_array()
+                .map(|hits| {
+                    hits.iter()
+                        .filter_map(|hit| hit["_id"].as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if ids.is_empty() {
+                return Ok(());
+            }
+            let mut ndjson = String::new();
+            for id in &ids {
+                ndjson.push_str(&action_header(
+                    "delete",
+                    index,
+                    id,
+                    Some(parent_id),
+                    version,
+                ));
+            }
+            let (status, body) = self
+                .send(reqwest::Method::POST, "/_bulk?refresh=true", Some(ndjson))
+                .await?;
+            if status != 200 {
+                return Err(CoreError::Sink(format!(
+                    "delete children of {index}/{parent_id}: {status}"
+                )));
             }
             let deleted = body["items"]
                 .as_array()
@@ -185,35 +311,7 @@ impl ElasticsearchSink {
     /// one action per operation, in order, so it identifies the operation even
     /// when a batch holds two writes for the same document.
     async fn bulk_once(&self, batch: &[LsnOp]) -> Result<(Lsn, Vec<(usize, String)>), CoreError> {
-        let mut ndjson = String::new();
-        for op in batch {
-            match &op.op {
-                DocumentOp::Upsert {
-                    index,
-                    id,
-                    doc,
-                    version,
-                } => {
-                    ndjson.push_str(&format!(
-                        "{{\"index\":{{\"_index\":{},\"_id\":{}{}}}}}\n",
-                        serde_json::to_string(index).unwrap(),
-                        serde_json::to_string(id).unwrap(),
-                        version_fields(*version)
-                    ));
-                    ndjson.push_str(&serde_json::to_string(doc).unwrap());
-                    ndjson.push('\n');
-                }
-                DocumentOp::Delete { index, id, version } => {
-                    ndjson.push_str(&format!(
-                        "{{\"delete\":{{\"_index\":{},\"_id\":{}{}}}}}\n",
-                        serde_json::to_string(index).unwrap(),
-                        serde_json::to_string(id).unwrap(),
-                        version_fields(*version)
-                    ));
-                }
-            }
-        }
-        ndjson.push('\n');
+        let ndjson = ndjson_body(batch)?;
 
         let resp = self
             .http
@@ -279,6 +377,80 @@ impl ElasticsearchSink {
         }
         Ok((batch.last().expect("nonempty").lsn, permanent))
     }
+
+    async fn bulk_with_retry(
+        &self,
+        batch: &[LsnOp],
+    ) -> Result<(Lsn, Vec<(usize, String)>), CoreError> {
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            match self.bulk_once(batch).await {
+                Ok(done) => return Ok(done),
+                Err(e) if attempt < self.retry.max_attempts && is_retryable(&e) => {
+                    let backoff = self.retry.base_backoff_ms * 2u64.saturating_pow(attempt - 1);
+                    tracing::warn!(target: "pg2osync::sink",
+                        "bulk attempt {attempt} failed ({e}); backing off {backoff}ms");
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff.min(30_000))).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+/// The ndjson body of one bulk request, one action per operation in order.
+///
+/// A cascade is not a bulk action — `write` runs it between bulk requests —
+/// so one reaching here is a bug in the caller and is reported rather than
+/// skipped, which would silently lose it.
+fn ndjson_body(batch: &[LsnOp]) -> Result<String, CoreError> {
+    let mut ndjson = String::new();
+    for op in batch {
+        match &op.op {
+            DocumentOp::Upsert {
+                index,
+                id,
+                routing,
+                doc,
+                version,
+            } => {
+                ndjson.push_str(&action_header(
+                    "index",
+                    index,
+                    id,
+                    routing.as_deref(),
+                    *version,
+                ));
+                ndjson.push_str(&serde_json::to_string(doc).unwrap_or_default());
+                ndjson.push('\n');
+            }
+            DocumentOp::Delete {
+                index,
+                id,
+                routing,
+                version,
+            } => {
+                ndjson.push_str(&action_header(
+                    "delete",
+                    index,
+                    id,
+                    routing.as_deref(),
+                    *version,
+                ));
+            }
+            DocumentOp::DeleteChildren {
+                index, parent_id, ..
+            } => {
+                return Err(CoreError::Sink(format!(
+                    "the cascade for {index}/{parent_id} reached a bulk request; \
+                     write must run it between bulk requests"
+                )));
+            }
+        }
+    }
+    ndjson.push('\n');
+    Ok(ndjson)
 }
 
 #[async_trait]
@@ -334,7 +506,7 @@ impl Sink for ElasticsearchSink {
     async fn get_documents(
         &self,
         index: &str,
-        ids: &[String],
+        ids: &[(String, Option<String>)],
     ) -> Result<Vec<Option<Value>>, CoreError> {
         if ids.is_empty() {
             return Ok(vec![]);
@@ -343,7 +515,7 @@ impl Sink for ElasticsearchSink {
             .send(
                 reqwest::Method::POST,
                 &format!("/{index}/_mget"),
-                Some(json!({"ids": ids}).to_string()),
+                Some(crate::mget_body(ids).to_string()),
             )
             .await?;
         if status != 200 {
@@ -364,25 +536,42 @@ impl Sink for ElasticsearchSink {
                 "engine must never send empty batches".into(),
             ));
         }
-        let mut attempt = 0u32;
-        loop {
-            attempt += 1;
-            match self.bulk_once(&batch).await {
-                Ok((lsn, permanent)) => {
-                    return Ok(SinkAck {
-                        max_lsn: lsn,
-                        rejected: crate::rejections(&batch, permanent)?,
-                    });
-                }
-                Err(e) if attempt < self.retry.max_attempts && is_retryable(&e) => {
-                    let backoff = self.retry.base_backoff_ms * 2u64.saturating_pow(attempt - 1);
-                    tracing::warn!(target: "pg2osync::sink",
-                        "bulk attempt {attempt} failed ({e}); backing off {backoff}ms");
-                    tokio::time::sleep(std::time::Duration::from_millis(backoff.min(30_000))).await;
-                }
-                Err(e) => return Err(e),
+        // A cascade is not a bulk action, and it has to run after the parent's
+        // own delete and before anything that follows it, so the batch is
+        // written in the runs between cascades, in order.
+        let mut permanent = Vec::new();
+        let mut start = 0;
+        for (nth, op) in batch.iter().enumerate() {
+            let DocumentOp::DeleteChildren {
+                index,
+                field,
+                parent_name,
+                parent_id,
+                version,
+            } = &op.op
+            else {
+                continue;
+            };
+            if nth > start {
+                let (_, perm) = self.bulk_with_retry(&batch[start..nth]).await?;
+                // a rejection is paired with its operation by position, so a
+                // run's positions have to be put back where the batch has them
+                permanent.extend(perm.into_iter().map(|(i, why)| (start + i, why)));
             }
+            self.delete_children(index, field, parent_name, parent_id, *version)
+                .await?;
+            start = nth + 1;
         }
+        if start < batch.len() {
+            let (_, perm) = self.bulk_with_retry(&batch[start..]).await?;
+            permanent.extend(perm.into_iter().map(|(i, why)| (start + i, why)));
+        }
+        // the batch is non-empty, checked above
+        let max_lsn = batch.last().expect("nonempty").lsn;
+        Ok(SinkAck {
+            max_lsn,
+            rejected: crate::rejections(&batch, permanent)?,
+        })
     }
 
     async fn truncate_index(&self, index: &str, version: Option<u64>) -> Result<(), CoreError> {
@@ -693,4 +882,80 @@ impl Sink for ElasticsearchSink {
 
 fn is_retryable(e: &CoreError) -> bool {
     matches!(e, CoreError::SinkTransient(_))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lines(batch: &[LsnOp]) -> Vec<Value> {
+        ndjson_body(batch)
+            .expect("bulk actions")
+            .lines()
+            // the body ends with the blank line the bulk API requires
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str(line).expect("json line"))
+            .collect()
+    }
+
+    #[test]
+    fn a_routed_action_header_carries_routing_and_version() {
+        let batch = vec![
+            LsnOp {
+                lsn: Lsn(0x2A),
+                op: DocumentOp::Upsert {
+                    index: "shop".into(),
+                    id: "order-7".into(),
+                    routing: Some("7".into()),
+                    doc: json!({"amount": 3}),
+                    version: Some(0x2A),
+                },
+            },
+            LsnOp {
+                lsn: Lsn(0x2A),
+                op: DocumentOp::Delete {
+                    index: "shop".into(),
+                    id: "order-8".into(),
+                    routing: Some("7".into()),
+                    version: Some(0x2A),
+                },
+            },
+        ];
+        assert_eq!(
+            lines(&batch),
+            vec![
+                json!({"index": {"_index": "shop", "_id": "order-7", "routing": "7",
+                                 "version": 42, "version_type": "external_gte"}}),
+                json!({"amount": 3}),
+                json!({"delete": {"_index": "shop", "_id": "order-8", "routing": "7",
+                                  "version": 42, "version_type": "external_gte"}}),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_parent_id_is_encoded_before_it_reaches_the_url() {
+        assert_eq!(query_string(&[("routing", "a&b#c")]), "routing=a%26b%23c");
+        assert_eq!(
+            query_string(&[("routing", "customer-1")]),
+            "routing=customer-1"
+        );
+    }
+
+    #[test]
+    fn an_unrouted_action_header_is_unchanged() {
+        let batch = vec![LsnOp {
+            lsn: Lsn(1),
+            op: DocumentOp::Delete {
+                index: "users".into(),
+                id: "1".into(),
+                routing: None,
+                version: None,
+            },
+        }];
+        assert_eq!(
+            lines(&batch),
+            vec![json!({"delete": {"_index": "users", "_id": "1"}})]
+        );
+    }
 }

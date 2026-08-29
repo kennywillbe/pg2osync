@@ -14,7 +14,7 @@ use pg2osync_core::checkpoint::Checkpoint;
 use pg2osync_core::error::CoreError;
 use pg2osync_core::lsn::Lsn;
 use pg2osync_core::sink::{
-    BulkLoadSettings, Health, IndexSpec, LsnOp, Rejection, Sink, SinkAck, StoredReject,
+    BulkLoadSettings, DocumentOp, Health, IndexSpec, LsnOp, Rejection, Sink, SinkAck, StoredReject,
 };
 use serde_json::{Value, json};
 
@@ -253,6 +253,110 @@ impl OpenSearchSink {
         }
     }
 
+    /// Remove every child of one parent, at the parent's own position.
+    ///
+    /// The children are found by the parent-id subfield the join field keeps
+    /// for each parent relation, minus the parent's own relation — the parent
+    /// document is deleted by the bulk action ahead of this, and `has_parent`
+    /// would find nothing once it is gone. Everything is routed to the
+    /// parent's shard, because that is the one shard a join child can be on.
+    ///
+    /// Terminates like `truncate_at_version`: a child written after the
+    /// parent's delete carries a higher version, its delete is refused, and
+    /// once only those remain a round deletes nothing. That survivor is the
+    /// ordering rule working, not a leak.
+    async fn delete_children(
+        &self,
+        index: &str,
+        field: &str,
+        parent_name: &str,
+        parent_id: &str,
+        version: Option<i64>,
+    ) -> Result<(), CoreError> {
+        const PAGE: usize = 1000;
+        // a search only sees refreshed segments, so a child written moments
+        // ago — in this very batch, even — would outlive the parent that
+        // owns it
+        let resp = self
+            .client
+            .indices()
+            .refresh(opensearch::indices::IndicesRefreshParts::Index(&[index]))
+            .send()
+            .await
+            .map_err(http_err)?;
+        check_status(resp, "pre-cascade refresh").await?;
+
+        let query = json!({"bool": {
+            "filter": [{"term": {format!("{field}#{parent_name}"): parent_id}}],
+            "must_not": [{"term": {field: parent_name}}]
+        }});
+        loop {
+            let resp = self
+                .client
+                .search(opensearch::SearchParts::Index(&[index]))
+                .routing(&[parent_id])
+                .body(json!({"size": PAGE, "_source": false, "query": query}))
+                .send()
+                .await
+                .map_err(http_err)?;
+            let body: Value = resp.json().await.map_err(http_err)?;
+            if let Some(error) = body.get("error") {
+                return Err(CoreError::Sink(format!(
+                    "find children of {index}/{parent_id}: {error}"
+                )));
+            }
+            let ids: Vec<String> = body["hits"]["hits"]
+                .as_array()
+                .map(|hits| {
+                    hits.iter()
+                        .filter_map(|hit| hit["_id"].as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if ids.is_empty() {
+                return Ok(());
+            }
+
+            let ops: Vec<BulkOperation<Value>> = ids
+                .iter()
+                .map(|id| {
+                    let op = BulkOperation::delete(id.clone())
+                        .index(index.to_string())
+                        .routing(parent_id.to_string());
+                    match version {
+                        Some(v) => op.version(v).version_type(VersionType::ExternalGte).into(),
+                        None => op.into(),
+                    }
+                })
+                .collect();
+            let resp = self
+                .client
+                .bulk(opensearch::BulkParts::None)
+                .body(ops)
+                .refresh(opensearch::params::Refresh::True)
+                .send()
+                .await
+                .map_err(http_err)?;
+            let body: Value = resp.json().await.map_err(http_err)?;
+            let deleted = body["items"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter(|item| {
+                            item["delete"]["status"]
+                                .as_u64()
+                                .is_some_and(|s| (200..300).contains(&s))
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            if deleted == 0 {
+                return Ok(());
+            }
+        }
+    }
+
     async fn warn_on_suspended_refresh(&self, tables: &[IndexSpec]) {
         if tables.is_empty() {
             return;
@@ -359,37 +463,10 @@ impl OpenSearchSink {
     /// operation, in order, so the position identifies the operation even when a
     /// batch holds two writes for the same document.
     async fn bulk_once(&self, batch: &[LsnOp]) -> Result<(Lsn, Vec<(usize, String)>), CoreError> {
-        // Build operations; upserts use index (last-write-wins by _id)
-        // every operation carries its own _index header, so no URL-level index
-        let ops: Vec<BulkOperation<Value>> = batch
+        let ops = batch
             .iter()
-            .map(|op| match &op.op {
-                pg2osync_core::sink::DocumentOp::Upsert {
-                    index,
-                    id,
-                    doc,
-                    version,
-                } => {
-                    let op = BulkOperation::index(doc.clone())
-                        .id(id.clone())
-                        .index(index.clone());
-                    // external_gte, not external: a replay after a crash writes
-                    // the same position again, and `external` rejects an equal
-                    // version while `external_gte` accepts it
-                    match external_version(*version) {
-                        Some(v) => op.version(v).version_type(VersionType::ExternalGte).into(),
-                        None => op.into(),
-                    }
-                }
-                pg2osync_core::sink::DocumentOp::Delete { index, id, version } => {
-                    let op = BulkOperation::delete(id.clone()).index(index.clone());
-                    match external_version(*version) {
-                        Some(v) => op.version(v).version_type(VersionType::ExternalGte).into(),
-                        None => op.into(),
-                    }
-                }
-            })
-            .collect();
+            .map(|op| bulk_action(&op.op))
+            .collect::<Result<Vec<_>, _>>()?;
 
         let resp = self
             .client
@@ -490,6 +567,66 @@ impl OpenSearchSink {
     }
 }
 
+/// One operation as its bulk action.
+///
+/// Upserts are `index` actions: last write wins by `_id`, which is what makes
+/// a replay idempotent. Every action carries its own `_index` header, so the
+/// request needs no URL-level index. A cascade is not a bulk action at all —
+/// `write` segments the batch around it, so one reaching here is a bug in the
+/// caller and is reported as such rather than silently skipped.
+fn bulk_action(op: &DocumentOp) -> Result<BulkOperation<Value>, CoreError> {
+    match op {
+        DocumentOp::Upsert {
+            index,
+            id,
+            routing,
+            doc,
+            version,
+        } => {
+            let mut action = BulkOperation::index(doc.clone())
+                .id(id.clone())
+                .index(index.clone());
+            if let Some(routing) = routing {
+                action = action.routing(routing.clone());
+            }
+            // external_gte, not external: a replay after a crash writes the
+            // same position again, and `external` rejects an equal version
+            // while `external_gte` accepts it
+            Ok(match external_version(*version) {
+                Some(v) => action
+                    .version(v)
+                    .version_type(VersionType::ExternalGte)
+                    .into(),
+                None => action.into(),
+            })
+        }
+        DocumentOp::Delete {
+            index,
+            id,
+            routing,
+            version,
+        } => {
+            let mut action = BulkOperation::delete(id.clone()).index(index.clone());
+            if let Some(routing) = routing {
+                action = action.routing(routing.clone());
+            }
+            Ok(match external_version(*version) {
+                Some(v) => action
+                    .version(v)
+                    .version_type(VersionType::ExternalGte)
+                    .into(),
+                None => action.into(),
+            })
+        }
+        DocumentOp::DeleteChildren {
+            index, parent_id, ..
+        } => Err(CoreError::Sink(format!(
+            "the cascade for {index}/{parent_id} reached a bulk request; \
+             write must run it between bulk requests"
+        ))),
+    }
+}
+
 fn is_retryable(e: &CoreError) -> bool {
     matches!(e, CoreError::SinkTransient(_))
 }
@@ -535,16 +672,18 @@ pub fn reject_doc_id(index: &str, doc_id: &str) -> String {
 }
 
 /// Serialize a rejection into its stored document form.
+///
+/// A cascade never becomes a rejection — its failure surfaces as an error from
+/// `write`, since there is no single document to set aside — but the arm is
+/// here so the stored form can say what every variant is, rather than the
+/// type promising a round trip it cannot deliver.
 pub fn reject_doc(r: &Rejection) -> Value {
     let (action, document, version) = match &r.op {
-        pg2osync_core::sink::DocumentOp::Upsert { doc, version, .. } => {
-            ("upsert", doc.clone(), *version)
-        }
-        pg2osync_core::sink::DocumentOp::Delete { version, .. } => {
-            ("delete", Value::Null, *version)
-        }
+        DocumentOp::Upsert { doc, version, .. } => ("upsert", doc.clone(), *version),
+        DocumentOp::Delete { version, .. } => ("delete", Value::Null, *version),
+        DocumentOp::DeleteChildren { version, .. } => ("delete_children", Value::Null, *version),
     };
-    json!({
+    let mut doc = json!({
         "index": r.index,
         "doc_id": r.doc_id,
         "reason": r.reason,
@@ -553,7 +692,24 @@ pub fn reject_doc(r: &Rejection) -> Value {
         "document": document,
         "version": version,
         "at_epoch": chrono_now(),
-    })
+    });
+    match &r.op {
+        DocumentOp::Upsert { routing, .. } | DocumentOp::Delete { routing, .. } => {
+            // a replay has to land on the shard the original write named
+            doc["routing"] = json!(routing);
+        }
+        DocumentOp::DeleteChildren {
+            field,
+            parent_name,
+            parent_id,
+            ..
+        } => {
+            doc["field"] = json!(field);
+            doc["parent_name"] = json!(parent_name);
+            doc["parent_id"] = json!(parent_id);
+        }
+    }
+    doc
 }
 
 /// Read a stored rejection back, or `None` if the document is not one.
@@ -561,16 +717,26 @@ pub fn reject_from_doc(id: &str, src: &Value) -> Option<StoredReject> {
     let index = src["index"].as_str()?.to_string();
     let doc_id = src["doc_id"].as_str()?.to_string();
     let version = src["version"].as_u64();
+    let routing = src["routing"].as_str().map(str::to_string);
     let op = match src["action"].as_str()? {
-        "upsert" => pg2osync_core::sink::DocumentOp::Upsert {
+        "upsert" => DocumentOp::Upsert {
             index: index.clone(),
             id: doc_id.clone(),
+            routing,
             doc: src["document"].clone(),
             version,
         },
-        "delete" => pg2osync_core::sink::DocumentOp::Delete {
+        "delete" => DocumentOp::Delete {
             index: index.clone(),
             id: doc_id.clone(),
+            routing,
+            version,
+        },
+        "delete_children" => DocumentOp::DeleteChildren {
+            index: index.clone(),
+            field: src["field"].as_str()?.to_string(),
+            parent_name: src["parent_name"].as_str()?.to_string(),
+            parent_id: src["parent_id"].as_str()?.to_string(),
             version,
         },
         _ => return None,
@@ -607,10 +773,13 @@ pub fn rejections(
             ))
         })?;
         let (index, doc_id) = match &op.op {
-            pg2osync_core::sink::DocumentOp::Upsert { index, id, .. }
-            | pg2osync_core::sink::DocumentOp::Delete { index, id, .. } => {
+            DocumentOp::Upsert { index, id, .. } | DocumentOp::Delete { index, id, .. } => {
                 (index.clone(), id.clone())
             }
+            // the parent is the one document a cascade can be filed under
+            DocumentOp::DeleteChildren {
+                index, parent_id, ..
+            } => (index.clone(), parent_id.clone()),
         };
         tracing::error!(target: "pg2osync::sink",
             "PERMANENT rejection {index}/{doc_id} at {}: {reason}", op.lsn);
@@ -623,6 +792,26 @@ pub fn rejections(
         });
     }
     Ok(out)
+}
+
+/// The `_mget` request for a set of `(id, routing)` pairs.
+///
+/// The plain `ids` form whenever nothing is routed — the overwhelming case,
+/// and keeping the wire shape identical for existing deployments is worth the
+/// branch. Both forms answer in request order, which the caller relies on.
+fn mget_body(ids: &[(String, Option<String>)]) -> Value {
+    if ids.iter().all(|(_, routing)| routing.is_none()) {
+        let ids: Vec<&str> = ids.iter().map(|(id, _)| id.as_str()).collect();
+        return json!({"ids": ids});
+    }
+    let docs: Vec<Value> = ids
+        .iter()
+        .map(|(id, routing)| match routing {
+            Some(routing) => json!({"_id": id, "routing": routing}),
+            None => json!({"_id": id}),
+        })
+        .collect();
+    json!({"docs": docs})
 }
 
 /// A source position as the target's external document version.
@@ -719,12 +908,12 @@ impl Sink for OpenSearchSink {
     async fn get_documents(
         &self,
         index: &str,
-        ids: &[String],
+        ids: &[(String, Option<String>)],
     ) -> Result<Vec<Option<Value>>, CoreError> {
         if ids.is_empty() {
             return Ok(vec![]);
         }
-        let body = json!({"ids": ids});
+        let body = mget_body(ids);
         let resp = self
             .client
             .mget(opensearch::MgetParts::Index(index))
@@ -755,7 +944,46 @@ impl Sink for OpenSearchSink {
                 "engine must never send empty batches".into(),
             ));
         }
-        let (max_lsn, permanent) = self.bulk_with_retry(&batch, &self.retry).await?;
+        // A cascade is not a bulk action, and it has to run after the parent's
+        // own delete and before anything that follows it, so the batch is
+        // written in the runs between cascades, in order.
+        let mut permanent = Vec::new();
+        let mut start = 0;
+        for (nth, op) in batch.iter().enumerate() {
+            let DocumentOp::DeleteChildren {
+                index,
+                field,
+                parent_name,
+                parent_id,
+                version,
+            } = &op.op
+            else {
+                continue;
+            };
+            if nth > start {
+                let (_, perm) = self
+                    .bulk_with_retry(&batch[start..nth], &self.retry)
+                    .await?;
+                // a rejection is paired with its operation by position, so a
+                // run's positions have to be put back where the batch has them
+                permanent.extend(perm.into_iter().map(|(i, why)| (start + i, why)));
+            }
+            self.delete_children(
+                index,
+                field,
+                parent_name,
+                parent_id,
+                external_version(*version),
+            )
+            .await?;
+            start = nth + 1;
+        }
+        if start < batch.len() {
+            let (_, perm) = self.bulk_with_retry(&batch[start..], &self.retry).await?;
+            permanent.extend(perm.into_iter().map(|(i, why)| (start + i, why)));
+        }
+        // the batch is non-empty, checked above
+        let max_lsn = batch.last().expect("nonempty checked").lsn;
         let rejected = rejections(&batch, permanent)?;
         Ok(SinkAck { max_lsn, rejected })
     }
@@ -875,14 +1103,18 @@ impl Sink for OpenSearchSink {
         &self,
         index: &str,
         key_field: &str,
+        only: Option<(&str, &str)>,
         after: Option<&Value>,
         size: usize,
-    ) -> Result<Vec<(String, Value)>, CoreError> {
+    ) -> Result<Vec<(String, Value, Option<String>)>, CoreError> {
         let mut body = json!({
             "size": size,
             "sort": [{ key_field: "asc" }],
             "_source": [key_field],
         });
+        if let Some((field, value)) = only {
+            body["query"] = json!({"term": {field: value}});
+        }
         if let Some(after) = after {
             body["search_after"] = json!([after]);
         }
@@ -906,7 +1138,10 @@ impl Sink for OpenSearchSink {
                         // the sort value rather than _source: it is what
                         // search_after needs back, in the form the index holds
                         let key = hit["sort"].as_array()?.first()?.clone();
-                        Some((id, key))
+                        // present only on a routed document, which is where a
+                        // delete of it has to be routed too
+                        let routing = hit["_routing"].as_str().map(str::to_string);
+                        Some((id, key, routing))
                     })
                     .collect()
             })
@@ -1286,9 +1521,10 @@ mod tests {
         // and a replay needs the operation that was actually refused.
         let op = |id: &str, doc: Value| LsnOp {
             lsn: Lsn(0x100),
-            op: pg2osync_core::sink::DocumentOp::Upsert {
+            op: DocumentOp::Upsert {
                 index: "i".into(),
                 id: id.into(),
+                routing: None,
                 doc,
                 version: Some(0x100),
             },
@@ -1314,15 +1550,146 @@ mod tests {
             doc_id: "7".into(),
             reason: "mapper_parsing_exception: amount".into(),
             lsn: Lsn(0x2A),
-            op: pg2osync_core::sink::DocumentOp::Delete {
+            op: DocumentOp::Delete {
                 index: "orders".into(),
                 id: "7".into(),
+                routing: None,
                 version: Some(0x2A),
             },
         };
         let stored = reject_from_doc("orders-7", &reject_doc(&r)).expect("readable");
         assert_eq!(stored.rejection, r, "a delete keeps being a delete");
         assert_eq!(stored.id, "orders-7");
+    }
+
+    #[test]
+    fn a_quarantined_document_keeps_its_routing() {
+        // A join child lives on its parent's shard; a replay that forgot the
+        // routing would write a second copy of the document somewhere else.
+        let rejection = |op| Rejection {
+            index: "shop".into(),
+            doc_id: "order-7".into(),
+            reason: "mapper_parsing_exception: amount".into(),
+            lsn: Lsn(0x2A),
+            op,
+        };
+        let upsert = rejection(DocumentOp::Upsert {
+            index: "shop".into(),
+            id: "order-7".into(),
+            routing: Some("customer-1".into()),
+            doc: json!({"amount": "lots"}),
+            version: Some(0x2A),
+        });
+        let doc = reject_doc(&upsert);
+        assert_eq!(doc["routing"], "customer-1");
+        let stored = reject_from_doc("shop-order-7", &doc).expect("readable");
+        assert_eq!(stored.rejection, upsert);
+
+        let delete = rejection(DocumentOp::Delete {
+            index: "shop".into(),
+            id: "order-7".into(),
+            routing: Some("customer-1".into()),
+            version: Some(0x2A),
+        });
+        let stored = reject_from_doc("shop-order-7", &reject_doc(&delete)).expect("readable");
+        assert_eq!(stored.rejection, delete);
+
+        let cascade = rejection(DocumentOp::DeleteChildren {
+            index: "shop".into(),
+            field: "relation".into(),
+            parent_name: "customer".into(),
+            parent_id: "customer-1".into(),
+            version: Some(0x2A),
+        });
+        let stored = reject_from_doc("shop-customer-1", &reject_doc(&cascade)).expect("readable");
+        assert_eq!(
+            stored.rejection, cascade,
+            "a cascade is not silently un-replayable"
+        );
+    }
+
+    /// The ndjson a bulk action serialises to, header line first.
+    fn action_lines(op: &DocumentOp) -> Vec<Value> {
+        use opensearch::http::request::Body as _;
+        let mut ops = opensearch::BulkOperations::new();
+        ops.push(bulk_action(op).expect("a bulk action"))
+            .expect("serialisable");
+        let bytes = ops.bytes().expect("buffered");
+        let text = std::str::from_utf8(&bytes).expect("utf-8");
+        text.lines()
+            .map(|line| serde_json::from_str(line).expect("json line"))
+            .collect()
+    }
+
+    #[test]
+    fn a_routed_upsert_names_its_shard_in_the_bulk_header() {
+        let lines = action_lines(&DocumentOp::Upsert {
+            index: "shop".into(),
+            id: "order-7".into(),
+            routing: Some("customer-1".into()),
+            doc: json!({"amount": 3}),
+            version: Some(0x2A),
+        });
+        assert_eq!(
+            lines[0],
+            json!({"index": {"_index": "shop", "_id": "order-7", "routing": "customer-1",
+                             "version": 42, "version_type": "external_gte"}})
+        );
+        assert_eq!(lines[1], json!({"amount": 3}));
+    }
+
+    #[test]
+    fn a_routed_delete_names_its_shard_in_the_bulk_header() {
+        let lines = action_lines(&DocumentOp::Delete {
+            index: "shop".into(),
+            id: "order-7".into(),
+            routing: Some("customer-1".into()),
+            version: None,
+        });
+        assert_eq!(
+            lines,
+            vec![json!({"delete": {"_index": "shop", "_id": "order-7", "routing": "customer-1"}})]
+        );
+    }
+
+    #[test]
+    fn an_unrouted_operation_carries_no_routing_at_all() {
+        // the wire shape every existing deployment sends stays byte-identical
+        let lines = action_lines(&DocumentOp::Upsert {
+            index: "users".into(),
+            id: "1".into(),
+            routing: None,
+            doc: json!({"id": 1}),
+            version: None,
+        });
+        assert_eq!(lines[0], json!({"index": {"_index": "users", "_id": "1"}}));
+    }
+
+    #[test]
+    fn a_cascade_is_never_a_bulk_action() {
+        let cascade = DocumentOp::DeleteChildren {
+            index: "shop".into(),
+            field: "relation".into(),
+            parent_name: "customer".into(),
+            parent_id: "customer-1".into(),
+            version: None,
+        };
+        assert!(bulk_action(&cascade).is_err());
+    }
+
+    #[test]
+    fn a_readback_keeps_the_plain_form_until_something_is_routed() {
+        let plain = vec![("1".to_string(), None), ("2".to_string(), None)];
+        assert_eq!(mget_body(&plain), json!({"ids": ["1", "2"]}));
+
+        let routed = vec![
+            ("customer-1".to_string(), None),
+            ("order-7".to_string(), Some("customer-1".to_string())),
+        ];
+        assert_eq!(
+            mget_body(&routed),
+            json!({"docs": [{"_id": "customer-1"}, {"_id": "order-7", "routing": "customer-1"}]})
+        );
     }
 
     #[test]

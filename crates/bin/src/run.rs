@@ -9,7 +9,8 @@ use pg2osync_core::event::ChangeEvent;
 use pg2osync_core::lsn::Lsn;
 use pg2osync_core::sink::{IndexSpec, Sink};
 use pg2osync_engine::mapping::{
-    Constants, DurableLsn, Projection, Projections, Rename, Renames, TableMapping, Transforms,
+    Constants, DurableLsn, JoinParent, JoinRule, Joins, ParentId, Projection, Projections, Rename,
+    Renames, TableMapping, Transforms,
 };
 use pg2osync_engine::metrics::SharedMetrics;
 use pg2osync_engine::{PipelineCtx, PositionRenderer};
@@ -55,14 +56,10 @@ pub async fn run_pipeline(
 ) -> Result<()> {
     let sink = build_sink(&cfg, target_password)?;
     check_rejection_policy(&cfg, sink.as_ref())?;
-    let index_specs: Vec<IndexSpec> = cfg
-        .sync
-        .iter()
-        .map(|(k, t)| IndexSpec {
-            name: t.index_name(k),
-            mapping: t.mapping.clone(),
-        })
-        .collect();
+    for note in embedded_children_with_own_section(&cfg) {
+        tracing::warn!(target: "pg2osync::run", "{note}");
+    }
+    let index_specs = index_specs(&cfg);
 
     match cfg.source.flavor.as_str() {
         "mysql" => {
@@ -102,6 +99,31 @@ pub async fn run_pipeline(
 /// Silently falling back to halting would be defensible; silently dropping the
 /// document would not, and the difference between the two is exactly what a
 /// permissive default here would blur.
+/// Tables that are both an embedded child of another section and a section
+/// of their own. The replication runner classifies such a table as somebody's
+/// child and reads its rows only as a re-fetch of the owner, so the table's
+/// own index gets the initial load and then never sees a change. Not refused:
+/// a load-once index is a legitimate thing to want, and the dev suites use it
+/// to compare an embedded object with the row itself — but it has to be said.
+pub fn embedded_children_with_own_section(cfg: &AppConfig) -> Vec<String> {
+    let mut notes = Vec::new();
+    for (owner, tbl) in &cfg.sync {
+        for child in &tbl.children {
+            if let Some((key, own)) = cfg.sync.iter().find(|(_, t)| t.table == child.table) {
+                notes.push(format!(
+                    "[sync.{key}] {} is also an embedded child of [sync.{owner}]: the \
+                     replication runner reads its rows only as a re-fetch of {}, so \
+                     index {:?} receives the initial load and no streamed change",
+                    child.table,
+                    tbl.table,
+                    own.index_name(key)
+                ));
+            }
+        }
+    }
+    notes
+}
+
 pub fn check_rejection_policy(cfg: &AppConfig, sink: &dyn Sink) -> Result<()> {
     if cfg.engine.on_permanent_rejection == pg2osync_engine::RejectionPolicy::Quarantine
         && !sink.can_quarantine()
@@ -166,6 +188,37 @@ pub fn build_sink(cfg: &AppConfig, target_password: Option<String>) -> Result<Ar
         ),
     };
     Ok(sink)
+}
+
+/// One spec per target index, in section order.
+///
+/// A join pair is two sections and one index; `ensure_ready` creates it once,
+/// from the parent's mapping — the only section allowed to carry one — so the
+/// mapping is kept from whichever section set it.
+pub fn index_specs(cfg: &AppConfig) -> Vec<IndexSpec> {
+    let mut specs: Vec<IndexSpec> = Vec::with_capacity(cfg.sync.len());
+    for (key, tbl) in &cfg.sync {
+        let name = tbl.index_name(key);
+        match specs.iter_mut().find(|spec| spec.name == name) {
+            Some(spec) => {
+                if spec.mapping.is_none() {
+                    spec.mapping = tbl.mapping.clone();
+                }
+            }
+            None => specs.push(IndexSpec {
+                name,
+                mapping: tbl.mapping.clone(),
+            }),
+        }
+    }
+    specs
+}
+
+/// Every target index once, in section order. The per-index settings the
+/// initial load suspends would otherwise be saved and restored twice for a
+/// shared index, the second restore reading the already-suspended values.
+pub fn index_names(cfg: &AppConfig) -> Vec<String> {
+    index_specs(cfg).into_iter().map(|spec| spec.name).collect()
 }
 
 fn table_mapping(cfg: &AppConfig) -> TableMapping {
@@ -293,6 +346,70 @@ fn fan_outs(cfg: &AppConfig) -> Result<pg2osync_engine::mapping::FanOuts> {
         ));
     }
     Ok(pg2osync_engine::mapping::FanOuts::from_pairs(pairs))
+}
+
+/// The join rules, resolved per index: a child's rule carries its parent
+/// section's relation name and id rule, because the parent's id is what the
+/// child's routing has to reproduce from its own column.
+fn joins(cfg: &AppConfig) -> Result<Joins> {
+    let mut by_index: HashMap<String, Vec<(&String, &crate::config::TableSync)>> = HashMap::new();
+    for (key, tbl) in &cfg.sync {
+        by_index
+            .entry(tbl.index_name(key))
+            .or_default()
+            .push((key, tbl));
+    }
+    let mut pairs = Vec::new();
+    for (index, members) in &by_index {
+        let parent = members.iter().find_map(|(key, tbl)| {
+            let join = tbl.join.as_ref()?;
+            join.parent.is_none().then_some((*key, *tbl, join))
+        });
+        for (key, tbl) in members {
+            let Some(join) = &tbl.join else { continue };
+            let parent = match &join.parent {
+                None => None,
+                Some(column) => {
+                    let Some((parent_key, parent_tbl, parent_join)) = parent else {
+                        bail!(
+                            "[sync.{key}] join names a parent through {column}, but no other \
+                             [sync.*] section writes index {index:?} as its parent"
+                        );
+                    };
+                    let id = match &parent_tbl.id {
+                        None => ParentId::Key,
+                        Some(spec) => ParentId::Template(
+                            pg2osync_engine::mapping::IdTemplate::parse(
+                                spec,
+                                &pk_columns_for(parent_tbl),
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "[sync.{parent_key}] id {spec:?} is not a usable id: {e}"
+                                )
+                            })?,
+                        ),
+                    };
+                    Some(JoinParent {
+                        column: column.clone(),
+                        name: parent_join.name.clone(),
+                        id,
+                        key_column: pk_columns_for(tbl).contains(column),
+                    })
+                }
+            };
+            let (schema, table) = split_qualified(&tbl.table);
+            pairs.push((
+                (schema.to_string(), table.to_string()),
+                JoinRule {
+                    field: join.field.clone(),
+                    name: join.name.clone(),
+                    parent,
+                },
+            ));
+        }
+    }
+    Ok(Joins::from_pairs(pairs))
 }
 
 /// The configured row filters, keyed by qualified table for the loaders.
@@ -439,6 +556,7 @@ pub fn pipeline_ctx(
         constants: constants(cfg)?,
         id_templates: id_templates(cfg)?,
         fan_outs: fan_outs(cfg)?,
+        joins: joins(cfg)?,
         filters: filters(cfg)?,
         cfg: cfg.engine.clone(),
         ack_tx,
@@ -456,12 +574,20 @@ pub fn pipeline_ctx(
 /// naming the ALTER statement now, the same way child tables are checked.
 /// A row filter adds no requirement of its own: a key-only id renders the
 /// delete of a row that left the filter from the key, and the other cases are
-/// the two above.
+/// the two above. A join child is the third: its delete has to name its
+/// parent's shard, and its routing comes from the same place its id does.
 async fn check_derived_identity_requirements(
     cfg: &AppConfig,
     admin: &tokio_postgres::Client,
 ) -> Result<()> {
     for (key, tbl) in &cfg.sync {
+        if tbl.fan_out.is_none() && tbl.id.is_none() && tbl.join.is_none() {
+            continue;
+        }
+        let (schema, table) = split_qualified(&tbl.table);
+        let info = pg2osync_source::catalog::table_info(admin, schema, table)
+            .await
+            .with_context(|| format!("cannot inspect table {}", tbl.table))?;
         // "outside the key" is decided twice, because there are two keys to
         // ask: the one the engine sees at write time (`primary_key`, one
         // column defaulting to `id`) and the one the database enforces. With
@@ -470,15 +596,15 @@ async fn check_derived_identity_requirements(
         // column; requiring FULL where the two views disagree is what makes
         // the before-image — already unavoidable for anything outside a key
         // — the only thing an id is ever rendered from.
+        let in_both_keys = |column: &str| {
+            info.pk_columns.iter().any(|k| k == column)
+                && pk_columns_for(tbl).iter().any(|k| k == column)
+        };
         let needs_full = if tbl.fan_out.is_some() {
             true
         } else {
             match &tbl.id {
                 Some(spec) => {
-                    let (schema, table) = split_qualified(&tbl.table);
-                    let info = pg2osync_source::catalog::table_info(admin, schema, table)
-                        .await
-                        .with_context(|| format!("cannot inspect table {}", tbl.table))?;
                     let from_catalog =
                         pg2osync_engine::mapping::IdTemplate::parse(spec, &info.pk_columns)
                             .map_err(|e| anyhow::anyhow!("[sync.{key}] id {spec:?}: {e}"))?;
@@ -490,13 +616,40 @@ async fn check_derived_identity_requirements(
                 None => false,
             }
         };
+        if let Some(join) = &tbl.join {
+            match join.parent.as_deref() {
+                // the child carries one column and renders the parent's id
+                // from it alone, which a composite key's `col=val` list is not
+                None if info.pk_columns.len() > 1 => bail!(
+                    "[sync.{key}] {} is a join parent with a composite primary key ({}); a \
+                     child carries one column and cannot render `{}`. A join parent needs a \
+                     single-column key",
+                    tbl.table,
+                    info.pk_columns.join(", "),
+                    info.pk_columns
+                        .iter()
+                        .map(|c| format!("{c}=…"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+                None => {}
+                // the same two-key rule as an id: a bare key value is bound to
+                // the parent column only when both views agree it is the key
+                Some(column) if !in_both_keys(column) && info.relreplident != 'f' => bail!(
+                    "[sync.{key}] {} has REPLICA IDENTITY '{}', but it is a join child whose \
+                     {column} is not part of its key: a delete would carry no parent, so the \
+                     document could not be routed to the shard that holds it. \
+                     Run: ALTER TABLE {} REPLICA IDENTITY FULL",
+                    tbl.table,
+                    info.relreplident,
+                    tbl.table
+                ),
+                Some(_) => {}
+            }
+        }
         if !needs_full {
             continue;
         }
-        let (schema, table) = split_qualified(&tbl.table);
-        let info = pg2osync_source::catalog::table_info(admin, schema, table)
-            .await
-            .with_context(|| format!("cannot inspect table {}", tbl.table))?;
         if info.relreplident != 'f' {
             bail!(
                 "[sync.{key}] {} has REPLICA IDENTITY '{}', but its derived identity needs \
@@ -578,11 +731,7 @@ fn start_api(
     let api_cfg = pg2osync_engine::api::ApiConfig {
         bind: cfg.api.bind.clone(),
         token,
-        indices: cfg
-            .sync
-            .iter()
-            .map(|(key, tbl)| tbl.index_name(key))
-            .collect(),
+        indices: index_names(cfg),
     };
     tokio::spawn(async move {
         pg2osync_engine::api::serve(
@@ -823,8 +972,7 @@ async fn with_bulk_load_settings<F, T>(sink: &Arc<dyn Sink>, cfg: &AppConfig, lo
 where
     F: std::future::Future<Output = Result<T>>,
 {
-    let indices: Vec<String> = cfg.sync.iter().map(|(k, t)| t.index_name(k)).collect();
-    let saved = sink.begin_bulk_load(&indices).await?;
+    let saved = sink.begin_bulk_load(&index_names(cfg)).await?;
     let result = load.await;
     // the tail still in the event channel is written after this, which is a
     // batch or two out of millions
@@ -1674,6 +1822,71 @@ mod tests {
         assert_eq!(percent_decode("p%40ss%3Aword"), "p@ss:word");
         assert_eq!(percent_decode("plain"), "plain");
         assert_eq!(percent_decode("trailing%"), "trailing%");
+    }
+
+    #[test]
+    fn a_shared_index_is_listed_once_with_the_mapping_its_parent_carries() {
+        let mut cfg: AppConfig = toml::from_str(
+            r#"
+[source]
+url = "postgres://u:p@localhost/db"
+[target]
+url = "http://localhost:9200"
+[sync.customers]
+table = "public.customers"
+index = "shop"
+[sync.customers.join]
+field = "relation"
+name = "customer"
+[sync.orders]
+table = "public.orders"
+index = "shop"
+[sync.orders.join]
+field = "relation"
+name = "order"
+parent = "customer_id"
+[sync.users]
+table = "public.users"
+"#,
+        )
+        .expect("parses");
+        // the mapping is read from a file at load; the test stands in for it
+        cfg.sync.get_mut("customers").expect("section").mapping =
+            Some(serde_json::json!({"mappings": {}}));
+
+        let specs = index_specs(&cfg);
+        assert_eq!(
+            specs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["shop", "users"],
+            "one entry per index, in section order"
+        );
+        assert!(
+            specs[0].mapping.is_some(),
+            "the parent's mapping survives the child's section, which has none"
+        );
+        assert_eq!(index_names(&cfg), ["shop", "users"]);
+
+        let joins = joins(&cfg).expect("resolves");
+        let child = joins
+            .for_table("public", "orders")
+            .expect("the child has a rule");
+        let parent = child.parent.as_ref().expect("it names its parent");
+        assert_eq!(parent.name, "customer");
+        assert!(
+            matches!(parent.id, ParentId::Key),
+            "a parent without an id files its documents under the key"
+        );
+        assert!(
+            !parent.key_column,
+            "customer_id is not the child's declared key"
+        );
+        assert!(
+            joins
+                .for_table("public", "customers")
+                .expect("the parent has a rule")
+                .parent
+                .is_none()
+        );
     }
 
     #[test]

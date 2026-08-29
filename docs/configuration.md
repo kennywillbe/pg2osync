@@ -129,6 +129,7 @@ One section per table. `<key>` is the index name when `index` is omitted.
 | `primary_key` | Overrides key detection; also the join column for nested children |
 | `id` | Derived document id, e.g. `tenant-{tenant_id}-{id}`; see [Document ids](#document-ids) |
 | `fan_out` | One row becomes one document per element of an array column; see [Fan-out](#fan-out) |
+| `join` | This table's place in a join field shared with another section: its relation name and, on the child, the parent column; see [Join fields](#join-fields) |
 | `columns` | Only these columns are indexed |
 | `exclude_columns` | All columns except these; mutually exclusive with `columns` |
 | `transform` | Map of column to an operation, see [Transforms](#transforms) |
@@ -207,7 +208,8 @@ and element fields alike.
   support fanned tables yet: both page by key, and one row now has many
   documents.
 
-Two tables may not map to the same index: document identity would be ambiguous.
+Two tables may not map to the same index — document identity would be
+ambiguous — except as a [join pair](#join-fields).
 
 ### Transforms
 
@@ -568,6 +570,103 @@ startup for the same reason.
   `binlog_row_image = FULL` (already required) is what lets a child DELETE
   carry its foreign key, so there is no REPLICA IDENTITY caveat.
 
+### Join fields
+
+The embedded array above is one document and one write, and it is the right
+choice nearly always. When the children are many, change far more often than
+the parent, or have to be searched in their own right, a join field keeps each
+child a document of its own — on its parent's shard, so `has_child` and
+`has_parent` queries work — instead of re-fetching the whole collection on
+every child change:
+
+```toml
+[sync.customers]
+table = "public.customers"
+index = "shop"
+id = "customer-{id}"
+mapping_file = "shop-mapping.json"
+
+[sync.customers.join]
+field = "relation"           # the join field the mapping declares
+name = "customer"            # this table's relation name inside it
+
+[sync.orders]
+table = "public.orders"
+index = "shop"
+id = "order-{id}"
+
+[sync.orders.join]
+field = "relation"
+name = "order"
+parent = "customer_id"       # column on THIS table holding the parent's key
+```
+
+`parent` is what makes a section the child: it names the column whose value,
+rendered through the parent section's `id`, is the parent document's id — and
+the child's routing. The parent omits it. Each document carries the join field
+in the shape the target expects, `"customer"` on a parent and
+`{"name": "order", "parent": "customer-1"}` on a child. It is written after
+projection and renames, like a constant, so nothing can strip it or move a
+document to another shard. OpenSearch and Elasticsearch only.
+
+- **The mapping lives on the parent, and only there.** A join pair is two
+  sections and one index; the parent's `mapping_file` creates it and has to
+  declare the field:
+
+  ```json
+  { "mappings": { "properties": {
+      "relation": { "type": "join", "relations": { "customer": ["order"] } } } } }
+  ```
+
+  A child that sets `mapping_file` is refused. Dynamic mapping cannot invent a
+  join field, so without this mapping — or an index template that declares
+  the field — the first document is rejected.
+- **Ids must be unique across the shared index.** Parent `customers.id = 1`
+  and child `orders.id = 1` would both render `_id = "1"`, and the child would
+  overwrite the parent. Configuration cannot see it; give each section an `id`
+  with its own prefix, as `customer-{id}` and `order-{id}` above.
+- **The parent's `id` may name only its key.** The child holds one column and
+  has to compute the parent's id from it alone, so an id naming anything else
+  is refused at load, and a parent with a composite key at startup.
+- **PostgreSQL: the child needs `REPLICA IDENTITY FULL`** unless its parent
+  column is part of its own key. A delete has to reach the shard that holds
+  the document, and the routing comes from the old row — the same rule a
+  non-key `id` follows; `run` refuses to start otherwise. A child whose parent
+  column changes moves: written under the new parent, deleted under the old.
+  MySQL already guarantees the before-image.
+- **A parent delete cascades.** The engine does not know which children the
+  target holds, so the sink refreshes the index and searches for them, after
+  the parent's own delete and at the parent's position. The refresh is what
+  makes it correct — a child written seconds earlier would otherwise survive —
+  and it is the cost: one per deleted parent, which the batch waits for. Each
+  batch that carries one counts a `join_cascade` event in
+  `pg2osync_events_total`.
+- **`TRUNCATE` on either table empties the shared index.** A truncate clears
+  an index, and the index is the pair's; PostgreSQL makes you truncate tables
+  that reference each other together anyway.
+- **A `where` filter is the operator's to keep consistent across the pair.**
+  A child whose parent the parent section's `where` filters out is indexed
+  with a `parent` that no document has.
+- A NULL in the parent column halts the pipeline, as a NULL in an `id` column
+  does; `validate` warns when the column is nullable, and refuses a column
+  the table does not have.
+- `reconcile` scopes its scan to one relation, so it checks either half of
+  the pair against its own table and routes the deletes it makes.
+
+Refused at config load: two sections on one index without `join` on every one
+of them; sections of one index naming different join fields; an index with no
+parent, or with two; two sections sharing a relation name; a child that only
+names a parent no other section provides; a child with `mapping_file`;
+`fan_out` together with `join`; a parent `id` naming a column outside its key;
+`join` against Meilisearch, which has no parent-child model; a `fields`
+rename, a constant, a `columns` entry or a `[[children]]` field that collides
+with the join field. `[[children]]` on a join child is allowed: embedding an
+array on this document and filing this document under a parent are unrelated.
+A table that is both an embedded child of another section and a section of
+its own is warned about at startup, not refused: the replication runner reads
+its rows only as a re-fetch of the owner, so its own index receives the initial
+load and no streamed change.
+
 ## `[engine]`
 
 Defaults are production-sane; tune only against measurements.
@@ -668,7 +767,7 @@ scrape_configs:
 ```
 
 ```
-pg2osync_events_total{type="row|truncate"}
+pg2osync_events_total{type="row|truncate|join_cascade"}   # join_cascade: a batch that removed a deleted parent's children
 pg2osync_batches_flushed
 pg2osync_toast_readbacks_total                  # reads to complete TOASTed columns
 pg2osync_sink_errors_total
