@@ -131,7 +131,7 @@ One section per table. `<key>` is the index name when `index` is omitted.
 | `fan_out` | One row becomes one document per element of an array column; see [Fan-out](#fan-out) |
 | `columns` | Only these columns are indexed |
 | `exclude_columns` | All columns except these; mutually exclusive with `columns` |
-| `transform` | Map of column to `"hash"` or `"redact"` |
+| `transform` | Map of column to an operation, see [Transforms](#transforms) |
 | `fields` | Map of source column to target field name; applied last, see [Field names](#field-names) |
 | `constants` | Map of field name to a literal value added to every document; `{schema}`/`{table}` in a string render at startup, see [Constant fields](#constant-fields) |
 | `poll_column` | Poll mode: overrides `[source] poll_column` for this table |
@@ -206,11 +206,69 @@ and element fields alike.
   support fanned tables yet: both page by key, and one row now has many
   documents.
 
-`hash` replaces the value with a truncated SHA-256 digest, stable across runs so
-it can still be grouped on. `redact` replaces it with `***`. Null values are
-left alone in both cases.
-
 Two tables may not map to the same index: document identity would be ambiguous.
+
+### Transforms
+
+A column can be reshaped on its way into the document. `transform` maps a
+source column to one of six named operations: a string for an op that takes
+no parameter, an inline table for one that does.
+
+```toml
+[sync.users]
+table = "public.users"
+
+[sync.users.transform]
+email   = "hash"
+phone   = "redact"
+payload = "json"                             # or { op = "json" }
+price   = "number"
+tags    = { op = "split", by = "," }
+born    = { op = "date", from = "%d/%m/%Y" }
+```
+
+`hash` replaces the value with a truncated SHA-256 digest, stable across runs so
+it can still be grouped on. `redact` replaces it with `***`. The other four turn
+a string into something more structured:
+
+| op | takes | turns | into |
+|---|---|---|---|
+| `hash` | — | any value | a truncated SHA-256 digest |
+| `redact` | — | any value | `***` |
+| `json` | — | a string holding JSON | that JSON value, an object or a bare number alike |
+| `split` | `by`, required and non-empty | a delimited string | an array of its trimmed, non-empty pieces: `"a, b ,c"` → `["a","b","c"]`, `""` → `[]` |
+| `number` | — | a string holding a number | a JSON number: an integer when it is one, otherwise a double |
+| `date` | `from`, a `strptime`-style format, required and non-empty | a string in that format | ISO 8601: `YYYY-MM-DD` for a date, `YYYY-MM-DDTHH:MM:SS` for a date-time, RFC 3339 with the offset kept when the format carries one |
+
+NULL is left alone by every op, and so is a value already in the target shape:
+a parsed `json`/`jsonb`/`JSON` column under `json`, an array under `split`, a
+number under `number`. That is what keeps the ops idempotent when
+at-least-once delivery replays a row, and it is why the three exist for
+*text* columns that hold something more structured. `number` is also the
+explicit opt-out of the rule that `numeric`/`DECIMAL` arrive as strings to
+keep their precision — for an index that sorts or range-queries on the value
+and accepts the double.
+
+A value an op cannot convert — `"abc"` under `number`, a date that does not
+match `from` — is indexed **exactly as it arrived**, counted in
+`pg2osync_transform_unconverted_total`, and logged once per table and column.
+The pipeline never halts on it: the target's mapping is the arbiter of what a
+field holds, and a document the mapping refuses takes the ordinary rejection
+path (see `on_permanent_rejection`). A fanned row counts once per element
+document.
+
+- If one field will hold both converted and unconverted values, `mapping_file`
+  should type it as `text`. Otherwise dynamic mapping types the field from the
+  first document and refuses the second — and that refusal is the halt or
+  quarantine path, not this policy.
+- Transforms name the **source** column and run after projection, before
+  `fields` renames and `constants`.
+- `split` cannot feed `fan_out`: fan-out reads the raw row, before any
+  transform, so it needs a real array column.
+
+Refused at load: an unknown op, a parameter the op does not take, `split`
+without a non-empty `by`, `date` without a non-empty `from`, and a transform
+on the `fan_out.field`.
 
 ### Field names
 
@@ -552,7 +610,10 @@ pg2osync_events_total{type="row|truncate"}
 pg2osync_batches_flushed
 pg2osync_toast_readbacks_total                  # reads to complete TOASTed columns
 pg2osync_sink_errors_total
+pg2osync_rejected_total                         # documents the target refused, quarantined instead of written
+pg2osync_transform_unconverted_total            # values a transform could not convert, indexed as they were
 pg2osync_reconnects_total
+pg2osync_source_connected                       # 1 while the source is streaming, 0 while reconnecting
 pg2osync_latency_ms{quantile="0.5|0.9|0.99"}   # source commit to indexed
 pg2osync_latency_ms_count
 pg2osync_position_current                       # highest position received
@@ -601,6 +662,7 @@ exclude_columns = ["password_hash"]
 
 [sync.users.transform]
 email = "redact"
+interests = { op = "split", by = "," }
 
 [sync.customers]
 table = "public.customers"

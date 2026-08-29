@@ -105,6 +105,21 @@ is not a column; written last, a constant wins a collision — so every collisio
 the configuration can see is refused at load, and the one only the catalogue
 can see is refused by `validate`.
 
+**Transforms are fixed, named reshapes, not a language.** (#63.) Six ops —
+`hash`, `redact`, `json`, `split`, `number`, `date` — and the README's promise
+holds: a closed set, one literal parameter at most, no chaining, nothing
+evaluated at run time, for the same reason constants carry no expressions. A
+value an op cannot convert is indexed as it arrived and counted, neither halted
+on nor nulled: halting turns a data-quality problem into an availability
+problem, and a NULL is silent loss. The target's mapping is the arbiter of what
+a field holds, quarantine already catches what it refuses, and
+`pg2osync_transform_unconverted_total` plus one warning per (table, column)
+keeps the rest visible. A value already in the target shape is not a failure,
+so every op is idempotent under at-least-once replay. `split` cannot feed
+`fan_out`, because fan-out reads the raw row — identity is a property of the
+row, as the id paragraph says. `chrono`, already in the build through the
+OpenSearch client, parses the dates: a strptime calendar is not protocol code.
+
 **Never acknowledge a position before it is durable.** The value reported to the
 source is clamped to the persisted checkpoint. Acknowledging further lets the
 database recycle history for rows that are not indexed yet — the classic way a
@@ -482,6 +497,8 @@ re-index on upgrade.
 **`numeric` and `decimal` become JSON strings.** A float round-trip loses
 precision, and these columns are usually money. MySQL decimals keep their
 declared scale so a streamed value matches what the initial load read.
+`transform = "number"` is the operator's explicit opt-out — an index that sorts
+or range-queries on money asks for it, and accepts the double.
 
 **Unknown types become strings.** Domains, ranges and composites are passed
 through as text rather than guessed at.

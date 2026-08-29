@@ -21,7 +21,7 @@ use pg2osync_core::lsn::Lsn;
 use pg2osync_core::sink::{DocumentOp, LsnOp, Sink, SinkAck};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::sync::{mpsc, watch};
@@ -264,6 +264,9 @@ pub async fn run(
     // without asking the target to make a comparison it cannot make.
     let mut superseded: HashMap<(String, String), u64> = HashMap::new();
     let mut cleared: HashMap<String, u64> = HashMap::new();
+    // One line per (table, column), not per row: a column with the wrong
+    // transform is wrong for every row, and the log would be nothing else.
+    let mut transform_warned: HashSet<(String, String)> = HashSet::new();
 
     let result = loop {
         let ev = match deferred.take().or_else(|| try_next(&mut events, &mut copy)) {
@@ -469,6 +472,7 @@ pub async fn run(
                     let previous = completion_id(&row.kind, &rules, (&row.schema, &row.table))
                         .and_then(|id| completions.get(&(index.to_string(), id)))
                         .and_then(Option::as_ref);
+                    let mut left_as_is = Vec::new();
                     let ops = match materialize(
                         index,
                         (&row.schema, &row.table),
@@ -476,6 +480,7 @@ pub async fn run(
                         &rules,
                         previous,
                         row.version,
+                        &mut left_as_is,
                     ) {
                         Ok(ops) => ops,
                         Err(e) => {
@@ -483,6 +488,24 @@ pub async fn run(
                             break;
                         }
                     };
+                    if !left_as_is.is_empty() {
+                        ctx.metrics
+                            .transform_unconverted_total
+                            .fetch_add(left_as_is.len() as u64, Ordering::Relaxed);
+                        for col in left_as_is {
+                            if transform_warned.insert((row.table.clone(), col.clone())) {
+                                let op = ctx
+                                    .transforms
+                                    .for_table(&row.schema, &row.table)
+                                    .and_then(|rules| rules.get(&col))
+                                    .map_or("transform", crate::mapping::TransformOp::name);
+                                tracing::warn!(target: "pg2osync::engine",
+                                    "{}.{}: {op} cannot convert {col}; the value is being \
+                                     indexed as it is",
+                                    row.schema, row.table);
+                            }
+                        }
+                    }
                     // A write the stream has already superseded is dropped
                     // here rather than sent for the target to refuse: by the
                     // time it lands the tombstone that would refuse it may be
@@ -1093,6 +1116,9 @@ fn materialize(
     rules: &Rules<'_>,
     previous: Option<&Value>,
     version: Option<u64>,
+    // Columns whose transform could not convert the value; appended to, so
+    // the caller sees one list for however many documents the row became.
+    left_as_is: &mut Vec<String>,
 ) -> Result<Vec<LsnOp>, CoreError> {
     // PENDING_LSN is overwritten by the commit handler before any ack can
     // reference it: rows never leave the buffer without their commit attached.
@@ -1131,13 +1157,18 @@ fn materialize(
     // `shaped` names the columns completed from the stored document: they
     // went through the transforms when they were first written, so they must
     // not go through them again
-    let finish = |docs: Vec<(String, Value)>, shaped: &[String]| -> Vec<LsnOp> {
+    let finish = |docs: Vec<(String, Value)>, shaped: &[String], left: &mut Vec<String>| {
         docs.into_iter()
             .map(|(id, mut doc)| {
                 rules.projections.apply(table.0, table.1, &mut doc);
-                rules
-                    .transforms
-                    .apply_except(table.0, table.1, &mut doc, shaped);
+                // owned only on the failure path, which is the rare one
+                left.extend(
+                    rules
+                        .transforms
+                        .apply_except(table.0, table.1, &mut doc, shaped)
+                        .into_iter()
+                        .map(str::to_string),
+                );
                 rules.renames.apply(table.0, table.1, &mut doc);
                 rules.constants.apply(table.0, table.1, &mut doc);
                 upsert(id, doc)
@@ -1147,7 +1178,7 @@ fn materialize(
     match kind {
         RowKind::Insert { pk, doc } => {
             let base = derived_id(table, pk, Some(doc), None, rules.id_templates)?;
-            Ok(finish(shape(&base, doc)?, &[]))
+            Ok(finish(shape(&base, doc)?, &[], left_as_is))
         }
         RowKind::Update {
             pk,
@@ -1175,7 +1206,7 @@ fn materialize(
             let before = before.as_ref();
             let base = derived_id(table, pk, Some(&doc), before, rules.id_templates)?;
             let new_docs = shape(&base, &doc)?;
-            let mut ops = finish(new_docs.clone(), &completed);
+            let mut ops = finish(new_docs.clone(), &completed, left_as_is);
             // write first, delete second: a crash between them leaves a
             // duplicate that the replay repairs, where the reverse order would
             // leave a gap that nothing repairs
@@ -2652,6 +2683,67 @@ mod pipeline_tests {
         .await
         .expect("engine ran");
         assert_eq!(sink.doc("7"), Some(json!({"id": 7, "entity": "user"})));
+    }
+
+    #[tokio::test]
+    async fn an_unconvertible_value_is_written_as_it_is_and_counted() {
+        // "written unchanged" alone is indistinguishable from "no transform
+        // was configured"; the counter is what says the op ran and gave up
+        let (events_tx, events_rx) = mpsc::channel(4);
+        let (copy_tx, copy_rx) = mpsc::channel(4);
+        drop(copy_tx);
+        let (ack_tx, _ack_rx) = watch::channel(None);
+        let (load_done_tx, _load_done_rx) = watch::channel(0u64);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sink = Arc::new(RecordingSink::default());
+        let metrics = Arc::new(crate::metrics::Metrics::default());
+        let ctx = Arc::new(PipelineCtx {
+            sink: sink.clone(),
+            mapping: TableMapping::from_pairs([(
+                ("public".to_string(), "users".to_string()),
+                "users".to_string(),
+            )]),
+            projections: crate::mapping::Projections::default(),
+            transforms: crate::mapping::Transforms::from_pairs([(
+                ("public".to_string(), "users".to_string()),
+                std::collections::HashMap::from([(
+                    "price".to_string(),
+                    crate::mapping::TransformOp::Number,
+                )]),
+            )]),
+            renames: crate::mapping::Renames::default(),
+            constants: crate::mapping::Constants::default(),
+            id_templates: Default::default(),
+            fan_outs: Default::default(),
+            cfg: EngineConfig::default(),
+            ack_tx,
+            load_done_tx,
+            metrics: metrics.clone(),
+        });
+        for event in [row_doc(7, json!({"id": 7, "price": "abc"})), commit(0x100)] {
+            events_tx.send(event).await.unwrap();
+        }
+        drop(events_tx);
+        run(
+            events_rx,
+            copy_rx,
+            ctx,
+            StreamId {
+                source: SOURCE_POSTGRES.into(),
+                stream: "slot".into(),
+                publication: "pub".into(),
+            },
+            Arc::new(|token| Lsn(token).to_string()),
+            crate::mapping::DurableLsn::default(),
+            shutdown_rx,
+        )
+        .await
+        .expect("a value that will not convert does not stop the pipeline");
+        assert_eq!(sink.doc("7"), Some(json!({"id": 7, "price": "abc"})));
+        assert_eq!(
+            metrics.transform_unconverted_total.load(Ordering::Relaxed),
+            1
+        );
     }
 
     #[tokio::test]

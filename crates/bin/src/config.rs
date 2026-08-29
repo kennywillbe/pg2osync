@@ -4,6 +4,7 @@
 //! plain-text secrets in the file are accepted but warn deprecated.
 
 use anyhow::{Context, Result};
+use pg2osync_engine::mapping::TransformOp;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -238,9 +239,10 @@ pub struct TableSync {
     /// Poll mode turns a matching row into a delete; the initial load skips it.
     #[serde(default)]
     pub soft_delete: Option<String>,
-    /// Column transformations, e.g. email = "hash" | "redact"
+    /// Column transformations: `email = "redact"` for an operation without a
+    /// parameter, `tags = { op = "split", by = "," }` for one with.
     #[serde(default)]
-    pub transform: std::collections::HashMap<String, String>,
+    pub transform: std::collections::HashMap<String, TransformSpec>,
     /// Target field names, source column → field. Applied after every other
     /// rule, so the rest of this section keeps naming source columns.
     #[serde(default)]
@@ -343,6 +345,112 @@ impl Constant {
                     .render(&serde_json::json!({ "schema": schema, "table": table }))
                     .map(serde_json::Value::String)
             }
+        }
+    }
+}
+
+/// One entry of `[sync.x.transform]`: the operation's name alone, or a table
+/// naming it with its parameter.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TransformSpec {
+    Op(String),
+    Table(TransformTable),
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransformTable {
+    pub op: String,
+    #[serde(default)]
+    pub by: Option<String>,
+    #[serde(default)]
+    pub from: Option<String>,
+}
+
+/// Hand-written for the same reason `Constant` is: an untagged enum reports
+/// "did not match any variant" and swallows the table's own error, which is
+/// the one that names a misspelt key.
+impl<'de> Deserialize<'de> for TransformSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Spec;
+        impl<'de> serde::de::Visitor<'de> for Spec {
+            type Value = TransformSpec;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(
+                    "a transform name like \"redact\", or a table like { op = \"split\", by = \",\" }",
+                )
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<TransformSpec, E> {
+                Ok(TransformSpec::Op(v.to_owned()))
+            }
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<TransformSpec, E> {
+                Ok(TransformSpec::Op(v))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<TransformSpec, A::Error> {
+                TransformTable::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(TransformSpec::Table)
+            }
+        }
+        deserializer.deserialize_any(Spec)
+    }
+}
+
+impl TransformSpec {
+    /// The engine operation this names, or why it is not one. Both the
+    /// startup check and the run-time build go through here, so one grammar
+    /// decides what a transform is.
+    pub fn parse(&self) -> std::result::Result<TransformOp, String> {
+        let (op, by, from) = match self {
+            Self::Op(op) => (op.as_str(), None, None),
+            Self::Table(t) => (t.op.as_str(), t.by.as_deref(), t.from.as_deref()),
+        };
+        let refuse = |param: &str| format!("{op:?} takes no {param:?}");
+        match op {
+            "hash" | "redact" | "json" | "number" => {
+                if by.is_some() {
+                    return Err(refuse("by"));
+                }
+                if from.is_some() {
+                    return Err(refuse("from"));
+                }
+                Ok(match op {
+                    "hash" => TransformOp::Hash,
+                    "redact" => TransformOp::Redact,
+                    "json" => TransformOp::Json,
+                    _ => TransformOp::Number,
+                })
+            }
+            "split" => {
+                if from.is_some() {
+                    return Err(refuse("from"));
+                }
+                match by {
+                    None => Err("split needs \"by\": { op = \"split\", by = \",\" }".into()),
+                    Some("") => Err("split needs a non-empty \"by\"".into()),
+                    Some(by) => Ok(TransformOp::Split { by: by.to_string() }),
+                }
+            }
+            "date" => {
+                if by.is_some() {
+                    return Err(refuse("by"));
+                }
+                match from {
+                    None => {
+                        Err("date needs \"from\": { op = \"date\", from = \"%d/%m/%Y\" }".into())
+                    }
+                    Some("") => Err("date needs a non-empty \"from\"".into()),
+                    Some(from) => Ok(TransformOp::Date {
+                        from: from.to_string(),
+                    }),
+                }
+            }
+            other => Err(format!(
+                "{other:?} is not a transform; expected one of \"hash\", \"redact\", \"json\", \
+                 \"split\", \"number\", \"date\""
+            )),
         }
     }
 }
@@ -556,10 +664,16 @@ impl AppConfig {
                     )
                 })?;
             }
-            for (col, op) in &tbl.transform {
-                if op != "hash" && op != "redact" {
+            for (col, spec) in &tbl.transform {
+                spec.parse()
+                    .map_err(|e| anyhow::anyhow!("[sync.{key}.transform] {col}: {e}"))?;
+                // fan-out reads the raw row, before transforms: a split on the
+                // array column would never reach it, and a scalar element
+                // would be re-split afterwards
+                if tbl.fan_out.as_ref().is_some_and(|fan| &fan.field == col) {
                     anyhow::bail!(
-                        "[sync.{key}.transform] {col} = {op:?} must be \"hash\" or \"redact\""
+                        "[sync.{key}.transform] {col} is the fan_out field; fan-out reads the \
+                         raw row, so a transform there never reaches it"
                     );
                 }
             }
@@ -829,6 +943,70 @@ table = "public.users"
             "{MINIMAL}index = \"same\"\n[sync.other]\ntable = \"public.other\"\nindex = \"same\"\n"
         );
         assert!(parse(&duplicate).is_err(), "two tables in one index");
+    }
+
+    #[test]
+    fn transform_specs_are_parsed_and_their_parameters_checked() {
+        let cfg = parse(&format!(
+            "{MINIMAL}[sync.users.transform]\nemail = \"redact\"\nprice = \"number\"\n\
+             payload = {{ op = \"json\" }}\ntags = {{ op = \"split\", by = \",\" }}\n\
+             born = {{ op = \"date\", from = \"%d/%m/%Y\" }}\n"
+        ))
+        .expect("both forms load");
+        let t = &cfg.sync["users"].transform;
+        assert_eq!(t["email"].parse(), Ok(TransformOp::Redact));
+        assert_eq!(t["payload"].parse(), Ok(TransformOp::Json));
+        assert_eq!(t["tags"].parse(), Ok(TransformOp::Split { by: ",".into() }));
+        assert_eq!(
+            t["born"].parse(),
+            Ok(TransformOp::Date {
+                from: "%d/%m/%Y".into()
+            })
+        );
+
+        let refused = [
+            ("tags = { op = \"split\" }", "split without by"),
+            (
+                "tags = { op = \"split\", by = \"\" }",
+                "split with an empty by",
+            ),
+            ("born = { op = \"date\" }", "date without from"),
+            (
+                "born = { op = \"date\", from = \"\" }",
+                "date with an empty from",
+            ),
+            (
+                "email = { op = \"hash\", by = \",\" }",
+                "a parameter hash does not take",
+            ),
+            (
+                "tags = { op = \"split\", by = \",\", from = \"x\" }",
+                "a parameter split does not take",
+            ),
+            ("price = 3", "neither a name nor a table"),
+        ];
+        for (line, why) in refused {
+            assert!(
+                parse(&format!("{MINIMAL}[sync.users.transform]\n{line}\n")).is_err(),
+                "{why}"
+            );
+        }
+        let err = parse(&format!(
+            "{MINIMAL}[sync.users.transform]\ntags = {{ op = \"split\", by = \",\", nope = 1 }}\n"
+        ))
+        .expect_err("an unknown key is refused");
+        assert!(
+            format!("{err:#}").contains("nope"),
+            "the error names the key, which is what the hand-written visitor is for: {err:#}"
+        );
+        assert!(
+            parse(&format!(
+                "{MINIMAL}[sync.users.fan_out]\nfield = \"tags\"\nid = \"u-{{id}}-{{tags}}\"\n\
+                 [sync.users.transform]\ntags = {{ op = \"split\", by = \",\" }}\n"
+            ))
+            .is_err(),
+            "a transform on the fan_out field never reaches fan-out"
+        );
     }
 
     #[test]

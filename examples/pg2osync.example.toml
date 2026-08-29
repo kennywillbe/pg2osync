@@ -87,6 +87,11 @@ exclude_columns = ["password_hash"]
 
 [sync.users.transform]
 email = "redact"                     # "redact" -> "***", "hash" -> SHA-256 prefix
+# Six named ops, no expression language. A value that will not convert is
+# indexed as it is and counted, so the pipeline never halts on one.
+# tags  = { op = "split", by = "," }
+# born  = { op = "date", from = "%d/%m/%Y" }
+# price = "number"
 
 # Store a column under another name. Applied last, so every other option
 # (columns, transform, id, ...) keeps naming the column as the source knows it.

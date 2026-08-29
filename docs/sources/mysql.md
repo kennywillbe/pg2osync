@@ -168,7 +168,7 @@ and the format description of a file resumed into the middle of) move nothing.
 | MySQL type | JSON |
 |---|---|
 | `TINYINT`…`BIGINT`, `YEAR` | number |
-| `DECIMAL`/`NUMERIC` | **string**, with the declared scale preserved (`8.50` stays `8.50`) |
+| `DECIMAL`/`NUMERIC` | **string**, with the declared scale preserved (`8.50` stays `8.50`); `transform = "number"` converts it if you accept float precision |
 | `FLOAT`, `DOUBLE` | number |
 | `DATE`, `DATETIME`, `TIMESTAMP`, `TIME` | string |
 | `CHAR`, `VARCHAR`, `TEXT` family | string |

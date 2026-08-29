@@ -66,19 +66,126 @@ pub struct Transforms {
     map: HashMap<(String, String), HashMap<String, TransformOp>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TransformOp {
     Hash,
     Redact,
+    /// A string that holds a JSON document becomes that document.
+    Json,
+    /// A delimited string becomes an array of its trimmed, non-empty pieces.
+    Split {
+        by: String,
+    },
+    /// A string that holds a number becomes a JSON number.
+    Number,
+    /// A string in `from` (strptime syntax) becomes an ISO 8601 string.
+    Date {
+        from: String,
+    },
 }
 
 impl TransformOp {
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "hash" => Some(Self::Hash),
-            "redact" => Some(Self::Redact),
-            _ => None,
+    /// The name the configuration knows this by, for a message that has to
+    /// say which operation was asked for.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Hash => "hash",
+            Self::Redact => "redact",
+            Self::Json => "json",
+            Self::Split { .. } => "split",
+            Self::Number => "number",
+            Self::Date { .. } => "date",
         }
+    }
+}
+
+/// What one operation did to one value.
+///
+/// `AlreadyShaped` is what makes the reshaping ops idempotent: a value that
+/// is already what the op produces is not a failure, so a replayed row
+/// reports nothing and the counter stays a signal rather than a hum.
+enum Applied {
+    Converted(serde_json::Value),
+    AlreadyShaped,
+    Unconvertible,
+}
+
+fn apply_op(op: &TransformOp, v: &serde_json::Value) -> Applied {
+    use serde_json::Value;
+    match op {
+        TransformOp::Redact => Applied::Converted(Value::String("***".into())),
+        TransformOp::Hash => {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(v.to_string().as_bytes());
+            let h = hasher.finalize();
+            Applied::Converted(Value::String(
+                h.iter().map(|b| format!("{b:02x}")).collect::<String>()[..16].to_string(),
+            ))
+        }
+        // A JSON column legitimately holds a bare number or bool, and json /
+        // jsonb columns already arrive parsed, so anything but a string is
+        // taken to be the document itself rather than counted against the op.
+        TransformOp::Json => match v {
+            Value::String(s) => {
+                serde_json::from_str(s).map_or(Applied::Unconvertible, Applied::Converted)
+            }
+            _ => Applied::AlreadyShaped,
+        },
+        // `by` is never empty here: the configuration refuses it, and an
+        // empty pattern would split between every character.
+        TransformOp::Split { by } => match v {
+            Value::String(s) => Applied::Converted(Value::Array(
+                s.split(by.as_str())
+                    .map(str::trim)
+                    .filter(|piece| !piece.is_empty())
+                    .map(|piece| Value::String(piece.to_string()))
+                    .collect(),
+            )),
+            Value::Array(_) => Applied::AlreadyShaped,
+            _ => Applied::Unconvertible,
+        },
+        // Integers first: 9007199254740993 is exact as an i64 and lossy as a
+        // double, and money is why these arrive as strings to begin with.
+        // `from_f64` refuses what Rust parses but JSON cannot hold (NaN, inf,
+        // 1e400), so those count as unconvertible instead of panicking.
+        TransformOp::Number => match v {
+            Value::String(s) => {
+                let s = s.trim();
+                if let Ok(i) = s.parse::<i64>() {
+                    Applied::Converted(Value::from(i))
+                } else if let Some(n) = s.parse::<f64>().ok().and_then(serde_json::Number::from_f64)
+                {
+                    Applied::Converted(Value::Number(n))
+                } else {
+                    Applied::Unconvertible
+                }
+            }
+            Value::Number(_) => Applied::AlreadyShaped,
+            _ => Applied::Unconvertible,
+        },
+        // Each of chrono's parsers demands exactly the fields its type has: a
+        // format carrying an offset parses only into DateTime, a date-only
+        // format only into NaiveDate. Most specific first, so a value that
+        // carries an offset keeps it instead of having it silently dropped.
+        // This op is not idempotent (an ISO value will not parse through
+        // `%d/%m/%Y`), but no value meets it twice: a completed TOAST column
+        // is skipped, and probing for "already ISO" would hide a wrong `from`.
+        TransformOp::Date { from } => match v {
+            Value::String(s) => {
+                let s = s.trim();
+                if let Ok(dt) = chrono::DateTime::<chrono::FixedOffset>::parse_from_str(s, from) {
+                    Applied::Converted(Value::String(dt.to_rfc3339()))
+                } else if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, from) {
+                    Applied::Converted(Value::String(dt.format("%Y-%m-%dT%H:%M:%S").to_string()))
+                } else if let Ok(d) = chrono::NaiveDate::parse_from_str(s, from) {
+                    Applied::Converted(Value::String(d.format("%Y-%m-%d").to_string()))
+                } else {
+                    Applied::Unconvertible
+                }
+            }
+            _ => Applied::Unconvertible,
+        },
     }
 }
 
@@ -97,48 +204,49 @@ impl Transforms {
 
     /// Apply configured transforms in place to a document.
     pub fn apply(&self, schema: &str, table: &str, doc: &mut serde_json::Value) {
+        // the caller has nowhere to report to; the engine uses apply_except
         self.apply_except(schema, table, doc, &[]);
     }
 
     /// The same, leaving `shaped` columns alone: a value completed from the
     /// stored document was transformed when it was first written, and a hash
     /// of a hash would never match what a fresh write of the row produces.
-    pub fn apply_except(
-        &self,
+    ///
+    /// Returns the columns whose value the operation could not convert. Those
+    /// values are written exactly as they arrived: the target's mapping is the
+    /// arbiter of what it will hold, and halting the pipeline on one row — or
+    /// nulling the field — would cost more than it saves.
+    pub fn apply_except<'a>(
+        &'a self,
         schema: &str,
         table: &str,
         doc: &mut serde_json::Value,
         shaped: &[String],
-    ) {
+    ) -> Vec<&'a str> {
+        let mut left = Vec::new();
         let Some(rules) = self.for_table(schema, table) else {
-            return;
+            return left;
         };
         let Some(doc_map) = doc.as_object_mut() else {
-            return;
+            return left;
         };
         for (col, op) in rules {
             if shaped.contains(col) {
                 continue;
             }
             if let Some(v) = doc_map.get_mut(col) {
+                // NULL carries no value to reshape
                 if v.is_null() {
                     continue;
                 }
-                *v = match op {
-                    TransformOp::Redact => serde_json::Value::String("***".into()),
-                    TransformOp::Hash => {
-                        use sha2::{Digest, Sha256};
-                        let mut hasher = Sha256::new();
-                        hasher.update(v.to_string().as_bytes());
-                        let h = hasher.finalize();
-                        serde_json::Value::String(
-                            h.iter().map(|b| format!("{b:02x}")).collect::<String>()[..16]
-                                .to_string(),
-                        )
-                    }
-                };
+                match apply_op(op, v) {
+                    Applied::Converted(new) => *v = new,
+                    Applied::AlreadyShaped => {}
+                    Applied::Unconvertible => left.push(col.as_str()),
+                }
             }
         }
+        left
     }
 }
 
@@ -604,6 +712,164 @@ mod tests {
         let mut doc = json!({"ssn": "already-a-digest"});
         t.apply_except("public", "users", &mut doc, &["ssn".to_string()]);
         assert_eq!(doc, json!({"ssn": "already-a-digest"}));
+    }
+
+    fn users_transforms(pairs: &[(&str, TransformOp)]) -> Transforms {
+        Transforms::from_pairs([(
+            ("public".into(), "users".into()),
+            pairs
+                .iter()
+                .map(|(col, op)| (col.to_string(), op.clone()))
+                .collect(),
+        )])
+    }
+
+    #[test]
+    fn json_parses_a_string_and_leaves_objects_and_garbage_alone() {
+        let t = users_transforms(&[
+            ("payload", TransformOp::Json),
+            ("already", TransformOp::Json),
+            ("bare", TransformOp::Json),
+            ("broken", TransformOp::Json),
+        ]);
+        let mut doc = json!({
+            "payload": "{\"k\": 1}",
+            "already": {"k": 2},
+            "bare": 3,
+            "broken": "not json",
+        });
+        let left = t.apply_except("public", "users", &mut doc, &[]);
+        assert_eq!(doc["payload"], json!({"k": 1}));
+        assert_eq!(
+            doc["already"],
+            json!({"k": 2}),
+            "a parsed column is the document"
+        );
+        assert_eq!(doc["bare"], json!(3));
+        assert_eq!(doc["broken"], json!("not json"), "left as it arrived");
+        assert_eq!(left, vec!["broken"], "only garbage counts");
+    }
+
+    #[test]
+    fn split_trims_and_drops_empty_pieces() {
+        let by = || TransformOp::Split { by: ",".into() };
+        let t = users_transforms(&[
+            ("tags", by()),
+            ("none", by()),
+            ("done", by()),
+            ("num", by()),
+        ]);
+        let mut doc = json!({"tags": "a, b ,,c", "none": "", "done": ["x"], "num": 4});
+        let left = t.apply_except("public", "users", &mut doc, &[]);
+        assert_eq!(doc["tags"], json!(["a", "b", "c"]));
+        assert_eq!(doc["none"], json!([]), "an empty string names no pieces");
+        assert_eq!(doc["done"], json!(["x"]));
+        assert_eq!(doc["num"], json!(4));
+        assert_eq!(left, vec!["num"]);
+    }
+
+    #[test]
+    fn number_parses_integers_and_floats_and_leaves_the_rest() {
+        let t = users_transforms(&[
+            ("int", TransformOp::Number),
+            ("big", TransformOp::Number),
+            ("float", TransformOp::Number),
+            ("nan", TransformOp::Number),
+            ("huge", TransformOp::Number),
+            ("word", TransformOp::Number),
+            ("done", TransformOp::Number),
+        ]);
+        let mut doc = json!({
+            "int": " 42 ", "big": "9007199254740993", "float": "99.99",
+            "nan": "NaN", "huge": "1e400", "word": "abc", "done": 7,
+        });
+        let mut left = t.apply_except("public", "users", &mut doc, &[]);
+        left.sort_unstable();
+        assert!(
+            doc["int"].is_i64(),
+            "an integer stays an integer, not a double"
+        );
+        assert_eq!(doc["big"], json!(9007199254740993i64), "exact past 2^53");
+        assert_eq!(doc["float"], json!(99.99));
+        assert_eq!(
+            doc["nan"],
+            json!("NaN"),
+            "JSON has no NaN; the value is left, not nulled"
+        );
+        assert_eq!(doc["huge"], json!("1e400"));
+        assert_eq!(doc["word"], json!("abc"));
+        assert_eq!(doc["done"], json!(7));
+        assert_eq!(left, vec!["huge", "nan", "word"]);
+    }
+
+    #[test]
+    fn date_normalizes_to_iso_8601_by_trying_offset_then_naive_then_date() {
+        let t = users_transforms(&[
+            (
+                "day",
+                TransformOp::Date {
+                    from: "%d/%m/%Y".into(),
+                },
+            ),
+            (
+                "at",
+                TransformOp::Date {
+                    from: "%Y-%m-%d %H:%M:%S".into(),
+                },
+            ),
+            (
+                "zoned",
+                TransformOp::Date {
+                    from: "%Y-%m-%dT%H:%M:%S%z".into(),
+                },
+            ),
+            (
+                "bad",
+                TransformOp::Date {
+                    from: "%d/%m/%Y".into(),
+                },
+            ),
+            (
+                "num",
+                TransformOp::Date {
+                    from: "%d/%m/%Y".into(),
+                },
+            ),
+        ]);
+        let mut doc = json!({
+            "day": "01/03/2024", "at": "2024-03-01 10:00:00",
+            "zoned": "2024-03-01T10:00:00+0200", "bad": "nope", "num": 5,
+        });
+        let mut left = t.apply_except("public", "users", &mut doc, &[]);
+        left.sort_unstable();
+        assert_eq!(doc["day"], json!("2024-03-01"));
+        assert_eq!(doc["at"], json!("2024-03-01T10:00:00"));
+        assert_eq!(
+            doc["zoned"],
+            json!("2024-03-01T10:00:00+02:00"),
+            "the offset is kept"
+        );
+        assert_eq!(doc["bad"], json!("nope"));
+        assert_eq!(left, vec!["bad", "num"]);
+    }
+
+    #[test]
+    fn a_null_is_left_alone_by_every_op_and_counts_for_none() {
+        let t = users_transforms(&[
+            ("a", TransformOp::Hash),
+            ("b", TransformOp::Redact),
+            ("c", TransformOp::Json),
+            ("d", TransformOp::Split { by: ",".into() }),
+            ("e", TransformOp::Number),
+            ("f", TransformOp::Date { from: "%Y".into() }),
+        ]);
+        let mut doc = json!({"a": null, "b": null, "c": null, "d": null, "e": null, "f": null});
+        let left = t.apply_except("public", "users", &mut doc, &[]);
+        assert_eq!(
+            doc,
+            json!({"a": null, "b": null, "c": null, "d": null, "e": null, "f": null})
+        );
+        assert!(left.is_empty());
     }
 
     #[test]
