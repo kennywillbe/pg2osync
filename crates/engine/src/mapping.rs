@@ -97,6 +97,19 @@ impl Transforms {
 
     /// Apply configured transforms in place to a document.
     pub fn apply(&self, schema: &str, table: &str, doc: &mut serde_json::Value) {
+        self.apply_except(schema, table, doc, &[]);
+    }
+
+    /// The same, leaving `shaped` columns alone: a value completed from the
+    /// stored document was transformed when it was first written, and a hash
+    /// of a hash would never match what a fresh write of the row produces.
+    pub fn apply_except(
+        &self,
+        schema: &str,
+        table: &str,
+        doc: &mut serde_json::Value,
+        shaped: &[String],
+    ) {
         let Some(rules) = self.for_table(schema, table) else {
             return;
         };
@@ -104,6 +117,9 @@ impl Transforms {
             return;
         };
         for (col, op) in rules {
+            if shaped.contains(col) {
+                continue;
+            }
             if let Some(v) = doc_map.get_mut(col) {
                 if v.is_null() {
                     continue;
@@ -153,10 +169,6 @@ impl Renames {
         }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
-    }
-
     /// The name `col` of `schema.table` is stored under in the target — the
     /// column itself when nothing renames it. TOAST completion reads the
     /// stored document, which is the one place the target name leaks back
@@ -201,6 +213,42 @@ fn rename_keys(
         .collect();
     for (to, v) in moved {
         obj.insert(to.clone(), v);
+    }
+}
+
+/// Per-table fields that come from no column, from `[sync.x.constants]`.
+///
+/// The values arrive rendered: `{schema}`/`{table}` were resolved once at
+/// startup, so nothing per row parses a template and the engine only inserts
+/// what it was handed. Applied after projection, transforms and renames —
+/// a constant is not a column, so `columns` would otherwise strip it.
+#[derive(Debug, Clone, Default)]
+pub struct Constants {
+    map: HashMap<(String, String), HashMap<String, serde_json::Value>>,
+}
+
+impl Constants {
+    pub fn from_pairs(
+        pairs: impl IntoIterator<Item = ((String, String), HashMap<String, serde_json::Value>)>,
+    ) -> Self {
+        Self {
+            map: pairs.into_iter().collect(),
+        }
+    }
+
+    /// Add the section's constants in place; a field of the same name is
+    /// overwritten, which is the one deterministic reading of a collision
+    /// the configuration checks could not see.
+    pub fn apply(&self, schema: &str, table: &str, doc: &mut serde_json::Value) {
+        let Some(fields) = self.map.get(&(schema.to_string(), table.to_string())) else {
+            return;
+        };
+        let Some(obj) = doc.as_object_mut() else {
+            return;
+        };
+        for (name, value) in fields {
+            obj.insert(name.clone(), value.clone());
+        }
     }
 }
 
@@ -548,6 +596,17 @@ mod tests {
     }
 
     #[test]
+    fn a_column_already_shaped_is_left_alone() {
+        let t = Transforms::from_pairs([(
+            ("public".into(), "users".into()),
+            HashMap::from([("ssn".to_string(), TransformOp::Hash)]),
+        )]);
+        let mut doc = json!({"ssn": "already-a-digest"});
+        t.apply_except("public", "users", &mut doc, &["ssn".to_string()]);
+        assert_eq!(doc, json!({"ssn": "already-a-digest"}));
+    }
+
+    #[test]
     fn hashing_is_deterministic() {
         let rules = HashMap::from([("v".to_string(), TransformOp::Hash)]);
         let t = Transforms::from_pairs([(("s".into(), "t".into()), rules)]);
@@ -637,6 +696,36 @@ mod tests {
         assert_eq!(r.target_name("public", "users", "bio"), "about");
         assert_eq!(r.target_name("public", "users", "id"), "id");
         assert_eq!(r.target_name("public", "orders", "bio"), "bio");
+    }
+
+    fn users_constants(pairs: &[(&str, serde_json::Value)]) -> Constants {
+        Constants::from_pairs([(
+            ("public".into(), "users".into()),
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+        )])
+    }
+
+    #[test]
+    fn constants_are_added_and_leave_other_tables_alone() {
+        let c = users_constants(&[("entity", json!("user")), ("rank", json!(3))]);
+        let mut doc = json!({"id": 1});
+        c.apply("public", "users", &mut doc);
+        assert_eq!(doc, json!({"id": 1, "entity": "user", "rank": 3}));
+
+        let mut other = json!({"id": 1});
+        c.apply("public", "orders", &mut other);
+        assert_eq!(other, json!({"id": 1}));
+    }
+
+    #[test]
+    fn a_constant_wins_over_a_field_of_the_same_name() {
+        let c = users_constants(&[("entity", json!("user"))]);
+        let mut doc = json!({"entity": "row"});
+        c.apply("public", "users", &mut doc);
+        assert_eq!(doc, json!({"entity": "user"}));
     }
 
     #[test]

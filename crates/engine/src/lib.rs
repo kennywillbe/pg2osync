@@ -147,6 +147,9 @@ pub struct PipelineCtx {
     pub transforms: crate::mapping::Transforms,
     /// Target field names; applied after everything else has shaped the document.
     pub renames: crate::mapping::Renames,
+    /// Fields that come from no column; added last, so a projection cannot
+    /// strip them.
+    pub constants: crate::mapping::Constants,
     /// Configured document ids; a table with no entry keeps `pk_to_id`.
     pub id_templates: crate::mapping::IdTemplates,
     /// Tables whose rows fan out into one document per array element.
@@ -435,6 +438,7 @@ pub async fn run(
                     projections: &ctx.projections,
                     transforms: &ctx.transforms,
                     renames: &ctx.renames,
+                    constants: &ctx.constants,
                     id_templates: &ctx.id_templates,
                     fan_outs: &ctx.fan_outs,
                 };
@@ -981,13 +985,14 @@ async fn fetch_completions(
 const COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// The per-table rules that decide what a row becomes in the target:
-/// projection, transforms, field renames, the document id, and whether one
-/// row fans out into many documents. Everything that mints an `_id` goes
-/// through here.
+/// projection, transforms, field renames, constants, the document id, and
+/// whether one row fans out into many documents. Everything that mints an
+/// `_id` goes through here.
 pub struct Rules<'a> {
     pub projections: &'a crate::mapping::Projections,
     pub transforms: &'a crate::mapping::Transforms,
     pub renames: &'a crate::mapping::Renames,
+    pub constants: &'a crate::mapping::Constants,
     pub id_templates: &'a crate::mapping::IdTemplates,
     pub fan_outs: &'a crate::mapping::FanOuts,
 }
@@ -1114,7 +1119,8 @@ fn materialize(
     let halt = |e: String| CoreError::Other(format!("{}.{}: {e}", table.0, table.1));
     // Identity renders from the row's RAW values, so every derivation below
     // reads the document before projections and transforms touch it; renames
-    // run last of all, so nothing but the target ever sees the new names.
+    // run after those, so nothing but the target ever sees the new names, and
+    // constants after that: they are not columns, a projection would strip them.
     let fan = rules.fan_outs.for_table(table.0, table.1);
     let shape = |base: &str, doc: &Value| -> Result<Vec<(String, Value)>, CoreError> {
         match fan {
@@ -1122,12 +1128,18 @@ fn materialize(
             Some(rule) => crate::mapping::fan_out_docs(rule, base, doc).map_err(halt),
         }
     };
-    let finish = |docs: Vec<(String, Value)>| -> Vec<LsnOp> {
+    // `shaped` names the columns completed from the stored document: they
+    // went through the transforms when they were first written, so they must
+    // not go through them again
+    let finish = |docs: Vec<(String, Value)>, shaped: &[String]| -> Vec<LsnOp> {
         docs.into_iter()
             .map(|(id, mut doc)| {
                 rules.projections.apply(table.0, table.1, &mut doc);
-                rules.transforms.apply(table.0, table.1, &mut doc);
+                rules
+                    .transforms
+                    .apply_except(table.0, table.1, &mut doc, shaped);
                 rules.renames.apply(table.0, table.1, &mut doc);
+                rules.constants.apply(table.0, table.1, &mut doc);
                 upsert(id, doc)
             })
             .collect()
@@ -1135,7 +1147,7 @@ fn materialize(
     match kind {
         RowKind::Insert { pk, doc } => {
             let base = derived_id(table, pk, Some(doc), None, rules.id_templates)?;
-            Ok(finish(shape(&base, doc)?))
+            Ok(finish(shape(&base, doc)?, &[]))
         }
         RowKind::Update {
             pk,
@@ -1145,6 +1157,7 @@ fn materialize(
             before,
         } => {
             let mut doc = doc.clone();
+            let mut completed = Vec::new();
             if !unchanged_toast_columns.is_empty()
                 && let Some(Value::Object(prev_map)) = previous
                 && let Value::Object(doc_map) = &mut doc
@@ -1155,13 +1168,14 @@ fn materialize(
                     let stored = rules.renames.target_name(table.0, table.1, col);
                     if let Some(v) = prev_map.get(stored) {
                         doc_map.insert(col.clone(), v.clone());
+                        completed.push(col.clone());
                     }
                 }
             }
             let before = before.as_ref();
             let base = derived_id(table, pk, Some(&doc), before, rules.id_templates)?;
             let new_docs = shape(&base, &doc)?;
-            let mut ops = finish(new_docs.clone());
+            let mut ops = finish(new_docs.clone(), &completed);
             // write first, delete second: a crash between them leaves a
             // duplicate that the replay repairs, where the reverse order would
             // leave a gap that nothing repairs
@@ -1545,6 +1559,7 @@ mod pipeline_tests {
             projections: crate::mapping::Projections::default(),
             transforms: crate::mapping::Transforms::default(),
             renames: crate::mapping::Renames::default(),
+            constants: crate::mapping::Constants::default(),
             id_templates: crate::mapping::IdTemplates::default(),
             fan_outs: crate::mapping::FanOuts::default(),
             cfg,
@@ -2412,11 +2427,29 @@ mod pipeline_tests {
         renames: crate::mapping::Renames,
         script: Vec<ChangeEvent>,
     ) -> Arc<RecordingSink> {
+        drive_rules_shaped(
+            ids,
+            fan,
+            renames,
+            crate::mapping::Constants::default(),
+            script,
+        )
+        .await
+    }
+
+    async fn drive_rules_shaped(
+        ids: crate::mapping::IdTemplates,
+        fan: crate::mapping::FanOuts,
+        renames: crate::mapping::Renames,
+        constants: crate::mapping::Constants,
+        script: Vec<ChangeEvent>,
+    ) -> Arc<RecordingSink> {
         drive_rules_at(
             500,
             ids,
             fan,
             renames,
+            constants,
             Arc::new(RecordingSink::default()),
             script,
         )
@@ -2428,6 +2461,7 @@ mod pipeline_tests {
         ids: crate::mapping::IdTemplates,
         fan: crate::mapping::FanOuts,
         renames: crate::mapping::Renames,
+        constants: crate::mapping::Constants,
         sink: Arc<RecordingSink>,
         script: Vec<ChangeEvent>,
     ) -> Arc<RecordingSink> {
@@ -2446,6 +2480,7 @@ mod pipeline_tests {
             projections: crate::mapping::Projections::default(),
             transforms: crate::mapping::Transforms::default(),
             renames,
+            constants,
             id_templates: ids,
             fan_outs: fan,
             cfg: EngineConfig {
@@ -2520,6 +2555,166 @@ mod pipeline_tests {
         )])
     }
 
+    fn users_constants(pairs: &[(&str, Value)]) -> crate::mapping::Constants {
+        crate::mapping::Constants::from_pairs([(
+            ("public".to_string(), "users".to_string()),
+            pairs
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.clone()))
+                .collect(),
+        )])
+    }
+
+    #[tokio::test]
+    async fn a_constant_field_is_written_on_every_document() {
+        let sink = drive_rules_shaped(
+            crate::mapping::IdTemplates::default(),
+            crate::mapping::FanOuts::default(),
+            crate::mapping::Renames::default(),
+            users_constants(&[("entity", json!("user"))]),
+            vec![row_doc(7, json!({"id": 7})), commit(0x100)],
+        )
+        .await;
+        assert_eq!(sink.doc("7"), Some(json!({"id": 7, "entity": "user"})));
+    }
+
+    #[tokio::test]
+    async fn every_fanned_element_carries_the_constants() {
+        let sink = drive_rules_shaped(
+            users_ids("user-{id}", &["id"]),
+            users_fan("tags", "user-{id}-{tags}"),
+            crate::mapping::Renames::default(),
+            users_constants(&[("kind", json!("tag"))]),
+            vec![
+                row_doc(7, json!({"id": 7, "tags": ["a", "b"]})),
+                commit(0x100),
+            ],
+        )
+        .await;
+        for id in ["user-7-a", "user-7-b"] {
+            assert_eq!(
+                sink.doc(id).and_then(|d| d.get("kind").cloned()),
+                Some(json!("tag")),
+                "{id} is shaped on its own, so it carries the constant too"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_constant_survives_an_include_projection() {
+        // `columns` keeps only what it lists; a constant is not a column, so
+        // it has to be added after the projection or it would never arrive
+        let (events_tx, events_rx) = mpsc::channel(4);
+        let (copy_tx, copy_rx) = mpsc::channel(4);
+        // the engine runs until both channels close
+        drop(copy_tx);
+        let (ack_tx, _ack_rx) = watch::channel(None);
+        let (load_done_tx, _load_done_rx) = watch::channel(0u64);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sink = Arc::new(RecordingSink::default());
+        let ctx = Arc::new(PipelineCtx {
+            sink: sink.clone(),
+            mapping: TableMapping::from_pairs([(
+                ("public".to_string(), "users".to_string()),
+                "users".to_string(),
+            )]),
+            projections: crate::mapping::Projections::from_pairs([(
+                ("public".to_string(), "users".to_string()),
+                crate::mapping::Projection::Include(vec!["id".into()]),
+            )]),
+            transforms: crate::mapping::Transforms::default(),
+            renames: crate::mapping::Renames::default(),
+            constants: users_constants(&[("entity", json!("user"))]),
+            id_templates: Default::default(),
+            fan_outs: Default::default(),
+            cfg: EngineConfig::default(),
+            ack_tx,
+            load_done_tx,
+            metrics: Arc::new(crate::metrics::Metrics::default()),
+        });
+        for event in [row_doc(7, json!({"id": 7, "name": "x"})), commit(0x100)] {
+            events_tx.send(event).await.unwrap();
+        }
+        drop(events_tx);
+        run(
+            events_rx,
+            copy_rx,
+            ctx,
+            StreamId {
+                source: SOURCE_POSTGRES.into(),
+                stream: "slot".into(),
+                publication: "pub".into(),
+            },
+            Arc::new(|token| Lsn(token).to_string()),
+            crate::mapping::DurableLsn::default(),
+            shutdown_rx,
+        )
+        .await
+        .expect("engine ran");
+        assert_eq!(sink.doc("7"), Some(json!({"id": 7, "entity": "user"})));
+    }
+
+    #[tokio::test]
+    async fn toast_completion_does_not_transform_the_stored_value_again() {
+        // the stored value is already a digest; hashing it once more would
+        // make the completed row disagree with a fresh write of the same row
+        let (events_tx, events_rx) = mpsc::channel(4);
+        let (copy_tx, copy_rx) = mpsc::channel(4);
+        drop(copy_tx);
+        let (ack_tx, _ack_rx) = watch::channel(None);
+        let (load_done_tx, _load_done_rx) = watch::channel(0u64);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sink = Arc::new(RecordingSink::default());
+        sink.store(json!({"bio": "already-a-digest"}));
+        let ctx = Arc::new(PipelineCtx {
+            sink: sink.clone(),
+            mapping: TableMapping::from_pairs([(
+                ("public".to_string(), "users".to_string()),
+                "users".to_string(),
+            )]),
+            projections: crate::mapping::Projections::default(),
+            transforms: crate::mapping::Transforms::from_pairs([(
+                ("public".to_string(), "users".to_string()),
+                std::collections::HashMap::from([(
+                    "bio".to_string(),
+                    crate::mapping::TransformOp::Hash,
+                )]),
+            )]),
+            renames: crate::mapping::Renames::default(),
+            constants: crate::mapping::Constants::default(),
+            id_templates: Default::default(),
+            fan_outs: Default::default(),
+            cfg: EngineConfig::default(),
+            ack_tx,
+            load_done_tx,
+            metrics: Arc::new(crate::metrics::Metrics::default()),
+        });
+        for event in [moved(1, 2, &["bio"]), commit(0x900)] {
+            events_tx.send(event).await.unwrap();
+        }
+        drop(events_tx);
+        run(
+            events_rx,
+            copy_rx,
+            ctx,
+            StreamId {
+                source: SOURCE_POSTGRES.into(),
+                stream: "slot".into(),
+                publication: "pub".into(),
+            },
+            Arc::new(|token| Lsn(token).to_string()),
+            crate::mapping::DurableLsn::default(),
+            shutdown_rx,
+        )
+        .await
+        .expect("engine ran");
+        assert_eq!(
+            sink.doc("2"),
+            Some(json!({"id": 2, "bio": "already-a-digest"})),
+            "a completed column keeps the digest it was stored with"
+        );
+    }
+
     #[tokio::test]
     async fn a_renamed_field_is_written_under_its_target_name() {
         let sink = drive_rules_with(
@@ -2555,6 +2750,7 @@ mod pipeline_tests {
             crate::mapping::IdTemplates::default(),
             crate::mapping::FanOuts::default(),
             users_renames(&[("bio", "about")]),
+            crate::mapping::Constants::default(),
             sink,
             vec![moved(1, 2, &["bio"]), commit(0x900)],
         )
@@ -2628,6 +2824,7 @@ mod pipeline_tests {
             projections: crate::mapping::Projections::default(),
             transforms: crate::mapping::Transforms::default(),
             renames: crate::mapping::Renames::default(),
+            constants: crate::mapping::Constants::default(),
             id_templates: users_ids("user-{tenant}", &["tenant"]),
             fan_outs: Default::default(),
             cfg: EngineConfig::default(),

@@ -133,6 +133,7 @@ One section per table. `<key>` is the index name when `index` is omitted.
 | `exclude_columns` | All columns except these; mutually exclusive with `columns` |
 | `transform` | Map of column to `"hash"` or `"redact"` |
 | `fields` | Map of source column to target field name; applied last, see [Field names](#field-names) |
+| `constants` | Map of field name to a literal value added to every document; `{schema}`/`{table}` in a string render at startup, see [Constant fields](#constant-fields) |
 | `poll_column` | Poll mode: overrides `[source] poll_column` for this table |
 | `soft_delete` | SQL predicate marking a row as deleted, e.g. `deleted_at IS NOT NULL` |
 | `mapping_file` | JSON mapping to create the index with, see below |
@@ -142,9 +143,9 @@ Projection and transforms apply to every path — initial load, live streaming a
 poll mode — so an excluded column never reaches the target. The primary key is
 read before projection, so excluding a key column is rejected at load time
 (it would collide document ids). Ids, likewise, render from the row's raw
-values: before projection and before transforms. `fields` renames run
-**last**, after projection and transforms; every other option names the column
-as the source knows it.
+values: before projection and before transforms. `fields` renames run after
+projection and transforms, and `constants` are added after that; every other
+option names the column as the source knows it.
 
 ### Document ids
 
@@ -244,6 +245,45 @@ itself renamed away.
   new name.
 - `mapping_file` must declare the **renamed** names: the mapping is compared
   against the index, never against the table.
+
+### Constant fields
+
+A tag several indices can be queried by, or a marker of where a document came
+from, needs no column. `constants` adds a literal value to every document of
+the section:
+
+```toml
+[sync.users]
+table = "public.users"
+
+[sync.users.constants]
+entity = "user"
+tenant = "eu"
+origin = "{schema}.{table}"
+rank = 3
+active = true
+```
+
+Scalars only — string, integer, float, boolean; arrays, tables and datetimes
+are refused at load. `{schema}` and `{table}` are the only placeholders,
+allowed only inside a string and rendered **once at startup**, so a string
+naming any other placeholder (or with a malformed `{`) is refused at load. A
+string without `{` is taken verbatim; there is no way to write a literal `{`.
+
+Constants are added **last** — after identity, fan-out, projection, transforms
+and renames — because `columns` would otherwise strip a field that is not a
+column. Every fanned element document carries them; child arrays do not.
+
+Refused at load: a name that is a rename target, a surviving entry of
+`columns` (one not itself renamed away), a child `field` (or its
+`_truncated`/`_total`), or the `fan_out.field`. `validate` additionally
+refuses a name that equals a live column the projection keeps. A name equal
+to a rename *key* is fine: that column leaves the document first. At write
+time the constant wins.
+
+- `mapping_file` is compared for containment, so a constant it does not name
+  gets whatever dynamic mapping infers from the first document; declare it
+  there if the type matters.
 
 ### Soft deletes
 

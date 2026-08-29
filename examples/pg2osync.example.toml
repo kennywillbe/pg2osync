@@ -93,6 +93,12 @@ email = "redact"                     # "redact" -> "***", "hash" -> SHA-256 pref
 [sync.users.fields]
 # usr_nm = "username"
 
+# Fields that come from no column: literals added to every document, last, so
+# projection cannot strip them. Only {schema} and {table} render, at startup.
+[sync.users.constants]
+# entity = "user"
+# origin = "{schema}.{table}"
+
 # Nested children: embed a one-to-many relation as a JSON array (one level).
 # Child tables should have REPLICA IDENTITY FULL so deletes can find the parent.
 # [sync.customers]

@@ -77,6 +77,10 @@ email = "redact"
 metadata = "meta"
 email = "contact"
 
+[sync.users.constants]
+entity = "user"
+origin = "{schema}.{table}"
+
 [sync.customers]
 table = "public.customers"
 index = "e2e_customers"
@@ -132,6 +136,15 @@ else
   ok "validate refuses renaming a column that is excluded"
 fi
 rm -f "${CONFIG}.bad"
+# users projects with exclude_columns, so config load cannot see that a
+# constant collides with the real name column — only the catalogue can
+sed 's/^entity = "user"/name = "x"/' "$CONFIG" > "${CONFIG}.bad"
+if $BIN validate -c "${CONFIG}.bad" > /dev/null 2>&1; then
+  bad "validate accepted a constant that would bury a column"
+else
+  ok "validate refuses a constant that would bury a column"
+fi
+rm -f "${CONFIG}.bad"
 
 say "2. bootstrap creates objects without streaming"
 $BIN bootstrap -c "$CONFIG" > /dev/null
@@ -155,6 +168,8 @@ check "the source name is gone after the rename" "$(os_has e2e_users 1 email)" "
 check "a child column is renamed inside the array" \
   "$(curl -s "$OS/e2e_customers/_doc/1" | jqf "sorted(k for k in d['_source']['orders'][0] if k in ('total','amount'))")" \
   "['amount']"
+check "a constant is added to every document" "$(os_field e2e_users 1 entity)" "user"
+check "the origin placeholder is rendered" "$(os_field e2e_users 1 origin)" "public.users"
 check "children attached during backfill" "$(os_len e2e_customers 1 orders)" "2"
 # a second collection exercises the multi-join path of the initial load
 check "second collection attached too" "$(os_len e2e_customers 1 tickets)" "1"
@@ -914,6 +929,9 @@ id = "fan-{id}"
 [sync.fan.fan_out]
 field = "tags"
 id = "fan-{id}-{tags}"
+
+[sync.fan.constants]
+kind = "tag"
 TOML
 fan_cleanup() {
   pkill -9 -f "pg2osync run" 2> /dev/null || true
@@ -945,6 +963,7 @@ for _ in $(seq 1 60); do
 done
 check "the load fans each array out into its own document" "$(os_count e2e_fan)" "3"
 check "element documents carry the configured id" "$(os_status e2e_fan fan-1-a)" "200"
+check "every fanned element carries the constants" "$(os_field e2e_fan fan-1-a kind)" "tag"
 check "a NULL array keeps the row itself, under the base id" "$(os_status e2e_fan fan-3)" "200"
 check "an empty array emits nothing" "$(os_status e2e_fan fan-2)" "404"
 
