@@ -50,6 +50,7 @@ async fn main() -> Result<()> {
         children: Default::default(),
         child_parents: Default::default(),
         parent_pk_columns: Default::default(),
+        key_columns: Default::default(),
     };
 
     let admin = pg2osync_source::tls::connect(&tls, &url).await?;
