@@ -191,37 +191,51 @@ impl OpenSearchSink {
     /// version, so its delete is refused and it stays — and once every
     /// remaining document is one of those, the round deletes nothing and the
     /// loop is done.
-    async fn truncate_at_version(&self, index: &str, version: i64) -> Result<(), CoreError> {
+    async fn truncate_at_version(
+        &self,
+        index: &str,
+        version: i64,
+        query: &Value,
+    ) -> Result<(), CoreError> {
         const PAGE: usize = 1000;
         loop {
             let resp = self
                 .client
                 .search(opensearch::SearchParts::Index(&[index]))
-                .body(json!({"size": PAGE, "_source": false, "query": {"match_all": {}}}))
+                .body(json!({"size": PAGE, "_source": false, "query": query}))
                 .send()
                 .await
                 .map_err(http_err)?;
             let body: Value = resp.json().await.map_err(http_err)?;
-            let ids: Vec<String> = body["hits"]["hits"]
+            // a join child lives on its parent's shard, and the delete has to
+            // name that shard the way the write did
+            let hits: Vec<(String, Option<String>)> = body["hits"]["hits"]
                 .as_array()
                 .map(|hits| {
                     hits.iter()
-                        .filter_map(|hit| hit["_id"].as_str().map(str::to_string))
+                        .filter_map(|hit| {
+                            hit["_id"].as_str().map(|id| {
+                                (id.to_string(), hit["_routing"].as_str().map(str::to_string))
+                            })
+                        })
                         .collect()
                 })
                 .unwrap_or_default();
-            if ids.is_empty() {
+            if hits.is_empty() {
                 return Ok(());
             }
 
-            let ops: Vec<BulkOperation<Value>> = ids
+            let ops: Vec<BulkOperation<Value>> = hits
                 .iter()
-                .map(|id| {
-                    BulkOperation::delete(id.clone())
+                .map(|(id, routing)| {
+                    let op = BulkOperation::delete(id.clone())
                         .index(index.to_string())
                         .version(version)
-                        .version_type(VersionType::ExternalGte)
-                        .into()
+                        .version_type(VersionType::ExternalGte);
+                    match routing {
+                        Some(r) => op.routing(r.clone()).into(),
+                        None => op.into(),
+                    }
                 })
                 .collect();
             let resp = self
@@ -988,7 +1002,16 @@ impl Sink for OpenSearchSink {
         Ok(SinkAck { max_lsn, rejected })
     }
 
-    async fn truncate_index(&self, index: &str, version: Option<u64>) -> Result<(), CoreError> {
+    async fn truncate_index(
+        &self,
+        index: &str,
+        version: Option<u64>,
+        only: Option<(&str, &str)>,
+    ) -> Result<(), CoreError> {
+        let query = match only {
+            Some((field, value)) => json!({"term": {field: value}}),
+            None => json!({"match_all": {}}),
+        };
         // delete_by_query only removes documents a search can see, so writes
         // still sitting in the translog would survive the TRUNCATE and
         // resurrect rows the source has already dropped
@@ -1009,7 +1032,7 @@ impl Sink for OpenSearchSink {
         // position instead, which is the honest ordering: earlier writes lose,
         // later ones survive.
         if let Some(version) = external_version(version) {
-            return self.truncate_at_version(index, version).await;
+            return self.truncate_at_version(index, version, &query).await;
         }
 
         let resp = self
@@ -1017,7 +1040,7 @@ impl Sink for OpenSearchSink {
             .delete_by_query(opensearch::DeleteByQueryParts::Index(&[index]))
             .refresh(true)
             .conflicts(opensearch::params::Conflicts::Proceed)
-            .body(json!({"query": {"match_all": {}}}))
+            .body(json!({"query": query}))
             .send()
             .await
             .map_err(http_err)?;

@@ -1309,13 +1309,14 @@ pg "INSERT INTO jord VALUES (10,1,5.00),(11,1,7.00),(12,2,1.00);" > /dev/null
 pg "DROP PUBLICATION IF EXISTS ${JSLOT}_pub; CREATE PUBLICATION ${JSLOT}_pub FOR TABLE jcust, jord;" > /dev/null 2>&1
 curl -s -XDELETE "$OS/e2e_shop?ignore_unavailable=true" > /dev/null
 curl -s -XDELETE "$OS/.pg2osync_meta/_doc/postgres-$JSLOT" > /dev/null
-# two sections on one index are only ever a join pair: the same file with the
-# join blocks removed has to be refused where it can still be fixed
-sed '/^\[sync\.[a-z]*\.join\]/,/^$/d' "$JCONFIG" > "${JCONFIG}.bad"
+# two sections on one index are a join pair or each declare an id (#61): the
+# same file with the join blocks and one id removed has to be refused where it
+# can still be fixed
+sed -e '/^\[sync\.[a-z]*\.join\]/,/^$/d' -e '/^id = "order-{id}"$/d' "$JCONFIG" > "${JCONFIG}.bad"
 if $BIN validate -c "${JCONFIG}.bad" > /dev/null 2>&1; then
-  bad "validate accepted two sections on one index without a join"
+  bad "validate accepted two sections on one index with neither a join nor ids"
 else
-  ok "validate refuses two sections on one index without a join"
+  ok "validate refuses two sections on one index with neither a join nor ids"
 fi
 rm -f "${JCONFIG}.bad"
 if $BIN validate -c "$JCONFIG" 2>&1 | grep -q "all checks passed"; then
@@ -1403,6 +1404,125 @@ case "$out" in
 esac
 check "and removed it under its parent's routing" "$(os_rstatus e2e_shop order-12 customer-2)" "404"
 check "leaving its sibling alone" "$(os_rstatus e2e_shop order-13 customer-2)" "200"
+
+# a TRUNCATE of one half of the pair clears that relation only: the join
+# field is what tells the halves apart, so the customers stay
+nohup $BIN run -c "$JCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sleep 3
+pg "TRUNCATE jord;" > /dev/null
+for _ in $(seq 1 30); do refresh; [ "$(os_rstatus e2e_shop order-13 customer-2)" = "404" ] && break; sleep 1; done
+check "a TRUNCATE of the children clears every child" "$(os_rstatus e2e_shop order-13 customer-2)" "404"
+check "and leaves the parents" "$(os_status e2e_shop customer-2)" "200"
+stop_sync
+
+echo -e "\n\033[1m== 25. one index fed by two tables ==\033[0m"
+# Two unrelated tables, one index, no join (#61). Each section's id is what
+# keeps the two tables' documents apart, so the same config with one id
+# removed has to be refused; and the two things a shared index cannot do —
+# reconcile, and clearing it on TRUNCATE — have to refuse rather than damage
+# the table that did not change.
+UCONFIG=$(mktemp /tmp/pg2osync-e2e-union.XXXXXX)
+USLOT=pg2osync_e2e_union
+drop_idle_probe_slots
+cat > "$UCONFIG" <<TOML
+[source]
+url_env = "PG2OSYNC_SOURCE_URL"
+slot_name = "$USLOT"
+publication = "${USLOT}_pub"
+
+[target]
+url = "http://localhost:9200"
+
+[metrics]
+bind = "127.0.0.1:9126"
+
+[sync.user_probe]
+table = "public.user_probe"
+index = "e2e_union"
+id = "user-{id}"
+
+[sync.order_probe]
+table = "public.order_probe"
+index = "e2e_union"
+id = "order-{id}"
+TOML
+union_cleanup() {
+  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  pg "SELECT pg_drop_replication_slot('$USLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$USLOT');" > /dev/null 2>&1 || true
+  pg "DROP PUBLICATION IF EXISTS ${USLOT}_pub; DROP TABLE IF EXISTS user_probe, order_probe;" > /dev/null 2>&1 || true
+  rm -f "$UCONFIG"
+}
+trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup; init_cleanup; fan_cleanup; bid_cleanup; shape_cleanup; where_cleanup; join_cleanup; union_cleanup' EXIT
+
+pg "DROP TABLE IF EXISTS user_probe, order_probe;" > /dev/null 2>&1
+pg "CREATE TABLE user_probe(id bigint primary key, name text);" > /dev/null
+pg "CREATE TABLE order_probe(id bigint primary key, total numeric(10,2));" > /dev/null
+# the same key in both tables: only the id prefixes keep them two documents
+pg "INSERT INTO user_probe VALUES (1,'acme');" > /dev/null
+pg "INSERT INTO order_probe VALUES (1,5.00);" > /dev/null
+pg "DROP PUBLICATION IF EXISTS ${USLOT}_pub; CREATE PUBLICATION ${USLOT}_pub FOR TABLE user_probe, order_probe;" > /dev/null 2>&1
+curl -s -XDELETE "$OS/e2e_union?ignore_unavailable=true" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/postgres-$USLOT" > /dev/null
+# the id is the whole declaration: the same file with one of them removed has
+# to be refused where it can still be fixed
+sed '/^id = "order-{id}"$/d' "$UCONFIG" > "${UCONFIG}.bad"
+# captured first: a refusal exits non-zero, which under pipefail would hide a
+# grep that matched
+out=$($BIN validate -c "${UCONFIG}.bad" 2>&1 || true)
+if grep -q "explicit id template" <<< "$out"; then
+  ok "validate refuses a shared index with a section that has no id"
+else
+  bad "validate accepted a shared index with a section that has no id"
+fi
+rm -f "${UCONFIG}.bad"
+nohup $BIN run -c "$UCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_count e2e_union)" = "2" ] && break
+  sleep 1
+done
+check "the load writes both tables into one index" "$(os_count e2e_union)" "2"
+check "the user is filed under its own prefix" "$(os_status e2e_union user-1)" "200"
+check "and so is the order with the same key" "$(os_status e2e_union order-1)" "200"
+
+pg "DELETE FROM order_probe WHERE id=1;" > /dev/null
+for _ in $(seq 1 30); do
+  [ "$(os_status e2e_union order-1)" = "404" ] && break
+  sleep 1
+done
+check "a deleted order is gone" "$(os_status e2e_union order-1)" "404"
+check "and the user with the same key is untouched" "$(os_status e2e_union user-1)" "200"
+
+# reconcile pages by one table's key column: every other table's document
+# would look like an orphan, so it has to refuse before it can call one that
+out=$($BIN reconcile -c "$UCONFIG" 2>&1 || true)
+if grep -q "fed by more than one table" <<< "$out"; then
+  ok "reconcile refuses an index more than one table feeds"
+else
+  bad "reconcile did not refuse the shared index"
+fi
+
+# clearing the index on TRUNCATE would take the users with it, which the
+# source never truncated, and halting would replay the same TRUNCATE at every
+# restart: the truncate is skipped, logged and counted, and the pipeline goes
+# on. The log is cumulative across sections, so only a new line counts.
+skips_before=$(grep -c "its documents are left in place" "$LOG" || true)
+pg "TRUNCATE order_probe;" > /dev/null
+for _ in $(seq 1 30); do
+  [ "$(grep -c 'its documents are left in place' "$LOG" || true)" -gt "$skips_before" ] && break
+  sleep 1
+done
+if [ "$(grep -c 'its documents are left in place' "$LOG" || true)" -gt "$skips_before" ]; then
+  ok "a TRUNCATE of one table is skipped and said so instead of clearing the index"
+else
+  bad "the TRUNCATE of a table sharing its index was neither skipped nor logged"
+fi
+check "the other table's document survived the TRUNCATE" "$(os_status e2e_union user-1)" "200"
+pg "INSERT INTO user_probe VALUES (2,'still-streaming');" > /dev/null
+for _ in $(seq 1 30); do refresh; [ "$(os_status e2e_union user-2)" = "200" ] && break; sleep 1; done
+check "and the pipeline is still streaming after it" "$(os_status e2e_union user-2)" "200"
+check "the skip is counted" "$(curl -s 127.0.0.1:9126/metrics | awk '/^pg2osync_events_total\{type="truncate_skipped"\} /{print $2}')" "1"
+stop_sync
 
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

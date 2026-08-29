@@ -95,12 +95,28 @@ routing comes from the same place identity does. Exactly one parent, one shared
 field, no fan-out on a join table, and a parent id naming anything outside its
 key is refused at config load — the child holds one column and computes the
 parent's id from it alone. Ids must be unique across the shared index, which
-config cannot see, and `TRUNCATE` on either table empties it. Two tables in one
-index remain otherwise refused (#61). A table that is both an embedded child
+config cannot see, and `TRUNCATE` on either table clears its relation only —
+the join field is what tells the halves apart. A table that is both an embedded child
 and a section of its own is warned about at startup rather than refused — a
 load-once index is a legitimate thing to want — because the runner reads its
 rows only as a re-fetch of the owner, so its own index receives the initial
 load and no streamed change.
+
+**Several tables can feed one index once each declares its identity.** (#61.)
+An index built before pg2osync is usually a union of several tables, and what
+the old refusal protected against was never the union: it was `_id` inherited
+from each table's own key, where two tables with a row `1` become one document
+by accident. An explicit `id` on every section sharing the index is the
+declaration that removes the accident — `user-{id}` on both sections still
+collides, but now it is something the operator wrote down, and nothing checks
+the values because nothing can see them. Two things cannot be recovered:
+`reconcile` pages an index by one table's key column, so every other table's
+document would look like an orphan, and it refuses; and `TRUNCATE` clears an
+index, which would wipe tables the source never truncated. It is not halted
+on — a halt would replay the same event from the slot at every restart with
+nothing the operator could change — but skipped, logged and counted, and the
+truncated table's documents stay until cleared by hand. A join pair escapes
+that: its relation name is exactly the set of documents to clear.
 
 **A column can be renamed in the target; the rename is the last step.**
 (`fields`, #66.) The source name is the one namespace the operator already

@@ -501,6 +501,7 @@ async fn reconcile_cmd(path: &Path, delete: bool) -> Result<()> {
     let sink = run::build_sink(&cfg, secrets.target_password)?;
     let client = connect_pg(&cfg, &secrets.source_url).await?;
 
+    let shared = cfg.shared_indexes();
     let mut total_orphans = 0usize;
     for (key, table) in &cfg.sync {
         // reconcile pages an index by one key column, and a fanned table has
@@ -511,6 +512,19 @@ async fn reconcile_cmd(path: &Path, delete: bool) -> Result<()> {
                 "[sync.{key}] fan_out is not supported by reconcile: it pages {} by \
                  its key column, and one row now holds many documents under many ids",
                 table.index_name(key)
+            );
+        }
+        // reconcile pages one index by one table's key column: every document
+        // that belongs to a *different* table in the same index has no row
+        // here and looks exactly like an orphan, which `--delete` would then
+        // remove. A join pair is scoped by its relation, so it can be paged.
+        let index = table.index_name(key);
+        if shared.contains(&index) && !cfg.is_join_index(&index) {
+            bail!(
+                "[sync.{key}] index {index} is fed by more than one table: reconcile pages it \
+                 by {}'s key column and cannot tell one table's documents from another's, so \
+                 the other tables' documents would all be reported as orphans",
+                table.table
             );
         }
         let spec = reconcile::Table {
@@ -564,7 +578,7 @@ async fn switch_alias(path: &Path, alias: &str) -> Result<()> {
     let indices = run::index_names(&cfg);
     let [index] = indices.as_slice() else {
         bail!(
-            "switch-alias needs a config with exactly one table; this one has {}",
+            "switch-alias needs a config that writes to exactly one index; this one writes to {}",
             indices.len()
         );
     };

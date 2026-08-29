@@ -63,12 +63,14 @@ pub async fn run_for(
 
     let sink = run::build_sink(cfg, target_password)?;
     // So a config pointed at a *new* index name gets its mapping first, which is
-    // what the re-index recipe does before switching an alias onto it.
-    sink.ensure_ready(&[IndexSpec {
-        name: index.clone(),
-        mapping: tbl.mapping.clone(),
-    }])
-    .await?;
+    // what the re-index recipe does before switching an alias onto it. The
+    // mapping may belong to a different section feeding this index, so the
+    // spec comes from the same place the pipeline's does.
+    let specs: Vec<IndexSpec> = run::index_specs(cfg)
+        .into_iter()
+        .filter(|spec| spec.name == index)
+        .collect();
+    sink.ensure_ready(&specs).await?;
 
     let stream_id = run::stream_id_for(cfg);
     let (events_tx, events_rx) = mpsc::channel::<ChangeEvent>(1);

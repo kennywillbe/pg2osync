@@ -1,6 +1,6 @@
 //! Logical table → index mapping and the shared durable-LSN cell.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 #[derive(Clone, Default)]
@@ -792,19 +792,34 @@ impl JoinRule {
 #[derive(Debug, Clone, Default)]
 pub struct TableMapping {
     map: HashMap<(String, String), String>,
+    /// Indices more than one table writes to. A TRUNCATE of one of them must
+    /// not clear the index: the other tables' documents are in it, and nothing
+    /// in the source would ever put them back.
+    shared: HashSet<String>,
 }
 
 impl TableMapping {
     pub fn from_pairs(pairs: impl IntoIterator<Item = ((String, String), String)>) -> Self {
-        Self {
-            map: pairs.into_iter().collect(),
+        let mut map = HashMap::new();
+        let mut seen = HashSet::new();
+        let mut shared = HashSet::new();
+        for (table, index) in pairs {
+            if !seen.insert(index.clone()) {
+                shared.insert(index.clone());
+            }
+            map.insert(table, index);
         }
+        Self { map, shared }
     }
 
     pub fn opt_index_for(&self, schema: &str, table: &str) -> Option<&str> {
         self.map
             .get(&(schema.to_string(), table.to_string()))
             .map(String::as_str)
+    }
+
+    pub fn is_shared(&self, index: &str) -> bool {
+        self.shared.contains(index)
     }
 }
 
@@ -1162,6 +1177,18 @@ mod tests {
         let m = TableMapping::from_pairs([(("public".into(), "users".into()), "users_v1".into())]);
         assert_eq!(m.opt_index_for("public", "users"), Some("users_v1"));
         assert_eq!(m.opt_index_for("public", "orders"), None);
+    }
+
+    #[test]
+    fn a_mapping_knows_which_indices_more_than_one_table_feeds() {
+        let m = TableMapping::from_pairs([
+            (("public".into(), "users".into()), "u".into()),
+            (("public".into(), "orders".into()), "u".into()),
+            (("public".into(), "carts".into()), "c".into()),
+        ]);
+        assert!(m.is_shared("u"));
+        assert!(!m.is_shared("c"));
+        assert!(!m.is_shared("nowhere"));
     }
 
     fn pk(spec: &str, pk_columns: &[&str]) -> IdTemplate {

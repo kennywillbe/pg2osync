@@ -534,6 +534,36 @@ impl TableSync {
     }
 }
 
+impl AppConfig {
+    /// Indices more than one `[sync.*]` section writes to.
+    ///
+    /// Sharing is allowed but never inherited: the sections that share an
+    /// index each declare an `id` or a join, so identity is a statement rather
+    /// than an accident of two tables both having a row 1.
+    pub fn shared_indexes(&self) -> std::collections::HashSet<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut shared = std::collections::HashSet::new();
+        for (key, tbl) in &self.sync {
+            let index = tbl.index_name(key);
+            if !seen.insert(index.clone()) {
+                shared.insert(index);
+            }
+        }
+        shared
+    }
+
+    /// Whether every section writing `index` is part of a join pair, whose
+    /// documents carry the relation that tells one table's from another's.
+    pub fn is_join_index(&self, index: &str) -> bool {
+        let mut members = self
+            .sync
+            .iter()
+            .filter(|(key, tbl)| tbl.index_name(key) == index)
+            .peekable();
+        members.peek().is_some() && members.all(|(_, tbl)| tbl.join.is_some())
+    }
+}
+
 #[derive(Debug)]
 pub struct ResolvedSecrets {
     pub source_url: String,
@@ -604,9 +634,9 @@ impl AppConfig {
                 "[source] mode = \"poll\" is PostgreSQL-only; MySQL always reads the binlog"
             );
         }
-        // Two sections may share an index only as a join pair, and whether
-        // they are one is a question about the group, not about either
-        // section, so the groups are checked after every section has been.
+        // Whether the sections sharing an index may do so is a question about
+        // the group, not about either section, so the groups are checked after
+        // every section has been.
         let mut by_index: BTreeMap<String, Vec<(&str, &TableSync)>> = BTreeMap::new();
         if self.sync.is_empty() {
             anyhow::bail!("no [sync.*] sections: nothing to synchronize");
@@ -970,10 +1000,9 @@ fn is_qualified_table(name: &str) -> bool {
     parts.len() == 2 && parts.iter().all(|p| !p.is_empty())
 }
 
-/// Whether the sections writing one index are a join pair: every one of them
-/// declares the same join field, exactly one is the parent, and each has a
-/// relation name of its own. A section alone in its index is only refused
-/// when it is a child, whose parent then exists nowhere.
+/// Whether the sections writing one index may share it: either as a join
+/// pair, or with an explicit id on each. A section alone in its index is only
+/// refused when it is a child, whose parent then exists nowhere.
 fn check_index_group(index: &str, members: &[(&str, &TableSync)]) -> Result<()> {
     let [(key, single)] = members else {
         return check_shared_index(index, members);
@@ -987,15 +1016,47 @@ fn check_index_group(index: &str, members: &[(&str, &TableSync)]) -> Result<()> 
     Ok(())
 }
 
+/// An index built before pg2osync is usually a union of several tables. What
+/// made that unsafe was `_id` inherited from each table's own key: two tables
+/// with a row 1 are one document. An explicit `id` on every section sharing
+/// the index is the declaration that makes a collision the operator's choice,
+/// so the only ones left are the ones written down.
+fn check_plain_shared_index(index: &str, members: &[(&str, &TableSync)]) -> Result<()> {
+    if let Some((key, _)) = members.iter().find(|(_, tbl)| tbl.id.is_none()) {
+        anyhow::bail!(
+            "[sync.{key}] two tables map to the same index {index:?}; give each an explicit \
+             id template so their documents cannot collide, or declare a join pair"
+        );
+    }
+    let described: Vec<&str> = members
+        .iter()
+        .filter(|(_, tbl)| tbl.mapping_file.is_some())
+        .map(|(key, _)| *key)
+        .collect();
+    if let [first, second, ..] = described.as_slice() {
+        anyhow::bail!(
+            "[sync.{second}] index {index:?} is also described by [sync.{first}]; an index is \
+             created once, so at most one of the sections feeding it may set mapping_file"
+        );
+    }
+    Ok(())
+}
+
+/// A join pair: every section declares the same join field, exactly one is
+/// the parent, and each has a relation name of its own.
 fn check_shared_index(index: &str, members: &[(&str, &TableSync)]) -> Result<()> {
+    let Some((joined_key, _)) = members.iter().find(|(_, tbl)| tbl.join.is_some()) else {
+        return check_plain_shared_index(index, members);
+    };
     let mut joined = Vec::with_capacity(members.len());
     for (key, tbl) in members {
         let Some(join) = &tbl.join else {
+            // A join field is read on every document of the index, so a table
+            // writing there without one leaves documents no relation names.
             anyhow::bail!(
-                "[sync.{key}] two tables map to the same index {index:?}; document identity \
-                 would be ambiguous. Two tables may only share an index as a join pair, where \
-                 every section declares [sync.*.join] with the same field and exactly one \
-                 omits parent"
+                "[sync.{key}] writes index {index:?} without join, but [sync.{joined_key}] \
+                 declares one; every section sharing a join field's index must be part of \
+                 the pair"
             );
         };
         joined.push((*key, *tbl, join));
@@ -1133,10 +1194,108 @@ table = "public.users"
         assert!(parse(&MINIMAL.replace("table = \"public.users\"", "table = \"users\"")).is_err());
         assert!(parse(&format!("{MINIMAL}index = \"_bad\"\n")).is_err());
         assert!(parse(&format!("{MINIMAL}index = \"Users\"\n")).is_err());
-        let duplicate = format!(
-            "{MINIMAL}index = \"same\"\n[sync.other]\ntable = \"public.other\"\nindex = \"same\"\n"
+    }
+
+    /// Two plain sections into one index, each holding a place for its id.
+    const UNION: &str = r#"
+[source]
+url = "postgres://u:p@localhost/db"
+[target]
+url = "http://localhost:9200"
+[sync.orders]
+table = "public.orders"
+index = "same"
+id = "order-{id}"
+[sync.users]
+table = "public.users"
+index = "same"
+id = "user-{id}"
+"#;
+
+    fn refused(toml_str: &str, why: &str) -> String {
+        parse(toml_str)
+            .err()
+            .unwrap_or_else(|| panic!("must be refused: {why}"))
+            .to_string()
+    }
+
+    #[test]
+    fn an_index_two_tables_share_needs_an_explicit_id_on_each() {
+        let neither = UNION
+            .replace("id = \"order-{id}\"\n", "")
+            .replace("id = \"user-{id}\"\n", "");
+        let message = refused(&neither, "two tables in one index without ids");
+        assert!(
+            message.contains("[sync.orders]") && message.contains("explicit id template"),
+            "the refusal names the first section without an id: {message}"
         );
-        assert!(parse(&duplicate).is_err(), "two tables in one index");
+        let one = UNION.replace("id = \"user-{id}\"\n", "");
+        let message = refused(&one, "an id on only one of the two");
+        assert!(
+            message.contains("[sync.users]") && message.contains("explicit id template"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn two_tables_may_share_an_index_once_each_declares_its_id() {
+        let cfg = parse(UNION).expect("both sections declare their identity");
+        assert_eq!(cfg.sync["orders"].index_name("orders"), "same");
+        assert_eq!(cfg.sync["users"].index_name("users"), "same");
+        parse(&UNION.replace(
+            "index = \"same\"\nid = \"user-{id}\"",
+            "index = \"same\"\nid = \"user-{id}\"\nmapping_file = \"m.json\"",
+        ))
+        .expect("one section may describe the index");
+    }
+
+    #[test]
+    fn only_one_section_may_describe_a_shared_index() {
+        let both = UNION.replace(
+            "index = \"same\"",
+            "index = \"same\"\nmapping_file = \"m.json\"",
+        );
+        let message = refused(&both, "two mapping files for one index");
+        assert!(
+            message.contains("[sync.users] index \"same\" is also described by [sync.orders]")
+                && message.contains("mapping_file"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_mixed_join_and_plain_group_is_refused() {
+        let mixed = UNION.replace(
+            "id = \"order-{id}\"",
+            "id = \"order-{id}\"\n[sync.orders.join]\nfield = \"relation\"\nname = \"order\"",
+        );
+        let message = refused(&mixed, "a join parent beside a plain section");
+        assert!(
+            message.contains("[sync.users] writes index \"same\" without join")
+                && message.contains("[sync.orders]"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn shared_indexes_names_only_the_indices_more_than_one_table_feeds() {
+        let cfg = parse(&format!(
+            "{UNION}[sync.carts]\ntable = \"public.carts\"\nindex = \"alone\"\n"
+        ))
+        .expect("loads");
+        let shared = cfg.shared_indexes();
+        assert!(shared.contains("same"));
+        assert!(!shared.contains("alone"));
+        assert_eq!(shared.len(), 1);
+        assert!(
+            !cfg.is_join_index("same"),
+            "two plain sections are not a pair"
+        );
+        assert!(!cfg.is_join_index("alone"));
+        assert!(
+            !cfg.is_join_index("nowhere"),
+            "an index nothing writes is not a join index"
+        );
     }
 
     #[test]
@@ -1510,7 +1669,7 @@ parent = "customer_id"
         let refused = [
             (
                 PAIR.replace("[sync.orders.join]\nfield = \"relation\"\nname = \"order\"\nparent = \"customer_id\"\n", ""),
-                "may only share an index as a join pair",
+                "[sync.orders] writes index \"shop\" without join, but [sync.customers] declares one",
                 "a section on the shared index without join",
             ),
             (
