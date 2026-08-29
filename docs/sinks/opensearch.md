@@ -108,3 +108,15 @@ reported as a conflict, because a wrong name produces documents no
 mapping cannot invent a join field, so an index a join pair writes to has to
 be created by pg2osync from the parent's `mapping_file`, or by an index
 template that declares the join, before the first document lands.
+
+## Ingest pipelines
+
+Semantic and hybrid search on OpenSearch go through the neural-search plugin:
+a `text_embedding` processor in an ingest pipeline reads a text field and
+writes the vector into a `knn_vector` field the mapping declares. pg2osync
+computes no embedding of its own; a section names the pipeline
+(`pipeline = "embed-products"`) and every document it writes carries that
+name on its bulk action, so the target runs the pipeline on the way in.
+`validate` refuses a pipeline the target does not have. See
+[Ingest pipelines](../configuration.md#ingest-pipelines) for the mapping the
+pipeline fills and what follows from the pipeline being per section.

@@ -135,6 +135,23 @@ template renders — there is no single index to page. And a template must
 carry a literal, because `TRUNCATE` clears what the template claims, and a
 claim of `*` is a claim on the cluster.
 
+**Vectors are the target's to compute.** (`pipeline`, #68.) Semantic search
+needs an embedding per document, and the obvious design — an embedding client
+inside pg2osync — puts a network hop and a rate limit inside every batch, adds
+a second failure mode that backpressure would have to respect on top of the
+target's, and makes a model choice that is not this project's to make. An
+ingest pipeline gets the same result for one config field: the section names
+the pipeline, every document it writes carries `"pipeline": "<name>"` on its
+bulk action, and the target — which already owns the model, the plugin and
+the `knn_vector` field — computes the vector on the way in. The document still
+travels the one write path, so a quarantined document replayed later goes
+through the pipeline again instead of landing without its vector. It is per
+section, not per index, because the pipeline rides on the operation rather
+than on the index: two tables feeding one index can embed different columns.
+A delete carries none, since an ingest pipeline runs on index actions only.
+Meilisearch has no ingest pipelines, and refuses the option at config load
+rather than ignoring it.
+
 **A column can be renamed in the target; the rename is the last step.**
 (`fields`, #66.) The source name is the one namespace the operator already
 knows, and the one every other check — projection, `transform`, `id`,

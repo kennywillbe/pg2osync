@@ -250,6 +250,12 @@ pub struct TableSync {
     /// which is what makes a row that leaves the filter a delete.
     #[serde(default, rename = "where")]
     pub filter: Option<String>,
+    /// The target's ingest pipeline every document of this section goes
+    /// through, e.g. one that computes a vector field. Named here rather than
+    /// implemented here: the target already owns the model, and the document
+    /// still takes the one write path. OpenSearch and Elasticsearch only.
+    #[serde(default)]
+    pub pipeline: Option<String>,
     /// Column transformations: `email = "redact"` for an operation without a
     /// parameter, `tags = { op = "split", by = "," }` for one with.
     #[serde(default)]
@@ -764,6 +770,17 @@ impl AppConfig {
                         "[sync.{key}] {} is the join field and also the field of child {}",
                         join.field,
                         child.table
+                    );
+                }
+            }
+            if let Some(pipeline) = &tbl.pipeline {
+                if pipeline.is_empty() {
+                    anyhow::bail!("[sync.{key}] pipeline must not be empty");
+                }
+                if self.target.flavor == "meilisearch" {
+                    anyhow::bail!(
+                        "[sync.{key}] pipeline is an OpenSearch and Elasticsearch feature, which \
+                         Meilisearch has no equivalent for; remove pipeline for this target"
                     );
                 }
             }
@@ -1899,6 +1916,58 @@ parent = "customer_id"
             "parent = \"customer_id\"\n[[sync.orders.children]]\ntable = \"public.lines\"\nfield = \"lines\"\nforeign_key = \"order_id\"\n",
         ))
         .expect("embedding an array on a join child is unrelated to filing it under a parent");
+    }
+
+    #[test]
+    fn a_pipeline_is_the_sections_choice_and_only_a_named_one_on_a_target_that_runs_them() {
+        let refusal = refused(
+            &MINIMAL.replace(
+                "table = \"public.users\"",
+                "table = \"public.users\"\npipeline = \"\"",
+            ),
+            "an empty pipeline name",
+        );
+        assert!(
+            refusal.contains("[sync.users] pipeline must not be empty"),
+            "{refusal}"
+        );
+
+        let refusal = refused(
+            &MINIMAL
+                .replace("[target]", "[target]\nflavor = \"meilisearch\"")
+                .replace(
+                    "table = \"public.users\"",
+                    "table = \"public.users\"\npipeline = \"embed-users\"",
+                ),
+            "a target without ingest pipelines",
+        );
+        assert!(
+            refusal.contains(
+                "[sync.users] pipeline is an OpenSearch and Elasticsearch feature, which \
+                 Meilisearch has no equivalent for; remove pipeline for this target"
+            ),
+            "{refusal}"
+        );
+
+        // per section, not per index: the pipeline rides on the operation, so
+        // two sections writing one index may each name their own
+        let cfg = parse(
+            &PAIR
+                .replace(
+                    "id = \"customer-{id}\"",
+                    "id = \"customer-{id}\"\npipeline = \"embed-customers\"",
+                )
+                .replace(
+                    "id = \"order-{id}\"",
+                    "id = \"order-{id}\"\npipeline = \"embed-orders\"",
+                ),
+        )
+        .expect("two pipelines on one index");
+        assert_eq!(
+            cfg.sync["customers"].pipeline.as_deref(),
+            Some("embed-customers")
+        );
+        assert_eq!(cfg.sync["orders"].pipeline.as_deref(), Some("embed-orders"));
     }
 
     #[test]

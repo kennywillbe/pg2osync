@@ -488,6 +488,15 @@ fn filters(cfg: &AppConfig) -> Result<pg2osync_engine::mapping::Filters> {
     ))
 }
 
+/// Each section's ingest pipeline keyed by (schema, table) for the engine.
+fn pipelines(cfg: &AppConfig) -> pg2osync_engine::mapping::Pipelines {
+    pg2osync_engine::mapping::Pipelines::from_pairs(cfg.sync.values().filter_map(|tbl| {
+        let pipeline = tbl.pipeline.clone()?;
+        let (schema, table) = split_qualified(&tbl.table);
+        Some(((schema.to_string(), table.to_string()), pipeline))
+    }))
+}
+
 /// Every synced table's primary key from the catalogue, for the decoder: under
 /// REPLICA IDENTITY FULL the WAL flags every column as identity, and the key
 /// the load filed a row under is the only thing a streamed change may address
@@ -631,6 +640,7 @@ pub fn pipeline_ctx(
         fan_outs: fan_outs(cfg)?,
         joins: joins(cfg)?,
         filters: filters(cfg)?,
+        pipelines: pipelines(cfg),
         cfg: cfg.engine.clone(),
         ack_tx,
         load_done_tx,

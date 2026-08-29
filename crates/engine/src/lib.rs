@@ -160,6 +160,8 @@ pub struct PipelineCtx {
     pub joins: crate::mapping::Joins,
     /// Row filters, judged on the raw row before anything else shapes it.
     pub filters: crate::mapping::Filters,
+    /// The target's ingest pipeline each table's documents go through.
+    pub pipelines: crate::mapping::Pipelines,
     pub cfg: EngineConfig,
     /// Updated by the sink task after every successful flush.
     pub ack_tx: watch::Sender<Option<Lsn>>,
@@ -452,6 +454,7 @@ pub async fn run(
                     fan_outs: &ctx.fan_outs,
                     joins: &ctx.joins,
                     filters: &ctx.filters,
+                    pipelines: &ctx.pipelines,
                 };
                 let completions = match fetch_completions(
                     &rows,
@@ -1077,6 +1080,7 @@ pub struct Rules<'a> {
     pub fan_outs: &'a crate::mapping::FanOuts,
     pub joins: &'a crate::mapping::Joins,
     pub filters: &'a crate::mapping::Filters,
+    pub pipelines: &'a crate::mapping::Pipelines,
 }
 
 /// Fill unchanged TOASTed columns from the document already in the target.
@@ -1349,6 +1353,9 @@ fn materialize(
         lsn: PENDING_LSN,
         op,
     };
+    // Stamped here and on nothing else: an ingest pipeline runs on index
+    // actions, so a delete has nothing to carry.
+    let pipeline = rules.pipelines.for_table(table.0, table.1);
     let upsert = |index: &str, id: String, routing: Option<String>, doc: Value| {
         mk(DocumentOp::Upsert {
             index: index.into(),
@@ -1356,6 +1363,7 @@ fn materialize(
             routing,
             doc,
             version,
+            pipeline: pipeline.map(str::to_string),
         })
     };
     let delete = |index: &str, id: String, routing: Option<String>| {
@@ -1655,6 +1663,9 @@ mod pipeline_tests {
         /// about which index a row landed in, so the expectations of every
         /// other test stay byte-identical.
         show_index: bool,
+        /// Render the ingest pipeline an upsert names as `|pipeline` — opted
+        /// into by the pipeline tests for the same reason.
+        show_pipeline: bool,
     }
 
     impl RecordingSink {
@@ -1780,11 +1791,20 @@ mod pipeline_tests {
                         id,
                         routing,
                         version,
+                        pipeline,
                         ..
-                    } => match version {
-                        Some(v) => format!("upsert:{}@{v}", target(index, id, routing)),
-                        None => format!("upsert:{}", target(index, id, routing)),
-                    },
+                    } => {
+                        let through = match pipeline {
+                            Some(p) if self.show_pipeline => format!("|{p}"),
+                            _ => String::new(),
+                        };
+                        match version {
+                            Some(v) => {
+                                format!("upsert:{}@{v}{through}", target(index, id, routing))
+                            }
+                            None => format!("upsert:{}{through}", target(index, id, routing)),
+                        }
+                    }
                     DocumentOp::Delete {
                         index, id, routing, ..
                     } => {
@@ -1959,6 +1979,7 @@ mod pipeline_tests {
             fan_outs: crate::mapping::FanOuts::default(),
             joins: crate::mapping::Joins::default(),
             filters: crate::mapping::Filters::default(),
+            pipelines: crate::mapping::Pipelines::default(),
             cfg,
             ack_tx,
             load_done_tx,
@@ -2630,6 +2651,7 @@ mod pipeline_tests {
                 routing: None,
                 doc: json!({"id": lsn}),
                 version: Some(lsn),
+                pipeline: None,
             },
         }]
     }
@@ -2850,6 +2872,7 @@ mod pipeline_tests {
             renames,
             constants,
             crate::mapping::Filters::default(),
+            crate::mapping::Pipelines::default(),
             Arc::new(RecordingSink::default()),
             script,
         )
@@ -2870,6 +2893,7 @@ mod pipeline_tests {
             crate::mapping::Renames::default(),
             crate::mapping::Constants::default(),
             filters,
+            crate::mapping::Pipelines::default(),
             sink,
             script,
         )
@@ -2884,6 +2908,7 @@ mod pipeline_tests {
         renames: crate::mapping::Renames,
         constants: crate::mapping::Constants,
         filters: crate::mapping::Filters,
+        pipelines: crate::mapping::Pipelines,
         sink: Arc<RecordingSink>,
         script: Vec<ChangeEvent>,
     ) -> Arc<RecordingSink> {
@@ -2907,6 +2932,7 @@ mod pipeline_tests {
             fan_outs: fan,
             joins: crate::mapping::Joins::default(),
             filters,
+            pipelines,
             cfg: EngineConfig {
                 batch_size,
                 checkpoint_interval_ms: 100,
@@ -3053,6 +3079,7 @@ mod pipeline_tests {
             fan_outs: Default::default(),
             joins: Default::default(),
             filters: Default::default(),
+            pipelines: Default::default(),
             cfg: EngineConfig::default(),
             ack_tx,
             load_done_tx,
@@ -3112,6 +3139,7 @@ mod pipeline_tests {
             fan_outs: Default::default(),
             joins: Default::default(),
             filters: Default::default(),
+            pipelines: Default::default(),
             cfg: EngineConfig::default(),
             ack_tx,
             load_done_tx,
@@ -3175,6 +3203,7 @@ mod pipeline_tests {
             fan_outs: Default::default(),
             joins: Default::default(),
             filters: Default::default(),
+            pipelines: Default::default(),
             cfg: EngineConfig::default(),
             ack_tx,
             load_done_tx,
@@ -3258,6 +3287,59 @@ mod pipeline_tests {
             "a non-matching insert and an update out of the filter delete; \
              an update into it and a matching insert write"
         );
+    }
+
+    #[tokio::test]
+    async fn an_upsert_names_its_tables_pipeline_and_a_delete_names_none() {
+        // the pipeline rides on the operation: the sink is never told which
+        // section a document came from, so this is the only place it can
+        // learn what the target should run on it
+        let sink = drive_rules_at(
+            500,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            crate::mapping::Pipelines::from_pairs([(
+                ("public".to_string(), "users".to_string()),
+                "embed-users".to_string(),
+            )]),
+            Arc::new(RecordingSink {
+                show_pipeline: true,
+                ..RecordingSink::default()
+            }),
+            vec![row(1), deleted_at(2, 0x100), commit(0x100)],
+        )
+        .await;
+        assert_eq!(
+            sink.events(),
+            vec!["write[upsert:1|embed-users delete:2]"],
+            "an ingest pipeline runs on index actions only"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_table_without_a_pipeline_writes_as_before() {
+        let sink = drive_rules_at(
+            500,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            crate::mapping::Pipelines::from_pairs([(
+                ("public".to_string(), "orders".to_string()),
+                "embed-orders".to_string(),
+            )]),
+            Arc::new(RecordingSink {
+                show_pipeline: true,
+                ..RecordingSink::default()
+            }),
+            vec![row(1), commit(0x100)],
+        )
+        .await;
+        assert_eq!(sink.events(), vec!["write[upsert:1]"]);
     }
 
     #[tokio::test]
@@ -3358,6 +3440,7 @@ mod pipeline_tests {
             users_renames(&[("bio", "about")]),
             crate::mapping::Constants::default(),
             crate::mapping::Filters::default(),
+            crate::mapping::Pipelines::default(),
             sink,
             vec![moved(1, 2, &["bio"]), commit(0x900)],
         )
@@ -3436,6 +3519,7 @@ mod pipeline_tests {
             fan_outs: Default::default(),
             joins: Default::default(),
             filters: Default::default(),
+            pipelines: Default::default(),
             cfg: EngineConfig::default(),
             ack_tx,
             load_done_tx,
@@ -3501,6 +3585,7 @@ mod pipeline_tests {
             fan_outs: Default::default(),
             joins,
             filters: Default::default(),
+            pipelines: Default::default(),
             cfg: EngineConfig::default(),
             ack_tx: ack_tx.clone(),
             load_done_tx: load_done_tx.clone(),
@@ -3806,6 +3891,7 @@ mod pipeline_tests {
             fan_outs: fan,
             joins: crate::mapping::Joins::default(),
             filters,
+            pipelines: crate::mapping::Pipelines::default(),
             cfg: EngineConfig {
                 batch_size: 500,
                 checkpoint_interval_ms: 100,
@@ -4151,6 +4237,7 @@ mod pipeline_tests {
             fan_outs: crate::mapping::FanOuts::default(),
             joins: shop_joins(),
             filters: crate::mapping::Filters::default(),
+            pipelines: crate::mapping::Pipelines::default(),
             cfg: EngineConfig {
                 batch_size: 500,
                 checkpoint_interval_ms: 100,

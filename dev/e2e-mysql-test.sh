@@ -836,5 +836,74 @@ fi
 check "no index was created for the refused name" "$(curl -s "$OS/_cat/indices/e2e-mysql-events-*?h=index" | wc -l | tr -d ' ')" "2"
 stop_sync
 
+say "19. the target runs an ingest pipeline on every document of a section"
+# The PostgreSQL suite's section 27 (#68) on the binlog path: the pipeline
+# rides on the bulk action, so the source makes no difference to it, and
+# the load and the stream both have to come out tagged.
+stop_sync
+PCONFIG=$(mktemp /tmp/pg2osync-mysql-pipe.XXXXXX)
+PSID=990007
+cat > "$PCONFIG" <<TOML
+[source]
+flavor = "mysql"
+url_env = "PG2OSYNC_MYSQL_URL"
+server_id = $PSID
+
+[target]
+url = "$OS"
+
+[metrics]
+bind = "127.0.0.1:9119"
+
+[sync.pipe]
+table = "sourcedb.pipe_probe"
+index = "e2e_mysql_pipe"
+pipeline = "e2e-tag-mysql"
+TOML
+pipe_cleanup() {
+  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  my "DROP TABLE IF EXISTS pipe_probe;" > /dev/null 2>&1 || true
+  curl -s -XDELETE "$OS/_ingest/pipeline/e2e-tag-mysql" > /dev/null 2>&1 || true
+  curl -s -XDELETE "$OS/e2e_mysql_pipe?ignore_unavailable=true" > /dev/null 2>&1 || true
+  rm -f "$PCONFIG"
+}
+trap 'cleanup; resume_cleanup; types_cleanup; child_cleanup; where_cleanup; events_cleanup; pipe_cleanup' EXIT
+
+my "DROP TABLE IF EXISTS pipe_probe;"
+my "CREATE TABLE pipe_probe(id bigint primary key, name varchar(20));"
+my "INSERT INTO pipe_probe VALUES (1,'one');"
+curl -s -XDELETE "$OS/e2e_mysql_pipe?ignore_unavailable=true" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/mysql-$PSID" > /dev/null
+curl -s -XPUT "$OS/_ingest/pipeline/e2e-tag-mysql" -H 'Content-Type: application/json' -d '{"processors":[{"set":{"field":"tagged","value":"yes"}}]}' > /dev/null
+# a pipeline the target does not have would reject every document at the
+# first write, so validate asks for it by name and refuses. Captured first: a
+# refusal exits non-zero, which under pipefail would hide a grep that matched.
+sed 's/^pipeline = "e2e-tag-mysql"$/pipeline = "e2e-missing"/' "$PCONFIG" > "${PCONFIG}.bad"
+out=$($BIN validate -c "${PCONFIG}.bad" 2>&1 || true)
+if grep -q "does not exist on the target" <<< "$out"; then
+  ok "validate refuses a pipeline the target does not have"
+else
+  bad "validate accepted a pipeline the target does not have"
+fi
+rm -f "${PCONFIG}.bad"
+out=$($BIN validate -c "$PCONFIG" 2>&1 || true)
+if grep -q "ingest pipeline e2e-tag-mysql exists" <<< "$out"; then
+  ok "validate names the pipeline it found"
+else
+  bad "validate did not report the pipeline the target has"
+fi
+nohup $BIN run -c "$PCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+await_count e2e_mysql_pipe 1
+# the field exists in no row: only the pipeline could have put it there
+check "the load goes through the pipeline" "$(os_field e2e_mysql_pipe 1 tagged)" "yes"
+my "INSERT INTO pipe_probe VALUES (2,'two');"
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_status e2e_mysql_pipe 2)" = "200" ] && break
+  sleep 1
+done
+check "and so does a streamed row" "$(os_field e2e_mysql_pipe 2 tagged)" "yes"
+stop_sync
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

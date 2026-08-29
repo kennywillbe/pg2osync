@@ -90,6 +90,7 @@ not expressions) — if you need those, you want Kafka.
 | TRUNCATE propagation | ✅ PostgreSQL and MySQL/MariaDB |
 | Polling fallback for managed databases without replication | ✅ upserts, plus deletes via `soft_delete` |
 | Index mappings you define (`mapping_file`) | ✅ applied at creation, compared at startup |
+| Vector fields through an ingest pipeline (`pipeline`) | ✅ the target embeds; pg2osync names the pipeline |
 | Reconcile an index against its table (`reconcile`) | ✅ names or removes documents whose row is gone |
 | Re-snapshot one table (`resnapshot`) | ✅ on demand, `--where` to narrow it, safe beside the stream |
 | Survive one document the target refuses | ✅ opt-in quarantine with its position, bounded, replayable |
