@@ -44,9 +44,16 @@ refresh()    { curl -s -XPOST "$OS/_refresh" > /dev/null; }
 synced()     { curl -s "http://127.0.0.1:9131/synced?refresh=true&timeout=10000" > /dev/null; refresh; }
 
 start_sync() {
-  nohup $BIN run -c "$CONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+  nohup $BIN run -c "$CONFIG" >> "$LOG" 2>&1 < /dev/null &
+  # stays a child of this shell so a section can wait for its exit code
+  SYNC_PID=$!
 }
-stop_sync() { pkill -f "pg2osync run" 2> /dev/null || true; }
+# pkill's default signal is SIGTERM, which drains rather than kills: whatever
+# follows a stop — a restart on the same slot, dropping it — needs the exit
+stop_sync() {
+  pkill -f "pg2osync run" 2> /dev/null || true
+  for _ in $(seq 1 100); do pgrep -f "pg2osync run" > /dev/null || break; sleep 0.1; done
+}
 drop_own_slot() { pg "SELECT pg_drop_replication_slot('pg2osync_e2e') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='pg2osync_e2e');" > /dev/null 2>&1 || true; }
 # Every probe section keeps its slot until the trap at exit, and the dev
 # database allows ten; a late section would otherwise start with "all
@@ -372,9 +379,24 @@ check "row written while down is recovered" "$(os_field e2e_users 8 name)" "eve-
 say "13. final consistency"
 check "row counts match" "$(pg "SELECT count(*) FROM users;")" "$(os_count e2e_users)"
 
-say "14. status and teardown"
+say "14. SIGTERM drains, then status and teardown"
+# docker stop and Kubernetes send SIGTERM, so it has to end the way Ctrl-C
+# does: with the last acknowledged position checkpointed, not with the default
+# handler's immediate exit and a replay on the next start
+pg "INSERT INTO users (id,name,email) VALUES (12,'term','t@test.io');" > /dev/null
+confirmed=$(curl -s "http://127.0.0.1:9131/synced?refresh=true&timeout=8000" | jqf "d['confirmed']")
+log_lines=$(wc -l < "$LOG")
+kill -TERM "$SYNC_PID"
+wait "$SYNC_PID" && code=0 || code=$?
+check "SIGTERM exits cleanly" "$code" "0"
+check "and is logged as the reason" \
+  "$(tail -n +$((log_lines + 1)) "$LOG" | grep -c 'shutdown signal received (SIGTERM)')" "1"
+# at or past rather than equal: a keepalive landing between /synced and the
+# signal moves the acknowledged position, and the checkpoint follows it
+ckpt_lsn=$(curl -s "$OS/.pg2osync_meta/_doc/postgres-pg2osync_e2e" | jqf "d['_source']['position']")
+check "the final checkpoint holds the last acknowledged position" \
+  "$(pg "SELECT pg_wal_lsn_diff('$ckpt_lsn'::pg_lsn, '$confirmed'::pg_lsn) >= 0;")" "t"
 $BIN status -c "$CONFIG" | sed 's/^/    /'
-stop_sync; sleep 1
 $BIN drop-slot -c "$CONFIG" > /dev/null
 check "slot dropped" "$(pg "SELECT count(*) FROM pg_replication_slots WHERE slot_name='pg2osync_e2e';")" "0"
 # a re-index runs two pipelines on one publication, so dropping it with the old

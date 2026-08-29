@@ -1269,11 +1269,39 @@ async fn validate_mysql(cfg: &config::AppConfig, source_url: &str) -> Result<()>
 fn shutdown_signal() -> tokio::sync::watch::Receiver<bool> {
     let (tx, rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        tracing::info!(target: "pg2osync", "shutdown signal received; draining");
+        let signal = wait_for_shutdown_signal().await;
+        tracing::info!(target: "pg2osync", "shutdown signal received ({signal}); draining");
         let _ = tx.send(true);
     });
     rx
+}
+
+/// Wait for a stop request and name the signal that carried it.
+///
+/// `docker stop`, Kubernetes and systemd all send SIGTERM; only a terminal
+/// sends SIGINT. Leaving SIGTERM to the default handler made every routine
+/// deploy an abrupt exit that replayed a checkpoint interval's worth of work.
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> &'static str {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut terminate = match signal(SignalKind::terminate()) {
+        Ok(stream) => stream,
+        Err(e) => {
+            tracing::warn!(target: "pg2osync", "cannot listen for SIGTERM ({e}); only SIGINT drains");
+            let _ = tokio::signal::ctrl_c().await;
+            return "SIGINT";
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => "SIGINT",
+        _ = terminate.recv() => "SIGTERM",
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> &'static str {
+    let _ = tokio::signal::ctrl_c().await;
+    "Ctrl-C"
 }
 
 async fn status(path: &Path, max_retained_mb: Option<u64>) -> Result<()> {

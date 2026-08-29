@@ -260,6 +260,10 @@ costume.
 | 0 | Clean shutdown — `SIGINT`/`SIGTERM`, or `bootstrap`/`validate` finishing |
 | non-zero | Fatal: bad configuration, insufficient privileges, a permanent document rejection, or reconnection gave up |
 
+A clean shutdown finishes the requests already sent to the target, writes a
+final checkpoint at the last acknowledged position, and exits; the next start
+resumes there rather than replaying an interval's worth of work.
+
 A supervisor is still worth having — it just no longer has to catch every
 network blip.
 
