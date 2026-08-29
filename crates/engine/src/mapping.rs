@@ -410,6 +410,50 @@ impl Pipelines {
     }
 }
 
+/// Tables declared `[sync.x] append_only = true`: they have no key the
+/// pipeline may address a row by, so a row is only ever inserted and is filed
+/// under a hash of its content unless the section configures an id.
+#[derive(Debug, Clone, Default)]
+pub struct AppendOnly {
+    tables: HashSet<(String, String)>,
+}
+
+impl FromIterator<(String, String)> for AppendOnly {
+    fn from_iter<I: IntoIterator<Item = (String, String)>>(pairs: I) -> Self {
+        Self {
+            tables: pairs.into_iter().collect(),
+        }
+    }
+}
+
+impl AppendOnly {
+    pub fn contains(&self, schema: &str, table: &str) -> bool {
+        self.tables
+            .contains(&(schema.to_string(), table.to_string()))
+    }
+}
+
+/// The document id of a row that has no key: a hash of the row itself.
+///
+/// Hashed from the RAW document, like every other identity, and over its
+/// canonical JSON: the workspace does not enable serde_json's `preserve_order`,
+/// so object keys are sorted and the same row serialises the same whichever
+/// path delivered it — a COPY or load, the WAL or binlog, a poll — which is
+/// what lets a replayed row land on the document it already is. 32 hex
+/// characters is 128 bits, enough that two distinct rows never collide in
+/// practice, and short enough to read in an index.
+pub fn content_id(doc: &serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(doc.to_string().as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()[..32]
+        .to_string()
+}
+
 /// A configured document id: literals plus `{column}` placeholders, e.g.
 /// `tenant-{tenant_id}-{id}`.
 ///
@@ -988,6 +1032,16 @@ impl TableMapping {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_content_id_depends_on_the_row_and_not_on_key_order() {
+        let a = content_id(&json!({"kind": "login", "at": "t1"}));
+        let b = content_id(&json!({"at": "t1", "kind": "login"}));
+        assert_eq!(a, b, "the same row must hash the same on every path");
+        assert_ne!(a, content_id(&json!({"at": "t2", "kind": "login"})));
+        assert_eq!(a.len(), 32);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
 
     #[test]
     fn include_keeps_only_listed_columns() {

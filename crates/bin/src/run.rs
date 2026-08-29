@@ -364,8 +364,31 @@ fn constants(cfg: &AppConfig) -> Result<Constants> {
 /// true — where the declared key and the database's own key disagree about a
 /// template, the table is required to be REPLICA IDENTITY FULL, so the
 /// before-image (which carries both) is what a template ever renders from.
+///
+/// An append-only table has no key at all, so nothing renders from one: a
+/// template on it always reads the row.
 pub fn pk_columns_for(tbl: &crate::config::TableSync) -> Vec<String> {
+    if tbl.append_only {
+        return Vec::new();
+    }
     vec![tbl.primary_key.clone().unwrap_or_else(|| "id".to_string())]
+}
+
+/// The (schema, table) pairs declared `append_only`, for whoever has to know
+/// a row of theirs carries no key.
+pub fn append_only_tables(cfg: &AppConfig) -> std::collections::HashSet<(String, String)> {
+    cfg.sync
+        .values()
+        .filter(|tbl| tbl.append_only)
+        .map(|tbl| {
+            let (schema, table) = split_qualified(&tbl.table);
+            (schema.to_string(), table.to_string())
+        })
+        .collect()
+}
+
+fn append_only(cfg: &AppConfig) -> pg2osync_engine::mapping::AppendOnly {
+    pg2osync_engine::mapping::AppendOnly::from_iter(append_only_tables(cfg))
 }
 
 fn id_templates(cfg: &AppConfig) -> Result<pg2osync_engine::mapping::IdTemplates> {
@@ -508,10 +531,17 @@ async fn key_columns_for(
     let mut out = HashMap::new();
     for tbl in cfg.sync.values() {
         let (schema, table) = split_qualified(&tbl.table);
-        let info = pg2osync_source::catalog::table_info(admin, schema, table)
-            .await
-            .with_context(|| format!("cannot read the key of {}", tbl.table))?;
-        out.insert((schema.to_string(), table.to_string()), info.pk_columns);
+        // declared keyless, so whatever the catalogue says is not what a
+        // document is filed under
+        let key = if tbl.append_only {
+            Vec::new()
+        } else {
+            pg2osync_source::catalog::table_info(admin, schema, table)
+                .await
+                .with_context(|| format!("cannot read the key of {}", tbl.table))?
+                .pk_columns
+        };
+        out.insert((schema.to_string(), table.to_string()), key);
     }
     Ok(out)
 }
@@ -641,6 +671,7 @@ pub fn pipeline_ctx(
         joins: joins(cfg)?,
         filters: filters(cfg)?,
         pipelines: pipelines(cfg),
+        append_only: append_only(cfg),
         cfg: cfg.engine.clone(),
         ack_tx,
         load_done_tx,
@@ -665,6 +696,11 @@ async fn check_derived_identity_requirements(
     admin: &tokio_postgres::Client,
 ) -> Result<()> {
     for (key, tbl) in &cfg.sync {
+        // no update or delete ever reaches an append-only table, so nothing
+        // on it is ever rendered from a before-image
+        if tbl.append_only {
+            continue;
+        }
         // (option, what it is for, the template): the two templates are one
         // rule, told apart only so the refusal can say which option needs it
         let mut declared: Vec<(&str, &str, &String)> = Vec::new();
@@ -1320,6 +1356,7 @@ fn wal_config(
         child_parents,
         parent_pk_columns,
         key_columns: HashMap::new(),
+        append_only: append_only_tables(cfg),
     })
 }
 
@@ -1339,7 +1376,7 @@ fn poll_config(
                     .poll_column
                     .clone()
                     .unwrap_or_else(|| cfg.source.poll_column.clone()),
-                pk_columns: vec![t.primary_key.clone().unwrap_or_else(|| "id".into())],
+                pk_columns: pk_columns_for(t),
                 soft_delete: t.soft_delete.clone(),
             })
             .collect(),
@@ -1782,6 +1819,7 @@ async fn attempt_mysql(
                         .with_table_filters(table_filters(cfg)?),
                     &load_children,
                     base,
+                    &src_cfg.append_only,
                 )
                 .await
             })
@@ -1884,6 +1922,7 @@ pub fn mysql_config_for(
         child_parents,
         gtid: None,
         gtid_resume: None,
+        append_only: append_only_tables(cfg),
         version_base: 0,
     })
 }
@@ -1935,6 +1974,38 @@ mod tests {
         assert_eq!(percent_decode("p%40ss%3Aword"), "p@ss:word");
         assert_eq!(percent_decode("plain"), "plain");
         assert_eq!(percent_decode("trailing%"), "trailing%");
+    }
+
+    #[test]
+    fn an_append_only_table_has_no_key_columns() {
+        let cfg: AppConfig = toml::from_str(
+            r#"
+[source]
+url = "postgres://u:p@localhost/db"
+[target]
+url = "http://localhost:9200"
+[sync.events]
+table = "public.events"
+append_only = true
+[sync.users]
+table = "public.users"
+"#,
+        )
+        .expect("parses");
+        // nothing renders from a key the table does not have: an id or index
+        // template on it always reads the row
+        assert!(pk_columns_for(&cfg.sync["events"]).is_empty());
+        assert_eq!(pk_columns_for(&cfg.sync["users"]), ["id"]);
+        assert!(append_only(&cfg).contains("public", "events"));
+        assert!(!append_only(&cfg).contains("public", "users"));
+        let poll = poll_config(&cfg, "postgres://u:p@localhost/db", Default::default())
+            .expect("a poll config");
+        let events = poll
+            .tables
+            .iter()
+            .find(|t| t.qualified == "public.events")
+            .expect("configured");
+        assert!(events.pk_columns.is_empty(), "the poll row carries no key");
     }
 
     #[test]

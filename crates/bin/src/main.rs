@@ -245,25 +245,25 @@ async fn init(
     // Everything below is advice, not a requirement: a config can be written
     // without ever reaching the database, which is what makes this work before
     // the credentials exist.
-    let mut resolved: Vec<String> = Vec::new();
+    let mut resolved: Vec<SourceTable> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
     match &source_url {
         Some(url) => match eligible_tables(url, mysql).await {
             Ok(found) => {
+                let names: Vec<String> = found.iter().map(|t| t.qualified.clone()).collect();
                 if found.is_empty() {
-                    notes.push(
-                        "no tables with a primary key were found; pg2osync needs one to \
-                         derive a stable document id"
-                            .into(),
-                    );
+                    notes.push("no tables were found in the source".into());
                 }
                 for wanted in tables {
-                    match qualify(wanted, &found) {
-                        Some(full) => resolved.push(full),
+                    match qualify(wanted, &names) {
+                        Some(full) => resolved.push(SourceTable {
+                            keyed: found.iter().any(|t| t.qualified == full && t.keyed),
+                            qualified: full,
+                        }),
                         None => bail!(
-                            "table {wanted:?} does not exist in the source, or has no primary \
-                             key. Tables it can sync: {}",
-                            preview(&found)
+                            "table {wanted:?} does not exist in the source. Tables it can \
+                             sync: {}",
+                            preview(&names)
                         ),
                     }
                 }
@@ -271,7 +271,7 @@ async fn init(
                     notes.push(format!(
                         "tables available to sync: {}. Add one with --table, or edit the \
                          [sync.*] section below",
-                        preview(&found)
+                        preview(&names)
                     ));
                 }
             }
@@ -289,10 +289,13 @@ async fn init(
     if resolved.is_empty() {
         // A placeholder rather than an empty file: a config with no table is
         // rejected at load time, and an example is what makes the shape obvious.
-        resolved.push(if mysql {
-            "appdb.users".into()
-        } else {
-            "public.users".into()
+        resolved.push(SourceTable {
+            qualified: if mysql {
+                "appdb.users".into()
+            } else {
+                "public.users".into()
+            },
+            keyed: true,
         });
     }
 
@@ -320,11 +323,16 @@ async fn init(
     Ok(())
 }
 
-/// Qualified names of tables that have a primary key.
-///
-/// The primary key is the filter because it is the hard requirement: without one
-/// there is no stable document id, and the run would fail on that table later.
-async fn eligible_tables(source_url: &str, mysql: bool) -> Result<Vec<String>> {
+/// A table `init` found in the source.
+struct SourceTable {
+    qualified: String,
+    /// Whether it has a primary key. Without one the starter config declares
+    /// it `append_only`, which is the only way such a table syncs.
+    keyed: bool,
+}
+
+/// Every base table in the source, and whether it has a primary key.
+async fn eligible_tables(source_url: &str, mysql: bool) -> Result<Vec<SourceTable>> {
     if mysql {
         let url = url::Url::parse(source_url).context("source url is not a valid URL")?;
         let tls = pg2osync_source::tls::TlsSettings::resolve(source_url, None, None)?;
@@ -344,14 +352,24 @@ async fn eligible_tables(source_url: &str, mysql: bool) -> Result<Vec<String>> {
         .context("cannot connect to the source")?;
         let rows = conn
             .query_text_rows(
-                "SELECT t.table_schema, t.table_name FROM information_schema.tables t                  JOIN information_schema.table_constraints c                    ON c.table_schema = t.table_schema AND c.table_name = t.table_name                   AND c.constraint_type = 'PRIMARY KEY'                  WHERE t.table_type = 'BASE TABLE'                    AND t.table_schema NOT IN ('mysql','information_schema','performance_schema','sys')                  ORDER BY 1, 2",
+                "SELECT t.table_schema, t.table_name, c.constraint_name IS NOT NULL \
+                 FROM information_schema.tables t \
+                 LEFT JOIN information_schema.table_constraints c \
+                   ON c.table_schema = t.table_schema AND c.table_name = t.table_name \
+                  AND c.constraint_type = 'PRIMARY KEY' \
+                 WHERE t.table_type = 'BASE TABLE' \
+                   AND t.table_schema NOT IN ('mysql','information_schema','performance_schema','sys') \
+                 ORDER BY 1, 2",
             )
             .await?;
         return Ok(rows
             .iter()
             .filter_map(
                 |r| match (r.first().cloned().flatten(), r.get(1).cloned().flatten()) {
-                    (Some(schema), Some(table)) => Some(format!("{schema}.{table}")),
+                    (Some(schema), Some(table)) => Some(SourceTable {
+                        qualified: format!("{schema}.{table}"),
+                        keyed: r.get(2).cloned().flatten().as_deref() == Some("1"),
+                    }),
                     _ => None,
                 },
             )
@@ -364,14 +382,22 @@ async fn eligible_tables(source_url: &str, mysql: bool) -> Result<Vec<String>> {
         .context("cannot connect to the source")?;
     let rows = client
         .query(
-            "SELECT n.nspname, c.relname FROM pg_class c              JOIN pg_namespace n ON n.oid = c.relnamespace              WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog', 'information_schema')                AND EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary)              ORDER BY 1, 2",
+            "SELECT n.nspname, c.relname, \
+                    EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary) \
+             FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+             ORDER BY 1, 2",
             &[],
         )
         .await
         .context("cannot list tables")?;
     Ok(rows
         .iter()
-        .map(|r| format!("{}.{}", r.get::<_, String>(0), r.get::<_, String>(1)))
+        .map(|r| SourceTable {
+            qualified: format!("{}.{}", r.get::<_, String>(0), r.get::<_, String>(1)),
+            keyed: r.get(2),
+        })
         .collect())
 }
 
@@ -409,7 +435,7 @@ fn preview(found: &[String]) -> String {
 
 /// The smallest config that runs, with the two decisions an operator has to
 /// make left visible rather than buried.
-fn starter_config(tables: &[String], target: &str, mysql: bool) -> String {
+fn starter_config(tables: &[SourceTable], target: &str, mysql: bool) -> String {
     let mut out = String::new();
     out.push_str("# Written by `pg2osync init`. Every option is documented in\n");
     out.push_str("# docs/configuration.md; what is here is what a run needs.\n\n");
@@ -429,12 +455,20 @@ fn starter_config(tables: &[String], target: &str, mysql: bool) -> String {
     out.push_str("bind = \"127.0.0.1:9100\"\n");
     for table in tables {
         let index = table
+            .qualified
             .split_once('.')
             .map(|(_, t)| t.to_string())
-            .unwrap_or_else(|| table.clone());
+            .unwrap_or_else(|| table.qualified.clone());
         out.push_str(&format!("\n[sync.{index}]\n"));
-        out.push_str(&format!("table = \"{table}\"\n"));
+        out.push_str(&format!("table = \"{}\"\n", table.qualified));
         out.push_str(&format!("index = \"{index}\"\n"));
+        if !table.keyed {
+            out.push_str(
+                "# No primary key: rows are indexed as they arrive, under a hash of their \
+                 content; an UPDATE or DELETE halts the pipeline.\n",
+            );
+            out.push_str("append_only = true\n");
+        }
     }
     out
 }
@@ -524,6 +558,14 @@ async fn reconcile_cmd(path: &Path, delete: bool) -> Result<()> {
                 "[sync.{key}] index {index} is fed by more than one table: reconcile pages it \
                  by {}'s key column and cannot tell one table's documents from another's, so \
                  the other tables' documents would all be reported as orphans",
+                table.table
+            );
+        }
+        // and there is no key column to page by on a table declared keyless
+        if table.append_only {
+            bail!(
+                "[sync.{key}] {} is append-only: reconcile pages the index by a key column \
+                 this table does not have",
                 table.table
             );
         }
@@ -1042,6 +1084,16 @@ async fn validate_postgres(cfg: &config::AppConfig, source_url: &str) -> Result<
             .split_once('.')
             .context("table must be schema-qualified")?;
         let info = pg2osync_source::catalog::table_info(&client, schema, name).await?;
+        // the load would say the same thing later; here it also says what
+        // to do about it
+        if info.pk_columns.is_empty() && !table.append_only {
+            bail!(
+                "table {} has no primary key; pg2osync needs one to derive a stable \
+                 document id, or `append_only = true` on its [sync] section to index its \
+                 rows as they arrive",
+                table.table
+            );
+        }
         let nullable: Vec<String> = client
             .query(
                 "SELECT attname::text FROM pg_attribute \
@@ -1054,7 +1106,15 @@ async fn validate_postgres(cfg: &config::AppConfig, source_url: &str) -> Result<
             .map(|r| r.get(0))
             .collect();
         check_configured_columns(table, &live, &info.pk_columns, &nullable)?;
-        println!("✓ table {} exists ({} columns)", table.table, live.len());
+        if table.append_only {
+            println!(
+                "✓ table {} exists, append-only ({} columns)",
+                table.table,
+                live.len()
+            );
+        } else {
+            println!("✓ table {} exists ({} columns)", table.table, live.len());
+        }
         // LIMIT 0 still parses, plans and type-checks the predicate — which
         // the grammar cannot do — and reads nothing
         if let Some(spec) = &table.filter {
@@ -1157,14 +1217,28 @@ async fn validate_mysql(cfg: &config::AppConfig, source_url: &str) -> Result<()>
             .table
             .split_once('.')
             .context("table must be written as database.table for MySQL")?;
-        let live = pg2osync_source_mysql::catalog::table_schema(&mut admin, schema, name).await?;
+        let live = pg2osync_source_mysql::catalog::table_schema(
+            &mut admin,
+            schema,
+            name,
+            table.append_only,
+        )
+        .await?;
         let names: Vec<String> = live.columns.iter().map(|c| c.name.clone()).collect();
         check_configured_columns(table, &names, &live.pk_columns, &[])?;
-        println!(
-            "✓ table {} exists with a primary key ({} columns)",
-            table.table,
-            names.len()
-        );
+        if table.append_only {
+            println!(
+                "✓ table {} exists, append-only ({} columns)",
+                table.table,
+                names.len()
+            );
+        } else {
+            println!(
+                "✓ table {} exists with a primary key ({} columns)",
+                table.table,
+                names.len()
+            );
+        }
         // MySQL coerces where PostgreSQL errors, so this mostly catches a
         // column the catalogue spelled differently — still cheap, still worth
         // having before a load
@@ -1355,6 +1429,7 @@ fn mysql_source(
             // so it records nothing and resumes from nowhere
             gtid: None,
             gtid_resume: None,
+            append_only: run::append_only_tables(cfg),
             version_base: 0,
             tls: cfg.tls_settings(source_url)?,
         },
@@ -1523,9 +1598,16 @@ mod tests {
         assert_eq!(qualify("public.missing", &found()), None);
     }
 
+    fn keyed(qualified: &str) -> SourceTable {
+        SourceTable {
+            qualified: qualified.to_string(),
+            keyed: true,
+        }
+    }
+
     #[test]
     fn the_starter_config_loads_and_names_the_table_it_was_given() {
-        let toml_text = starter_config(&["public.orders".to_string()], "http://os:9200", false);
+        let toml_text = starter_config(&[keyed("public.orders")], "http://os:9200", false);
         let parsed: config::AppConfig =
             toml::from_str(&toml_text).expect("what init writes has to load");
         assert_eq!(parsed.sync.len(), 1);
@@ -1535,8 +1617,33 @@ mod tests {
     }
 
     #[test]
+    fn a_keyless_table_is_written_as_append_only() {
+        // the only way such a table syncs, so the smallest config still runs
+        let toml_text = starter_config(
+            &[
+                keyed("public.orders"),
+                SourceTable {
+                    qualified: "public.events_log".to_string(),
+                    keyed: false,
+                },
+            ],
+            "http://os:9200",
+            false,
+        );
+        let parsed: config::AppConfig =
+            toml::from_str(&toml_text).expect("what init writes has to load");
+        parsed.validate().expect("and pass validation");
+        assert!(parsed.sync["events_log"].append_only);
+        assert!(!parsed.sync["orders"].append_only);
+        assert!(
+            toml_text.contains("append_only = true"),
+            "the flag is spelled out where the operator will read it"
+        );
+    }
+
+    #[test]
     fn the_mysql_starter_says_so_and_carries_a_server_id() {
-        let toml_text = starter_config(&["appdb.users".to_string()], "http://os:9200", true);
+        let toml_text = starter_config(&[keyed("appdb.users")], "http://os:9200", true);
         let parsed: config::AppConfig = toml::from_str(&toml_text).expect("loads");
         assert_eq!(parsed.source.flavor, "mysql");
         assert_ne!(

@@ -26,7 +26,9 @@ Breaking one of these is a bug even if the tests pass:
 - Protocol decoding stays inside its source crate — pgoutput in
   `crates/source`, binlog in `crates/source-mysql`. No CDC framework.
 - New targets implement `Sink`. The engine never matches on a sink kind.
-- Delivery is at-least-once with idempotent writes (`_id` = primary key).
+- Delivery is at-least-once with idempotent writes: `_id` is the primary key,
+  an id the configuration derives, or — for an `append_only` table — a content
+  hash, so a replay overwrites rather than duplicates.
 - A partial transaction must never be visible as a complete one.
 - A source position is acknowledged only after the data is durably written and
   checkpointed. Acknowledging early loses data on crash-restart.

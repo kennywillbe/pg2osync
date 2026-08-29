@@ -48,6 +48,9 @@ pub async fn run(
     // rows would carry versions from the previous server's numbering and the
     // target would refuse them.
     version_base: u64,
+    // Tables declared `append_only`: read without a primary key, whole, and
+    // with no key on their rows.
+    append_only: &std::collections::HashSet<(String, String)>,
 ) -> Result<()> {
     // No explicit transaction, and READ COMMITTED so that an implicit one
     // cannot outlive its statement either. A read view held for the length of a
@@ -69,7 +72,13 @@ pub async fn run(
             continue;
         }
         let progress_key = load_progress_key(stream, &qualified);
-        let resolved = catalog::table_schema(conn, schema, table).await?;
+        let resolved = catalog::table_schema(
+            conn,
+            schema,
+            table,
+            append_only.contains(&(schema.clone(), table.clone())),
+        )
+        .await?;
         let specs = children
             .get(&(schema.clone(), table.clone()))
             .cloned()
@@ -102,9 +111,10 @@ pub async fn run(
         };
 
         // A key we cannot carry from one chunk to the next cannot be a cursor,
-        // so such a table is read in one statement. One statement is still one
-        // read view, which is the whole difference from a snapshot spanning
-        // every table.
+        // so such a table is read in one statement — as is an append-only
+        // table, which has no key at all. One statement is still one read
+        // view, which is the whole difference from a snapshot spanning every
+        // table.
         let unusable_key: Vec<&str> = resolved
             .pk_columns
             .iter()
@@ -117,12 +127,14 @@ pub async fn run(
             })
             .map(String::as_str)
             .collect();
-        let chunked = unusable_key.is_empty();
-        if !chunked {
+        let chunked = unusable_key.is_empty() && !resolved.pk_columns.is_empty();
+        if !unusable_key.is_empty() {
             tracing::warn!(target: "pg2osync::load",
                 "{qualified} is read in one statement: its key column(s) {} cannot carry \
                  a cursor from one chunk to the next",
                 unusable_key.join(", "));
+        }
+        if !chunked {
             cursor = None;
         }
 

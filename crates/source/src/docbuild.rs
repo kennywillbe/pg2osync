@@ -23,6 +23,18 @@ pub enum BuildError {
         name: String,
         source: typemap::TypeError,
     },
+
+    /// An append-only table has no key, so a document written under a
+    /// content hash cannot be found again from the row that replaced it.
+    #[error(
+        "{schema}.{name}: {what} arrived on an append-only table; nothing can say \
+         which document it is"
+    )]
+    AppendOnly {
+        schema: String,
+        name: String,
+        what: &'static str,
+    },
 }
 
 fn convert_column(
@@ -152,10 +164,14 @@ impl Incoming {
     }
 }
 
+/// `append_only` declares the table keyless: an insert carries no key (the
+/// engine files it under a hash of its content), and an update or delete is
+/// an error, because no key means nothing can say which document it is.
 pub fn build_row_change(
     rel: &Relation,
     incoming: Incoming,
     key_columns: Option<&[String]>,
+    append_only: bool,
 ) -> Result<RowChange, BuildError> {
     let change = |kind: RowKind| RowChange {
         schema: rel.schema.clone(),
@@ -165,6 +181,16 @@ pub fn build_row_change(
         // transaction around it, which only the caller tracks
         version: None,
     };
+    if append_only && !matches!(incoming, Incoming::Insert(_)) {
+        return Err(BuildError::AppendOnly {
+            schema: rel.schema.clone(),
+            name: rel.name.clone(),
+            what: match incoming {
+                Incoming::Update(..) => "an UPDATE",
+                _ => "a DELETE",
+            },
+        });
+    }
     // without a replica identity there is no key to address the row on
     // update/delete; inserts are unaffected
     if !matches!(incoming, Incoming::Insert(_)) {
@@ -172,7 +198,11 @@ pub fn build_row_change(
     }
     match incoming {
         Incoming::Insert(new) => {
-            let pk = extract_pk(rel, &new, key_columns)?;
+            let pk = if append_only {
+                Value::Null
+            } else {
+                extract_pk(rel, &new, key_columns)?
+            };
             let (doc, _) = build_doc(rel, &new, None)?;
             Ok(change(RowKind::Insert { pk, doc }))
         }
@@ -293,7 +323,7 @@ mod tests {
             TupleValue::Text(b"12345678901234567890.5".to_vec()),
             TupleValue::Null,
         ]);
-        let change = build_row_change(&rel, Incoming::Insert(t), None).unwrap();
+        let change = build_row_change(&rel, Incoming::Insert(t), None, false).unwrap();
         assert_eq!(change.schema, "public");
         match change.kind {
             RowKind::Insert { pk, doc } => {
@@ -323,7 +353,7 @@ mod tests {
             TupleValue::Text(b"99.9".to_vec()),
             TupleValue::UnchangedToast,
         ]);
-        let change = build_row_change(&rel, Incoming::Update(Some(old), new), None).unwrap();
+        let change = build_row_change(&rel, Incoming::Update(Some(old), new), None, false).unwrap();
         match change.kind {
             RowKind::Update {
                 pk,
@@ -357,7 +387,7 @@ mod tests {
             TupleValue::Null,
             TupleValue::Text(b"bio".to_vec()),
         ]);
-        let change = build_row_change(&rel, Incoming::Update(Some(old), new), None).unwrap();
+        let change = build_row_change(&rel, Incoming::Update(Some(old), new), None, false).unwrap();
         match change.kind {
             RowKind::Update {
                 pk, previous_pk, ..
@@ -384,7 +414,7 @@ mod tests {
             TupleValue::Null,
             TupleValue::Text(b"bio".to_vec()),
         ]);
-        let change = build_row_change(&rel, Incoming::Update(Some(old), new), None).unwrap();
+        let change = build_row_change(&rel, Incoming::Update(Some(old), new), None, false).unwrap();
         match change.kind {
             RowKind::Update {
                 pk, previous_pk, ..
@@ -406,7 +436,7 @@ mod tests {
             TupleValue::Null,
             TupleValue::UnchangedToast,
         ]);
-        let change = build_row_change(&rel, Incoming::Update(None, new), None).unwrap();
+        let change = build_row_change(&rel, Incoming::Update(None, new), None, false).unwrap();
         match change.kind {
             RowKind::Update {
                 unchanged_toast_columns,
@@ -425,7 +455,7 @@ mod tests {
             TupleValue::Null,
             TupleValue::Null,
         ]);
-        let change = build_row_change(&rel, Incoming::Delete(key), None).unwrap();
+        let change = build_row_change(&rel, Incoming::Delete(key), None, false).unwrap();
         assert!(matches!(change.kind, RowKind::Delete { pk, .. } if pk == serde_json::json!(42)));
     }
 
@@ -433,7 +463,7 @@ mod tests {
     fn replica_identity_nothing_is_rejected_upfront() {
         let rel = users_relation(pgoutput::ReplicaIdentity::None);
         let key = tuple(vec![TupleValue::Null; 4]);
-        assert!(build_row_change(&rel, Incoming::Delete(key), None).is_err());
+        assert!(build_row_change(&rel, Incoming::Delete(key), None, false).is_err());
     }
 
     #[test]
@@ -452,7 +482,7 @@ mod tests {
             TupleValue::Null,
             TupleValue::Text(b"7".to_vec()),
         ]);
-        let change = build_row_change(&rel, Incoming::Delete(key), None).unwrap();
+        let change = build_row_change(&rel, Incoming::Delete(key), None, false).unwrap();
         match change.kind {
             RowKind::Delete { pk, .. } => {
                 assert_eq!(pk, serde_json::json!({"id": 42, "tenant_id": 7}))
@@ -476,7 +506,7 @@ mod tests {
             TupleValue::Text(b"1".to_vec()),
             TupleValue::Text(b"bio".to_vec()),
         ]);
-        let change = build_row_change(&rel, Incoming::Update(Some(old), new), None).unwrap();
+        let change = build_row_change(&rel, Incoming::Update(Some(old), new), None, false).unwrap();
         match change.kind {
             RowKind::Update { before, .. } => assert_eq!(
                 before,
@@ -504,7 +534,7 @@ mod tests {
             TupleValue::Text(b"1".to_vec()),
             TupleValue::Text(b"bio".to_vec()),
         ]);
-        let change = build_row_change(&rel, Incoming::Update(Some(old), new), None).unwrap();
+        let change = build_row_change(&rel, Incoming::Update(Some(old), new), None, false).unwrap();
         match change.kind {
             RowKind::Update {
                 before,
@@ -527,7 +557,7 @@ mod tests {
             TupleValue::Text(b"7".to_vec()),
             TupleValue::Null,
         ]);
-        let change = build_row_change(&rel, Incoming::Delete(key), None).unwrap();
+        let change = build_row_change(&rel, Incoming::Delete(key), None, false).unwrap();
         match change.kind {
             RowKind::Delete { before, .. } => assert_eq!(
                 before,
@@ -552,17 +582,67 @@ mod tests {
             TupleValue::Null,
         ]);
         let keys = vec!["id".to_string()];
-        let change = build_row_change(&rel, Incoming::Insert(row.clone()), Some(&keys)).unwrap();
+        let change =
+            build_row_change(&rel, Incoming::Insert(row.clone()), Some(&keys), false).unwrap();
         match change.kind {
             RowKind::Insert { pk, .. } => assert_eq!(pk, serde_json::json!(42)),
             other => panic!("unexpected kind {other:?}"),
         }
         // without a known key the flags are all there is
-        let change = build_row_change(&rel, Incoming::Delete(row), None).unwrap();
+        let change = build_row_change(&rel, Incoming::Delete(row), None, false).unwrap();
         match change.kind {
             RowKind::Delete { pk, .. } => assert!(pk.is_object(), "the whole row: {pk}"),
             other => panic!("unexpected kind {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_append_only_insert_carries_no_key() {
+        // the engine files the row under a hash of its content, so a key
+        // here would only be something for the two paths to disagree about
+        let mut rel = users_relation(pgoutput::ReplicaIdentity::Default);
+        for col in &mut rel.columns {
+            col.in_replica_identity = false;
+        }
+        let row = tuple(vec![
+            TupleValue::Text(b"42".to_vec()),
+            TupleValue::Text(b"a@x.io".to_vec()),
+            TupleValue::Null,
+            TupleValue::Null,
+        ]);
+        let change = build_row_change(&rel, Incoming::Insert(row), None, true).unwrap();
+        match change.kind {
+            RowKind::Insert { pk, doc } => {
+                assert_eq!(pk, Value::Null);
+                assert_eq!(doc["email"], serde_json::json!("a@x.io"));
+            }
+            other => panic!("unexpected kind {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_update_or_delete_on_an_append_only_table_is_refused() {
+        let rel = users_relation(pgoutput::ReplicaIdentity::Full);
+        let row = tuple(vec![
+            TupleValue::Text(b"42".to_vec()),
+            TupleValue::Text(b"a@x.io".to_vec()),
+            TupleValue::Null,
+            TupleValue::Null,
+        ]);
+        let err = build_row_change(&rel, Incoming::Update(None, row.clone()), None, true)
+            .expect_err("no key, so no document to replace");
+        assert_eq!(
+            err.to_string(),
+            "public.users: an UPDATE arrived on an append-only table; nothing can say \
+             which document it is"
+        );
+        let err = build_row_change(&rel, Incoming::Delete(row), None, true)
+            .expect_err("no key, so no document to remove");
+        assert!(
+            err.to_string()
+                .contains("a DELETE arrived on an append-only table"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -574,7 +654,7 @@ mod tests {
             TupleValue::Null,
             TupleValue::Null,
         ]);
-        let change = build_row_change(&rel, Incoming::Delete(key), None).unwrap();
+        let change = build_row_change(&rel, Incoming::Delete(key), None, false).unwrap();
         match change.kind {
             RowKind::Delete { before, .. } => assert_eq!(before, None),
             other => panic!("unexpected kind {other:?}"),

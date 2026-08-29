@@ -890,13 +890,17 @@ else
 fi
 check "and qualified the table from the catalogue" \
   "$(grep -c 'table = "public.init_probe"' "$INITDIR/pg2osync.toml" 2> /dev/null || echo 0)" "1"
-# No primary key means no stable document id, so it has to be refused here
-# rather than at the first row of the load.
-if (cd "$INITDIR" && "$ABIN" init --force --table init_no_pk > /dev/null 2>&1); then
-  bad "init accepted a table with no primary key"
+# No primary key used to be refused here. It now comes out declared
+# append_only (#70), so an event log's smallest config runs unedited. Written
+# to its own file so the init_probe config stays untouched for the beats
+# below.
+if (cd "$INITDIR" && "$ABIN" init -c no_pk.toml --table init_no_pk > /dev/null 2>&1); then
+  ok "init wrote a config for a table with no primary key"
 else
-  ok "init refused a table with no primary key"
+  bad "init refused a table with no primary key"
 fi
+check "and declared it append_only" \
+  "$(grep -c '^append_only = true' "$INITDIR/no_pk.toml" 2> /dev/null || echo 0)" "1"
 if (cd "$INITDIR" && "$ABIN" init --table init_probe > /dev/null 2>&1); then
   bad "init overwrote an existing config without --force"
 else
@@ -1733,6 +1737,110 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 check "and so does a streamed row" "$(os_field e2e_pipe 2 tagged)" "yes"
+stop_sync
+
+echo -e "\n\033[1m== 28. a table with no primary key syncs insert-only, under a content hash ==\033[0m"
+# An event log has no key and never needs one (#70): declared append_only,
+# each row is filed under a hash of its raw values, so the load and the
+# stream agree on the id without a position, and a row the source cannot
+# tell from another is one document. What has to hold: validate takes the
+# declaration and refuses a key beside it, a duplicate never doubles the
+# count on either path, and an UPDATE — which nothing can address — halts
+# by name.
+ACONFIG=$(mktemp /tmp/pg2osync-e2e-append.XXXXXX)
+ASLOT=pg2osync_e2e_append
+drop_idle_probe_slots
+cat > "$ACONFIG" <<TOML
+[source]
+url_env = "PG2OSYNC_SOURCE_URL"
+slot_name = "$ASLOT"
+publication = "${ASLOT}_pub"
+
+[target]
+url = "http://localhost:9200"
+
+[metrics]
+bind = "127.0.0.1:9129"
+
+[sync.events_log]
+table = "public.events_log"
+index = "e2e_append"
+append_only = true
+TOML
+append_cleanup() {
+  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  pg "SELECT pg_drop_replication_slot('$ASLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$ASLOT');" > /dev/null 2>&1 || true
+  pg "DROP PUBLICATION IF EXISTS ${ASLOT}_pub; DROP TABLE IF EXISTS events_log;" > /dev/null 2>&1 || true
+  curl -s -XDELETE "$OS/e2e_append?ignore_unavailable=true" > /dev/null 2>&1 || true
+  rm -f "$ACONFIG"
+}
+trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup; init_cleanup; fan_cleanup; bid_cleanup; shape_cleanup; where_cleanup; join_cleanup; union_cleanup; events_cleanup; pipe_cleanup; append_cleanup' EXIT
+
+pg "DROP TABLE IF EXISTS events_log; CREATE TABLE events_log(at timestamptz, kind text, payload text);" > /dev/null 2>&1
+# the third row is the first one again, byte for byte: same hash, same document
+pg "INSERT INTO events_log VALUES ('2024-01-01T00:00:00Z','login','alice'), ('2024-01-01T00:00:01Z','logout','alice'), ('2024-01-01T00:00:00Z','login','alice');" > /dev/null
+pg "DROP PUBLICATION IF EXISTS ${ASLOT}_pub; CREATE PUBLICATION ${ASLOT}_pub FOR TABLE events_log;" > /dev/null 2>&1
+curl -s -XDELETE "$OS/e2e_append?ignore_unavailable=true" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/postgres-$ASLOT" > /dev/null
+if $BIN validate -c "$ACONFIG" 2>&1 | grep -q "all checks passed"; then
+  ok "validate accepts a keyless table declared append_only"
+else
+  bad "validate refused an append_only table with no primary key"
+fi
+# a key and the declaration cannot both be true of one table. Captured
+# first: a refusal exits non-zero, which under pipefail would hide a grep
+# that matched.
+printf 'primary_key = "kind"\n' | cat "$ACONFIG" - > "${ACONFIG}.bad"
+out=$($BIN validate -c "${ACONFIG}.bad" 2>&1 || true)
+if grep -q "contradict" <<< "$out"; then
+  ok "validate refuses primary_key beside append_only"
+else
+  bad "validate accepted primary_key on an append_only table"
+fi
+rm -f "${ACONFIG}.bad"
+nohup $BIN run -c "$ACONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_count e2e_append)" = "2" ] && break
+  sleep 1
+done
+check "the load files three rows as two documents: the duplicate is the same one" "$(os_count e2e_append)" "2"
+pg "INSERT INTO events_log VALUES ('2024-01-01T00:00:02Z','login','bob');" > /dev/null
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_count e2e_append)" = "3" ] && break
+  sleep 1
+done
+check "a streamed row is a new document" "$(os_count e2e_append)" "3"
+# the same row again, then a fresh one to wait on: the stream hashes as the
+# load did, so the count moves by one, not two
+pg "INSERT INTO events_log VALUES ('2024-01-01T00:00:02Z','login','bob');" > /dev/null
+pg "INSERT INTO events_log VALUES ('2024-01-01T00:00:03Z','logout','bob');" > /dev/null
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_count e2e_append)" -ge 4 ] && break
+  sleep 1
+done
+check "a streamed duplicate is the document it already is" "$(os_count e2e_append)" "4"
+# Nothing can say which document a changed row is, so the pipeline halts by
+# name rather than guess or skip. PostgreSQL itself refuses an UPDATE on a
+# published table with no replica identity, so the one way an UPDATE can
+# reach the pipeline is under FULL — set while stopped, as in section 26.
+# The log is cumulative across sections, so only a new line counts.
+stop_sync
+pg "ALTER TABLE events_log REPLICA IDENTITY FULL;" > /dev/null 2>&1
+halts_before=$(grep -c "an UPDATE arrived on an append-only table" "$LOG" || true)
+nohup $BIN run -c "$ACONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+pg "UPDATE events_log SET kind='x';" > /dev/null
+for _ in $(seq 1 30); do
+  [ "$(grep -c 'an UPDATE arrived on an append-only table' "$LOG" || true)" -gt "$halts_before" ] && break
+  sleep 1
+done
+if [ "$(grep -c 'an UPDATE arrived on an append-only table' "$LOG" || true)" -gt "$halts_before" ]; then
+  ok "an UPDATE on an append-only table halts the pipeline"
+else
+  bad "an UPDATE on an append-only table was not refused"
+fi
 stop_sync
 
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"

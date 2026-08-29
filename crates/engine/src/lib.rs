@@ -162,6 +162,9 @@ pub struct PipelineCtx {
     pub filters: crate::mapping::Filters,
     /// The target's ingest pipeline each table's documents go through.
     pub pipelines: crate::mapping::Pipelines,
+    /// Tables with no key: insert-only, filed under a content hash unless
+    /// the section configures an id.
+    pub append_only: crate::mapping::AppendOnly,
     pub cfg: EngineConfig,
     /// Updated by the sink task after every successful flush.
     pub ack_tx: watch::Sender<Option<Lsn>>,
@@ -455,6 +458,7 @@ pub async fn run(
                     joins: &ctx.joins,
                     filters: &ctx.filters,
                     pipelines: &ctx.pipelines,
+                    append_only: &ctx.append_only,
                 };
                 let completions = match fetch_completions(
                     &rows,
@@ -1081,6 +1085,7 @@ pub struct Rules<'a> {
     pub joins: &'a crate::mapping::Joins,
     pub filters: &'a crate::mapping::Filters,
     pub pipelines: &'a crate::mapping::Pipelines,
+    pub append_only: &'a crate::mapping::AppendOnly,
 }
 
 /// Fill unchanged TOASTed columns from the document already in the target.
@@ -1236,9 +1241,18 @@ fn derived_id(
     pk: &Value,
     doc: Option<&Value>,
     before: Option<&Value>,
-    templates: &crate::mapping::IdTemplates,
+    rules: &Rules<'_>,
 ) -> Result<String, CoreError> {
-    let Some(template) = templates.for_table(table.0, table.1) else {
+    let Some(template) = rules.id_templates.for_table(table.0, table.1) else {
+        // A keyless row is its content: the source sends it with a null key,
+        // and the row itself is the only thing that can name the document.
+        // The before-image is the same raw row, which is what a filtered-out
+        // insert carries by the time it reaches here.
+        if rules.append_only.contains(table.0, table.1)
+            && let Some(row) = doc.or(before)
+        {
+            return Ok(crate::mapping::content_id(row));
+        }
         return Ok(pk_to_id(pk));
     };
     render_for_row("id", table, template, pk, doc, before)
@@ -1284,6 +1298,11 @@ fn completion_key(
         return None;
     };
     if unchanged_toast_columns.is_empty() {
+        return None;
+    }
+    // no update ever reaches an append-only table's documents: the write path
+    // halts on it, so there is nothing to complete against
+    if rules.append_only.contains(table.0, table.1) {
         return None;
     }
     let old_pk = previous_pk.as_ref().unwrap_or(pk);
@@ -1375,6 +1394,22 @@ fn materialize(
         })
     };
     let halt = |e: String| CoreError::Other(format!("{}.{}: {e}", table.0, table.1));
+    // Judged on the row as the source sent it, before the filter can turn an
+    // insert into a delete: an append-only table has no key, so nothing can
+    // say which document a changed or removed row was, and guessing would
+    // leave the index quietly wrong. Halting is the honest answer.
+    if rules.append_only.contains(table.0, table.1) {
+        let what = match kind {
+            RowKind::Insert { .. } => None,
+            RowKind::Update { .. } => Some("an UPDATE"),
+            RowKind::Delete { .. } => Some("a DELETE"),
+        };
+        if let Some(what) = what {
+            return Err(halt(format!(
+                "{what} arrived on an append-only table; nothing can say which document it is"
+            )));
+        }
+    }
     // Identity — and the index, which is identity's twin — renders from the
     // row's RAW values, so every derivation below reads the document before
     // projections and transforms touch it; renames run after those, so
@@ -1456,7 +1491,7 @@ fn materialize(
     let kind = filtered.as_ref();
     match kind {
         RowKind::Insert { pk, doc } => {
-            let base = derived_id(table, pk, Some(doc), None, rules.id_templates)?;
+            let base = derived_id(table, pk, Some(doc), None, rules)?;
             let index = rendered_index(target, table, pk, Some(doc), None)?;
             let filed = file(doc)?;
             Ok(finish(&index, shape(&base, doc)?, filed, &[], left_as_is))
@@ -1476,7 +1511,7 @@ fn materialize(
             let old_pk = previous_pk.as_ref().unwrap_or(pk);
             // the completed document is what identity renders from, so the
             // index sees the same row and the two cannot disagree
-            let base = derived_id(table, pk, Some(&doc), before, rules.id_templates)?;
+            let base = derived_id(table, pk, Some(&doc), before, rules)?;
             let index = rendered_index(target, table, pk, Some(&doc), before)?;
             let filed = file(&doc)?;
             let routing = filed.as_ref().and_then(|(_, routing)| routing.clone());
@@ -1493,8 +1528,7 @@ fn materialize(
                 // than a delete nobody asked for; lingering stale documents
                 // are the reconcile tool's to find.
                 if let Some(before) = before {
-                    let old_base =
-                        derived_id(table, old_pk, None, Some(before), rules.id_templates)?;
+                    let old_base = derived_id(table, old_pk, None, Some(before), rules)?;
                     let old_index = rendered_index(target, table, old_pk, None, Some(before))?;
                     // One row, one index: every element document went where
                     // the row did, so when the row moved index nothing in the
@@ -1548,7 +1582,7 @@ fn materialize(
         }
         RowKind::Delete { pk, before } => {
             let before = before.as_ref();
-            let base = derived_id(table, pk, None, before, rules.id_templates)?;
+            let base = derived_id(table, pk, None, before, rules)?;
             // the before-image names the index the document is in; a
             // template it cannot satisfy halts, as the startup check promised
             let index = rendered_index(target, table, pk, None, before)?;
@@ -1980,6 +2014,7 @@ mod pipeline_tests {
             joins: crate::mapping::Joins::default(),
             filters: crate::mapping::Filters::default(),
             pipelines: crate::mapping::Pipelines::default(),
+            append_only: Default::default(),
             cfg,
             ack_tx,
             load_done_tx,
@@ -2933,6 +2968,7 @@ mod pipeline_tests {
             joins: crate::mapping::Joins::default(),
             filters,
             pipelines,
+            append_only: Default::default(),
             cfg: EngineConfig {
                 batch_size,
                 checkpoint_interval_ms: 100,
@@ -3080,6 +3116,7 @@ mod pipeline_tests {
             joins: Default::default(),
             filters: Default::default(),
             pipelines: Default::default(),
+            append_only: Default::default(),
             cfg: EngineConfig::default(),
             ack_tx,
             load_done_tx,
@@ -3140,6 +3177,7 @@ mod pipeline_tests {
             joins: Default::default(),
             filters: Default::default(),
             pipelines: Default::default(),
+            append_only: Default::default(),
             cfg: EngineConfig::default(),
             ack_tx,
             load_done_tx,
@@ -3204,6 +3242,7 @@ mod pipeline_tests {
             joins: Default::default(),
             filters: Default::default(),
             pipelines: Default::default(),
+            append_only: Default::default(),
             cfg: EngineConfig::default(),
             ack_tx,
             load_done_tx,
@@ -3520,6 +3559,7 @@ mod pipeline_tests {
             joins: Default::default(),
             filters: Default::default(),
             pipelines: Default::default(),
+            append_only: Default::default(),
             cfg: EngineConfig::default(),
             ack_tx,
             load_done_tx,
@@ -3586,6 +3626,7 @@ mod pipeline_tests {
             joins,
             filters: Default::default(),
             pipelines: Default::default(),
+            append_only: Default::default(),
             cfg: EngineConfig::default(),
             ack_tx: ack_tx.clone(),
             load_done_tx: load_done_tx.clone(),
@@ -3892,6 +3933,7 @@ mod pipeline_tests {
             joins: crate::mapping::Joins::default(),
             filters,
             pipelines: crate::mapping::Pipelines::default(),
+            append_only: Default::default(),
             cfg: EngineConfig {
                 batch_size: 500,
                 checkpoint_interval_ms: 100,
@@ -4238,6 +4280,7 @@ mod pipeline_tests {
             joins: shop_joins(),
             filters: crate::mapping::Filters::default(),
             pipelines: crate::mapping::Pipelines::default(),
+            append_only: Default::default(),
             cfg: EngineConfig {
                 batch_size: 500,
                 checkpoint_interval_ms: 100,
@@ -4463,5 +4506,205 @@ mod pipeline_tests {
                 "relation": {"name": "order", "parent": "customer-2"}
             }))
         );
+    }
+
+    /// `public.users` declared append-only, with whatever id the section
+    /// configures. Reports how the engine ended, for the tests about a halt.
+    async fn drive_append_only(
+        ids: crate::mapping::IdTemplates,
+        script: Vec<ChangeEvent>,
+    ) -> (Arc<RecordingSink>, Result<(), CoreError>) {
+        let (events_tx, events_rx) = mpsc::channel(1024);
+        let (copy_tx, copy_rx) = mpsc::channel(1024);
+        drop(copy_tx);
+        let (ack_tx, _ack_rx) = watch::channel(None);
+        let (load_done_tx, _load_done_rx) = watch::channel(0u64);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sink = Arc::new(RecordingSink::default());
+        let ctx = Arc::new(PipelineCtx {
+            sink: sink.clone(),
+            mapping: TableMapping::from_pairs([(
+                ("public".to_string(), "users".to_string()),
+                "users".to_string(),
+            )]),
+            projections: crate::mapping::Projections::default(),
+            transforms: crate::mapping::Transforms::default(),
+            renames: crate::mapping::Renames::default(),
+            constants: crate::mapping::Constants::default(),
+            id_templates: ids,
+            fan_outs: Default::default(),
+            joins: Default::default(),
+            filters: Default::default(),
+            pipelines: Default::default(),
+            append_only: crate::mapping::AppendOnly::from_iter([(
+                "public".to_string(),
+                "users".to_string(),
+            )]),
+            cfg: EngineConfig {
+                batch_size: 500,
+                checkpoint_interval_ms: 100,
+                ..EngineConfig::default()
+            },
+            ack_tx,
+            load_done_tx,
+            metrics: Arc::new(crate::metrics::Metrics::default()),
+        });
+        for event in script {
+            events_tx.send(event).await.expect("channel has room");
+        }
+        drop(events_tx);
+        let outcome = run(
+            events_rx,
+            copy_rx,
+            ctx,
+            StreamId {
+                source: SOURCE_POSTGRES.into(),
+                stream: "slot".into(),
+                publication: "pub".into(),
+            },
+            Arc::new(|token| Lsn(token).to_string()),
+            crate::mapping::DurableLsn::default(),
+            shutdown_rx,
+        )
+        .await;
+        (sink, outcome)
+    }
+
+    /// A change on a table with no key, exactly as a source sends it.
+    fn keyless(kind: RowKind) -> ChangeEvent {
+        ChangeEvent::Row(RowChange {
+            schema: "public".into(),
+            table: "users".into(),
+            kind,
+            version: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn an_append_only_row_is_filed_under_its_content_hash() {
+        let first = json!({"at": "2026-01-01T00:00:00Z", "kind": "login", "payload": "ok"});
+        let second = json!({"at": "2026-01-01T00:00:01Z", "kind": "login", "payload": "ok"});
+        let (sink, outcome) = drive_append_only(
+            Default::default(),
+            vec![
+                keyless(RowKind::Insert {
+                    pk: Value::Null,
+                    doc: first.clone(),
+                }),
+                keyless(RowKind::Insert {
+                    pk: Value::Null,
+                    doc: first.clone(),
+                }),
+                keyless(RowKind::Insert {
+                    pk: Value::Null,
+                    doc: second.clone(),
+                }),
+                commit(0x100),
+            ],
+        )
+        .await;
+        outcome.expect("engine ran");
+        let written: Vec<String> = sink
+            .docs
+            .lock()
+            .expect("not poisoned")
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect();
+        assert_eq!(
+            written.len(),
+            3,
+            "every insert is written; the target collapses replays"
+        );
+        assert_eq!(
+            written[0], written[1],
+            "the same row is the same document, so a replay lands on itself"
+        );
+        assert_ne!(
+            written[0], written[2],
+            "different rows are different documents"
+        );
+        for id in &written {
+            assert!(
+                id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit()),
+                "a content id is 32 hex characters: {id}"
+            );
+        }
+        assert_eq!(written[0], crate::mapping::content_id(&first));
+        assert_eq!(written[2], crate::mapping::content_id(&second));
+    }
+
+    #[tokio::test]
+    async fn an_update_on_an_append_only_table_halts() {
+        let (sink, outcome) = drive_append_only(
+            Default::default(),
+            vec![
+                keyless(RowKind::Update {
+                    pk: Value::Null,
+                    previous_pk: None,
+                    doc: json!({"kind": "x"}),
+                    unchanged_toast_columns: vec![],
+                    before: None,
+                }),
+                commit(0x100),
+            ],
+        )
+        .await;
+        let message = outcome
+            .expect_err("an update on a keyless table must stop the pipeline")
+            .to_string();
+        assert!(
+            message.contains("public.users")
+                && message.contains("an UPDATE arrived on an append-only table"),
+            "the halt must name the table and the change: {message}"
+        );
+        assert!(
+            sink.events().is_empty(),
+            "nothing is written before the halt"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delete_on_an_append_only_table_halts() {
+        let (sink, outcome) = drive_append_only(
+            Default::default(),
+            vec![
+                keyless(RowKind::Delete {
+                    pk: Value::Null,
+                    before: Some(json!({"kind": "x"})),
+                }),
+                commit(0x100),
+            ],
+        )
+        .await;
+        let message = outcome
+            .expect_err("a delete on a keyless table must stop the pipeline")
+            .to_string();
+        assert!(
+            message.contains("public.users")
+                && message.contains("a DELETE arrived on an append-only table"),
+            "the halt must name the table and the change: {message}"
+        );
+        assert!(
+            sink.events().is_empty(),
+            "nothing is written before the halt"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_append_only_table_with_an_id_template_uses_it() {
+        let (sink, outcome) = drive_append_only(
+            users_ids("event-{event_id}", &[]),
+            vec![
+                keyless(RowKind::Insert {
+                    pk: Value::Null,
+                    doc: json!({"event_id": "e-1", "kind": "login"}),
+                }),
+                commit(0x100),
+            ],
+        )
+        .await;
+        outcome.expect("engine ran");
+        assert_eq!(sink.events(), vec!["write[upsert:event-e-1]"]);
     }
 }

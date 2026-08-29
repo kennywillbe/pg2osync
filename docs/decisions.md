@@ -152,6 +152,24 @@ A delete carries none, since an ingest pipeline runs on index actions only.
 Meilisearch has no ingest pipelines, and refuses the option at config load
 rather than ignoring it.
 
+**A table without a key syncs as insert-only, under a content hash.**
+(`append_only`, #70.) The key requirement was right for a mutable row — an
+update or a delete has to find the document the row already owns, and only a
+key says which — and wrong for an event log or an audit trail, which never
+updates or deletes and was refused for a case that never arises. Declared
+`append_only`, a table files each row under a sha256 of its raw values as
+canonical JSON. Not the source position: the initial load has no per-row
+position, and the same row has to hash the same on every path — COPY, WAL,
+poll, MySQL load and binlog — which key-sorted JSON of the raw row gives and a
+position never could. Two identical rows are therefore one document, and that
+is the at-least-once guarantee restated: a replayed row is the same document,
+and a duplicate the source itself cannot tell apart is not one the index
+should invent a difference for. An UPDATE or DELETE that arrives anyway halts
+the pipeline, naming the table, rather than being missed: nothing can say
+which document it addresses. `init` writes the flag for a keyless table
+instead of refusing it, so the smallest config still runs and the declaration
+sits where the operator will read it.
+
 **A column can be renamed in the target; the rename is the last step.**
 (`fields`, #66.) The source name is the one namespace the operator already
 knows, and the one every other check — projection, `transform`, `id`,

@@ -240,7 +240,8 @@ async fn key_bounds(
     // predicate would cost a second scan to save nothing.
     // A composite key would need a row-constructor comparison, which is right
     // for PostgreSQL and pathological on MySQL; until that is worth branching
-    // for, such a table is read in one piece as before.
+    // for, such a table is read in one piece as before. So is an append-only
+    // table, which has no key to cut by at all.
     let pk: Vec<&ColMeta> = cols.iter().filter(|c| c.is_pk).collect();
     let [key] = pk.as_slice() else {
         return Ok(whole);
@@ -449,6 +450,7 @@ pub async fn run(
             child_specs,
             soft_delete: tbl.soft_delete.as_deref(),
             pk_column: pk_column.as_deref(),
+            append_only: tbl.append_only,
             filter: scope.filter.as_deref(),
             table_filter: scope.table_filter(&tbl.table),
         };
@@ -527,6 +529,9 @@ struct RangePlan<'a> {
     child_specs: &'a [ChildSpec],
     soft_delete: Option<&'a str>,
     pk_column: Option<&'a str>,
+    /// Declared keyless: its rows go out with no key, and the engine files
+    /// them under a hash of their content.
+    append_only: bool,
     filter: Option<&'a str>,
     table_filter: Option<&'a pg2osync_core::filter::Filter>,
 }
@@ -594,6 +599,7 @@ async fn read_range(
                     &fields,
                     chunk_lsn,
                     plan.child_specs,
+                    plan.append_only,
                 )?
             };
             if tx.send(ChangeEvent::Row(change)).await.is_err() {
@@ -689,6 +695,7 @@ fn build_change(
     fields: &[Option<Vec<u8>>],
     version: Option<u64>,
     children: &[ChildSpec],
+    append_only: bool,
 ) -> Result<pg2osync_core::event::RowChange> {
     let mut doc = serde_json::Map::new();
     let mut pk_map = serde_json::Map::new();
@@ -698,21 +705,23 @@ fn build_change(
             fields.get(i).and_then(|f| f.as_deref()),
         )
         .map_err(|e| anyhow::anyhow!("column {}: {e}", meta.name))?;
-        if meta.is_pk {
+        if meta.is_pk && !append_only {
             pk_map.insert(meta.name.clone(), value.clone());
         }
         doc.insert(meta.name.clone(), value);
     }
-    if pk_map.is_empty() {
-        bail!(
+    // An append-only row carries no key even when the table happens to have
+    // one: the engine mints its id from the document, the same way the
+    // stream's rows get theirs, so the two paths cannot file one row twice.
+    let pk = match pk_map.len() {
+        0 if append_only => serde_json::Value::Null,
+        0 => bail!(
             "table {schema}.{table} has no primary key; pg2osync needs one to \
-             derive a stable document id"
-        );
-    }
-    let pk = if pk_map.len() == 1 {
-        pk_map.into_iter().next().expect("single entry").1
-    } else {
-        serde_json::Value::Object(pk_map)
+             derive a stable document id, or `append_only = true` on its [sync] \
+             section to index its rows as they arrive"
+        ),
+        1 => pk_map.into_iter().next().expect("single entry").1,
+        _ => serde_json::Value::Object(pk_map),
     };
     // The collection totals ride at the end of the row, one per child in
     // configuration order. A collection cut short says so, in the same two

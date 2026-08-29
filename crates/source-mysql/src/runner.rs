@@ -39,6 +39,10 @@ pub struct MySqlSourceConfig {
     pub gtid: Option<std::sync::Arc<std::sync::Mutex<crate::gtid::GtidTracker>>>,
     /// The GTID position to ask the server to resume from, when there is one.
     pub gtid_resume: Option<crate::gtid::GtidPosition>,
+    /// Tables declared `append_only`: a primary key is not required, their
+    /// inserts carry no key, and an update or delete on one is an error
+    /// rather than a document nothing can find.
+    pub append_only: std::collections::HashSet<(String, String)>,
     /// Added to every coordinate to make the ordering token and the document
     /// version. A failover moves to a different, often lower, coordinate space,
     /// and versions may only go up — so the generation lives here rather than
@@ -58,6 +62,11 @@ impl MySqlSourceConfig {
             tls: self.tls.clone(),
         }
     }
+
+    fn is_append_only(&self, schema: &str, table: &str) -> bool {
+        self.append_only
+            .contains(&(schema.to_string(), table.to_string()))
+    }
 }
 
 /// A table registered by a TABLE_MAP event, with its resolved schema.
@@ -67,6 +76,7 @@ struct RegisteredTable {
     meta: binlog::TableMeta,
     columns: Vec<String>,
     pk_columns: Vec<String>,
+    append_only: bool,
 }
 
 pub struct MySqlSource {
@@ -90,7 +100,9 @@ impl MySqlSource {
     pub async fn bootstrap(&self, admin: &mut MySqlConnection) -> Result<()> {
         catalog::check_prerequisites(admin).await?;
         for (schema, table) in &self.cfg.tables {
-            let resolved = catalog::table_schema(admin, schema, table).await?;
+            let resolved =
+                catalog::table_schema(admin, schema, table, self.cfg.is_append_only(schema, table))
+                    .await?;
             tracing::debug!(target: "pg2osync::source",
                 "{schema}.{table}: {} columns, pk {:?}",
                 resolved.columns.len(), resolved.pk_columns);
@@ -376,8 +388,9 @@ impl MySqlSource {
                     // TABLE_MAP optional metadata carries names only when the
                     // server runs binlog_row_metadata=FULL; information_schema
                     // is the portable source of truth
+                    let append_only = self.cfg.is_append_only(&meta.schema, &meta.name);
                     let resolved: TableSchema = schemas
-                        .get(&mut admin, &meta.schema, &meta.name)
+                        .get(&mut admin, &meta.schema, &meta.name, append_only)
                         .await?
                         .clone();
                     let columns = if opt.column_names.len() == meta.columns.len() {
@@ -411,6 +424,7 @@ impl MySqlSource {
                             meta,
                             columns,
                             pk_columns: resolved.pk_columns.clone(),
+                            append_only,
                         },
                     );
                 }
@@ -620,12 +634,28 @@ async fn wait_shutdown(shutdown: &tokio::sync::watch::Receiver<bool>) {
 }
 
 /// Turn one decoded binlog row into a change event with named columns.
+///
+/// On an append-only table an insert carries no key — the engine files it
+/// under a hash of its content — and an update or delete is an error, because
+/// without a key nothing can say which document it is.
 fn build_change(
     rt: &RegisteredTable,
     kind: &RowsKind,
     row: &binlog::RowsRow,
     version: u64,
 ) -> Result<ChangeEvent> {
+    if rt.append_only && !matches!(kind, RowsKind::Write) {
+        let what = match kind {
+            RowsKind::Update => "an UPDATE",
+            _ => "a DELETE",
+        };
+        anyhow::bail!(
+            "{}.{}: {what} arrived on an append-only table; nothing can say which \
+             document it is",
+            rt.schema,
+            rt.table
+        );
+    }
     // Deletes carry only the before-image; inserts and updates carry an after-
     // image whose values are the new row state.
     let (values, key_values) = match kind {
@@ -647,7 +677,11 @@ fn build_change(
     };
 
     let doc = document(&rt.columns, values);
-    let pk = primary_key(&rt.columns, key_values, &rt.pk_columns)?;
+    let pk = if rt.append_only {
+        Value::Null
+    } else {
+        primary_key(&rt.columns, key_values, &rt.pk_columns)?
+    };
 
     let kind = match kind {
         RowsKind::Write => RowKind::Insert {
@@ -742,7 +776,47 @@ mod tests {
             },
             columns: vec!["id".into(), "total".into()],
             pk_columns: vec!["id".into()],
+            append_only: false,
         }
+    }
+
+    #[test]
+    fn an_append_only_insert_carries_no_key_and_an_update_is_refused() {
+        let rt = RegisteredTable {
+            pk_columns: vec![],
+            append_only: true,
+            ..table()
+        };
+        let row = binlog::RowsRow {
+            before: None,
+            after: Some(vec![Some(json!(1)), Some(json!("5.00"))]),
+        };
+        let ChangeEvent::Row(change) = build_change(&rt, &RowsKind::Write, &row, 900).unwrap()
+        else {
+            panic!("expected a row change");
+        };
+        // the engine mints the id from the document, so a key here would only
+        // be something for the load and the stream to disagree about
+        assert_eq!(change.pk(), &Value::Null);
+        let RowKind::Insert { doc, .. } = &change.kind else {
+            panic!("expected an insert");
+        };
+        assert_eq!(doc["total"], json!("5.00"));
+
+        let updated = binlog::RowsRow {
+            before: Some(vec![Some(json!(1)), Some(json!("5.00"))]),
+            after: Some(vec![Some(json!(1)), Some(json!("9.00"))]),
+        };
+        let err = build_change(&rt, &RowsKind::Update, &updated, 900)
+            .expect_err("no key, so no document to replace");
+        assert_eq!(
+            err.to_string(),
+            "shop.orders: an UPDATE arrived on an append-only table; nothing can say which \
+             document it is"
+        );
+        let err = build_change(&rt, &RowsKind::Delete, &updated, 900)
+            .expect_err("no key, so no document to remove");
+        assert!(err.to_string().contains("a DELETE arrived"), "{err}");
     }
 
     #[test]

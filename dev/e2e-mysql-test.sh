@@ -905,5 +905,77 @@ done
 check "and so does a streamed row" "$(os_field e2e_mysql_pipe 2 tagged)" "yes"
 stop_sync
 
+say "20. a table with no primary key syncs insert-only, under a content hash"
+# The PostgreSQL suite's section 28 (#70) on the binlog path: the hash is
+# minted in the engine from the raw row, so the load and the stream have to
+# agree on it here too, a duplicate stays one document, and an UPDATE —
+# which MySQL allows on a keyless table — halts by name.
+stop_sync
+ACONFIG=$(mktemp /tmp/pg2osync-mysql-append.XXXXXX)
+ASID=990008
+cat > "$ACONFIG" <<TOML
+[source]
+flavor = "mysql"
+url_env = "PG2OSYNC_MYSQL_URL"
+server_id = $ASID
+
+[target]
+url = "$OS"
+
+[metrics]
+bind = "127.0.0.1:9120"
+
+[sync.events_log]
+table = "sourcedb.events_log"
+index = "e2e_mysql_append"
+append_only = true
+TOML
+append_cleanup() {
+  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  my "DROP TABLE IF EXISTS events_log;" > /dev/null 2>&1 || true
+  curl -s -XDELETE "$OS/e2e_mysql_append?ignore_unavailable=true" > /dev/null 2>&1 || true
+  rm -f "$ACONFIG"
+}
+trap 'cleanup; resume_cleanup; types_cleanup; child_cleanup; where_cleanup; events_cleanup; pipe_cleanup; append_cleanup' EXIT
+
+my "DROP TABLE IF EXISTS events_log;"
+my "CREATE TABLE events_log(\`at\` datetime, kind varchar(20), payload text);"
+# the third row is the first one again, byte for byte: same hash, same document
+my "INSERT INTO events_log VALUES ('2024-01-01 00:00:00','login','alice'), ('2024-01-01 00:00:01','logout','alice'), ('2024-01-01 00:00:00','login','alice');"
+curl -s -XDELETE "$OS/e2e_mysql_append?ignore_unavailable=true" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/mysql-$ASID" > /dev/null
+if $BIN validate -c "$ACONFIG" 2>&1 | grep -q "all checks passed"; then
+  ok "validate accepts a keyless table declared append_only"
+else
+  bad "validate refused an append_only table with no primary key"
+fi
+nohup $BIN run -c "$ACONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+await_count e2e_mysql_append 2
+check "the load files three rows as two documents: the duplicate is the same one" "$(os_count e2e_mysql_append)" "2"
+my "INSERT INTO events_log VALUES ('2024-01-01 00:00:02','login','bob');"
+await_count e2e_mysql_append 3
+check "a streamed row is a new document" "$(os_count e2e_mysql_append)" "3"
+# the same row again, then a fresh one to wait on: the stream hashes as the
+# load did, so the count moves by one, not two
+my "INSERT INTO events_log VALUES ('2024-01-01 00:00:02','login','bob');"
+my "INSERT INTO events_log VALUES ('2024-01-01 00:00:03','logout','bob');"
+await_count e2e_mysql_append 4
+check "a streamed duplicate is the document it already is" "$(os_count e2e_mysql_append)" "4"
+# Nothing can say which document a changed row is, so the pipeline halts by
+# name rather than guess or skip. The log is cumulative across sections, so
+# only a new line counts.
+halts_before=$(grep -c "an UPDATE arrived on an append-only table" "$LOG" || true)
+my "UPDATE events_log SET kind='x';"
+for _ in $(seq 1 30); do
+  [ "$(grep -c 'an UPDATE arrived on an append-only table' "$LOG" || true)" -gt "$halts_before" ] && break
+  sleep 1
+done
+if [ "$(grep -c 'an UPDATE arrived on an append-only table' "$LOG" || true)" -gt "$halts_before" ]; then
+  ok "an UPDATE on an append-only table halts the pipeline"
+else
+  bad "an UPDATE on an append-only table was not refused"
+fi
+stop_sync
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

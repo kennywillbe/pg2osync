@@ -51,10 +51,11 @@ impl SchemaCache {
         conn: &mut MySqlConnection,
         schema: &str,
         table: &str,
+        keyless_ok: bool,
     ) -> Result<&TableSchema> {
         let key = (schema.to_string(), table.to_string());
         if !self.entries.contains_key(&key) {
-            let resolved = table_schema(conn, schema, table).await?;
+            let resolved = table_schema(conn, schema, table, keyless_ok).await?;
             self.entries.insert(key.clone(), resolved);
         }
         Ok(self.entries.get(&key).expect("inserted above"))
@@ -62,10 +63,15 @@ impl SchemaCache {
 }
 
 /// Resolve one table's columns and primary key.
+///
+/// A table without a primary key is an error unless `keyless_ok`, which a
+/// section declared `append_only` grants: its rows are filed under a hash of
+/// their content, so no key is needed and `pk_columns` stays empty.
 pub async fn table_schema(
     conn: &mut MySqlConnection,
     schema: &str,
     table: &str,
+    keyless_ok: bool,
 ) -> Result<TableSchema> {
     let rows = conn
         .query_text_rows(&format!(
@@ -109,10 +115,11 @@ pub async fn table_schema(
         .iter()
         .filter_map(|r| r.first().cloned().flatten())
         .collect();
-    if pk_columns.is_empty() {
+    if pk_columns.is_empty() && !keyless_ok {
         bail!(
             "table {schema}.{table} has no PRIMARY KEY; pg2osync needs one to \
-             derive a stable document id"
+             derive a stable document id, or `append_only = true` on its [sync] \
+             section to index its rows as they arrive"
         );
     }
     Ok(TableSchema {
@@ -399,6 +406,10 @@ pub fn parse_stored_position(text: &str) -> Option<StoredPosition> {
 }
 
 /// Build one backfill document plus its primary key.
+///
+/// A keyless (append-only) table yields `Null` for the key: the engine mints
+/// the id from the document, and an empty object here would be a key that
+/// every row shares.
 pub fn build_document(schema: &TableSchema, row: &[Option<Vec<u8>>]) -> (Value, Value) {
     let mut doc = Map::new();
     let mut pk = Map::new();
@@ -409,10 +420,10 @@ pub fn build_document(schema: &TableSchema, row: &[Option<Vec<u8>>]) -> (Value, 
         }
         doc.insert(col.name.clone(), value);
     }
-    let pk = if pk.len() == 1 {
-        pk.into_iter().next().expect("single entry").1
-    } else {
-        Value::Object(pk)
+    let pk = match pk.len() {
+        0 => Value::Null,
+        1 => pk.into_iter().next().expect("single entry").1,
+        _ => Value::Object(pk),
     };
     (Value::Object(doc), pk)
 }
@@ -539,6 +550,22 @@ mod tests {
         };
         let (_, pk) = build_document(&composite, &row);
         assert_eq!(pk["tenant"], Value::from("acme"));
+    }
+
+    #[test]
+    fn a_keyless_document_carries_no_key() {
+        // an append-only table: the engine files the row under a hash of its
+        // content, and an empty object would be one key every row shared
+        let schema = TableSchema {
+            columns: vec![Column {
+                name: "kind".into(),
+                shape: ValueShape::Text,
+            }],
+            pk_columns: vec![],
+        };
+        let (doc, pk) = build_document(&schema, &[Some(b"click".to_vec())]);
+        assert_eq!(pk, Value::Null);
+        assert_eq!(doc["kind"], Value::from("click"));
     }
 
     #[test]

@@ -44,6 +44,10 @@ pub struct WalSourceConfig {
     /// IDENTITY FULL pgoutput flags every column as identity, and only this
     /// says which of them a document is actually filed under.
     pub key_columns: HashMap<(String, String), Vec<String>>,
+    /// Tables declared `append_only`: their inserts carry no key, and an
+    /// update or delete on one is an error rather than a document nothing
+    /// can find.
+    pub append_only: std::collections::HashSet<(String, String)>,
     /// Highest durably-flushed position as reported by the engine's
     /// checkpoint task. Feedback to PostgreSQL is clamped to this: acking
     /// beyond it lets PG recycle WAL for events we have not indexed yet,
@@ -439,6 +443,7 @@ impl WalSource {
             rel,
             incoming,
             self.cfg.key_columns.get(&table).map(Vec::as_slice),
+            self.cfg.append_only.contains(&table),
         )?;
         if self.cfg.children.contains_key(&table) {
             Ok(Classified::ParentRow(table, change))
@@ -563,6 +568,7 @@ mod tests {
             child_parents: HashMap::new(),
             parent_pk_columns: HashMap::new(),
             key_columns: HashMap::new(),
+            append_only: Default::default(),
             durable: None,
         })
     }

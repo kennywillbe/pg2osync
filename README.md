@@ -19,8 +19,9 @@ export PG2OSYNC_SOURCE_URL="postgres://user:pass@db-host/mydb"
 ```
 
 `init` reads your database to write the config, so an unqualified `users` comes
-out as `public.users` and a table without a primary key is refused before you
-find out at run time. `validate` is worth reading rather than skipping:
+out as `public.users` and a table without a primary key comes out declared
+`append_only` rather than failing at the first row of the load. `validate` is
+worth reading rather than skipping:
 
 ```
 ✓ config structure valid (1 table mappings)
@@ -83,6 +84,7 @@ not expressions) — if you need those, you want Kafka.
 | Column projection (`columns` / `exclude_columns`) | ✅ |
 | Derived document ids (`id = "tenant-{tenant_id}-{id}"`) | ✅ default stays the primary key; non-key columns need `REPLICA IDENTITY FULL` |
 | One row to many documents (`fan_out` over a JSON-array column) | ✅ elements added, moved and removed as versioned writes |
+| Append-only tables without a primary key (`append_only`) | ✅ content-hash ids; an UPDATE or DELETE halts |
 | Column transforms (`hash`, `redact`, `json`, `split`, `number`, `date`) | ✅ six named reshapes, no expression language; a value that will not convert is indexed as it is and counted |
 | Row filters (`where`) | ✅ a SQL subset the load pushes down and the stream evaluates; a row that leaves the filter is deleted |
 | Field renames (`fields`) | ✅ source column to target field, on every path and inside child arrays |
@@ -131,7 +133,8 @@ Stated up front, because finding these out in production is expensive:
 ## Requirements
 
 **PostgreSQL source** — 15 or newer, `wal_level = logical`, a user with
-`REPLICATION`, and a primary key on every synced table. TLS is supported on
+`REPLICATION`, and a primary key on every synced table — or `append_only` on
+one that has none. TLS is supported on
 every connection via `[source] sslmode` (libpq semantics, `prefer` by default).
 
 **MySQL source** — MySQL 8.0+ or MariaDB 10.6+ with `log_bin = ON`,
@@ -201,8 +204,9 @@ curl -s localhost:9200/users/_doc/1 | jq .
 
 Against **your own** database the only difference is the URL: `init` finds the
 tables, and `validate` names anything the server still needs — `wal_level`, a
-replication role, a primary key. `pg2osync setup-sql` prints the SQL for a DBA
-to run when you do not hold those privileges yourself.
+replication role, a primary key or `append_only` in its place.
+`pg2osync setup-sql` prints the SQL for a DBA to run when you do not hold
+those privileges yourself.
 
 ## A fuller configuration
 
@@ -298,8 +302,8 @@ pipeline at a promoted replica resumes instead of reloading. `dev/failover-probe
 promotes a real replica and proves it. MariaDB needs no setting for this.
 
 **Crash safety** — restart the process; it resumes from the last checkpoint.
-Delivery is at-least-once with idempotent writes (`_id` is the primary key, or
-an id shaped by configuration), so
+Delivery is at-least-once with idempotent writes (`_id` is the primary key, an
+id shaped by configuration, or a content hash on an `append_only` table), so
 replays overwrite rather than duplicate. The acknowledgement sent back to the
 source is clamped to the durable checkpoint, so the database never recycles
 history for rows that are not indexed yet.
