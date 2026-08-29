@@ -21,8 +21,8 @@ re-read a table from the start, is a major version.
 
 ### Features
 
-* rename columns in the target document ([#66](https://github.com/kennywillbe/pg2osync/issues/66)) ([6ba3bb1](https://github.com/kennywillbe/pg2osync/commit/6ba3bb1803db7f67ce18fb4d0ff757bb4dbc8dcc))
 * rename columns in the target document ([#77](https://github.com/kennywillbe/pg2osync/issues/77)) ([6ba3bb1](https://github.com/kennywillbe/pg2osync/commit/6ba3bb1803db7f67ce18fb4d0ff757bb4dbc8dcc))
+* add fields that come from no column ([#80](https://github.com/kennywillbe/pg2osync/issues/80)) ([3569e08](https://github.com/kennywillbe/pg2osync/commit/3569e087150bcebba6dc38121abd50aa6bf9c8a1))
 
 
 ### Bug Fixes
