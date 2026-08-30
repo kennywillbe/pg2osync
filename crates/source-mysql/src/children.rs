@@ -63,7 +63,9 @@ pub async fn fetch_many(
         return Ok(HashMap::new());
     }
     let resolved = catalog::table_schema(conn, &spec.schema, &spec.table, false).await?;
-    let sql = fetch_statement(spec, &resolved, keys);
+    let fk_shape = fk_shape(spec, &resolved);
+    let projected = project(spec, &resolved);
+    let sql = fetch_statement(spec, &projected, keys);
     let mut rows = conn
         .text_query(&sql)
         .await
@@ -71,17 +73,11 @@ pub async fn fetch_many(
 
     // The foreign key and the total ride after the child's own columns, so the
     // row prefix is exactly what build_document expects.
-    let columns = resolved.columns.len();
+    let columns = projected.columns.len();
     let mut out: HashMap<String, (Value, i64)> = HashMap::new();
     while let Some(row) = rows.next().await? {
-        let (doc, _) = catalog::build_document(&resolved, &row);
+        let (doc, _) = catalog::build_document(&projected, &row);
         let key_raw = row.get(columns).and_then(|v| v.as_deref());
-        let fk_shape = resolved
-            .columns
-            .iter()
-            .find(|c| c.name == spec.foreign_key)
-            .map(|c| c.shape.clone())
-            .unwrap_or(crate::typemap::ValueShape::Text);
         let key = crate::typemap::convert(&fk_shape, key_raw);
         let total: i64 = row
             .get(columns + 1)
@@ -144,13 +140,49 @@ pub async fn refetch_parents(
     Ok(out)
 }
 
+/// How to read the parent key that rides beside each element.
+///
+/// It is taken from the whole table and never from the projection: the key is
+/// its own column in the result, so projecting the foreign key out of the
+/// element must not turn an integer key into text — the caller matches parents
+/// on the JSON form, where `1` and `"1"` are different parents and every array
+/// would silently come back empty.
+fn fk_shape(spec: &ChildSpec, resolved: &TableSchema) -> crate::typemap::ValueShape {
+    resolved
+        .columns
+        .iter()
+        .find(|c| c.name == spec.foreign_key)
+        .map(|c| c.shape.clone())
+        .unwrap_or(crate::typemap::ValueShape::Text)
+}
+
+/// The child's columns as the element is to carry them.
+///
+/// MySQL aggregates in Rust, so the projection is the select list: the same
+/// schema builds the statement, positions `pg2osync_fk` after the last column
+/// and maps the row back to JSON, and the three cannot drift apart.
+fn project(spec: &ChildSpec, resolved: &TableSchema) -> TableSchema {
+    let keep = |name: &str| match &spec.columns {
+        Some(columns) => columns.iter().any(|c| c == name),
+        None => !spec.exclude_columns.iter().any(|c| c == name),
+    };
+    TableSchema {
+        columns: resolved
+            .columns
+            .iter()
+            .filter(|c| keep(&c.name))
+            .cloned()
+            .collect(),
+        pk_columns: resolved.pk_columns.clone(),
+    }
+}
+
 /// The statement one collection's rows come back on.
 ///
 /// Ordered by the child's key so the same rows come back twice running, capped by
 /// the server rather than after the fact, and carrying the count before the cap so
 /// a cut array can say how much it is missing.
 fn fetch_statement(spec: &ChildSpec, resolved: &TableSchema, keys: &[Value]) -> String {
-    let fk = catalog::quote_ident(&spec.foreign_key);
     let columns: Vec<String> = resolved
         .columns
         .iter()
@@ -187,7 +219,6 @@ fn fetch_statement(spec: &ChildSpec, resolved: &TableSchema, keys: &[Value]) -> 
         .iter()
         .map(|c| format!("r.{}", catalog::quote_ident(&c.name)))
         .collect();
-    let _ = fk;
     match spec.max_rows {
         Some(n) => format!(
             "SELECT {}, r.pg2osync_fk, r.pg2osync_total FROM ({ranked}) r \
@@ -277,6 +308,49 @@ mod tests {
             sql.contains("ORDER BY r.pg2osync_fk, r.pg2osync_rn"),
             "{sql}"
         );
+    }
+
+    #[test]
+    fn the_projection_is_the_select_list() {
+        let mut spec = spec();
+        spec.columns = Some(vec!["id".into()]);
+        let projected = project(&spec, &schema());
+        let sql = fetch_statement(&spec, &projected, &[json!(1)]);
+        assert!(
+            sql.contains("SELECT t.`id`, t.`parent_id` AS pg2osync_fk"),
+            "{sql}"
+        );
+        assert!(
+            !sql.contains("t.`parent_id`,"),
+            "an unlisted column is never read: {sql}"
+        );
+        assert_eq!(
+            projected.columns.len(),
+            1,
+            "the offset of pg2osync_fk is the projected column count"
+        );
+
+        spec.columns = None;
+        spec.exclude_columns = vec!["parent_id".into()];
+        assert_eq!(project(&spec, &schema()).columns.len(), 1);
+    }
+
+    #[test]
+    fn an_excluded_foreign_key_still_reads_as_the_column_it_is() {
+        // The trap: take the shape from the projection and an excluded integer
+        // key falls through to Text, so every parent matches "1" against 1 and
+        // silently gets an empty array.
+        let mut spec = spec();
+        spec.exclude_columns = vec!["parent_id".into()];
+        let full = schema();
+        assert!(
+            !project(&spec, &full)
+                .columns
+                .iter()
+                .any(|c| c.name == "parent_id"),
+            "the key is not force-kept in the element"
+        );
+        assert!(matches!(fk_shape(&spec, &full), ValueShape::Int));
     }
 
     #[test]

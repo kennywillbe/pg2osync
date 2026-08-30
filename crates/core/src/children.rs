@@ -33,6 +33,13 @@ pub struct ChildSpec {
     pub order_by: Vec<String>,
     /// How many children to embed, or all of them.
     pub max_rows: Option<u32>,
+    /// The only child columns to embed, or all of them.
+    ///
+    /// Projection happens in the read rather than after it, so the initial load
+    /// and a streamed re-fetch cannot embed different shapes.
+    pub columns: Option<Vec<String>>,
+    /// Child columns to leave out. Mutually exclusive with `columns`.
+    pub exclude_columns: Vec<String>,
 }
 
 impl ChildSpec {
@@ -55,6 +62,8 @@ impl ChildSpec {
             parent_column: parent_column.into(),
             order_by: Vec::new(),
             max_rows: None,
+            columns: None,
+            exclude_columns: Vec::new(),
         })
     }
 

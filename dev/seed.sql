@@ -21,10 +21,13 @@ CREATE TABLE IF NOT EXISTS customers (
 );
 
 CREATE TABLE IF NOT EXISTS orders (
-    id          bigint PRIMARY KEY,
-    customer_id bigint NOT NULL REFERENCES customers(id),
-    total       numeric(12, 2) NOT NULL
+    id             bigint PRIMARY KEY,
+    customer_id    bigint NOT NULL REFERENCES customers(id),
+    total          numeric(12, 2) NOT NULL,
+    internal_notes text
 );
+
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS internal_notes text;
 
 -- integer rather than bigint on purpose: a child key narrower than i64 is the
 -- common case and once broke the typed comparison

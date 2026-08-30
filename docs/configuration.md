@@ -870,6 +870,28 @@ total = "amount"             # every element of `orders` carries `amount`
 
 `<field>_truncated` and `<field>_total` follow the child `field`, not a rename.
 
+A child collection is projected the same way as a section, with `columns` or
+`exclude_columns` on the child rather than on the parent:
+
+```toml
+[[sync.customers.children]]
+table = "public.orders"
+field = "orders"
+foreign_key = "customer_id"
+exclude_columns = ["internal_notes"]   # every element leaves this column out
+# columns = ["id", "total"]            # or list what to keep — not both
+```
+
+The two are mutually exclusive, as on a section, and an empty `columns` list is
+refused. The projection happens **in the read**: the initial load and the
+per-transaction re-fetch are built from the same expression, so they cannot
+embed different shapes, and PostgreSQL never reads a column the element does not
+name. `fields` runs after the projection and names the source column, so a
+column that is excluded — or left out of `columns` — cannot also be renamed;
+that is refused at startup rather than silently dropping the rename. The
+`foreign_key` is kept only if you list it: it is read as its own column beside
+the element, so leaving it out of the array changes nothing but the array.
+
 - PostgreSQL and MySQL/MariaDB alike.
 - One level deep only.
 - Children are fetched during the initial load and re-fetched whenever the

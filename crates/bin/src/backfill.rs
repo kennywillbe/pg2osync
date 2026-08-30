@@ -1101,6 +1101,24 @@ mod tests {
         );
         assert!(sql.contains("ORDER BY \"id\""), "ordered: {sql}");
         assert!(sql.contains("rn <= 500"), "capped: {sql}");
+
+        // and the projection rides along, because it lives in that aggregation
+        spec.exclude_columns = vec!["internal_notes".into()];
+        let projected = copy_statement(
+            "public.customers",
+            &[col("id")],
+            std::slice::from_ref(&spec),
+            None,
+            &whole(),
+            None,
+            None,
+            None,
+        );
+        assert!(
+            projected.contains(&pg2osync_source::children::agg_subquery(&spec, None))
+                && projected.contains("ARRAY['internal_notes']::text[]"),
+            "the load cannot embed a different element from the re-fetch: {projected}"
+        );
     }
 
     #[test]

@@ -66,12 +66,13 @@ pub fn agg_subquery(spec: &ChildSpec, filter: Option<&str>) -> String {
         None => String::new(),
     };
     let ranked = format!(
-        "SELECT {fk} AS k, to_jsonb(t) AS doc, \
+        "SELECT {fk} AS k, {element} AS doc, \
          row_number() OVER (PARTITION BY {fk}{ordered}) AS rn, \
          count(*) OVER (PARTITION BY {fk}) AS total \
          FROM {}.{} t{where_clause}",
         pg_quote_ident(&spec.schema),
         pg_quote_ident(&spec.table),
+        element = element_expr(spec),
     );
     let capped = match spec.max_rows {
         Some(n) => format!("SELECT * FROM ({ranked}) r WHERE r.rn <= {n}"),
@@ -81,6 +82,31 @@ pub fn agg_subquery(spec: &ChildSpec, filter: Option<&str>) -> String {
         "SELECT k, COALESCE(jsonb_agg(doc ORDER BY rn), '[]'::jsonb) AS agg, \
          max(total) AS total FROM ({capped}) c GROUP BY k"
     )
+}
+
+/// One child row as the JSON object that lands in the array.
+///
+/// The projection lives in the element expression rather than after the read, so
+/// the `COPY` of the initial load and the per-transaction re-fetch share it by
+/// construction; PostgreSQL also never reads a column the expression does not
+/// name, which for a TOASTed one is the whole point.
+fn element_expr(spec: &ChildSpec) -> String {
+    if let Some(columns) = &spec.columns {
+        let pairs: Vec<String> = columns
+            .iter()
+            .map(|c| format!("{}, t.{}", pg_quote_literal(c), pg_quote_ident(c)))
+            .collect();
+        return format!("jsonb_build_object({})", pairs.join(", "));
+    }
+    if spec.exclude_columns.is_empty() {
+        return "to_jsonb(t)".to_string();
+    }
+    let names: Vec<String> = spec
+        .exclude_columns
+        .iter()
+        .map(|c| pg_quote_literal(c))
+        .collect();
+    format!("to_jsonb(t) - ARRAY[{}]::text[]", names.join(", "))
 }
 
 /// Every listed parent's child array, in one query.
@@ -150,6 +176,10 @@ fn any_predicate(
 
 fn pg_quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn pg_quote_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 /// Attach every configured child collection to a group of parent documents.
@@ -311,6 +341,36 @@ mod tests {
             filtered[inner..].contains("WHERE \"customer_id\" = ANY"),
             "the key filter reaches the innermost read: {filtered}"
         );
+    }
+
+    #[test]
+    fn the_projection_is_the_element_the_load_and_the_stream_share() {
+        let mut spec = ChildSpec::new("public.orders", "orders", "customer_id", "id").unwrap();
+        spec.order_by = vec!["id".into()];
+        assert!(
+            agg_subquery(&spec, None).contains("to_jsonb(t) AS doc"),
+            "no projection leaves the whole row"
+        );
+
+        spec.columns = Some(vec!["id".into(), "o'dd".into()]);
+        let listed = agg_subquery(&spec, None);
+        assert!(
+            listed.contains("jsonb_build_object('id', t.\"id\", 'o''dd', t.\"o'dd\") AS doc"),
+            "names are literals, columns are identifiers: {listed}"
+        );
+        assert!(
+            listed.contains("PARTITION BY \"customer_id\" ORDER BY \"id\""),
+            "the key is read beside the element, so it need not be in it: {listed}"
+        );
+
+        spec.columns = None;
+        spec.exclude_columns = vec!["internal_notes".into()];
+        let excluded = agg_subquery(&spec, None);
+        assert!(
+            excluded.contains("to_jsonb(t) - ARRAY['internal_notes']::text[] AS doc"),
+            "{excluded}"
+        );
+        assert!(excluded.contains("count(*) OVER (PARTITION BY \"customer_id\")"));
     }
 
     #[test]

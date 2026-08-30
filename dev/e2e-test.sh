@@ -108,6 +108,7 @@ index = "e2e_customers"
 table = "public.orders"
 field = "orders"
 foreign_key = "customer_id"
+exclude_columns = ["internal_notes"]
 
 [sync.customers.children.fields]
 total = "amount"
@@ -131,7 +132,8 @@ pg "INSERT INTO users (id,name,email,password_hash,metadata) VALUES
       (2,'bob','bob@test.io','secret-2','{\"role\":\"user\"}'),
       (3,'carol','carol@test.io','secret-3','{}');" > /dev/null
 pg "INSERT INTO customers (id,name) VALUES (1,'acme'),(2,'globex'),(3,'no-children');" > /dev/null
-pg "INSERT INTO orders (id,customer_id,total) VALUES (10,1,99.90),(11,1,5.00),(12,2,42.00);" > /dev/null
+pg "INSERT INTO orders (id,customer_id,total,internal_notes) VALUES
+      (10,1,99.90,'do not index'),(11,1,5.00,'nor this'),(12,2,42.00,'nor that');" > /dev/null
 pg "INSERT INTO tickets (id,customer_id,subject) VALUES (20,1,'late delivery');" > /dev/null
 # ignore_unavailable, because a multi-index delete where one index is absent
 # returns 404 and deletes *none* of them — which silently leaves the previous
@@ -197,6 +199,9 @@ check "the source name is gone after the rename" "$(os_has e2e_users 1 email)" "
 check "a child column is renamed inside the array" \
   "$(curl -s "$OS/e2e_customers/_doc/1" | jqf "sorted(k for k in d['_source']['orders'][0] if k in ('total','amount'))")" \
   "['amount']"
+check "a child column is excluded from the array" \
+  "$(curl -s "$OS/e2e_customers/_doc/1" | jqf "'internal_notes' in d['_source']['orders'][0]")" \
+  "False"
 check "a constant is added to every document" "$(os_field e2e_users 1 entity)" "user"
 check "the origin placeholder is rendered" "$(os_field e2e_users 1 origin)" "public.users"
 check "children attached during backfill" "$(os_len e2e_customers 1 orders)" "2"
@@ -251,6 +256,14 @@ check "child INSERT refreshes parent" "$(os_len e2e_customers 2 orders)" "2"
 pg "DELETE FROM orders WHERE id=13;" > /dev/null
 sleep 2; refresh
 check "child DELETE refreshes parent" "$(os_len e2e_customers 2 orders)" "1"
+
+# the re-fetch shares the load's element expression, so the projection holds on
+# the streamed path too — a change to the excluded column may not leak it
+pg "UPDATE orders SET internal_notes='still secret' WHERE id=12;" > /dev/null
+sleep 2; refresh
+check "the excluded child column stays out on the stream" \
+  "$(curl -s "$OS/e2e_customers/_doc/2" | jqf "'internal_notes' in d['_source']['orders'][0]")" \
+  "False"
 
 # Many children of one parent in one transaction: the parent is re-read once for
 # the group, not once per row, and the array that lands is the whole collection.
