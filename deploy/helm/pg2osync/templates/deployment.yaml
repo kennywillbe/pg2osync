@@ -1,3 +1,13 @@
+{{- if not (has .Values.reloadOnChange (list "restart" "signal")) }}
+{{- fail (printf "reloadOnChange must be \"restart\" or \"signal\", not %q" (toString .Values.reloadOnChange)) }}
+{{- end }}
+{{- if eq .Values.reloadOnChange "signal" }}
+{{- range .Values.extraVolumeMounts }}
+{{- if and .subPath (hasPrefix "/etc/pg2osync" .mountPath) }}
+{{- fail (printf "reloadOnChange=signal cannot work with the subPath mount at %s: the kubelet never updates a subPath mount in place, so the file the sidecar watches would never change. Mount the whole volume, or use reloadOnChange=restart" .mountPath) }}
+{{- end }}
+{{- end }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -17,8 +27,10 @@ spec:
   template:
     metadata:
       annotations:
+        {{- if eq .Values.reloadOnChange "restart" }}
         # restarts the pod when the rendered config changes
         checksum/config: {{ include "pg2osync.config" . | sha256sum }}
+        {{- end }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -35,6 +47,10 @@ spec:
       {{- end }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- if eq .Values.reloadOnChange "signal" }}
+      # the sidecar has to be able to see — and signal — the pipeline process
+      shareProcessNamespace: true
+      {{- end }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       containers:
         - name: pg2osync
@@ -108,6 +124,38 @@ spec:
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+        {{- if eq .Values.reloadOnChange "signal" }}
+        # The ConfigMap volume is updated in place by the kubelet, on its own
+        # sync period — up to about a minute after `helm upgrade` returns. This
+        # watches the file the pipeline actually reads and sends it SIGHUP when
+        # it changes; the pipeline validates the file itself and refuses in
+        # place anything a running process cannot take, so a mistake here costs
+        # a log line rather than the pod.
+        - name: reload
+          image: {{ .Values.reloadSidecar.image | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              seen=""
+              while :; do
+                now="$(stat -c %Y /etc/pg2osync/pg2osync.toml 2>/dev/null || echo missing)"
+                if [ -n "$seen" ] && [ "$now" != "$seen" ]; then
+                  echo "pg2osync.toml changed; sending SIGHUP"
+                  pkill -HUP -x pg2osync || echo "no pg2osync process to signal"
+                fi
+                seen="$now"
+                sleep {{ .Values.reloadSidecar.intervalSeconds }}
+              done
+          resources:
+            {{- toYaml .Values.reloadSidecar.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/pg2osync
+              readOnly: true
+        {{- end }}
       volumes:
         - name: config
           configMap:

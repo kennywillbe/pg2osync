@@ -128,7 +128,24 @@ pg2osync status   -c pg2osync.toml --max-retained-mb 10240   # exit 1 over 10 GB
 pg2osync bootstrap -c pg2osync.toml  # create slot/publication/indices, then exit
 pg2osync switch-alias -c pg2osync.toml --alias users   # point an alias here
 pg2osync drop-slot -c pg2osync.toml  # teardown; --publication drops that too
+
+pg2osync validate -c pg2osync.toml && kill -HUP "$(pidof pg2osync)"   # reload
 ```
+
+That last line is the whole reload workflow. SIGHUP makes the running process
+read its file again; the file is validated whole before anything is applied, so
+a mistake anywhere in it changes nothing, and `validate` checks exactly what the
+reload checks. Batch sizes, the checkpoint interval, the load's rate ceiling,
+the retry budget and `[log] filter` take effect on the next batch. Everything
+else is refused in place with one `ERROR` line naming the field, both values and
+what it would take — a restart, a re-snapshot or a re-index. The full table is
+in [Configuration](configuration.md#reloading); `pg2osync_config_reloads_total`
+`{result}` counts the outcomes, so a config pushed by a deployment tool is
+something an alert can watch rather than something to read logs for.
+
+SIGHUP used to terminate the process, since that is the signal's default
+disposition. If anything in your tooling sends it expecting a restart, it now
+gets a reload.
 
 `status` output:
 
@@ -198,6 +215,15 @@ RUST_LOG=pg2osync=debug   # per-event decisions
 RUST_LOG=pg2osync::sink=debug,pg2osync=info   # narrow to one component
 ```
 
+`RUST_LOG` is fixed when the process starts, so turning a level up on a running
+pipeline means `[log] filter` in the config file plus a SIGHUP. `RUST_LOG` wins
+wherever both are set; unset it if you want the file to decide.
+
+```toml
+[log]
+filter = "pg2osync::sink=debug,pg2osync=info"
+```
+
 Targets: `pg2osync::source`, `::engine`, `::sink`, `::checkpoint`, `::backfill`,
 `::catalog`, `::config`, `::metrics`, `::run`. Credentials are never logged.
 
@@ -227,6 +253,8 @@ PG2OSYNC_LOG_FORMAT=json pg2osync run -c pg2osync.toml
 | `server switched to 'caching_sha2_password'` | MySQL user's auth plugin | Recreate the user with `mysql_native_password` |
 | `bogus data in log event` | Resuming at an invalid binlog offset | Delete the checkpoint document to force a fresh initial load |
 | Checkpoint ignored, full load runs | Checkpoint belongs to another slot/`server_id`/source | Expected. Restore the original identifier or accept the reload |
+| `the configuration was not reloaded and nothing changed: …` | SIGHUP found a file that does not validate | The process keeps running on the previous configuration. Fix the file and HUP again; counted as `pg2osync_config_reloads_total{result="invalid"}` |
+| `[…] … changed from … to …; … restart to change it` | SIGHUP found a change a running pipeline cannot take | The rest of the reload still applied. See [Reloading](configuration.md#reloading) for which class it is and whether the answer is a restart, a re-snapshot or a re-index |
 
 A permanent rejection stops the pipeline on purpose: skipping the document would
 be silent data loss, and every batch after it would widen the divergence. It stops

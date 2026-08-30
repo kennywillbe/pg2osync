@@ -942,6 +942,44 @@ checkpoint. On MySQL the comparison is between the catalog's answer before a
 DDL and its answer after, since the binlog says a statement ran but not what it
 did to a column layout.
 
+**A reload changes settings; everything else is refused with the reason.** On
+SIGHUP the file is read again and validated whole, so a file with a mistake
+anywhere in it changes nothing at all — `pg2osync validate && kill -HUP $(pidof
+pg2osync)` is the workflow, and `validate` checks exactly what the reload
+checks. What a reload may change is the handful of `[engine]` settings a batch
+consults each time round — `batch_size`, `batch_max_bytes`, `txn_buffer_cap_mb`,
+`checkpoint_interval_ms`, `load_max_rows_per_sec` — plus the retry budget
+(`retry_max`, `retry_backoff_ms`, `retry_max_elapsed_ms`) and `[log] filter`.
+Those are hot because nothing is built from them: the engine copies them at the
+top of every turn, the retry budget lives in atomics behind the sink, and the
+subscriber's filter is reloadable. Everything else is refused
+in place, naming the field, both values and what it would take. `[source]` and
+`[target]` name the stream and the checkpoint bound to it; a listener is bound
+once and an environment variable is fixed when the process is executed; the sink
+task is built with `write_concurrency`, `on_permanent_rejection` and
+`max_rejects` when an attempt starts. Inside `[sync.*]` there are two further
+classes and the difference is what it costs to put right: changing `table`,
+`index`, `id`, `primary_key`, `append_only`, `routing`, `fan_out`, `join` or
+`children` changes what a row *is filed as*, so every document already written
+is filed the old way and the answer is a re-index behind an alias; changing
+`columns`, `transform`, `fields`, `constants`, `where`, `pipeline`,
+`soft_delete` or `mapping_file` only reshapes the document, so the index would
+hold a mixture with nothing recording which, and the answer is a re-snapshot.
+`poll_column` is a third class of one: it decides which rows the poll query
+reads rather than what a document is or how it is shaped, so neither answer
+applies and the fix is a plain restart.
+Adding or removing a section is refused too: a table joins a running pipeline
+only once its rows are loaded beside the stream and — on PostgreSQL — its name
+is in the publication, and the ordering that makes that safe is the initial
+load's argument, not something to approximate. Refusing loudly is the point. A
+reload that silently ignored half the file would be worse than no reload,
+because the file would stop describing the process. Every outcome is counted as
+`pg2osync_config_reloads_total{result}`, for the same reason schema drift is:
+a log line nobody can be paged on is barely a report. SIGHUP and nothing else —
+a `pg2osync reload` subcommand would need a pidfile to find the running process,
+which is state outside the target, and under a container runtime `kill -HUP 1`
+is the same step. Nothing a reload does moves the checkpoint, by construction.
+
 **A binlog shape the catalog cannot match is skipped, not fatal.** MySQL's
 TABLE_MAP describes the table as it was when the row was written, and
 `information_schema` only ever answers for now. A crash-restart resumes from the

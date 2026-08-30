@@ -11,7 +11,7 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     pub source: SourceConfig,
@@ -23,9 +23,25 @@ pub struct AppConfig {
     pub metrics: MetricsConfig,
     #[serde(default)]
     pub api: ApiConfig,
+    #[serde(default)]
+    pub log: LogConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// `[log]`: what this process logs, as the config file says it.
+///
+/// `RUST_LOG` still wins where both are set — the environment is what a
+/// container runtime and a systemd unit reach for, and a file that quietly
+/// overrode it would make the variable a lie. This exists because the
+/// environment is fixed at exec: it is the only way to turn a level up on a
+/// running pipeline.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LogConfig {
+    /// A `tracing` filter directive, e.g. `pg2osync=debug`.
+    pub filter: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceConfig {
     /// What this source is called in a directory of configs: the name every
@@ -147,7 +163,7 @@ fn default_publication() -> String {
     "pg2osync_pub".into()
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TargetConfig {
     pub url: String,
@@ -232,7 +248,7 @@ impl Default for MetricsConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TableSync {
     /// Schema-qualified table name, e.g. "public.users".
@@ -563,7 +579,7 @@ impl TransformSpec {
 /// template element documents are filed under; it renders from the merged
 /// child document (parent-minus-array plus element), so its placeholders may
 /// name parent columns as well as fields of the element.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FanOut {
     pub field: String,
@@ -572,7 +588,7 @@ pub struct FanOut {
 
 /// This section's place in a join field: its relation name, and — for a
 /// child — the column holding its parent's key.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JoinSpec {
     /// The join field, as the parent's mapping declares it.
@@ -586,7 +602,7 @@ pub struct JoinSpec {
 }
 
 /// A child table joined into the parent document.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChildJoin {
     /// Schema-qualified child table, e.g. "public.orders".
@@ -861,6 +877,13 @@ impl AppConfig {
                 anyhow::bail!("[source] sslkey needs sslcert; set both or neither")
             }
             _ => {}
+        }
+        if let Some(filter) = &self.log.filter {
+            // Checked here so a reload with an unparsable filter is rejected
+            // whole, rather than applying every other change and then leaving
+            // the process logging at a level nobody asked for.
+            tracing_subscriber::EnvFilter::try_new(filter)
+                .map_err(|e| anyhow::anyhow!("[log] filter {filter:?} is not a filter: {e}"))?;
         }
         if self.engine.load_max_rows_per_sec == Some(0) {
             anyhow::bail!(
