@@ -318,7 +318,9 @@ fn transforms(cfg: &AppConfig) -> Result<Transforms> {
         }
         pairs.push(((schema.to_string(), table.to_string()), rules));
     }
-    Ok(Transforms::from_pairs(pairs))
+    Transforms::from_pairs(pairs)
+        .with_keys(cfg.pseudonym_keys()?)
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 fn renames(cfg: &AppConfig) -> Renames {

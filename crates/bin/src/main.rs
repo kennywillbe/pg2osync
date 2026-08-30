@@ -905,6 +905,11 @@ async fn validate(path: &Path) -> Result<()> {
         "✓ config structure valid ({} table mappings)",
         cfg.sync.len()
     );
+    // The name only, never the key: this output is what people paste into an
+    // issue when a pipeline will not start.
+    for name in &secrets.pseudonym_key_vars {
+        println!("✓ pseudonym key present (64 bytes) from {name}");
+    }
 
     if cfg.source.flavor == "mysql" {
         validate_mysql(&cfg, &secrets.source_url).await?;

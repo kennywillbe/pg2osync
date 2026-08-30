@@ -1330,5 +1330,55 @@ check "an uncapped book says nothing extra" \
   "$(os_has e2e_mysql_through_capped 1 authors_truncated)" "False"
 stop_sync
 
+say "23. a keyed pseudonym over the binlog"
+# The engine is source-agnostic and the op lives there, so this only has to
+# show the binlog path reaching it: equal values, equal tokens (#143).
+PSCONFIG=$(mktemp /tmp/pg2osync-mysql-pseudonym.XXXXXX)
+PSSID=$((RANDOM + 6600))
+export PG2OSYNC_E2E_PSEUDONYM_KEY=$(python3 -c "print('cd' * 64)")
+cat > "$PSCONFIG" <<TOML
+[source]
+flavor = "mysql"
+url_env = "PG2OSYNC_MYSQL_URL"
+server_id = $PSSID
+
+[target]
+url = "$OS"
+
+[metrics]
+bind = "127.0.0.1:9123"
+
+[sync.people]
+table = "sourcedb.pseudo_people"
+index = "e2e_mysql_pseudo"
+
+[sync.people.transform]
+email = { op = "pseudonym", key_env = "PG2OSYNC_E2E_PSEUDONYM_KEY" }
+TOML
+pseudo_cleanup() {
+  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  my "DROP TABLE IF EXISTS pseudo_people;" > /dev/null 2>&1 || true
+  curl -s -XDELETE "$OS/e2e_mysql_pseudo?ignore_unavailable=true" > /dev/null 2>&1 || true
+  rm -f "$PSCONFIG"
+}
+trap 'cleanup; resume_cleanup; types_cleanup; child_cleanup; where_cleanup; events_cleanup; pipe_cleanup; append_cleanup; routing_cleanup; through_cleanup; pseudo_cleanup' EXIT
+
+my "DROP TABLE IF EXISTS pseudo_people;"
+my "CREATE TABLE pseudo_people(id bigint primary key, email varchar(64));"
+my "INSERT INTO pseudo_people VALUES (1,'alice@example.com'),(2,'alice@example.com'),(3,'bob@example.com');"
+curl -s -XDELETE "$OS/e2e_mysql_pseudo?ignore_unavailable=true" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/mysql-$PSSID" > /dev/null
+
+nohup $BIN run -c "$PSCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+await_count e2e_mysql_pseudo 3
+one=$(os_field e2e_mysql_pseudo 1 email)
+check "two rows sharing an address share a token" "$one" "$(os_field e2e_mysql_pseudo 2 email)"
+case "$one" in
+  *@*) bad "the token is the plaintext ($one)" ;;
+  *) ok "the token is not the address ($one)" ;;
+esac
+stop_sync
+unset PG2OSYNC_E2E_PSEUDONYM_KEY
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

@@ -2554,5 +2554,129 @@ case "$refusal" in
   *) bad "a rebuild under require_alias did not explain itself: $refusal" ;;
 esac
 
+echo -e "\n\033[1m== 34. a keyed pseudonym, so a join survives it ==\033[0m"
+# The whole point of AES-SIV over a hash (#143): equal values give equal
+# tokens, so a foreign key still finds its parent — provided both sides name
+# the same scope, since the default is the column's own schema.table.column.
+PCONFIG=$(mktemp /tmp/pg2osync-e2e-pseudonym.XXXXXX)
+PSLOT=pg2osync_e2e_pseudonym
+PKEY=$(python3 -c "print('ab' * 64)")
+drop_idle_probe_slots
+cat > "$PCONFIG" <<TOML
+[source]
+url_env = "PG2OSYNC_SOURCE_URL"
+slot_name = "$PSLOT"
+publication = "${PSLOT}_pub"
+
+[target]
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
+
+[metrics]
+bind = "127.0.0.1:9135"
+
+[sync.people]
+table = "public.pseudo_people"
+index = "e2e_pseudo_people"
+
+[sync.people.transform]
+email = { op = "pseudonym", key_env = "PG2OSYNC_E2E_PSEUDONYM_KEY", scope = "public.pseudo_people.email" }
+
+[sync.orders]
+table = "public.pseudo_orders"
+index = "e2e_pseudo_orders"
+
+[sync.orders.transform]
+owner_email = { op = "pseudonym", key_env = "PG2OSYNC_E2E_PSEUDONYM_KEY", scope = "public.pseudo_people.email" }
+TOML
+pseudo_cleanup() {
+  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  pg "SELECT pg_drop_replication_slot('$PSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$PSLOT');" > /dev/null 2>&1 || true
+  pg "DROP PUBLICATION IF EXISTS ${PSLOT}_pub; DROP TABLE IF EXISTS pseudo_people, pseudo_orders;" > /dev/null 2>&1 || true
+  curl -s -XDELETE "$OS/e2e_pseudo_people" > /dev/null 2>&1 || true
+  curl -s -XDELETE "$OS/e2e_pseudo_orders" > /dev/null 2>&1 || true
+  rm -f "$PCONFIG"
+}
+trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup; init_cleanup; fan_cleanup; bid_cleanup; shape_cleanup; where_cleanup; join_cleanup; union_cleanup; events_cleanup; pipe_cleanup; append_cleanup; routing_cleanup; reindex_cleanup; rate_cleanup; through_cleanup; ra_cleanup; pseudo_cleanup' EXIT
+
+# validate refuses a key that is not there and one that is not a key, and
+# neither message may carry the value
+unset PG2OSYNC_E2E_PSEUDONYM_KEY
+refusal=$($BIN validate -c "$PCONFIG" 2>&1 || true)
+case "$refusal" in
+  *"PG2OSYNC_E2E_PSEUDONYM_KEY"*missing*) ok "validate refuses a pseudonym whose key variable is unset" ;;
+  *) bad "a missing key was accepted: $refusal" ;;
+esac
+short=$(python3 -c "print('ab' * 32)")
+refusal=$(PG2OSYNC_E2E_PSEUDONYM_KEY="$short" $BIN validate -c "$PCONFIG" 2>&1 || true)
+case "$refusal" in
+  *"128 hex characters"*) ok "validate refuses a 64-character key and says the length wanted" ;;
+  *) bad "a short key was accepted: $refusal" ;;
+esac
+if grep -q "$short" <<< "$refusal"; then
+  bad "the error echoes the key material"
+else
+  ok "the error names no key material"
+fi
+
+pg "DROP TABLE IF EXISTS pseudo_people, pseudo_orders;" > /dev/null 2>&1
+pg "CREATE TABLE pseudo_people(id bigint primary key, email text); CREATE TABLE pseudo_orders(id bigint primary key, owner_email text);" > /dev/null
+pg "INSERT INTO pseudo_people VALUES (1,'alice@example.com'),(2,'alice@example.com'),(3,'bob@example.com');" > /dev/null
+pg "INSERT INTO pseudo_orders VALUES (10,'alice@example.com');" > /dev/null
+pg "DROP PUBLICATION IF EXISTS ${PSLOT}_pub; CREATE PUBLICATION ${PSLOT}_pub FOR TABLE pseudo_people, pseudo_orders;" > /dev/null 2>&1
+curl -s -XDELETE "$OS/e2e_pseudo_people" > /dev/null 2>&1 || true
+curl -s -XDELETE "$OS/e2e_pseudo_orders" > /dev/null 2>&1 || true
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/postgres-$PSLOT" > /dev/null
+
+export PG2OSYNC_E2E_PSEUDONYM_KEY="$PKEY"
+# captured rather than piped: the slot does not exist until the pipeline below
+# creates it, so validate reports the key and then exits non-zero, and under
+# `pipefail` that exit would sink a grep that had already matched
+accepted=$($BIN validate -c "$PCONFIG" 2>&1 || true)
+case "$accepted" in
+  *"pseudonym key present (64 bytes) from PG2OSYNC_E2E_PSEUDONYM_KEY"*)
+    ok "validate reports the key by the name of its variable" ;;
+  *) bad "validate does not report the key: $accepted" ;;
+esac
+
+nohup $BIN run -c "$PCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_count e2e_pseudo_people)" = "3" ] && [ "$(os_count e2e_pseudo_orders)" = "1" ] && break
+  sleep 1
+done
+check "both tables loaded" "$(os_count e2e_pseudo_people)" "3"
+
+one=$(os_field e2e_pseudo_people 1 email)
+two=$(os_field e2e_pseudo_people 2 email)
+three=$(os_field e2e_pseudo_people 3 email)
+order=$(os_field e2e_pseudo_orders 10 owner_email)
+check "two rows sharing an address share a token" "$one" "$two"
+check "the foreign key joins back to the parent" "$order" "$one"
+if [ "$one" = "$three" ]; then
+  bad "two different addresses produced the same token"
+else
+  ok "a different address gives a different token"
+fi
+case "$one" in
+  *@*) bad "the token is the plaintext ($one)" ;;
+  "") bad "the token is empty" ;;
+  *) ok "the token is not the address ($one)" ;;
+esac
+# 16-byte synthetic IV plus the 17-byte address, base64url unpadded
+check "the token is the documented length" "${#one}" "44"
+
+# a live change goes through the same op, so the stream and the load agree
+pg "UPDATE pseudo_people SET email='alice@example.com' WHERE id=3;" > /dev/null
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_field e2e_pseudo_people 3 email)" = "$one" ] && break
+  sleep 1
+done
+check "a streamed update produces the token the load did" \
+  "$(os_field e2e_pseudo_people 3 email)" "$one"
+stop_sync
+unset PG2OSYNC_E2E_PSEUDONYM_KEY
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

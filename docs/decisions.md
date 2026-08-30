@@ -218,16 +218,18 @@ is not a column; written last, a constant wins a collision — so every collisio
 the configuration can see is refused at load, and the one only the catalogue
 can see is refused by `validate`.
 
-**Transforms are fixed, named reshapes, not a language.** (#63.) Six ops —
-`hash`, `redact`, `json`, `split`, `number`, `date` — and the README's promise
-holds: a closed set, one literal parameter at most, no chaining, nothing
-evaluated at run time, for the same reason constants carry no expressions. A
-value an op cannot convert is indexed as it arrived and counted, neither halted
-on nor nulled: halting turns a data-quality problem into an availability
-problem, and a NULL is silent loss. The target's mapping is the arbiter of what
-a field holds, quarantine already catches what it refuses, and
-`pg2osync_transform_unconverted_total` plus one warning per (table, column)
-keeps the rest visible. A value already in the target shape is not a failure,
+**Transforms are fixed, named reshapes, not a language.** (#63.) Eight ops —
+`hash`, `redact`, `json`, `split`, `number`, `date`, `lookup`, `pseudonym` —
+and the README's promise holds: a closed set, one literal parameter at most, no
+chaining, nothing evaluated at run time, for the same reason constants carry no
+expressions. A value a *reshaping* op cannot convert is indexed as it arrived
+and counted, neither halted on nor nulled: halting turns a data-quality problem
+into an availability problem, and a NULL is silent loss. The target's mapping is
+the arbiter of what a field holds, quarantine already catches what it refuses,
+and `pg2osync_transform_unconverted_total` plus one warning per (table, column)
+keeps the rest visible. A *protective* op is the exception: `pseudonym` writes
+`***` instead, because indexing what the op was asked to hide is the one outcome
+worse than losing it. A value already in the target shape is not a failure,
 so every op is idempotent under at-least-once replay. `split` cannot feed
 `fan_out`, because fan-out reads the raw row — identity is a property of the
 row, as the id paragraph says. `chrono`, already in the build through the
@@ -246,6 +248,37 @@ a data-quality problem, and halting would make it an availability one. It keeps
 the original value, or `default` when the configuration would rather every
 document carry a label; either way it is counted, because the counter measures
 what the dictionary failed to cover, not what was written.
+
+**A pseudonym is keyed and deterministic, so joins survive.** (`pseudonym`,
+#143.) `hash` is one-way and truncated: two values can collide, so it is unsafe
+on a unique or a foreign-key column, and nobody can get the value back. AES-SIV
+(RFC 5297) is deterministic for the same key, plaintext and associated data, so
+equal values give equal tokens across tables and across runs — a join on the
+pseudonymised column still joins, uniqueness survives, and the key holder can
+decrypt. It is chosen over a keyed hash because it is invertible; over a
+random-nonce cipher because that breaks equality, which is the whole point.
+
+The associated data is a *scope*, and it defaults to the column's own
+`schema.table.column`, so a token cannot be replayed into another context. A
+foreign key must therefore name its parent's scope explicitly
+(`scope = "public.users.id"`): the default is fully qualified, and two columns
+that must join have to spell the same label.
+
+The key arrives only as `key_env` — 128 hex characters, a 64-byte AES-256-SIV
+key — never inline, never in a log, an error or a `Debug`. A transform whose
+`key_env` has no value is refused when the rules are built rather than at the
+row, because a missing key at run time could only fall back to publishing the
+plaintext. An unconvertible value is redacted for the same reason, and so is the
+(unreachable) encryption failure: this op fails closed.
+
+There is no `decrypt` subcommand. It would want the key on a command line, it
+would want the scope too, and the construction — base64url of
+`AES-SIV-Encrypt(K, headers = [scope], plaintext)`, documented in
+[configuration.md](configuration.md) — is four lines with any RFC 5297 library.
+What this buys is pseudonymisation, not anonymisation: it is reversible by the
+key holder, so under GDPR the index still holds personal data, and because it is
+deterministic a low-cardinality column is de-anonymised by counting. `hash`
+stays for the cases that want no key and no way back.
 
 **A row filter is SQL the database also runs, evaluated once more in the
 engine.** (`where`, #64.) A subset, because a stream has no query to push a
