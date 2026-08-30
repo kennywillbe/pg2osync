@@ -31,6 +31,9 @@ Operational consequences:
 
 ## Behavior
 
+- On startup pg2osync creates each configured index with `id` as its primary
+  key, and leaves an index that already exists alone — so a restart, a resume
+  or a second pipeline over the same index starts normally.
 - Documents are upserted with the primary key as Meilisearch's document id.
 - Writes are asynchronous server-side tasks; the sink waits for each task to
   complete before acknowledging, so the checkpoint only advances after durable

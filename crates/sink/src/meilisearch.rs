@@ -77,6 +77,17 @@ impl MeilisearchSink {
 
     /// Meilisearch operations are async tasks; block (bounded) until success.
     async fn wait_task(&self, task_uid: u64) -> Result<(), CoreError> {
+        self.wait_task_tolerating(task_uid, None).await
+    }
+
+    /// `tolerated` is a Meilisearch error code that counts as success: the
+    /// outcome of an operation is reported on its task, so an error meaning
+    /// "already done" arrives here rather than on the request that enqueued it.
+    async fn wait_task_tolerating(
+        &self,
+        task_uid: u64,
+        tolerated: Option<&str>,
+    ) -> Result<(), CoreError> {
         for _ in 0..600 {
             let (status, body) = self
                 .send(reqwest::Method::GET, &format!("/tasks/{task_uid}"), None)
@@ -85,6 +96,9 @@ impl MeilisearchSink {
                 match body["status"].as_str() {
                     Some("succeeded") => return Ok(()),
                     Some("failed") => {
+                        if tolerated.is_some() && body["error"]["code"].as_str() == tolerated {
+                            return Ok(());
+                        }
                         return Err(CoreError::Sink(format!(
                             "task {task_uid} failed: {}",
                             body["error"]
@@ -147,6 +161,19 @@ impl Sink for MeilisearchSink {
                     spec.name
                 )));
             }
+            // Asking first is what makes a restart work: the index the
+            // previous run created is left alone instead of being created
+            // again, which Meilisearch reports as a failed task.
+            let (status, _) = self
+                .send(
+                    reqwest::Method::GET,
+                    &format!("/indexes/{}", spec.name),
+                    None,
+                )
+                .await?;
+            if status == 200 {
+                continue;
+            }
             // "id" as primary key matches our pk_to_id rendering contract
             let (status, body) = self
                 .send(
@@ -160,7 +187,10 @@ impl Sink for MeilisearchSink {
                 .await?;
             if status == 202 {
                 if let Some(uid) = body["taskUid"].as_u64() {
-                    self.wait_task(uid).await?;
+                    // two pipelines starting at once, or a replay, can still
+                    // create the same index between the check above and here
+                    self.wait_task_tolerating(uid, Some("index_already_exists"))
+                        .await?;
                 }
             } else if status != 200 && status != 201 {
                 // index_already_exists is acceptable
@@ -379,3 +409,174 @@ impl Sink for MeilisearchSink {
 }
 
 use std::collections::HashMap;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A loopback HTTP server answering by request line, so what the
+    /// assertions read is the sequence of requests the sink really made.
+    struct FakeTarget {
+        url: String,
+        state_dir: String,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FakeTarget {
+        async fn start(answer: fn(&str) -> (u16, &'static str)) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind a loopback port");
+            let address = listener.local_addr().expect("local address");
+            let url = format!("http://{address}");
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let record = Arc::clone(&seen);
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let record = Arc::clone(&record);
+                    tokio::spawn(async move {
+                        let Some(line) = read_request(&mut stream).await else {
+                            return;
+                        };
+                        crate::lock(&record).push(line.clone());
+                        let (status, body) = answer(&line);
+                        let response = format!(
+                            "HTTP/1.1 {status} Fake\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        let _ = stream.shutdown().await;
+                    });
+                }
+            });
+            let state_dir = std::env::temp_dir()
+                .join(format!("pg2osync-meili-test-{}", address.port()))
+                .to_string_lossy()
+                .into_owned();
+            Self {
+                url,
+                state_dir,
+                seen,
+            }
+        }
+
+        fn sink(&self) -> MeilisearchSink {
+            MeilisearchSink::new(MeilisearchSinkConfig {
+                url: self.url.clone(),
+                api_key: None,
+                state_dir: self.state_dir.clone(),
+            })
+            .expect("a sink over plain http")
+        }
+
+        fn seen(&self) -> Vec<String> {
+            crate::lock(&self.seen).clone()
+        }
+    }
+
+    impl Drop for FakeTarget {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.state_dir);
+        }
+    }
+
+    /// The request line of one HTTP/1.1 request, once the whole request —
+    /// headers and the body Content-Length announces — has been read, so the
+    /// reply never races the client's own write.
+    async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<String> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut chunk).await.ok()?;
+            if n == 0 {
+                return None;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+            let announced = head
+                .lines()
+                .find_map(|l| {
+                    l.split_once(':')
+                        .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                })
+                .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if buf.len() - end - 4 >= announced {
+                let mut words = head.lines().next().unwrap_or_default().split_whitespace();
+                return Some(format!(
+                    "{} {}",
+                    words.next().unwrap_or_default(),
+                    words.next().unwrap_or_default()
+                ));
+            }
+        }
+    }
+
+    fn users() -> Vec<IndexSpec> {
+        vec![IndexSpec {
+            name: "users".into(),
+            mapping: None,
+            pattern: false,
+        }]
+    }
+
+    #[tokio::test]
+    async fn an_index_that_already_exists_is_not_created_again() {
+        let target = FakeTarget::start(|line| match line {
+            "GET /indexes/users" => (200, r#"{"uid":"users","primaryKey":"id"}"#),
+            _ => (500, r#"{"code":"internal"}"#),
+        })
+        .await;
+        target
+            .sink()
+            .ensure_ready(&users())
+            .await
+            .expect("a restart over the index the previous run created");
+        assert_eq!(target.seen(), vec!["GET /indexes/users".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_create_task_that_lost_the_race_is_success() {
+        let target = FakeTarget::start(|line| match line {
+            "GET /indexes/users" => (404, r#"{"code":"index_not_found"}"#),
+            "POST /indexes" => (202, r#"{"taskUid":6,"status":"enqueued"}"#),
+            "GET /tasks/6" => (
+                200,
+                r#"{"status":"failed","error":{"code":"index_already_exists"}}"#,
+            ),
+            _ => (500, r#"{"code":"internal"}"#),
+        })
+        .await;
+        target
+            .sink()
+            .ensure_ready(&users())
+            .await
+            .expect("an index someone else created in the meantime");
+        assert_eq!(target.seen().len(), 3, "{:?}", target.seen());
+    }
+
+    #[tokio::test]
+    async fn any_other_create_task_failure_is_an_error() {
+        let target = FakeTarget::start(|line| match line {
+            "GET /indexes/users" => (404, r#"{"code":"index_not_found"}"#),
+            "POST /indexes" => (202, r#"{"taskUid":7,"status":"enqueued"}"#),
+            "GET /tasks/7" => (
+                200,
+                r#"{"status":"failed","error":{"code":"invalid_index_uid"}}"#,
+            ),
+            _ => (500, r#"{"code":"internal"}"#),
+        })
+        .await;
+        let result = target.sink().ensure_ready(&users()).await;
+        assert!(
+            matches!(result, Err(CoreError::Sink(ref e)) if e.contains("invalid_index_uid")),
+            "an index that was never created looked ready: {result:?}"
+        );
+    }
+}
