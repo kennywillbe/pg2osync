@@ -16,7 +16,12 @@ COPY crates/source-mysql/Cargo.toml crates/source-mysql/
 COPY crates/sink/Cargo.toml crates/sink/
 COPY crates/engine/Cargo.toml crates/engine/
 COPY crates/bin/Cargo.toml crates/bin/
-RUN mkdir -p crates/core/src crates/tls/src crates/source/src crates/source-mysql/src \
+# BuildKit cache mounts survive the layer cache: when a Cargo.lock change
+# invalidates this layer, the dependencies already compiled are still in the
+# mount and only what actually changed is rebuilt.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    mkdir -p crates/core/src crates/tls/src crates/source/src crates/source-mysql/src \
              crates/sink/src crates/engine/src crates/bin/src \
     && echo "" > crates/core/src/lib.rs \
     && echo "" > crates/tls/src/lib.rs \
@@ -29,16 +34,22 @@ RUN mkdir -p crates/core/src crates/tls/src crates/source/src crates/source-mysq
     && rm -rf crates/*/src
 
 COPY crates crates
-# touch so cargo rebuilds the crates themselves, not their dependencies
-RUN find crates -name '*.rs' -exec touch {} + \
+# touch so cargo rebuilds the crates themselves, not their dependencies. The
+# final copy is what makes the binary survive: target/ is a cache mount, so it
+# is gone the moment the RUN ends and only /build/pg2osync reaches a layer the
+# runtime stage can copy from.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    find crates -name '*.rs' -exec touch {} + \
     && cargo build --release --locked -p pg2osync \
-    && strip target/release/pg2osync
+    && strip target/release/pg2osync \
+    && cp target/release/pg2osync /build/pg2osync
 
 FROM alpine:3.24
 RUN apk add --no-cache ca-certificates tzdata \
     && adduser -D -u 10001 pg2osync
 COPY LICENSE /usr/share/licenses/pg2osync/LICENSE
-COPY --from=builder /build/target/release/pg2osync /usr/local/bin/pg2osync
+COPY --from=builder /build/pg2osync /usr/local/bin/pg2osync
 
 LABEL org.opencontainers.image.title="pg2osync" \
       org.opencontainers.image.description="Real-time PostgreSQL/MySQL to OpenSearch, Elasticsearch and Meilisearch sync" \

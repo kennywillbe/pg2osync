@@ -238,12 +238,12 @@ check "and still has the field" "$(os_has e2e_customers 3 profile)" "True"
 
 say "4. live streaming"
 pg "INSERT INTO users (id,name,email,password_hash) VALUES (4,'dave','dave@test.io','secret-4');" > /dev/null
-sleep 2; refresh
+synced
 check "INSERT propagated" "$(os_count e2e_users)" "4"
 check "excluded column still absent" "$(os_has e2e_users 4 password_hash)" "False"
 
 pg "UPDATE users SET name='dave-renamed', email='new@test.io' WHERE id=4;" > /dev/null
-sleep 2; refresh
+synced
 check "UPDATE propagated" "$(os_field e2e_users 4 name)" "dave-renamed"
 check "transform applied on update" "$(os_field e2e_users 4 contact)" "***"
 
@@ -252,40 +252,40 @@ check "transform applied on update" "$(os_field e2e_users 4 contact)" "***"
 # complete the document from the one already indexed
 pg "UPDATE users SET metadata = (SELECT jsonb_build_object('blob', string_agg(md5(random()::text), ''))
                                  FROM generate_series(1, 400)) WHERE id = 4;" > /dev/null
-sleep 2; refresh
+synced
 toast_len=$(curl -s "$OS/e2e_users/_doc/4" | jqf "len(d['_source']['meta']['blob'])")
 pg "UPDATE users SET name = 'dave-toast' WHERE id = 4;" > /dev/null
-sleep 2; refresh
+synced
 check "an update that leaves a TOASTed column alone keeps its value" \
   "$(curl -s "$OS/e2e_users/_doc/4" | jqf "len(d['_source']['meta']['blob'])")" "$toast_len"
 check "the rest of that update still applied" "$(os_field e2e_users 4 name)" "dave-toast"
 
 pg "DELETE FROM users WHERE id=3;" > /dev/null
-sleep 2; refresh
+synced
 check "DELETE propagated" "$(os_status e2e_users 3)" "404"
 
 say "5. changing a primary key moves the document"
 pg "UPDATE users SET id = 40 WHERE id = 4;" > /dev/null
-sleep 2; refresh
+synced
 check "row lives at its new id" "$(os_field e2e_users 40 name)" "dave-toast"
 # the old document must not survive: nothing would ever collect it
 check "old document removed" "$(os_status e2e_users 4)" "404"
 pg "DELETE FROM users WHERE id = 40;" > /dev/null
-sleep 2; refresh
+synced
 check "deleting the moved row leaves nothing" "$(os_status e2e_users 40)" "404"
 
 say "6. nested children stay fresh"
 pg "INSERT INTO orders (id,customer_id,total) VALUES (13,2,7.50);" > /dev/null
-sleep 2; refresh
+synced
 check "child INSERT refreshes parent" "$(os_len e2e_customers 2 orders)" "2"
 pg "DELETE FROM orders WHERE id=13;" > /dev/null
-sleep 2; refresh
+synced
 check "child DELETE refreshes parent" "$(os_len e2e_customers 2 orders)" "1"
 
 # the re-fetch shares the load's element expression, so the projection holds on
 # the streamed path too — a change to the excluded column may not leak it
 pg "UPDATE orders SET internal_notes='still secret' WHERE id=12;" > /dev/null
-sleep 2; refresh
+synced
 check "the excluded child column stays out on the stream" \
   "$(curl -s "$OS/e2e_customers/_doc/2" | jqf "'internal_notes' in d['_source']['orders'][0]")" \
   "False"
@@ -293,7 +293,7 @@ check "the excluded child column stays out on the stream" \
 # a one-to-one child that goes away leaves the field present and null, so a
 # query for it need not know whether this parent ever had one
 pg "DELETE FROM profiles WHERE id=30;" > /dev/null
-sleep 2; refresh
+synced
 check "a deleted one-to-one child becomes null" \
   "$(curl -s "$OS/e2e_customers/_doc/1" | jqf "d['_source']['profile']")" "None"
 check "the field is still there" "$(os_has e2e_customers 1 profile)" "True"
@@ -301,7 +301,7 @@ check "the field is still there" "$(os_has e2e_customers 1 profile)" "True"
 # a second matching row is a warning, not a halt: the lowest-keyed row stands
 dup_lines=$(wc -l < "$LOG")
 pg "INSERT INTO profiles (id,customer_id,bio) VALUES (31,1,'kept'),(32,1,'extra');" > /dev/null
-sleep 2; refresh
+synced
 check "the lowest-keyed row stands" \
   "$(curl -s "$OS/e2e_customers/_doc/1" | jqf "d['_source']['profile']['bio']")" "kept"
 if tail -n +$((dup_lines + 1)) "$LOG" | grep -q "public.profiles"; then
@@ -310,7 +310,7 @@ else
   bad "a second matching row was embedded without a word"
 fi
 pg "DELETE FROM profiles WHERE id IN (31,32);" > /dev/null
-sleep 2; refresh
+synced
 
 # Many children of one parent in one transaction: the parent is re-read once for
 # the group, not once per row, and the array that lands is the whole collection.
@@ -319,7 +319,7 @@ before_reads=$(pg "SELECT COALESCE(sum(calls),0) FROM pg_stat_statements
                      AND query NOT LIKE '%pg_stat_statements%';" 2>/dev/null || echo 0)
 pg "INSERT INTO orders (id,customer_id,total)
       SELECT 1000 + g, 2, g FROM generate_series(1, 40) g;" > /dev/null
-sleep 3; refresh
+synced
 check "one transaction of 40 children lands whole" "$(os_len e2e_customers 2 orders)" "41"
 after_reads=$(pg "SELECT COALESCE(sum(calls),0) FROM pg_stat_statements
                   WHERE query LIKE '%FROM \"public\".\"orders\"%'
@@ -335,7 +335,7 @@ else
   bad "children still resolved per row ($((after_reads - before_reads)) fetches for 40 rows)"
 fi
 pg "DELETE FROM orders WHERE id > 1000;" > /dev/null
-sleep 3; refresh
+synced
 check "the parent is back to its own children" "$(os_len e2e_customers 2 orders)" "1"
 
 say "7. TRUNCATE clears the index"
@@ -433,7 +433,7 @@ say "10. reconnects after the server drops the stream"
 before_pid=$(pgrep -f "pg2osync run" | head -1)
 pg "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE backend_type='walsender';" > /dev/null
 pg "INSERT INTO users (id,name,email) VALUES (9,'written-while-disconnected','w@test.io');" > /dev/null
-sleep 8; refresh
+synced
 # the same process must still be running: recovery happens in process, not by
 # a supervisor restarting us
 check "same process recovered" "$(pgrep -f "pg2osync run" | head -1)" "$before_pid"

@@ -143,12 +143,12 @@ check "and a code it does not know takes the default" "$(os_field e2e_mysql_user
 
 say "3. live binlog streaming"
 my "INSERT INTO shop_users (id,name,email,balance) VALUES (4,'dave','dave@test.io',7.00);"
-sleep 3; refresh
+synced
 check "INSERT propagated" "$(os_count e2e_mysql_users)" "4"
 check "insert uses named columns" "$(os_field e2e_mysql_users 4 name)" "dave"
 
 my "UPDATE shop_users SET name='dave-renamed', balance=8.50 WHERE id=4;"
-sleep 3; refresh
+synced
 check "UPDATE propagated" "$(os_field e2e_mysql_users 4 name)" "dave-renamed"
 check "the stream converts the decimal too" "$(os_field e2e_mysql_users 4 credit)" "8.5"
 
@@ -168,16 +168,16 @@ my "DELETE FROM shop_users WHERE id=7;"
 synced
 
 my "DELETE FROM shop_users WHERE id=3;"
-sleep 3; refresh
+synced
 check "DELETE propagated" "$(os_status e2e_mysql_users 3)" "404"
 
 say "4. changing a primary key moves the document"
 my "UPDATE shop_users SET id = 40 WHERE id = 4;"
-sleep 3; refresh
+synced
 check "row lives at its new id" "$(os_field e2e_mysql_users 40 name)" "dave-renamed"
 check "old document removed" "$(os_status e2e_mysql_users 4)" "404"
 my "DELETE FROM shop_users WHERE id = 40;"
-sleep 3; refresh
+synced
 check "deleting the moved row leaves nothing" "$(os_status e2e_mysql_users 40)" "404"
 
 say "5. TRUNCATE clears the index"
@@ -212,7 +212,7 @@ else
   my "KILL ${dump_id};" || true
 fi
 my "INSERT INTO shop_users (id,name,email) VALUES (9,'written-while-disconnected','w@test.io');"
-sleep 8; refresh
+synced
 check "same process recovered" "$(pgrep -f "pg2osync run" | head -1)" "$before_pid"
 check "row written while disconnected arrived" "$(os_field e2e_mysql_users 9 name)" "written-while-disconnected"
 metrics=$(curl -s http://127.0.0.1:9112/metrics)
