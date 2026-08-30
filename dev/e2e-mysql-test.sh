@@ -13,6 +13,9 @@
 #   TARGET_FLAVOR  opensearch|elasticsearch (default opensearch)
 #   E2E_LOG        pipeline log file        (default /tmp/pg2osync-mysql-e2e.log)
 set -euo pipefail
+# shellcheck source=dev/e2e-lock.sh
+source "$(dirname "$0")/e2e-lock.sh"
+e2e_lock
 
 cd "$(dirname "$0")/.."
 BIN=./target/release/pg2osync
@@ -63,7 +66,7 @@ synced()    { curl -s "http://127.0.0.1:9132/synced?refresh=true&timeout=10000" 
 
 start_sync() { nohup $BIN run -c "$CONFIG" >> "$LOG" 2>&1 < /dev/null & disown; }
 stop_sync()  { pkill -f "pg2osync run" 2> /dev/null || true; }
-cleanup()    { stop_sync; rm -f "$CONFIG"; }
+cleanup()    { stop_sync; rm -f "$CONFIG"; e2e_unlock; }
 trap cleanup EXIT
 
 cat > "$CONFIG" <<TOML
