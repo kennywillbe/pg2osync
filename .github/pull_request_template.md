@@ -4,12 +4,10 @@
 
 ## How it was verified
 
-<!-- Delete what does not apply; paste output for what you ran. -->
+<!-- CONTRIBUTING.md: push on a green RESULT line; CI should never be the
+     first to tell you a change is red. -->
 
-- [ ] `cargo fmt --all` and `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace`
-- [ ] `./dev/e2e-test.sh` (pipeline changes)
-- [ ] `./dev/e2e-mysql-test.sh` (MySQL source changes)
+- [ ] `./dev/ci-local.sh` ended with a green `RESULT` line
 - [ ] Regression test added that fails without this change
 
 ## Checklist

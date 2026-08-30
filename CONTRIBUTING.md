@@ -150,8 +150,11 @@ Write short, descriptive commit subjects in the imperative mood
 (`fix truncate ordering against pending writes`). Explain the reasoning in the
 body when it is not obvious from the diff. Keep one logical change per commit.
 
-Pull requests should say what changed, why, and how you verified it — include
-the e2e output when you touched the pipeline.
+Pull request descriptions follow [.github/pull_request_template.md](.github/pull_request_template.md)
+— keep its headings and checklists. The web UI pre-fills it; `gh pr create`
+does not, so paste it into `--body` yourself. Put what changed and why under
+*What and why*, and the `RESULT` line of `./dev/ci-local.sh` under *How it was
+verified*.
 
 ## Reporting bugs
 

@@ -1,8 +1,8 @@
-blank_issues_enabled: true
+blank_issues_enabled: false
 contact_links:
   - name: Security vulnerability
     url: https://github.com/kennywillbe/pg2osync/security/advisories/new
     about: Report privately. Please do not open a public issue.
   - name: Question or help with a setup
-    url: https://github.com/kennywillbe/pg2osync/discussions
-    about: Ask in Discussions; issues are for bugs and proposals.
+    url: https://kennywillbe.github.io/pg2osync/
+    about: The documentation covers setup, configuration and operations; issues are for bugs and proposals.
