@@ -1,20 +1,27 @@
 {
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
-  "release-type": "rust",
-  "bootstrap-sha": "66f780cfc2ee21b586a2e910678c4aff9f8ba763",
+  "release-type": "simple",
+  "bootstrap-sha": "cebbab9ba93899d69a029f388b76b51274ba6f9e",
   "include-component-in-tag": false,
   "separate-pull-requests": true,
   "always-update": true,
   "pull-request-title-pattern": "chore: release ${version}",
   "packages": {
-    "crates/bin": {
-      "component": "pg2osync"
+    ".": {
+      "component": "pg2osync",
+      "changelog-path": "crates/bin/CHANGELOG.md",
+      "extra-files": [
+        {
+          "type": "toml",
+          "path": "crates/bin/Cargo.toml",
+          "jsonpath": "$.package.version"
+        },
+        {
+          "type": "toml",
+          "path": "Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value=='pg2osync')].version"
+        }
+      ]
     }
-  },
-  "plugins": [
-    {
-      "type": "cargo-workspace",
-      "merge": false
-    }
-  ]
+  }
 }
