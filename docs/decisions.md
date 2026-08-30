@@ -712,6 +712,19 @@ checkpoint. On MySQL the comparison is between the catalog's answer before a
 DDL and its answer after, since the binlog says a statement ran but not what it
 did to a column layout.
 
+**A binlog shape the catalog cannot match is skipped, not fatal.** MySQL's
+TABLE_MAP describes the table as it was when the row was written, and
+`information_schema` only ever answers for now. A crash-restart resumes from the
+last durable checkpoint, so any DDL that committed after that checkpoint is
+replayed: the rows before it carry a column count the catalog no longer has, and
+re-reading the catalog cannot bring the old layout back. Refusing to continue
+there looks safe and is not — the reconnect resumes from the same checkpoint,
+reaches the same event and fails again, so the pipeline stops replicating
+*everything* rather than the handful of rows it cannot decode. Those rows are
+therefore counted as drift, named in the log and left undecoded, which is the
+same bargain the rest of this section makes: the index and the table disagree
+about a shape that changed, and only a rebuild closes that.
+
 **No event trigger in the user's database.** The attractive version of DDL
 detection puts a `CREATE EVENT TRIGGER` in the source, which writes each schema
 change into the WAL as a logical message so it arrives inline and correctly

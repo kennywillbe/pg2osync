@@ -421,14 +421,25 @@ impl MySqlSource {
                         report_drift(&tx, &meta.schema, &meta.name, drift).await?;
                     }
                     if columns.len() != meta.columns.len() {
-                        anyhow::bail!(
-                            "{}.{}: binlog reports {} columns but the catalog has {}; \
-                             a concurrent DDL is in flight — restart to resynchronize",
+                        // A shape a fresh catalog read still disagrees with is
+                        // history, not a race: the stream is replaying from a
+                        // checkpoint written before a DDL that has since
+                        // committed, and no read can bring back the layout
+                        // those rows were written under. Failing the attempt
+                        // here wedged the pipeline — every reconnect resumed
+                        // from the same checkpoint and reached the same event,
+                        // so nothing after it was ever replicated again, which
+                        // costs far more than the rows this skips.
+                        tracing::warn!(target: "pg2osync::source",
+                            "{}.{}: the binlog describes {} columns and the catalog has {}; \
+                             these rows predate a DDL that has already committed and cannot \
+                             be decoded, so they are skipped and the stream carries on",
                             meta.schema,
                             meta.name,
                             meta.columns.len(),
-                            columns.len()
-                        );
+                            columns.len());
+                        registered.remove(&tid);
+                        continue;
                     }
                     // The row image says nothing about whether a string column
                     // holds characters or bytes, nor what an enum ordinal means.
