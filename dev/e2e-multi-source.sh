@@ -5,8 +5,13 @@
 # both report themselves, and — the point of the whole feature — one of them
 # going away does not touch the other.
 #
-# Runs one at a time: stopping the pipeline kills every pg2osync process, so
-# two suites at once take each other's down and report failures that are not.
+# One suite at a time per stack: the slot, the tables and the indices are
+# fixed, so two suites against the same PostgreSQL, MySQL and OpenSearch
+# overwrite each other's state. dev/e2e-lock.sh enforces that on the shared dev
+# stack with a machine-wide lock; a second suite waits. A run with a stack of
+# its own — ci-local --isolated — passes E2E_LOCK=none and takes no lock,
+# because a stop only ever signals the pipelines this run started
+# (dev/e2e-pipeline.sh).
 #
 # Prerequisites:
 #   docker compose -f dev/docker-compose.yml up -d
@@ -22,9 +27,13 @@
 #   MYSQL_CONTAINER MySQL container name     (default mysql-test)
 #   MYSQL_PORT      MySQL port on localhost  (default 13306)
 #   E2E_LOG         pipeline log file        (default /tmp/pg2osync-multi-e2e.log)
+#   E2E_LOCK        lock directory, or none  (default /tmp/pg2osync-e2e.lock)
+#   E2E_PORT_BASE   first metrics/API port   (default 9100, a 40-port block)
 set -euo pipefail
 # shellcheck source=dev/e2e-lock.sh
 source "$(dirname "$0")/e2e-lock.sh"
+# shellcheck source=dev/e2e-pipeline.sh
+source "$(dirname "$0")/e2e-pipeline.sh"
 e2e_lock
 
 cd "$(dirname "$0")/.."
@@ -45,8 +54,12 @@ MYSQL_CLIENT=${MYSQL_CLIENT:-mysql}
 # break every later one with "File exists".
 CONFIG_DIR=$(mktemp -d /tmp/pg2osync-multi.XXXXXX)
 LOG=${E2E_LOG:-/tmp/pg2osync-multi-e2e.log}
-METRICS=127.0.0.1:9138
-API=127.0.0.1:9139
+# The process binds its metrics and API ports on this machine rather than
+# inside a container, so two suites at once need two blocks: E2E_PORT_BASE
+# moves both ports this one uses.
+PORT_BASE=${E2E_PORT_BASE:-9100}
+METRICS=127.0.0.1:$((PORT_BASE + 38))
+API=127.0.0.1:$((PORT_BASE + 39))
 export PG2OSYNC_SOURCE_URL="postgres://postgres:postgres@localhost:$PG_PORT/sourcedb"
 export PG2OSYNC_MYSQL_URL="mysql://$MYSQL_USER:$MYSQL_PASSWORD@localhost:$MYSQL_PORT/sourcedb"
 PASS=0; FAIL=0
@@ -85,12 +98,16 @@ state_of() {
   metrics | sed -n "s/^pg2osync_source_state{source=\"$1\",state=\"\\([a-z]*\\)\"} 1$/\\1/p"
 }
 
-start_sync() { nohup $BIN run --config-dir "$CONFIG_DIR" >> "$LOG" 2>&1 < /dev/null & SYNC_PID=$!; }
-# SIGTERM rather than SIGKILL: draining is what the last section is about
-stop_sync() {
-  pkill -f "pg2osync run" 2> /dev/null || true
-  for _ in $(seq 1 100); do pgrep -f "pg2osync run" > /dev/null || break; sleep 0.1; done
+# remember_sync sets SYNC_PID, which the drain section signals and waits on.
+start_sync() {
+  nohup "$BIN" run --config-dir "$CONFIG_DIR" >> "$LOG" 2>&1 < /dev/null &
+  remember_sync $!
 }
+# SIGTERM rather than SIGKILL: draining is what the last section is about
+stop_sync() { sync_stop; }
+# How many of the pipelines this run started are still up. Counting every
+# pg2osync on the machine would count the suite running beside this one.
+sync_count() { live_syncs || true; printf '%s' "$LIVE_SYNCS" | wc -w | tr -d ' '; }
 drop_own_slot() { pg "SELECT pg_drop_replication_slot('pg2osync_multi') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='pg2osync_multi');" > /dev/null 2>&1 || true; }
 # a suite that stopped MySQL and then failed must not leave it stopped for the
 # suites that follow
@@ -193,7 +210,7 @@ await_count e2e_multi_my_users 3
 check "PostgreSQL rows indexed" "$(os_count e2e_multi_pg_users)" "2"
 check "MySQL rows indexed" "$(os_count e2e_multi_my_users)" "3"
 # both sources are served by the one --config-dir process, not by two
-check "one process" "$(pgrep -f "run --config-dir" | wc -l | tr -d " ")" "1"
+check "one process" "$(sync_count)" "1"
 
 say "3. one exposition, a source label on every series"
 await_state pgsrc streaming || true
@@ -250,7 +267,7 @@ check "the halted source fails its own probe" "$(http_code "http://$METRICS/heal
 # a 503 here would have the kubelet restart the pipeline that is working
 check "liveness stays up" "$(http_code "http://$METRICS/healthz")" "200"
 check "the working source stays ready" "$(http_code "http://$METRICS/healthz/pgsrc")" "200"
-check "the process is still running" "$(pgrep -f "run --config-dir" | wc -l | tr -d " ")" "1"
+check "the process is still running" "$(sync_count)" "1"
 check "/synced still answers for the source that is up" \
   "$(http_code "http://$API/synced?source=pgsrc&timeout=10000")" "200"
 

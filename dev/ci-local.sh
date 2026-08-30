@@ -12,6 +12,11 @@
 #   --fast                skip the e2e suites, the image build and the matrix
 #   --matrix              run the compatibility cells even if nothing asks for them
 #   --no-matrix           never run them
+#   --isolated            give this run containers of its own, on ports Docker
+#                         picks, instead of the shared dev stack — that is what
+#                         lets two runs go at once on one machine
+#   --jobs <n>            compatibility cells to run at once (default 2 under
+#                         --isolated, 1 on the shared stack)
 #   --title "<text>"      the pull request title to check (default: the open
 #                         pull request for this branch, via gh)
 #   --list                print the job names and exit
@@ -29,6 +34,22 @@
 #   audit                dependencies have no known advisories (audit.yml)
 #   compat-*             the six compatibility cells           (compat.yml)
 #
+# By default the e2e jobs use the shared dev stack (dev/docker-compose.yml plus
+# the mysql-test container): nothing to pull, nothing to start, and the suites
+# queue on dev/e2e-lock.sh so two runs do not overwrite each other's tables.
+# --isolated instead gives every e2e and compatibility job of this run its own
+# throwaway containers, named pg2osync-ci-<run id>-*, on ports Docker assigns,
+# and its own block of localhost ports for the pipelines the suites start.
+# Such a run shares nothing, takes no lock and leaves the dev stack alone, so it
+# can go beside another one, and its compatibility cells — a container set and a
+# port block each — run two at a time instead of one after the other (--jobs).
+# A cell measures about 1 GB — 0.9 for OpenSearch on its 512 MB heap, the rest
+# PostgreSQL, half a gigabyte more for a MySQL one — against a dev stack of
+# 2.6 GB, so an 8 GB Docker VM carries about two isolated runs beside it. Past
+# that, Docker's OOM killer takes a container down, and the job waiting on it
+# fails within seconds naming the container rather than hanging: readiness is
+# polled, and a container that is no longer running ends the wait.
+#
 # Tools: docker, helm, kubectl, mdbook, rustup/cargo, curl, python3; gh only
 # when --title is not given; cargo-audit is installed on demand.
 # shellcheck disable=SC2329
@@ -45,9 +66,14 @@ TITLE_WF=.github/workflows/pr-title.yml
 AUDIT_WF=.github/workflows/audit.yml
 COMPAT_WF=.github/workflows/compat.yml
 
+# Identifies this run in its log directory and, under --isolated, in the name
+# of every container it starts. The pid is what keeps two runs started in the
+# same second apart.
+RUN_ID=$(date +%Y%m%d-%H%M%S)-$$
+
 # One directory per run, stamped: a stale log read as this run's evidence is
 # worse than no log at all, and two runs on one machine must not share a file.
-RUN_DIR=${PG2OSYNC_CI_LOG_DIR:-/tmp/pg2osync-ci-local/$(date +%Y%m%d-%H%M%S)}
+RUN_DIR=${PG2OSYNC_CI_LOG_DIR:-/tmp/pg2osync-ci-local/$RUN_ID}
 
 # ci.yml's env block. RUSTFLAGS is what makes a warning fail the build there,
 # so leaving it out here would let a warning through to CI.
@@ -56,6 +82,8 @@ export RUSTFLAGS=${RUSTFLAGS:--D warnings}
 
 # The compatibility cells are throwaway containers, so they get ports of their
 # own and never collide with the dev stack on 15432/9200 or a MySQL on 13306.
+# Under --isolated a second run would collide with the first on exactly these,
+# so there the ports are Docker's to pick and read back.
 COMPAT_PG_PORT=15433
 COMPAT_OS_PORT=9201
 COMPAT_ES_PORT=9202
@@ -65,6 +93,8 @@ COMPAT_MYSQL_PORT=13307
 ONLY=""
 SKIP=""
 FAST=0
+ISOLATED=0
+JOBS=
 MATRIX=auto
 PR_TITLE=""
 PR_TITLE_GIVEN=0
@@ -87,6 +117,8 @@ while [ $# -gt 0 ]; do
     --fast) FAST=1; shift ;;
     --matrix) MATRIX=force; shift ;;
     --no-matrix) MATRIX=never; shift ;;
+    --isolated) ISOLATED=1; shift ;;
+    --jobs) JOBS=$2; shift 2 ;;
     --title) PR_TITLE=$2; PR_TITLE_GIVEN=1; shift 2 ;;
     --list) printf '%s\n' "$ALL_JOBS" | tr ' ' '\n'; exit 0 ;;
     -h|--help) usage; exit 0 ;;
@@ -134,6 +166,59 @@ case "$MSRV" in
   *) warn "ci.yml pins Rust $MSRV but Cargo.toml says rust-version = $CARGO_MSRV" ;;
 esac
 
+# A cell is one set of throwaway containers with names and ports of its own.
+# The compatibility cells have always been one; --isolated makes the e2e jobs
+# cells too, and moves the names out of the way of the run next door.
+if [ "$ISOLATED" = 1 ]; then
+  CELL_BASE=pg2osync-ci-$RUN_ID
+  # Nothing here is shared, so there is nothing to queue on — and queueing
+  # would defeat the point of running beside another run.
+  export E2E_LOCK=none
+  JOBS=${JOBS:-2}
+else
+  CELL_BASE=compat
+  # The cells here carry the fixed names and the fixed ports, and their suites
+  # queue on the machine-wide lock, so two of them at once would collide on all
+  # three. Running them side by side is what --isolated is for.
+  if [ -n "$JOBS" ] && [ "$JOBS" != 1 ]; then
+    echo "--jobs $JOBS needs --isolated: on the shared stack the cells share their" >&2
+    echo "names, their ports and one lock, so they can only run one at a time." >&2
+    exit 2
+  fi
+  JOBS=1
+fi
+case $JOBS in
+  '' | *[!0-9]* | 0) echo "--jobs takes a number of 1 or more" >&2; exit 2 ;;
+esac
+
+# One namespace per cell, so two cells running at once never share a container
+# name; on the shared stack there is one namespace and it is the old one.
+cell_use() {
+  if [ "$ISOLATED" = 1 ]; then
+    CELL=$CELL_BASE-${1#compat-}
+    # 0 means "Docker, pick one": probing for a free port and then binding it
+    # leaves a window in which the cell beside this one binds the same port.
+    CELL_PG_PORT=0
+    CELL_OS_PORT=0
+    CELL_ES_PORT=0
+    CELL_MEILI_PORT=0
+    CELL_MYSQL_PORT=0
+  else
+    CELL=$CELL_BASE
+    CELL_PG_PORT=$COMPAT_PG_PORT
+    CELL_OS_PORT=$COMPAT_OS_PORT
+    CELL_ES_PORT=$COMPAT_ES_PORT
+    CELL_MEILI_PORT=$COMPAT_MEILI_PORT
+    CELL_MYSQL_PORT=$COMPAT_MYSQL_PORT
+  fi
+  CELL_PG=$CELL-postgres
+  CELL_OS=$CELL-opensearch
+  CELL_ES=$CELL-elasticsearch
+  CELL_MEILI=$CELL-meilisearch
+  CELL_MYSQL=$CELL-mysql
+}
+cell_use default
+
 # ----------------------------------------------------------- what CI would run
 CHANGED=$(git diff --name-only origin/main...HEAD 2> /dev/null || true)
 CHANGED="$CHANGED
@@ -171,7 +256,24 @@ cleanup_containers() {
   docker rm -f $CLEANUP_CONTAINERS > /dev/null 2>&1 || true
   CLEANUP_CONTAINERS=""
 }
-trap cleanup_containers EXIT
+
+# A pooled cell registers its containers inside a subshell, where the parent
+# cannot see the list, so its namespace is what gets removed instead. Only an
+# isolated run has a prefix of its own; nothing else may be matched by name.
+cleanup_cell() {
+  local ids
+  [ "$ISOLATED" = 1 ] || return 0
+  ids=$(docker ps -aq --filter "name=^$1-" 2> /dev/null || true)
+  [ -n "$ids" ] || return 0
+  # shellcheck disable=SC2086
+  docker rm -f $ids > /dev/null 2>&1 || true
+}
+
+cleanup_run() {
+  cleanup_containers
+  cleanup_cell "$CELL_BASE"
+}
+trap cleanup_run EXIT
 
 selected() {
   local slug=$1
@@ -185,28 +287,8 @@ selected() {
 # A job function returns 0 for green, 78 when CI itself would not have run it,
 # anything else for red. errexit does not apply inside a function called from a
 # condition, so every step in one ends in `|| return 1`.
-run_job() {
-  local slug=$1 name=$2 cell=${3:-} fn=job_${1//-/_} log start rc=0 took
-  if ! selected "$slug"; then
-    SKIPPED=$((SKIPPED + 1))
-    printf -- '- %s (not selected)\n' "$name"
-    return 0
-  fi
-  log=$RUN_DIR/$slug.log
-  start=$SECONDS
-  printf '\033[2m.. %s\033[0m\n' "$name"
-  # Seeding the databases and running a suite must not interleave with another
-  # run's suite, so the whole job holds the lock the suites queue on.
-  case $slug in
-    e2e-*|compat-*) e2e_lock ;;
-  esac
-  "$fn" > "$log" 2>&1 || rc=$?
-  case $slug in
-    e2e-*|compat-*) e2e_unlock ;;
-  esac
-  cleanup_containers
-  took=$((SECONDS - start))
-  printf '\033[1A\033[2K'
+report_job() {
+  local name=$1 cell=$2 rc=$3 took=$4 log=$5
   case $rc in
     0) PASSED=$((PASSED + 1)); printf '\033[32m✓\033[0m %s (%ss)\n' "$name" "$took" ;;
     # a skipping job explains itself on its last line
@@ -223,15 +305,180 @@ run_job() {
   esac
 }
 
+run_job() {
+  local slug=$1 name=$2 cell=${3:-} fn=job_${1//-/_} log start rc=0 took
+  if ! selected "$slug"; then
+    SKIPPED=$((SKIPPED + 1))
+    printf -- '- %s (not selected)\n' "$name"
+    return 0
+  fi
+  log=$RUN_DIR/$slug.log
+  start=$SECONDS
+  printf '\033[2m.. %s\033[0m\n' "$name"
+  cell_use "$slug"
+  # Seeding the databases and running a suite must not interleave with another
+  # run's suite, so the whole job holds the lock the suites queue on.
+  case $slug in
+    e2e-*|compat-*) e2e_lock ;;
+  esac
+  "$fn" > "$log" 2>&1 || rc=$?
+  case $slug in
+    e2e-*|compat-*) e2e_unlock ;;
+  esac
+  cleanup_containers
+  printf '\033[1A\033[2K'
+  report_job "$name" "$cell" "$rc" "$((SECONDS - start))" "$log"
+}
+
+# ------------------------------------------------------------------- the pool
+# Cells that share nothing can run at once. Each background cell gets a
+# namespace and a port block of its own, indexed by the pool slot it holds, and
+# is collected — log, exit code, containers — as soon as it ends.
+POOL_PID=()
+POOL_SLUG=()
+POOL_NAME=()
+POOL_CELL=()
+POOL_START=()
+FREED_SLOT=""
+
+# A finished child is a zombie until it is waited for, and kill -0 still finds
+# one, so the state is what says whether a slot is still busy.
+slot_running() {
+  case "$(ps -o state= -p "${1:-0}" 2> /dev/null)" in "" | Z*) return 1 ;; *) return 0 ;; esac
+}
+
+start_cell() {
+  local slot=$1 slug=$2 name=$3 cell=$4 fn=job_${2//-/_}
+  printf '\033[2m.. %s (started)\033[0m\n' "$name"
+  (
+    cell_use "$slug"
+    # the shared stack has no block of its own: one cell at a time there, on
+    # the ports the suites use by default
+    export E2E_PORT_BASE=$((${E2E_PORT_BASE:-9100} + slot * 40))
+    # As in run_job, and for the same reason: on the shared stack a cell still
+    # seeds and streams on the names and ports every other run uses. Under
+    # --isolated it owns all of them, and E2E_LOCK=none makes this a no-op.
+    e2e_lock
+    # as in run_job: the `||` is what keeps errexit out of the cell's own steps
+    rc=0
+    "$fn" || rc=$?
+    # The parent cannot see the list a cell registered in here, and on the
+    # shared stack it may not remove by name either — those names are not this
+    # run's. So the cell removes its own containers, and before it lets the
+    # lock go: on the shared stack the next run's cell claims the same names.
+    cleanup_containers
+    e2e_unlock
+    exit $rc
+  ) > "$RUN_DIR/$slug.log" 2>&1 &
+  POOL_PID[$slot]=$!
+  POOL_SLUG[$slot]=$slug
+  POOL_NAME[$slot]=$name
+  POOL_CELL[$slot]=$cell
+  POOL_START[$slot]=$SECONDS
+}
+
+# Waits for one cell to end, reports it, removes its containers and leaves its
+# slot number in FREED_SLOT.
+collect_cell() {
+  local slot rc
+  while :; do
+    for slot in $(seq 0 $((JOBS - 1))); do
+      [ -n "${POOL_PID[$slot]:-}" ] || continue
+      if ! slot_running "${POOL_PID[$slot]}"; then
+        rc=0
+        wait "${POOL_PID[$slot]}" || rc=$?
+        report_job "${POOL_NAME[$slot]}" "${POOL_CELL[$slot]}" "$rc" \
+          "$((SECONDS - POOL_START[slot]))" "$RUN_DIR/${POOL_SLUG[$slot]}.log"
+        cleanup_cell "$CELL_BASE-${POOL_SLUG[$slot]#compat-}"
+        POOL_PID[$slot]=""
+        FREED_SLOT=$slot
+        return 0
+      fi
+    done
+    sleep 2
+  done
+}
+
+# Runs the cells read from stdin, at most $JOBS of them at a time.
+run_cells() {
+  local slot slug name cell free=""
+  for slot in $(seq 0 $((JOBS - 1))); do free="$free $slot"; done
+  while IFS='|' read -r slug name cell; do
+    [ -n "$slug" ] || continue
+    if ! selected "$slug"; then
+      SKIPPED=$((SKIPPED + 1))
+      printf -- '- %s (not selected)\n' "$name"
+      continue
+    fi
+    if [ -z "${free// /}" ]; then
+      collect_cell
+      free=" $FREED_SLOT"
+    fi
+    free=${free# }
+    slot=${free%% *}
+    case "$free" in *' '*) free=" ${free#* }" ;; *) free="" ;; esac
+    start_cell "$slot" "$slug" "$name" "$cell"
+  done
+  while pool_busy; do collect_cell; done
+}
+
+pool_busy() {
+  local slot
+  for slot in $(seq 0 $((JOBS - 1))); do
+    [ -z "${POOL_PID[$slot]:-}" ] || return 0
+  done
+  return 1
+}
+
 # ------------------------------------------------------------------ containers
-wait_for() {
-  local what=$1 tries=$2
-  shift 2
+# Polls the readiness check, and gives up early on a container that is no
+# longer running: one Docker's OOM killer took is never going to answer, and
+# waiting out the tries would turn a run past this machine's memory into three
+# minutes of silence per container instead of an error naming it.
+wait_for_container() {
+  local name=$1 what=$2 tries=$3
+  shift 3
   for _ in $(seq 1 "$tries"); do
     if "$@" > /dev/null 2>&1; then return 0; fi
+    if [ "$(container_state "$name")" != "running" ]; then
+      echo "$what stopped before it was ready: $(docker inspect \
+        -f 'status={{.State.Status}} exit={{.State.ExitCode}} oom-killed={{.State.OOMKilled}}' \
+        "$name" 2> /dev/null)"
+      docker logs --tail 20 "$name" 2>&1 | sed 's/^/    /'
+      return 1
+    fi
     sleep 2
   done
   echo "$what never became ready"
+  return 1
+}
+
+# Read back rather than assumed: under --isolated the host port is Docker's to
+# choose, and in the shared case this returns the fixed port it was given.
+published_port() { docker port "$1" "$2/tcp" | head -1 | sed 's/.*://'; }
+
+port_free() { ! (exec 3<> "/dev/tcp/127.0.0.1/$1") 2> /dev/null; }
+
+# The pipelines a suite starts bind their metrics and API ports on this machine,
+# not inside the cell, so an isolated run needs a region of one 40-port block
+# per pool slot. Regions do not overlap and the scan starts at this run's pid,
+# because two runs looking at the same moment see the same ports unbound — the
+# probe alone would have them both take the first region.
+pick_port_base() {
+  local want=$1 slots=64 i s k base ok
+  for i in $(seq 0 $((slots - 1))); do
+    s=$((($$ + i) % slots))
+    base=$((9300 + s * 40 * want))
+    ok=1
+    for k in $(seq 0 $((want - 1))); do
+      if port_free $((base + k * 40)) && port_free $((base + k * 40 + 20)) &&
+        port_free $((base + k * 40 + 32)); then continue; fi
+      ok=0
+      break
+    done
+    if [ "$ok" = 1 ]; then echo "$base"; return 0; fi
+  done
+  echo "no free block of $((want * 40)) ports for this run's pipelines" >&2
   return 1
 }
 
@@ -282,29 +529,6 @@ mysql_enable_gtid() {
   docker exec "$name" mysql -uroot -pmysqlpw -N -B -e "SELECT @@GLOBAL.gtid_mode;" || return 1
 }
 
-# The suites stop a pipeline by killing every pg2osync process, so a second one
-# running anywhere on this machine makes them report failures that are not real.
-# The suites queue on dev/e2e-lock.sh themselves; waiting here as well keeps a
-# run from starting its e2e jobs into someone else's pipeline and reporting a
-# red that was never about the change.
-no_pipeline_running() {
-  local waited=0 wait_max=${E2E_LOCK_WAIT:-5400}
-  # The lock this run took itself is not someone else's run.
-  while pgrep -f "pg2osync run" > /dev/null 2>&1 \
-    || { [ -d "$E2E_LOCK" ] && [ "${E2E_LOCK_OWNER:-}" != "$$" ]; }; do
-    if [ "$waited" -eq 0 ]; then
-      echo "another pg2osync pipeline or e2e suite is running on this machine; waiting for it"
-    fi
-    if [ "$waited" -ge "$wait_max" ]; then
-      echo "gave up after ${waited}s: a 'pg2osync run' process is still alive. Stop it and run again:"
-      echo "  pkill -f 'pg2osync run'"
-      return 1
-    fi
-    sleep 10
-    waited=$((waited + 10))
-  done
-}
-
 # CI gets PostgreSQL and OpenSearch as service containers; locally they are the
 # dev stack, brought up here when it is not already running.
 dev_stack_up() {
@@ -315,8 +539,8 @@ dev_stack_up() {
     echo "bringing up dev/docker-compose.yml ($PG_IMAGE + $OS_IMAGE)"
     docker compose -f dev/docker-compose.yml up -d || return 1
   fi
-  wait_for "PostgreSQL" 60 pg_ready dev-postgres-1 || return 1
-  wait_for "OpenSearch" 60 os_ready http://localhost:9200 || return 1
+  wait_for_container dev-postgres-1 "PostgreSQL" 60 pg_ready dev-postgres-1 || return 1
+  wait_for_container dev-opensearch-1 "OpenSearch" 60 os_ready http://localhost:9200 || return 1
   docker exec -i dev-postgres-1 psql -U postgres -d sourcedb < dev/seed.sql || return 1
 }
 
@@ -338,7 +562,7 @@ mysql_stack_up() {
     *) echo "starting the stopped mysql-test ($image)"
        docker start mysql-test > /dev/null || return 1 ;;
   esac
-  wait_for "MySQL" 90 mysql_ready mysql-test || return 1
+  wait_for_container mysql-test "MySQL" 90 mysql_ready mysql-test || return 1
   mysql_user mysql-test mysql "WITH mysql_native_password" || return 1
   mysql_enable_gtid mysql-test || return 1
   docker exec -i mysql-test mysql -uroot -pmysqlpw sourcedb < dev/mysql-seed.sql || return 1
@@ -364,23 +588,50 @@ job_msrv() {
   cargo "+$MSRV" check --workspace --locked || return 1
 }
 
+# Isolated, these are a cell like any other, only with ci.yml's images: the
+# same containers, the same seeding, and the suite told where to find them.
 job_e2e_postgres() {
-  no_pipeline_running || return 1
+  if [ "$ISOLATED" = 1 ]; then
+    cell_start "$CELL_PG" "$CELL_OS" || return 1
+    cell_opensearch "$OS_IMAGE" || return 1
+    cell_postgres "$PG_IMAGE" || return 1
+    PG_CONTAINER=$CELL_PG PG_PORT=$CELL_PG_PORT OS_URL=$CELL_OS_URL \
+      E2E_LOG=$RUN_DIR/e2e-postgres-pipeline.log ./dev/e2e-test.sh || return 1
+    return 0
+  fi
   dev_stack_up || return 1
   release_build || return 1
   E2E_LOG=$RUN_DIR/e2e-postgres-pipeline.log ./dev/e2e-test.sh || return 1
 }
 
 job_e2e_mysql() {
-  no_pipeline_running || return 1
+  if [ "$ISOLATED" = 1 ]; then
+    cell_start "$CELL_MYSQL" "$CELL_OS" || return 1
+    cell_opensearch "$OS_IMAGE" || return 1
+    cell_mysql "$MYSQL_IMAGE" "WITH mysql_native_password" || return 1
+    MYSQL_CONTAINER=$CELL_MYSQL MYSQL_PORT=$CELL_MYSQL_PORT OS_URL=$CELL_OS_URL \
+      E2E_LOG=$RUN_DIR/e2e-mysql-pipeline.log ./dev/e2e-mysql-test.sh || return 1
+    return 0
+  fi
   dev_stack_up || return 1
   mysql_stack_up || return 1
   release_build || return 1
   E2E_LOG=$RUN_DIR/e2e-mysql-pipeline.log ./dev/e2e-mysql-test.sh || return 1
 }
 
+# The only cell that needs both sources at once: one process reads a PostgreSQL
+# and a MySQL, so the isolated form is the two of them beside one target.
 job_e2e_multi_source() {
-  no_pipeline_running || return 1
+  if [ "$ISOLATED" = 1 ]; then
+    cell_start "$CELL_PG" "$CELL_MYSQL" "$CELL_OS" || return 1
+    cell_opensearch "$OS_IMAGE" || return 1
+    cell_postgres "$PG_IMAGE" || return 1
+    cell_mysql "$MYSQL_IMAGE" "WITH mysql_native_password" || return 1
+    PG_CONTAINER=$CELL_PG PG_PORT=$CELL_PG_PORT \
+      MYSQL_CONTAINER=$CELL_MYSQL MYSQL_PORT=$CELL_MYSQL_PORT OS_URL=$CELL_OS_URL \
+      E2E_LOG=$RUN_DIR/e2e-multi-source-pipeline.log ./dev/e2e-multi-source.sh || return 1
+    return 0
+  fi
   dev_stack_up || return 1
   mysql_stack_up || return 1
   release_build || return 1
@@ -456,29 +707,46 @@ job_audit() {
 }
 
 # ------------------------------------------------------------------ compat.yml
-compat_opensearch() {
-  docker run -d --name compat-opensearch -p "$COMPAT_OS_PORT:9200" \
+# The heap is what dev/docker-compose.yml gives the dev stack's node: without
+# it OpenSearch sizes itself off the whole Docker VM and two stacks do not fit.
+cell_opensearch() {
+  docker run -d --name "$CELL_OS" -p "$CELL_OS_PORT:9200" \
     -e discovery.type=single-node -e DISABLE_SECURITY_PLUGIN=true \
     -e OPENSEARCH_JAVA_OPTS="-Xms512m -Xmx512m" \
-    "$COMPAT_OS_IMAGE" > /dev/null || return 1
-  wait_for "OpenSearch" 90 os_green "http://localhost:$COMPAT_OS_PORT" || return 1
+    "$1" > /dev/null || return 1
+  CELL_OS_PORT=$(published_port "$CELL_OS" 9200)
+  CELL_OS_URL="http://localhost:$CELL_OS_PORT"
+  wait_for_container "$CELL_OS" "OpenSearch" 90 os_green "$CELL_OS_URL" || return 1
 }
 
 # The suite needs logical replication from the first connection and a service
 # container takes no server flags, so compat.yml starts this one by hand too.
-compat_postgres() {
-  docker run -d --name compat-postgres -p "$COMPAT_PG_PORT:5432" \
+cell_postgres() {
+  docker run -d --name "$CELL_PG" -p "$CELL_PG_PORT:5432" \
     -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
     -e POSTGRES_DB=sourcedb "$1" \
     -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10 > /dev/null || return 1
-  wait_for "PostgreSQL" 60 pg_ready compat-postgres || return 1
-  docker exec -i compat-postgres psql -U postgres -d sourcedb < dev/seed.sql || return 1
+  CELL_PG_PORT=$(published_port "$CELL_PG" 5432)
+  wait_for_container "$CELL_PG" "PostgreSQL" 60 pg_ready "$CELL_PG" || return 1
+  docker exec -i "$CELL_PG" psql -U postgres -d sourcedb < dev/seed.sql || return 1
 }
 
-# A cell owns throwaway containers; naming them here has run_job remove them
-# however the cell ends.
-compat_start() {
-  no_pipeline_running || return 1
+# Seeded the way ci.yml and compat.yml seed a service container: the user the
+# suite connects as, GTIDs on, and dev/mysql-seed.sql.
+cell_mysql() {
+  docker run -d --name "$CELL_MYSQL" -p "$CELL_MYSQL_PORT:3306" \
+    -e MYSQL_ROOT_PASSWORD=mysqlpw -e MYSQL_DATABASE=sourcedb \
+    "$1" > /dev/null || return 1
+  CELL_MYSQL_PORT=$(published_port "$CELL_MYSQL" 3306)
+  wait_for_container "$CELL_MYSQL" "MySQL" 90 mysql_ready "$CELL_MYSQL" || return 1
+  mysql_user "$CELL_MYSQL" mysql "$2" || return 1
+  mysql_enable_gtid "$CELL_MYSQL" || return 1
+  docker exec -i "$CELL_MYSQL" mysql -uroot -pmysqlpw sourcedb < dev/mysql-seed.sql || return 1
+}
+
+# A cell owns throwaway containers; naming them here has whatever runs the cell
+# remove them however it ends, and clears away what a killed run left first.
+cell_start() {
   CLEANUP_CONTAINERS="$*"
   cleanup_containers
   CLEANUP_CONTAINERS="$*"
@@ -486,72 +754,69 @@ compat_start() {
 }
 
 job_compat_postgres15() {
-  compat_start compat-postgres compat-opensearch || return 1
-  compat_opensearch || return 1
-  compat_postgres "$COMPAT_PG15_IMAGE" || return 1
-  PG_CONTAINER=compat-postgres PG_PORT=$COMPAT_PG_PORT \
-    OS_URL="http://localhost:$COMPAT_OS_PORT" E2E_LOG=$RUN_DIR/compat-postgres15-pipeline.log \
+  cell_start "$CELL_PG" "$CELL_OS" || return 1
+  cell_opensearch "$COMPAT_OS_IMAGE" || return 1
+  cell_postgres "$COMPAT_PG15_IMAGE" || return 1
+  PG_CONTAINER=$CELL_PG PG_PORT=$CELL_PG_PORT \
+    OS_URL=$CELL_OS_URL E2E_LOG=$RUN_DIR/compat-postgres15-pipeline.log \
     ./dev/e2e-test.sh || return 1
 }
 
 job_compat_elasticsearch() {
-  compat_start compat-postgres compat-elasticsearch || return 1
-  docker run -d --name compat-elasticsearch -p "$COMPAT_ES_PORT:9200" \
+  cell_start "$CELL_PG" "$CELL_ES" || return 1
+  docker run -d --name "$CELL_ES" -p "$CELL_ES_PORT:9200" \
     -e discovery.type=single-node -e xpack.security.enabled=false \
     -e xpack.security.enrollment.enabled=false -e ES_JAVA_OPTS="-Xms512m -Xmx512m" \
     "$COMPAT_ES_IMAGE" > /dev/null || return 1
+  CELL_ES_PORT=$(published_port "$CELL_ES" 9200)
   # not "green": a single-node Elasticsearch leaves every replica unassigned
-  wait_for "Elasticsearch" 90 es_yellow "http://localhost:$COMPAT_ES_PORT" || return 1
-  compat_postgres "$COMPAT_PG_IMAGE" || return 1
-  PG_CONTAINER=compat-postgres PG_PORT=$COMPAT_PG_PORT \
-    OS_URL="http://localhost:$COMPAT_ES_PORT" TARGET_FLAVOR=elasticsearch \
+  wait_for_container "$CELL_ES" "Elasticsearch" 90 es_yellow "http://localhost:$CELL_ES_PORT" || return 1
+  cell_postgres "$COMPAT_PG_IMAGE" || return 1
+  PG_CONTAINER=$CELL_PG PG_PORT=$CELL_PG_PORT \
+    OS_URL="http://localhost:$CELL_ES_PORT" TARGET_FLAVOR=elasticsearch \
     E2E_LOG=$RUN_DIR/compat-elasticsearch-pipeline.log ./dev/e2e-test.sh || return 1
 }
 
 job_compat_meilisearch() {
-  compat_start compat-postgres compat-meilisearch || return 1
-  docker run -d --name compat-meilisearch -p "$COMPAT_MEILI_PORT:7700" \
+  cell_start "$CELL_PG" "$CELL_MEILI" || return 1
+  docker run -d --name "$CELL_MEILI" -p "$CELL_MEILI_PORT:7700" \
     -e MEILI_MASTER_KEY=e2e-master-key -e MEILI_ENV=development \
     "$COMPAT_MEILI_IMAGE" > /dev/null || return 1
-  wait_for "Meilisearch" 60 meili_up "http://localhost:$COMPAT_MEILI_PORT" || return 1
-  compat_postgres "$COMPAT_PG_IMAGE" || return 1
+  CELL_MEILI_PORT=$(published_port "$CELL_MEILI" 7700)
+  wait_for_container "$CELL_MEILI" "Meilisearch" 60 meili_up "http://localhost:$CELL_MEILI_PORT" || return 1
+  cell_postgres "$COMPAT_PG_IMAGE" || return 1
   # Meilisearch has no mappings, no joins and no per-row indices, so the full
   # suite cannot run against it; this is what it does support.
-  PG_CONTAINER=compat-postgres PG_PORT=$COMPAT_PG_PORT \
-    MEILI_URL="http://localhost:$COMPAT_MEILI_PORT" MEILI_MASTER_KEY=e2e-master-key \
+  PG_CONTAINER=$CELL_PG PG_PORT=$CELL_PG_PORT \
+    MEILI_URL="http://localhost:$CELL_MEILI_PORT" MEILI_MASTER_KEY=e2e-master-key \
     E2E_LOG=$RUN_DIR/compat-meilisearch-pipeline.log ./dev/e2e-meili-smoke.sh || return 1
 }
 
 job_compat_mysql84() {
-  compat_start compat-mysql compat-opensearch || return 1
-  compat_opensearch || return 1
-  docker run -d --name compat-mysql -p "$COMPAT_MYSQL_PORT:3306" \
-    -e MYSQL_ROOT_PASSWORD=mysqlpw -e MYSQL_DATABASE=sourcedb \
-    "$COMPAT_MYSQL_IMAGE" > /dev/null || return 1
-  wait_for "MySQL" 90 mysql_ready compat-mysql || return 1
+  cell_start "$CELL_MYSQL" "$CELL_OS" || return 1
+  cell_opensearch "$COMPAT_OS_IMAGE" || return 1
   # 8.4 dropped mysql_native_password from the default plugins, so this is also
   # the cell that proves the caching_sha2_password handshake.
-  mysql_user compat-mysql mysql "WITH caching_sha2_password" || return 1
-  mysql_enable_gtid compat-mysql || return 1
-  docker exec -i compat-mysql mysql -uroot -pmysqlpw sourcedb < dev/mysql-seed.sql || return 1
-  MYSQL_CONTAINER=compat-mysql MYSQL_PORT=$COMPAT_MYSQL_PORT \
-    OS_URL="http://localhost:$COMPAT_OS_PORT" E2E_LOG=$RUN_DIR/compat-mysql84-pipeline.log \
+  cell_mysql "$COMPAT_MYSQL_IMAGE" "WITH caching_sha2_password" || return 1
+  MYSQL_CONTAINER=$CELL_MYSQL MYSQL_PORT=$CELL_MYSQL_PORT \
+    OS_URL=$CELL_OS_URL E2E_LOG=$RUN_DIR/compat-mysql84-pipeline.log \
     ./dev/e2e-mysql-test.sh || return 1
 }
 
 compat_mariadb() {
-  compat_start compat-mysql compat-opensearch || return 1
-  compat_opensearch || return 1
+  cell_start "$CELL_MYSQL" "$CELL_OS" || return 1
+  cell_opensearch "$COMPAT_OS_IMAGE" || return 1
   # MariaDB writes no binlog unless it is told to
-  docker run -d --name compat-mysql -p "$COMPAT_MYSQL_PORT:3306" \
+  docker run -d --name "$CELL_MYSQL" -p "$CELL_MYSQL_PORT:3306" \
     -e MARIADB_ROOT_PASSWORD=mysqlpw -e MARIADB_DATABASE=sourcedb "$1" \
     --log-bin --binlog-format=ROW --binlog-row-image=FULL --server-id=1 > /dev/null || return 1
-  wait_for "MariaDB" 90 maria_ready compat-mysql || return 1
-  mysql_user compat-mysql mariadb "" || return 1
-  docker exec -i compat-mysql mariadb -uroot -pmysqlpw sourcedb < dev/mysql-seed.sql || return 1
+  CELL_MYSQL_PORT=$(published_port "$CELL_MYSQL" 3306)
+  wait_for_container "$CELL_MYSQL" "MariaDB" 90 maria_ready "$CELL_MYSQL" || return 1
+  mysql_user "$CELL_MYSQL" mariadb "" || return 1
+  docker exec -i "$CELL_MYSQL" mariadb -uroot -pmysqlpw sourcedb < dev/mysql-seed.sql || return 1
   # MariaDB has no GTID position the suite can assert on; the script knows
-  MYSQL_CONTAINER=compat-mysql MYSQL_PORT=$COMPAT_MYSQL_PORT MYSQL_CLIENT=mariadb \
-    OS_URL="http://localhost:$COMPAT_OS_PORT" E2E_LOG=$RUN_DIR/compat-${1/:/-}-pipeline.log \
+  MYSQL_CONTAINER=$CELL_MYSQL MYSQL_PORT=$CELL_MYSQL_PORT MYSQL_CLIENT=mariadb \
+    OS_URL=$CELL_OS_URL E2E_LOG=$RUN_DIR/compat-${1/:/-}-pipeline.log \
     ./dev/e2e-mysql-test.sh || return 1
 }
 
@@ -561,7 +826,26 @@ job_compat_mariadb118() { compat_mariadb "$COMPAT_MARIADB_2"; }
 # ------------------------------------------------------------------------ main
 mkdir -p "$RUN_DIR"
 
+if [ "$ISOLATED" = 1 ]; then
+  # One block per pool slot: two cells at once mean two pipelines binding on
+  # this machine, and they cannot both have 9111.
+  E2E_PORT_BASE=$(pick_port_base "$JOBS") || exit 1
+  export E2E_PORT_BASE
+fi
+
 bold "pg2osync — what a pull request runs on CI, run here"
+note "run id      $RUN_ID"
+if [ "$ISOLATED" = 1 ]; then
+  note "mode        isolated — containers of this run's own ($CELL_BASE-*), no shared lock"
+  note "            pipelines on 127.0.0.1:$E2E_PORT_BASE-$((E2E_PORT_BASE + JOBS * 40 - 1))"
+  note "cells        $JOBS at a time"
+else
+  note "mode        shared dev stack, under $E2E_LOCK"
+  if [ -d "$E2E_LOCK" ] && kill -0 "$(cat "$E2E_LOCK/pid" 2> /dev/null || echo 0)" 2> /dev/null; then
+    warn "the dev stack is busy: pid $(cat "$E2E_LOCK/pid") holds the lock and the e2e"
+    warn "jobs will queue behind it. --isolated runs beside it instead."
+  fi
+fi
 note "logs        $RUN_DIR"
 note "postgres    $PG_IMAGE ($CI_WF)"
 note "opensearch  $OS_IMAGE ($CI_WF)"
@@ -573,8 +857,12 @@ note "matrix      $([ "$MATRIX_ON" = 1 ] && echo on || echo off) — $MATRIX_REA
 if [ "$MATRIX_ON" = 1 ]; then
   note "  images    $COMPAT_PG15_IMAGE, $COMPAT_PG_IMAGE, $COMPAT_ES_IMAGE, $COMPAT_MEILI_IMAGE,"
   note "            $COMPAT_MYSQL_IMAGE, $COMPAT_MARIADB_1, $COMPAT_MARIADB_2"
-  note "  ports     postgres $COMPAT_PG_PORT, opensearch $COMPAT_OS_PORT, elasticsearch $COMPAT_ES_PORT,"
-  note "            meilisearch $COMPAT_MEILI_PORT, mysql/mariadb $COMPAT_MYSQL_PORT"
+  if [ "$ISOLATED" = 1 ]; then
+    note "  ports     assigned by Docker"
+  else
+    note "  ports     postgres $COMPAT_PG_PORT, opensearch $COMPAT_OS_PORT, elasticsearch $COMPAT_ES_PORT,"
+    note "            meilisearch $COMPAT_MEILI_PORT, mysql/mariadb $COMPAT_MYSQL_PORT"
+  fi
 fi
 if [ "$FAST" = 1 ]; then
   warn "--fast: the e2e suites, the image build and the matrix are skipped."
@@ -600,12 +888,15 @@ run_job pr-title "the title is a conventional commit"
 run_job audit "dependencies have no known advisories"
 
 if [ "$MATRIX_ON" = 1 ] && [ "$FAST" = 0 ]; then
-  run_job compat-postgres15 "PostgreSQL 15 to OpenSearch" compat-postgres
-  run_job compat-elasticsearch "PostgreSQL 17 to Elasticsearch" compat-elasticsearch
-  run_job compat-meilisearch "PostgreSQL 17 to Meilisearch" compat-meilisearch
-  run_job compat-mysql84 "MySQL 8.4 to OpenSearch" compat-mysql
-  run_job compat-mariadb106 "MariaDB 10.6 to OpenSearch" compat-mariadb
-  run_job compat-mariadb118 "MariaDB 11.8 to OpenSearch" compat-mariadb
+  # slug, title, and the compat.yml job the advisory list is keyed by
+  run_cells <<CELLS
+compat-postgres15|PostgreSQL 15 to OpenSearch|compat-postgres
+compat-elasticsearch|PostgreSQL 17 to Elasticsearch|compat-elasticsearch
+compat-meilisearch|PostgreSQL 17 to Meilisearch|compat-meilisearch
+compat-mysql84|MySQL 8.4 to OpenSearch|compat-mysql
+compat-mariadb106|MariaDB 10.6 to OpenSearch|compat-mariadb
+compat-mariadb118|MariaDB 11.8 to OpenSearch|compat-mariadb
+CELLS
 fi
 
 echo

@@ -89,17 +89,24 @@ What it covers, job by job:
 The two cells `compat.yml` marks `continue-on-error` are reported as advisory
 (`!`) here too: a known gap being tracked does not make the run red.
 
-It brings the dev stack up if it is down, seeds it, and refuses to start an
-e2e suite while another `pg2osync run` is alive, because the suites stop a
-pipeline by killing every one of them. Logs land in
-`/tmp/pg2osync-ci-local/<timestamp>`, one file per job plus the pipeline log of
-each suite, and the run ends in a `RESULT` line.
+It brings the dev stack up if it is down and seeds it. The e2e suites share
+that stack, so they queue on one machine-wide lock (`dev/e2e-lock.sh`); a
+second run waits. `--isolated` instead gives the run throwaway containers of
+its own, `pg2osync-ci-<run id>-*`, on ports Docker assigns — it takes no lock,
+never touches the dev stack, and is how you run beside someone else's run. An
+8 GB Docker VM fits about two isolated runs next to the dev stack. Because each
+cell there is a namespace of its own, an isolated run also takes the six
+compatibility cells two at a time (`--jobs <n>`), which halves the matrix.
+Every run prints its mode and run id first, and logs land in
+`/tmp/pg2osync-ci-local/<run id>`, one file per job plus the pipeline log of
+each suite; the run ends in a `RESULT` line.
 
 Selectors: `--only <job>` / `--skip <job>` for one job, `--matrix` /
-`--no-matrix` for the compatibility cells, `--title "..."` to check a pull
-request title before it exists. `--fast` skips the e2e suites, the image build
-and the matrix — it is a quick loop while you work, **not** the definition of
-done.
+`--no-matrix` for the compatibility cells, `--isolated` for a run beside
+another one, `--jobs <n>` for how many cells go at once, `--title "..."` to
+check a pull request title before it exists. `--fast` skips the e2e suites,
+the image build and the matrix — it is a quick loop while you work, **not**
+the definition of done.
 
 Tools it needs: Docker, `helm`, `kubectl`, `mdbook`, `rustup`/`cargo`, `curl`,
 `python3`. `gh` is optional (only to read the title of an existing pull
