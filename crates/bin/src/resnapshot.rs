@@ -255,6 +255,7 @@ async fn mysql(
         &children,
         version_base,
         &append_only,
+        cfg.engine.load_max_rows_per_sec,
     )
     .await?)
 }

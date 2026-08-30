@@ -193,6 +193,17 @@ pub fn load_progress_key(stream: &crate::checkpoint::StreamId, qualified_table: 
     )
 }
 
+/// How a load's summary line names the operator's ceiling on its rate.
+///
+/// Shared by both sources so the number an operator configured is spelled the
+/// same wherever the load reports itself; an unexpectedly slow load is then
+/// explained on the line that shows it, not in another one further up.
+pub fn rate_cap_note(max_rows_per_sec: Option<u32>) -> String {
+    max_rows_per_sec
+        .map(|n| format!(", capped at {n} rows/s"))
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

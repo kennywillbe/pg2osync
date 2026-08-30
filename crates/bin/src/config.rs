@@ -738,6 +738,12 @@ impl AppConfig {
             }
             _ => {}
         }
+        if self.engine.load_max_rows_per_sec == Some(0) {
+            anyhow::bail!(
+                "[engine] load_max_rows_per_sec = 0 would stop the load rather than slow it; \
+                 leave the option unset, which means unlimited"
+            );
+        }
         if self.source.flavor == "mysql" && self.source.mode == "poll" {
             anyhow::bail!(
                 "[source] mode = \"poll\" is PostgreSQL-only; MySQL always reads the binlog"
@@ -1434,6 +1440,27 @@ table = "public.users"
         assert_eq!(cfg.target.flavor, "opensearch");
         assert_eq!(cfg.sync["users"].index_name("users"), "users");
         assert!(cfg.metrics.enabled, "metrics must default to on");
+    }
+
+    #[test]
+    fn a_load_rate_limit_of_zero_is_refused() {
+        let capped =
+            parse(&MINIMAL.replace("[target]", "[engine]\nload_max_rows_per_sec = 50\n[target]"))
+                .expect("a ceiling an operator named is valid");
+        assert_eq!(capped.engine.load_max_rows_per_sec, Some(50));
+        assert_eq!(
+            parse(MINIMAL).expect("valid").engine.load_max_rows_per_sec,
+            None,
+            "unset means unlimited"
+        );
+        let message = refused(
+            &MINIMAL.replace("[target]", "[engine]\nload_max_rows_per_sec = 0\n[target]"),
+            "zero is not a rate",
+        );
+        assert!(
+            message.contains("unset") && message.contains("unlimited"),
+            "the refusal says what to write instead: {message}"
+        );
     }
 
     #[test]

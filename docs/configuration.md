@@ -1211,6 +1211,7 @@ Defaults are production-sane; tune only against measurements.
 | `batch_size` | `500` | Rows per sink request |
 | `batch_max_bytes` | `10485760` | Approximate byte ceiling per request; whichever limit hits first splits the batch |
 | `write_concurrency` | `1` | Write requests open against the target at once. One at a time is what the initial load is limited by, not the source read; raising it multiplies the load on the target, and it needs a target that orders by document version, so Meilisearch refuses anything above 1 |
+| `load_max_rows_per_sec` | unset | Ceiling on how many rows a second the initial load, a re-snapshot and a rebuild take in. Unset means unlimited; `0` is refused. Load rows only — the stream is never held back |
 | `txn_buffer_cap_mb` | `256` | Warning threshold for one open transaction |
 | `retry_max` | `10` | Attempts per request before the pipeline stops |
 | `retry_backoff_ms` | `500` | Initial backoff, doubled per attempt, capped at 30 s |
@@ -1220,6 +1221,22 @@ Defaults are production-sane; tune only against measurements.
 
 `checkpoint_interval_ms` is the ceiling on replayed work after a crash: a lower
 value means less replay and more writes to the target.
+
+`load_max_rows_per_sec` is the way to be gentle with a production primary
+without waiting for the night. It is a token bucket in front of the engine's
+intake of load rows, refilled every second and holding at most one second of
+allowance, so an idle stretch cannot be spent as a burst; the loaders are slowed
+by it without knowing it exists, because the channel feeding the engine is
+bounded. The pause on the replication slot's `wal_status` stays where it is —
+that one protects the slot once the server is already straining, this one keeps
+the load off the source's CPU and IO before anything strains. It never applies
+to the stream: holding the stream back is what fills the slot. The load's
+summary line names the ceiling, so a rate far below what the server could give
+is explained where it is read:
+
+```text
+read 200 rows from public.orders in 4.0s (~50 rows/s) over 1 range(s), capped at 50 rows/s
+```
 
 A transaction larger than `txn_buffer_cap_mb` is split across requests, which
 means the target briefly holds part of it. Everything is idempotent, so the end

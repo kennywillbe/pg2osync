@@ -2261,5 +2261,59 @@ newer_index=$(curl -s "$OS/_alias/$XALIAS" | jqf "sorted(d.keys())[0] if d else 
 refresh
 check "and the alias points at the newest rebuild" "$(os_count "$newer_index")" "4"
 
+echo -e "\n\033[1m== 31. the load obeys a rate limit the operator asked for ==\033[0m"
+# A ceiling on load rows a second (#144), so being gentle with a production
+# primary does not mean waiting for the night. It is enforced once, at the
+# engine's intake of load rows, which is where both sources and all three
+# commands that run a load converge — so a re-snapshot is the cheapest way to
+# see it, and it needs no slot and no pipeline.
+RTCONFIG=$(mktemp /tmp/pg2osync-e2e-rate.XXXXXX)
+RTLOG=/tmp/pg2osync-e2e-rate.log
+: > "$RTLOG"
+cat > "$RTCONFIG" <<TOML
+[source]
+url_env = "PG2OSYNC_SOURCE_URL"
+slot_name = "pg2osync_e2e_rate"
+publication = "pg2osync_e2e_rate_pub"
+
+[target]
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
+
+[engine]
+load_max_rows_per_sec = 50
+
+[sync.rate]
+table = "public.rate_probe"
+index = "e2e_rate"
+TOML
+rate_cleanup() {
+  pg "DROP TABLE IF EXISTS rate_probe;" > /dev/null 2>&1 || true
+  curl -s -XDELETE "$OS/e2e_rate" > /dev/null 2>&1 || true
+  rm -f "$RTCONFIG"
+}
+trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup; init_cleanup; fan_cleanup; bid_cleanup; shape_cleanup; where_cleanup; join_cleanup; union_cleanup; events_cleanup; pipe_cleanup; append_cleanup; routing_cleanup; reindex_cleanup; rate_cleanup' EXIT
+
+pg "DROP TABLE IF EXISTS rate_probe; CREATE TABLE rate_probe(id bigint primary key, v text);" > /dev/null 2>&1
+pg "INSERT INTO rate_probe SELECT g, 'v' || g FROM generate_series(1, 200) g;" > /dev/null
+curl -s -XDELETE "$OS/e2e_rate" > /dev/null 2>&1
+
+started=$SECONDS
+$BIN resnapshot -c "$RTCONFIG" --table public.rate_probe >> "$RTLOG" 2>&1
+took=$((SECONDS - started))
+refresh
+check "every row of a capped load is still indexed" "$(os_count e2e_rate)" "200"
+# 200 rows at 50 a second is four seconds of intake however fast everything else is
+if [ "$took" -ge 3 ]; then
+  ok "200 rows at 50 rows/s took ${took}s"
+else
+  bad "the cap did not hold the load back: 200 rows in ${took}s"
+fi
+if grep -q "capped at 50 rows/s" "$RTLOG"; then
+  ok "the load's summary line names the ceiling"
+else
+  bad "the summary line does not name the ceiling: $(grep 'rows from' "$RTLOG" || true)"
+fi
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

@@ -508,6 +508,33 @@ saturates is transporting the data, not the backend producing it; server-side th
 same read scales to 141,000 with four readers, so PostgreSQL is not the problem
 and neither is our connection count.
 
+**The load can be capped, the stream cannot.** `[engine] load_max_rows_per_sec`
+is a ceiling on how many load rows a second the pipeline takes; unset, which is
+the default, means none. It stands beside the reactive pause on `wal_status`
+rather than replacing it, because the two protect different things. The pause
+protects the replication slot and only fires once the server is already
+straining. The cap protects the source's CPU and IO before anything strains, for
+the case no measurement of ours can see: a DBA who has decided the load may not
+cost more than n rows a second while the business day is on. Nothing here can
+work that number out, so there is no default — it exists only when an operator
+names it.
+
+Rows a second, not bytes a second. Rows are the unit the load is already watched
+in — `pg_stat_statements` and `SHOW PROCESSLIST` count them, and so does our own
+load summary — and a byte ceiling would be a number nobody could convert into
+what they are looking at. Wide rows make a row ceiling conservative, which is the
+direction worth being wrong in.
+
+It is enforced in one place: the engine's intake of the copy channel, where both
+sources' loaders and all three commands that run a load — `run`, `resnapshot`,
+`reindex` — converge. A token bucket refilled per second, holding at most one
+second of allowance so an idle stretch cannot be spent as a burst later. That
+channel is bounded, so a throttled intake reaches back and stops the reads
+filling it without either loader having to know. The stream keeps its own channel
+and is never counted: on PostgreSQL, holding the stream back is precisely what
+fills the slot, so a cap that covered it would turn a load that is merely slow
+into a slot that is lost.
+
 **Write requests are open concurrently and completed in order.** Concurrency
 that reordered completions would break three things at once, so it does not: a
 position is acknowledged only after every batch sent before it is durable, a

@@ -52,6 +52,10 @@ batch_max_bytes = 10485760
 # Write requests open against the target at once. One is what the initial load
 # is limited by; four roughly doubles it, at four times the load on the target.
 write_concurrency = 1
+# A ceiling on the initial load, a re-snapshot and a rebuild, in rows a second.
+# Unset means unlimited; it never applies to the stream, because holding the
+# stream back is what fills the replication slot.
+# load_max_rows_per_sec = 20000
 txn_buffer_cap_mb = 256
 retry_max = 10
 retry_backoff_ms = 500

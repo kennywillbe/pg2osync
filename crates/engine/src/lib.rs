@@ -52,6 +52,14 @@ pub struct EngineConfig {
     /// What to do about a document the target will never accept.
     #[serde(default)]
     pub on_permanent_rejection: RejectionPolicy,
+    /// A ceiling on how many initial-load rows a second the engine takes in.
+    ///
+    /// Unset means unlimited, which is the only sane default: no measurement
+    /// here can know what an operator's primary has to spare. It counts load
+    /// rows only — the stream is never held back, because on PostgreSQL that is
+    /// what fills the slot.
+    #[serde(default)]
+    pub load_max_rows_per_sec: Option<u32>,
     /// How many documents may be quarantined before the pipeline halts anyway.
     ///
     /// One malformed row should not stop replication; a mapping that refuses a
@@ -90,6 +98,7 @@ impl Default for EngineConfig {
             checkpoint_interval_ms: 500,
             on_permanent_rejection: RejectionPolicy::Halt,
             max_rejects: default_max_rejects(),
+            load_max_rows_per_sec: None,
         }
     }
 }
@@ -182,13 +191,18 @@ pub struct PipelineCtx {
 /// rejection — correctness-first failure policy).
 pub async fn run(
     mut events: mpsc::Receiver<ChangeEvent>,
-    mut copy: mpsc::Receiver<ChangeEvent>,
+    copy: mpsc::Receiver<ChangeEvent>,
     ctx: Arc<PipelineCtx>,
     stream: StreamId,
     render_position: PositionRenderer,
     durable: crate::mapping::DurableLsn,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), CoreError> {
+    if let Some(rows_per_sec) = ctx.cfg.load_max_rows_per_sec {
+        tracing::info!(target: "pg2osync::engine",
+            "the load is capped at {rows_per_sec} rows/s; the stream is not capped");
+    }
+    let mut copy = LoadIntake::new(copy, ctx.cfg.load_max_rows_per_sec);
     let (batch_tx, batch_rx) = mpsc::channel::<SinkCommand>(64);
     let (ckpt_done_tx, ckpt_done_rx) = watch::channel::<Option<Lsn>>(None);
 
@@ -723,9 +737,127 @@ pub async fn run(
 /// batch fills from both producers instead of one row at a time from the copy.
 fn try_next(
     events: &mut mpsc::Receiver<ChangeEvent>,
-    copy: &mut mpsc::Receiver<ChangeEvent>,
+    copy: &mut LoadIntake,
 ) -> Option<ChangeEvent> {
-    events.try_recv().or_else(|_| copy.try_recv()).ok()
+    match events.try_recv() {
+        Ok(ev) => Some(ev),
+        Err(_) => copy.try_recv(),
+    }
+}
+
+/// The engine's intake of load rows, with the optional ceiling on how many of
+/// them a second it takes.
+///
+/// The ceiling lives here because this is the one place both sources' loaders
+/// meet — PostgreSQL ranges and MySQL chunks are read by different code, and a
+/// re-snapshot and a rebuild come through the same channel as the initial load.
+/// The channel is bounded, so slowing the intake reaches back and slows the
+/// reads that fill it without either loader knowing there is a limit.
+///
+/// The stream has its own channel and is never counted against this. Holding
+/// the stream back is what fills the replication slot, so a cap that covered it
+/// would trade a slow load for a lost one.
+struct LoadIntake {
+    rx: mpsc::Receiver<ChangeEvent>,
+    limit: Option<RateLimit>,
+    /// When the limit will let another row through; `None` means now.
+    open_at: Option<std::time::Instant>,
+}
+
+impl LoadIntake {
+    fn new(rx: mpsc::Receiver<ChangeEvent>, max_rows_per_sec: Option<u32>) -> Self {
+        Self {
+            rx,
+            limit: max_rows_per_sec.map(RateLimit::new),
+            open_at: None,
+        }
+    }
+
+    /// Nothing while the limit is being paid off, so the caller falls back to
+    /// waiting rather than spinning on a channel it may not read yet.
+    fn try_recv(&mut self) -> Option<ChangeEvent> {
+        if self.held(std::time::Instant::now()) {
+            return None;
+        }
+        let ev = self.rx.try_recv().ok()?;
+        self.charge(&ev);
+        Some(ev)
+    }
+
+    /// Cancel-safe: the debt is only paid off once the sleep completes, and
+    /// nothing is charged for an event that was not returned.
+    async fn recv(&mut self) -> Option<ChangeEvent> {
+        if let Some(at) = self.open_at {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await;
+            self.open_at = None;
+        }
+        let ev = self.rx.recv().await?;
+        self.charge(&ev);
+        Some(ev)
+    }
+
+    fn held(&mut self, now: std::time::Instant) -> bool {
+        match self.open_at {
+            Some(at) if now < at => true,
+            Some(_) => {
+                self.open_at = None;
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Only rows are counted: a mark or a boundary costs the source nothing to
+    /// produce, and delaying one would only stall the load without saving work.
+    fn charge(&mut self, ev: &ChangeEvent) {
+        if let (Some(limit), ChangeEvent::Row(_)) = (self.limit.as_mut(), ev) {
+            let now = std::time::Instant::now();
+            let wait = limit.charge(1, now);
+            if !wait.is_zero() {
+                self.open_at = Some(now + wait);
+            }
+        }
+    }
+}
+
+/// A token bucket refilled continuously at `per_sec` tokens a second.
+///
+/// It holds at most one second of allowance, so a load that was idle — waiting
+/// for a chunk to be written, or for the slot to recover — cannot spend that
+/// stretch as a burst afterwards. A charge is never split across tokens: the
+/// bucket goes into debt and the caller waits it off, which keeps the average
+/// exactly the configured rate however the rows arrive.
+struct RateLimit {
+    per_sec: f64,
+    tokens: f64,
+    last: std::time::Instant,
+}
+
+impl RateLimit {
+    fn new(rows_per_sec: u32) -> Self {
+        Self {
+            // zero is refused by config validation; clamping here keeps a
+            // division by zero out of the arithmetic either way
+            per_sec: f64::from(rows_per_sec.max(1)),
+            // Empty, not full: the first rows of a load are the ones an
+            // operator asking for a limit most wants limited.
+            tokens: 0.0,
+            last: std::time::Instant::now(),
+        }
+    }
+
+    /// Charge `rows` and say how long the caller must wait before taking more.
+    fn charge(&mut self, rows: u64, now: std::time::Instant) -> std::time::Duration {
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        self.last = now;
+        self.tokens = (self.tokens + elapsed * self.per_sec).min(self.per_sec);
+        self.tokens -= rows as f64;
+        if self.tokens < 0.0 {
+            std::time::Duration::from_secs_f64(-self.tokens / self.per_sec)
+        } else {
+            std::time::Duration::ZERO
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2838,6 +2970,79 @@ mod pipeline_tests {
             load_done,
             task,
         }
+    }
+
+    #[test]
+    fn a_capped_load_takes_the_time_the_cap_implies() {
+        // A clock that only moves when the bucket says to wait: the whole point
+        // of the ceiling is that the waits it hands out add up to n/limit, and
+        // a real sleep would prove that far more slowly and far less exactly.
+        let mut limit = RateLimit::new(50);
+        let start = std::time::Instant::now();
+        let mut now = start;
+        for _ in 0..200 {
+            now += limit.charge(1, now);
+        }
+        assert!(
+            // a millisecond of slack over four seconds: a wait is handed out
+            // as a Duration, which rounds the last nanosecond off
+            now.duration_since(start).as_secs_f64() >= 200.0 / 50.0 - 0.001,
+            "200 rows at 50 rows/s cannot be taken in under four seconds, took {:?}",
+            now.duration_since(start)
+        );
+    }
+
+    #[test]
+    fn an_idle_stretch_is_not_saved_up_as_a_burst() {
+        // The load waits for every chunk to be written, so allowance banked
+        // while it waits would let the next chunk cost the source everything
+        // the operator asked it not to.
+        let mut limit = RateLimit::new(50);
+        let now = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        assert!(
+            !limit.charge(60, now).is_zero(),
+            "an hour of idleness may buy one second of allowance, not an hour of it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_capped_intake_hands_rows_over_no_faster_than_the_cap() {
+        // Against the real clock, because what has to hold is that the intake
+        // actually waits rather than merely computing a wait. The stream needs
+        // no counterpart test: it keeps its own receiver, and only this one
+        // counts.
+        let queued = |n: i64| async move {
+            let (tx, rx) = mpsc::channel(1024);
+            for id in 1..=n {
+                tx.send(row(id)).await.expect("channel has room");
+            }
+            rx
+        };
+        let drain = async |intake: &mut LoadIntake| {
+            let mut rows = 0;
+            while intake.recv().await.is_some() {
+                rows += 1;
+            }
+            rows
+        };
+
+        let mut capped = LoadIntake::new(queued(20).await, Some(50));
+        let started = std::time::Instant::now();
+        let rows = drain(&mut capped).await;
+        let took = started.elapsed();
+        assert_eq!(rows, 20, "every row still arrives, only later");
+        assert!(
+            took.as_secs_f64() >= 0.35,
+            "20 rows at 50 rows/s cannot be taken in {took:?}"
+        );
+
+        let mut uncapped = LoadIntake::new(queued(20).await, None);
+        let started = std::time::Instant::now();
+        assert_eq!(drain(&mut uncapped).await, 20);
+        assert!(
+            started.elapsed().as_secs_f64() < 0.1,
+            "unset means unlimited"
+        );
     }
 
     #[tokio::test]
