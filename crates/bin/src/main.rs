@@ -7,6 +7,7 @@ mod reconcile;
 mod reindex;
 mod resnapshot;
 mod run;
+mod workspace;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -27,15 +28,26 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Initial load plus continuous streaming (main mode).
+    /// Initial load plus continuous streaming (main mode). One config file:
+    /// `--config-dir` is read by `validate` and `status` only.
     Run {
         #[arg(short, long, value_name = "FILE", default_value = "pg2osync.toml")]
         config: PathBuf,
     },
     /// Validate the config and check both connections.
     Validate {
-        #[arg(short, long, value_name = "FILE", default_value = "pg2osync.toml")]
+        #[arg(
+            short,
+            long,
+            value_name = "FILE",
+            default_value = "pg2osync.toml",
+            group = "configs"
+        )]
         config: PathBuf,
+        /// Validate every *.toml in this directory as one set, and check what
+        /// they mean together: two sources sharing a slot, an index or a name.
+        #[arg(long, value_name = "DIR", group = "configs")]
+        config_dir: Option<PathBuf>,
     },
     /// Create source-side objects and target indices, then exit.
     Bootstrap {
@@ -44,8 +56,17 @@ enum Command {
     },
     /// Show the checkpoint and the source's current position.
     Status {
-        #[arg(short, long, value_name = "FILE", default_value = "pg2osync.toml")]
+        #[arg(
+            short,
+            long,
+            value_name = "FILE",
+            default_value = "pg2osync.toml",
+            group = "configs"
+        )]
         config: PathBuf,
+        /// Report every *.toml in this directory, one source after another.
+        #[arg(long, value_name = "DIR", group = "configs")]
+        config_dir: Option<PathBuf>,
         /// Exit 0 only once the checkpoint has reached the source's current
         /// position, so a script can wait instead of comparing by eye.
         #[arg(long)]
@@ -212,18 +233,18 @@ async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Run { config } => pipeline(&config, run::Mode::Run).await,
         Command::Bootstrap { config } => pipeline(&config, run::Mode::Bootstrap).await,
-        Command::Validate { config } => validate(&config).await,
+        Command::Validate { config, config_dir } => {
+            validate(workspace::Workspace::load(&config, config_dir.as_deref())?).await
+        }
         Command::Status {
             config,
+            config_dir,
             caught_up,
             timeout,
             max_retained_mb,
         } => {
-            if caught_up {
-                wait_until_caught_up(&config, timeout).await
-            } else {
-                status(&config, max_retained_mb).await
-            }
+            let ws = workspace::Workspace::load(&config, config_dir.as_deref())?;
+            status(ws, caught_up, timeout, max_retained_mb).await
         }
         Command::Reconcile { config, delete } => reconcile_cmd(&config, delete).await,
         Command::SwitchAlias { config, alias } => switch_alias(&config, &alias).await,
@@ -721,23 +742,6 @@ async fn switch_alias(path: &Path, alias: &str) -> Result<()> {
     Ok(())
 }
 
-/// The stream this config identifies, which is also where its checkpoint lives.
-fn stream_id(cfg: &config::AppConfig) -> pg2osync_core::checkpoint::StreamId {
-    if cfg.source.flavor == "mysql" {
-        pg2osync_core::checkpoint::StreamId {
-            source: "mysql".into(),
-            stream: cfg.source.server_id.to_string(),
-            publication: String::new(),
-        }
-    } else {
-        pg2osync_core::checkpoint::StreamId {
-            source: "postgres".into(),
-            stream: cfg.source.slot_name.clone(),
-            publication: cfg.source.publication.clone(),
-        }
-    }
-}
-
 /// A binlog checkpoint token as the pair it orders by.
 ///
 /// The file name carries a zero-padded sequence number, so files compare as
@@ -751,14 +755,13 @@ fn binlog_coordinate(token: &str) -> Option<(String, u32)> {
 ///
 /// The reindex recipe says "wait for lag to reach zero", which until now meant
 /// watching a metric by eye. This is the same question with an exit code.
-async fn wait_until_caught_up(path: &Path, timeout_secs: u64) -> Result<()> {
-    let cfg = config::AppConfig::load(path)?;
+async fn wait_until_caught_up(cfg: config::AppConfig, timeout_secs: u64) -> Result<()> {
     let secrets = cfg.resolve_secrets()?;
     let sink = run::build_sink(&cfg, secrets.target_password)?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
 
     loop {
-        let checkpoint = sink.read_checkpoint(&stream_id(&cfg)).await?;
+        let checkpoint = sink.read_checkpoint(&cfg.stream_id()).await?;
         let position = checkpoint.map(|c| c.position);
         let (current, reached) = if cfg.source.flavor == "mysql" {
             let source = mysql_source(&cfg, &secrets.source_url)?;
@@ -895,8 +898,45 @@ async fn rejects_cmd(path: &Path, replay: bool, limit: usize) -> Result<()> {
     Ok(())
 }
 
-async fn validate(path: &Path) -> Result<()> {
-    let cfg = config::AppConfig::load(path)?;
+/// Validate every source, and report all of them: an operator fixing a
+/// directory of configs wants the whole list, not the first line of it.
+async fn validate(ws: workspace::Workspace) -> Result<()> {
+    let total = ws.sources.len();
+    let mut failed: Vec<String> = Vec::new();
+    for source in &ws.sources {
+        if total > 1 {
+            println!("\n── {} ({})", source.name, source.path.display());
+        }
+        if let Err(e) = validate_source(source.cfg.clone()).await {
+            // one config is what `--config` has always given, and its refusal
+            // is that refusal: nothing to gather across, nothing to head
+            if total == 1 {
+                return Err(e);
+            }
+            println!("✗ {e:#}");
+            failed.push(source.name.clone());
+        }
+    }
+    every_source(&failed, total, "failed")?;
+    println!("\nall checks passed");
+    Ok(())
+}
+
+/// The verdict on a set of sources. A refusal anywhere is the command's
+/// refusal: the report is read whole, and the exit status has to say that
+/// there is a refusal in it.
+fn every_source(failed: &[String], total: usize, verb: &str) -> Result<()> {
+    if failed.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "{} of {total} source(s) {verb}: {}",
+        failed.len(),
+        failed.join(", ")
+    )
+}
+
+async fn validate_source(cfg: config::AppConfig) -> Result<()> {
     let secrets = cfg.resolve_secrets()?;
     for warning in &secrets.warnings {
         tracing::warn!(target: "pg2osync::config", "{warning}");
@@ -967,7 +1007,6 @@ async fn validate(path: &Path) -> Result<()> {
         );
     }
 
-    println!("\nall checks passed");
     Ok(())
 }
 
@@ -1820,11 +1859,40 @@ async fn wait_for_shutdown_signal() -> &'static str {
     "Ctrl-C"
 }
 
-async fn status(path: &Path, max_retained_mb: Option<u64>) -> Result<()> {
-    let cfg = config::AppConfig::load(path)?;
+/// Report each source in turn. One failure is not the others': a directory
+/// of configs is a directory of independent pipelines.
+async fn status(
+    ws: workspace::Workspace,
+    caught_up: bool,
+    timeout: u64,
+    max_retained_mb: Option<u64>,
+) -> Result<()> {
+    let total = ws.sources.len();
+    let mut failed: Vec<String> = Vec::new();
+    for source in &ws.sources {
+        if total > 1 {
+            println!("\n── {} ({})", source.name, source.path.display());
+        }
+        let result = if caught_up {
+            wait_until_caught_up(source.cfg.clone(), timeout).await
+        } else {
+            status_of(source.cfg.clone(), max_retained_mb).await
+        };
+        if let Err(e) = result {
+            if total == 1 {
+                return Err(e);
+            }
+            println!("✗ {e:#}");
+            failed.push(source.name.clone());
+        }
+    }
+    every_source(&failed, total, "reported a problem")
+}
+
+async fn status_of(cfg: config::AppConfig, max_retained_mb: Option<u64>) -> Result<()> {
     let secrets = cfg.resolve_secrets()?;
     let sink = run::build_sink(&cfg, secrets.target_password)?;
-    match sink.read_checkpoint(&stream_id(&cfg)).await? {
+    match sink.read_checkpoint(&cfg.stream_id()).await? {
         Some(ckpt) => println!(
             "checkpoint: source={} stream={} position={}",
             ckpt.stream.source, ckpt.stream.stream, ckpt.position
@@ -1994,6 +2062,16 @@ mod tests {
         assert_eq!(LogFormat::parse("text").expect("text"), LogFormat::Text);
         assert!(LogFormat::parse("jsonl").is_err());
         assert!(LogFormat::parse("").is_err());
+    }
+
+    #[test]
+    fn a_refusal_anywhere_in_the_set_is_the_command_s_refusal() {
+        every_source(&[], 3, "failed").expect("nothing failed");
+        let why = format!(
+            "{:#}",
+            every_source(&["billing".to_string()], 3, "failed").expect_err("one failed")
+        );
+        assert_eq!(why, "1 of 3 source(s) failed: billing");
     }
 
     fn found() -> Vec<String> {

@@ -332,7 +332,7 @@ async fn refuse_a_live_stream(
     // The slot says nothing on MySQL and nothing about a pipeline that is
     // between reconnects on PostgreSQL; a checkpoint that moves says it on
     // both.
-    let stream = run::stream_id_for(cfg);
+    let stream = cfg.stream_id();
     let position = |c: Option<pg2osync_core::checkpoint::Checkpoint>| c.map(|c| c.position);
     let first = position(sink.read_checkpoint(&stream).await?);
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;

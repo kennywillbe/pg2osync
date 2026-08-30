@@ -123,7 +123,7 @@ pub(crate) async fn load_one(
     sink: Arc<dyn pg2osync_core::sink::Sink>,
     scope: &LoadScope,
 ) -> Result<()> {
-    let stream_id = run::stream_id_for(cfg);
+    let stream_id = cfg.stream_id();
     let (events_tx, events_rx) = mpsc::channel::<ChangeEvent>(1);
     // no source stream in this process: closing it leaves the engine reading only
     // the copy channel
