@@ -240,6 +240,30 @@ sleep 6; refresh
 check "row written while down is recovered" "$(os_field e2e_mysql_users 5 name)" "eve-during-downtime"
 check "no full reload needed" "$(( $(grep -c 'rows from sourcedb' "$LOG") - loads_before ))" "0"
 
+say "9b. a DDL replayed after a crash does not wedge the stream"
+# The checkpoint a kill -9 leaves behind can predate a DDL that has already
+# committed on the source, so the replay meets row events written under a
+# column layout information_schema no longer answers with. Failing the attempt
+# there stopped the pipeline for good: every reconnect resumed from the same
+# checkpoint, reached the same event and failed again, so nothing after it was
+# replicated. Running the whole DDL while the process is down is what makes
+# that replay certain rather than a race against the checkpoint interval.
+pkill -9 -f "pg2osync run"; sleep 1
+my "ALTER TABLE shop_users ADD COLUMN drift_probe varchar(32);"
+my "INSERT INTO shop_users (id,name,email,drift_probe) VALUES (92,'old-shape','o@test.io','gone');"
+my "DELETE FROM shop_users WHERE id=92;"
+my "ALTER TABLE shop_users DROP COLUMN drift_probe;"
+my "INSERT INTO shop_users (id,name,email) VALUES (6,'after-the-replayed-ddl','six@test.io');"
+start_sync
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_field e2e_mysql_users 6 name)" = "after-the-replayed-ddl" ] && break
+  sleep 1
+done
+check "the stream got past the replayed DDL" \
+  "$(os_field e2e_mysql_users 6 name)" "after-the-replayed-ddl"
+check "the rows it could not decode are not in the index" "$(os_status e2e_mysql_users 92)" "404"
+
 say "10. final consistency"
 check "row counts match" "$(my 'SELECT count(*) FROM shop_users;')" "$(os_count e2e_mysql_users)"
 
