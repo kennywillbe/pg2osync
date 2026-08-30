@@ -1321,6 +1321,49 @@ impl Sink for OpenSearchSink {
             .unwrap_or_default())
     }
 
+    async fn count_documents(&self, index: &str) -> Result<Option<u64>, CoreError> {
+        let resp = self
+            .client
+            .count(opensearch::CountParts::Index(&[index]))
+            .send()
+            .await
+            .map_err(http_err)?;
+        if resp.status_code() == 404 {
+            return Ok(None);
+        }
+        let body: Value = resp.json().await.map_err(http_err)?;
+        body["count"]
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| CoreError::Sink(format!("count {index}: {body}")))
+    }
+
+    async fn index_exists(&self, name: &str) -> Result<bool, CoreError> {
+        let resp = self
+            .client
+            .indices()
+            .exists(opensearch::indices::IndicesExistsParts::Index(&[name]))
+            .send()
+            .await
+            .map_err(http_err)?;
+        Ok(resp.status_code().is_success())
+    }
+
+    async fn delete_index(&self, name: &str) -> Result<(), CoreError> {
+        let resp = self
+            .client
+            .indices()
+            .delete(opensearch::indices::IndicesDeleteParts::Index(&[name]))
+            .send()
+            .await
+            .map_err(http_err)?;
+        // gone already is the state the caller asked for
+        if resp.status_code() == 404 {
+            return Ok(());
+        }
+        check_status(resp, &format!("delete index {name}")).await
+    }
+
     async fn switch_alias(&self, alias: &str, index: &str) -> Result<(), CoreError> {
         // where it points now, so the remove names real indices: a remove
         // against a wildcard errors when the alias does not exist yet

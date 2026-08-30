@@ -863,6 +863,46 @@ impl Sink for ElasticsearchSink {
             .unwrap_or_default())
     }
 
+    async fn count_documents(&self, index: &str) -> Result<Option<u64>, CoreError> {
+        let (status, body) = self
+            .send(reqwest::Method::GET, &format!("/{index}/_count"), None)
+            .await?;
+        match status {
+            404 => Ok(None),
+            200 => body["count"]
+                .as_u64()
+                .map(Some)
+                .ok_or_else(|| CoreError::Sink(format!("count {index}: {body}"))),
+            other => Err(CoreError::Sink(format!("count {index}: {other} {body}"))),
+        }
+    }
+
+    async fn index_exists(&self, name: &str) -> Result<bool, CoreError> {
+        let (status, body) = self
+            .send(reqwest::Method::HEAD, &format!("/{name}"), None)
+            .await?;
+        match status {
+            200 => Ok(true),
+            404 => Ok(false),
+            other => Err(CoreError::Sink(format!(
+                "does index {name} exist: {other} {body}"
+            ))),
+        }
+    }
+
+    async fn delete_index(&self, name: &str) -> Result<(), CoreError> {
+        let (status, body) = self
+            .send(reqwest::Method::DELETE, &format!("/{name}"), None)
+            .await?;
+        // gone already is the state the caller asked for
+        if status == 200 || status == 404 {
+            return Ok(());
+        }
+        Err(CoreError::Sink(format!(
+            "delete index {name}: {status} {body}"
+        )))
+    }
+
     async fn switch_alias(&self, alias: &str, index: &str) -> Result<(), CoreError> {
         // where it points now, so the remove names real indices: a remove
         // against a wildcard errors when the alias does not exist yet

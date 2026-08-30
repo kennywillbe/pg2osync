@@ -259,6 +259,36 @@ pub trait Sink: Send + Sync {
         ))
     }
 
+    /// How many documents `index` holds, or `None` when there is no such
+    /// index.
+    ///
+    /// `None` rather than zero because the two answers lead different places:
+    /// an index that was never created is a mistake to report, and an empty
+    /// one is a count to compare.
+    async fn count_documents(&self, _index: &str) -> Result<Option<u64>, CoreError> {
+        Err(CoreError::Sink(
+            "this target cannot count the documents in an index".into(),
+        ))
+    }
+
+    /// Whether an index of this name is already there.
+    ///
+    /// Asked before a rebuild names one: finding the collision after a
+    /// multi-hour load would throw the load away.
+    async fn index_exists(&self, _name: &str) -> Result<bool, CoreError> {
+        Err(CoreError::Sink(
+            "this target cannot say whether an index exists".into(),
+        ))
+    }
+
+    /// Remove an index and everything in it; absent is success.
+    ///
+    /// Only ever called on an index the caller named explicitly — the old one
+    /// a rebuild replaced — never inferred from a pattern.
+    async fn delete_index(&self, _name: &str) -> Result<(), CoreError> {
+        Err(CoreError::Sink("this target cannot delete an index".into()))
+    }
+
     /// Point `alias` at `index`, removing it from wherever it was, in one
     /// step.
     ///
