@@ -169,6 +169,73 @@ jobs:
       - run: cargo build --release --locked -p pg2osync
       - run: ./dev/e2e-mysql-test.sh
 
+  # Both sources at once, in one process. What it covers is not either source's
+  # behaviour — the two suites above own that — but what only shows up when
+  # they share a process: one exposition, health and /synced per source, and a
+  # source that goes away without taking the other down.
+  e2e-multi-source:
+    name: e2e several sources in one process
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: sourcedb
+        ports: ["15432:5432"]
+        options: >-
+          --name dev-postgres-1
+          --health-cmd "pg_isready -U postgres -d sourcedb"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: mysqlpw
+          MYSQL_DATABASE: sourcedb
+        ports: ["13306:3306"]
+        options: >-
+          --name mysql-test
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -pmysqlpw"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+      opensearch:
+        image: opensearchproject/opensearch:2.19.6
+        env:
+          discovery.type: single-node
+          DISABLE_SECURITY_PLUGIN: "true"
+          OPENSEARCH_JAVA_OPTS: -Xms512m -Xmx512m
+        ports: ["9200:9200"]
+        options: >-
+          --health-cmd "curl -s http://localhost:9200/_cluster/health | grep -q green"
+          --health-interval 10s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # the service container needs logical replication, which the image's
+      # default command does not enable
+      - name: Enable logical replication
+        run: |
+          docker exec dev-postgres-1 bash -c "
+            echo 'wal_level = logical' >> /var/lib/postgresql/data/postgresql.conf
+            echo 'max_replication_slots = 10' >> /var/lib/postgresql/data/postgresql.conf
+            echo 'max_wal_senders = 10' >> /var/lib/postgresql/data/postgresql.conf"
+          docker restart dev-postgres-1
+          until docker exec dev-postgres-1 pg_isready -U postgres -d sourcedb; do sleep 2; done
+      - name: Create the replication user
+        run: |
+          docker exec mysql-test mysql -uroot -pmysqlpw -e "
+            CREATE USER 'repl'@'%' IDENTIFIED WITH mysql_native_password BY 'replpw';
+            GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'repl'@'%';"
+      - run: docker exec -i dev-postgres-1 psql -U postgres -d sourcedb < dev/seed.sql
+      - run: docker exec -i mysql-test mysql -uroot -pmysqlpw sourcedb < dev/mysql-seed.sql
+      - run: cargo build --release --locked -p pg2osync
+      - run: ./dev/e2e-multi-source.sh
+
   docker:
     name: container image builds
     runs-on: ubuntu-latest

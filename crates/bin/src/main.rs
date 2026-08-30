@@ -8,6 +8,7 @@ mod reindex;
 mod reload;
 mod resnapshot;
 mod run;
+mod supervisor;
 mod workspace;
 
 use anyhow::{Context, Result, bail};
@@ -29,11 +30,23 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Initial load plus continuous streaming (main mode). One config file:
-    /// `--config-dir` is read by `validate` and `status` only.
+    /// Initial load plus continuous streaming (main mode).
     Run {
-        #[arg(short, long, value_name = "FILE", default_value = "pg2osync.toml")]
+        #[arg(
+            short,
+            long,
+            value_name = "FILE",
+            default_value = "pg2osync.toml",
+            group = "configs"
+        )]
         config: PathBuf,
+        /// Run every *.toml in this directory as one process: one metrics
+        /// port, one /synced endpoint, and a pipeline of its own per file.
+        #[arg(long, value_name = "DIR", group = "configs")]
+        config_dir: Option<PathBuf>,
+        /// Run only the source of this name out of the directory.
+        #[arg(long, value_name = "NAME")]
+        source: Option<String>,
     },
     /// Validate the config and check both connections.
     Validate {
@@ -453,8 +466,25 @@ async fn main() -> Result<()> {
 
 async fn run_command(command: Command) -> Result<()> {
     match command {
-        Command::Run { config } => pipeline(&config, run::Mode::Run).await,
-        Command::Bootstrap { config } => pipeline(&config, run::Mode::Bootstrap).await,
+        Command::Run {
+            config,
+            config_dir,
+            source,
+        } => {
+            let ws = workspace::Workspace::load(&config, config_dir.as_deref())?;
+            let ws = match source {
+                Some(name) => ws.only(&name)?,
+                None => ws,
+            };
+            pipeline(ws, run::Mode::Run).await
+        }
+        Command::Bootstrap { config } => {
+            pipeline(
+                workspace::Workspace::load_file(&config)?,
+                run::Mode::Bootstrap,
+            )
+            .await
+        }
         Command::Validate { config, config_dir } => {
             validate(workspace::Workspace::load(&config, config_dir.as_deref())?).await
         }
@@ -502,31 +532,10 @@ async fn run_command(command: Command) -> Result<()> {
     }
 }
 
-async fn pipeline(path: &Path, mode: run::Mode) -> Result<()> {
-    let cfg = config::AppConfig::load(path)?;
-    reload::apply_log_filter(cfg.log.filter.as_deref())?;
-    let secrets = cfg.resolve_secrets()?;
-    for warning in &secrets.warnings {
-        tracing::warn!(target: "pg2osync::config", "{warning}");
-    }
-    // Installed before the pipeline starts, so a SIGHUP that arrives during
-    // the initial load is a reload rather than the default disposition, which
-    // is to kill the process.
-    let reload = reload::ReloadSource {
-        path: path.to_path_buf(),
-        generations: reload::on_sighup(),
-    };
-    run::run_pipeline(
-        cfg,
-        secrets.source_url,
-        secrets.admin_url,
-        secrets.target_password,
-        shutdown_signal(),
-        pg2osync_engine::mapping::DurableLsn::default(),
-        mode,
-        reload,
-    )
-    .await
+/// Hand the workspace to the supervisor. One source or thirty is the same
+/// call: the shutdown signal is the process's, and so is the exit code.
+async fn pipeline(ws: workspace::Workspace, mode: run::Mode) -> Result<()> {
+    supervisor::run_all(ws, shutdown_signal(), mode).await
 }
 
 /// Write a starter config, and check what it names against the real source.

@@ -1477,16 +1477,28 @@ then answers. A query made after it returns is guaranteed to see those writes.
 
 | Parameter | Default | Description |
 |---|---|---|
+| `source` | the only source | Which pipeline to wait on, by [name](#names); required once the process runs more than one |
 | `position` | read from the source | Where to wait for; omit and pg2osync reads it itself |
 | `timeout` | `5000` | Milliseconds to wait, capped at 30 s |
 | `refresh` | `false` | Also make the writes searchable, not merely stored |
 
 ```
 GET /synced?refresh=true&timeout=2000
-200 {"synced":true,"requested":"0/1B4F2A8","confirmed":"0/1B4F2B0","waited_ms":5}
+200 {"source":"orders","synced":true,"requested":"0/1B4F2A8","confirmed":"0/1B4F2B0","waited_ms":5}
 408 {"synced":false,…}   still behind when the timeout elapsed
 400 the position could not be parsed
+400 several sources and no source=; the body names them
+404 no source of that name; the body names the known ones
+503 the source has not connected yet
 ```
+
+A process running one source answers without `source=` exactly as before; one
+running several refuses to guess, because answering for whichever pipeline
+came first would tell a caller its write is visible when the pipeline carrying
+it has written nothing. `503 … has not connected yet` is a source that exists
+but has not yet registered with the endpoint — it does so once it can render
+a position, which for MySQL is after a round trip to the server — and is
+distinct from a `404`, so a caller can retry the one and fix the other.
 
 Leave `position` out unless you have a reason not to. Reading it requires
 `REPLICATION CLIENT` on MySQL — a privilege an application account should not
@@ -1508,10 +1520,12 @@ never calls this and pays nothing.
 | `bind` | `127.0.0.1:9100` | Listen address; use `0.0.0.0:9100` in a container |
 | `token_env` | unset | Variable holding a bearer token required on `/metrics` |
 
-Only `GET /metrics` and `GET /healthz` are served; anything else is a 404.
-`/healthz` is never authenticated, because a kubelet probe has nowhere to keep
-a token and a liveness check that fails on a missing one would restart a
-healthy pipeline.
+Only `GET /metrics`, `GET /healthz` and `GET /healthz/<name>` are served;
+anything else is a 404. Neither health endpoint is ever authenticated, because
+a kubelet probe has nowhere to keep a token and a liveness check that fails on
+a missing one would restart a healthy pipeline. `/healthz` is the process
+being up and nothing more; `/healthz/<name>` is one source's readiness — see
+[operations](operations.md#health) for what each answers.
 
 With `token_env` set, Prometheus sends the same token:
 
@@ -1525,6 +1539,11 @@ scrape_configs:
       - targets: ["pg2osync:9100"]
 ```
 
+Every series carries `source="<name>"` — the [name](#names) of the config it
+came from — so one process running a directory of them is one scrape, and a
+single-file process reads the same way; [operations](operations.md#the-source-label)
+says what that means for an existing query. Omitted below for brevity.
+
 ```
 pg2osync_events_total{type="row|truncate|join_cascade"}   # join_cascade: a batch that removed a deleted parent's children
 pg2osync_batches_flushed
@@ -1535,6 +1554,7 @@ pg2osync_transform_unconverted_total            # values a transform could not c
 pg2osync_schema_drift_total{table="schema.table"}  # a table changed shape; the index keeps the old one until rebuilt
 pg2osync_reconnects_total
 pg2osync_source_connected                       # 1 while the source is streaming, 0 while reconnecting
+pg2osync_source_state{state="starting|loading|streaming|reconnecting|halted|stopped"}   # exactly one 1 per source
 pg2osync_latency_ms{quantile="0.5|0.9|0.99"}   # source commit to indexed
 pg2osync_latency_ms_count
 pg2osync_position_current                       # highest position received
@@ -1550,11 +1570,29 @@ One file is one source: its own slot, its own checkpoint, its own target.
 ```sh
 pg2osync validate --config-dir /etc/pg2osync
 pg2osync status   --config-dir /etc/pg2osync
+pg2osync run      --config-dir /etc/pg2osync                  # every source, one process
+pg2osync run      --config-dir /etc/pg2osync --source orders  # one of them
 ```
 
-`--config` and `--config-dir` are alternatives — passing both is an error — and
-`run` still takes exactly one file. What the directory adds is everything two
-files can disagree about, none of which is visible from inside either one.
+`--config` and `--config-dir` are alternatives — passing both is an error.
+`run` with a directory starts one pipeline per file inside one process. Each
+source keeps its own sink, engine, checkpoint, retry policy and initial load;
+what they share is the process and its two listeners, so every metric carries
+a `source` label, `/healthz/<name>` answers for one source and `/synced` takes
+`?source=` — [operations](operations.md#health) has the endpoints,
+[architecture](architecture.md#several-sources-in-one-process) the shape.
+`--source <name>` narrows the directory to that one source, which is how a
+single tenant is restarted or debugged without moving files. `bootstrap`
+still takes one `--config`: it creates objects and exits.
+
+There is deliberately no write budget across the files. The sum of every
+`[engine] write_concurrency` and `batch_size` in the directory is what the
+process costs, and sizing it is the operator's — a shared cap would make
+every source wait on every other's slowest target, which is the coupling
+running them apart avoided.
+
+What the directory adds is everything two files can disagree about, none of
+which is visible from inside either one.
 
 Which files are read:
 
@@ -1610,10 +1648,11 @@ every name it can render, in any file: a fixed `events-2024` inside another
 file's `events-{tenant}` is refused, because a re-snapshot of the templated
 section would clear it.
 
-**A listener.** `[metrics]` and `[api]` describe the process, not a source. A
-file that leaves the section out takes whatever the files that declare it say;
-two files declaring it differently are refused, naming both — one process opens
-one listener.
+**A listener, and the log.** `[metrics]`, `[api]` and `[log]` describe the
+process, not a source: one process opens one metrics port, one `/synced` port
+and one log subscriber. A file that leaves one of these sections out takes
+whatever the files that declare it say; two files declaring it differently are
+refused, naming both.
 
 ## `[log]`
 

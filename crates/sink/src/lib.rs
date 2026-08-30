@@ -633,7 +633,7 @@ impl OpenSearchSink {
         }
         let status = resp.status_code();
         let body: Value = resp.json().await.unwrap_or(Value::Null);
-        if body["error"]["type"] == "resource_already_exists_exception" {
+        if already_exists(&body) {
             return Ok(false);
         }
         Err(CoreError::Sink(format!(
@@ -711,7 +711,7 @@ impl OpenSearchSink {
             .send()
             .await
             .map_err(http_err)?;
-        check_status(resp, "create meta index").await
+        check_created(resp, "create meta index").await
     }
 
     async fn ensure_rejects_index(&self) -> Result<(), CoreError> {
@@ -743,7 +743,7 @@ impl OpenSearchSink {
             .send()
             .await
             .map_err(http_err)?;
-        check_status(resp, "create rejects index").await
+        check_created(resp, "create rejects index").await
     }
 
     /// One bulk request. Returns how far it got and, for each document the
@@ -924,6 +924,28 @@ fn is_retryable(e: &CoreError) -> bool {
 
 fn http_err(e: opensearch::Error) -> CoreError {
     CoreError::Sink(format!("http request failed: {e}"))
+}
+
+/// A create that lost a race is a create that succeeded.
+///
+/// The hidden indices are the target's, not one pipeline's, so every source in
+/// a process ensures the same two at startup and one of them is always second.
+/// The target saying it is already there is the outcome the caller asked for.
+async fn check_created(resp: Response, what: &str) -> Result<(), CoreError> {
+    if resp.status_code().is_success() {
+        return Ok(());
+    }
+    let status = resp.status_code();
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    if already_exists(&body) {
+        return Ok(());
+    }
+    Err(CoreError::Sink(format!("{what} failed: {status} {body}")))
+}
+
+/// Whether a refused create says the index is already there.
+pub(crate) fn already_exists(body: &Value) -> bool {
+    body["error"]["type"] == "resource_already_exists_exception"
 }
 
 async fn check_status(resp: Response, what: &str) -> Result<(), CoreError> {
@@ -1859,6 +1881,20 @@ impl Sink for OpenSearchSink {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_create_that_lost_the_race_is_not_a_failure() {
+        // two sources in one process ensure the hidden indices at once, and
+        // the second one halting on it would be a pipeline lost to a startup
+        // order nobody controls
+        assert!(super::already_exists(&serde_json::json!({
+            "error": {"type": "resource_already_exists_exception"}
+        })));
+        assert!(!super::already_exists(&serde_json::json!({
+            "error": {"type": "illegal_argument_exception"}
+        })));
+        assert!(!super::already_exists(&serde_json::Value::Null));
+    }
+
     #[test]
     fn a_position_becomes_the_documents_external_version() {
         assert_eq!(external_version(Some(4096)), Some(4096));

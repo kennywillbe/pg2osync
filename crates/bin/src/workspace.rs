@@ -5,7 +5,7 @@
 //! about — a name, a replication slot, an index, the port a listener binds —
 //! and none of that is visible from inside either file.
 
-use crate::config::{self, AppConfig, Label, TableSync};
+use crate::config::{self, ApiConfig, AppConfig, Label, LogConfig, MetricsConfig, TableSync};
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -17,9 +17,13 @@ pub struct Source {
     pub cfg: AppConfig,
 }
 
-/// Every source one invocation was given.
+/// Every source one invocation was given, and what they share by being one
+/// process: two listeners and a log subscriber.
 pub struct Workspace {
     pub sources: Vec<Source>,
+    pub metrics: MetricsConfig,
+    pub api: ApiConfig,
+    pub log: LogConfig,
 }
 
 impl Workspace {
@@ -96,13 +100,39 @@ impl Workspace {
         Self::assemble(sources)
     }
 
+    /// Narrow the workspace to the one source a command names.
+    pub fn only(self, name: &str) -> Result<Self> {
+        let Self {
+            sources,
+            metrics,
+            api,
+            log,
+        } = self;
+        let kept: Vec<Source> = sources.into_iter().filter(|s| s.name == name).collect();
+        if kept.is_empty() {
+            bail!("no source is called {name:?}");
+        }
+        Ok(Self {
+            sources: kept,
+            metrics,
+            api,
+            log,
+        })
+    }
+
     fn assemble(sources: Vec<Source>) -> Result<Self> {
         validate_across(&sources)?;
-        // the agreement is the check: which listener the process then opens is
-        // the supervisor's question, and the supervisor is the next change
-        agree(&sources, "metrics", |cfg| &cfg.metrics)?;
-        agree(&sources, "api", |cfg| &cfg.api)?;
-        Ok(Self { sources })
+        // the sections are per file but the listeners are per process, so the
+        // agreement is what lets one answer stand for the whole workspace
+        let metrics = agree(&sources, "metrics", |cfg| &cfg.metrics)?;
+        let api = agree(&sources, "api", |cfg| &cfg.api)?;
+        let log = agree(&sources, "log", |cfg| &cfg.log)?;
+        Ok(Self {
+            sources,
+            metrics,
+            api,
+            log,
+        })
     }
 }
 
@@ -223,11 +253,11 @@ fn validate_across(sources: &[Source]) -> Result<()> {
 /// A section that describes the process, not a source. Files that leave it out
 /// take whatever the ones that declare it say; files that declare it
 /// differently are asking for two listeners, and there is one process.
-fn agree<T: PartialEq + Default>(
+fn agree<T: PartialEq + Default + Clone>(
     sources: &[Source],
     section: &str,
     of: impl Fn(&AppConfig) -> &T,
-) -> Result<()> {
+) -> Result<T> {
     let default = T::default();
     let mut declared: Option<(&Source, &T)> = None;
     for source in sources {
@@ -237,15 +267,15 @@ fn agree<T: PartialEq + Default>(
         }
         match declared {
             Some((first, chosen)) if chosen != value => bail!(
-                "[{section}] differs between {} and {}: one process opens one {section} \
-                 listener, so the files that declare the section must declare the same one",
+                "[{section}] differs between {} and {}: the section describes the process \
+                 rather than one source, so the files that declare it must declare the same one",
                 file_name(&first.path),
                 file_name(&source.path)
             ),
             _ => declared = Some((source, value)),
         }
     }
-    Ok(())
+    Ok(declared.map_or(default, |(_, value)| value.clone()))
 }
 
 #[cfg(test)]
@@ -514,6 +544,30 @@ mod tests {
         dir.write("b.toml", &config("slot_name = \"b\"", "invoices"));
         let ws = Workspace::load_dir(dir.path()).expect("one declaration, no disagreement");
         assert_eq!(names(&ws), ["a", "b"]);
+        assert_eq!(ws.metrics.bind, "0.0.0.0:9100");
+    }
+
+    #[test]
+    fn two_files_asking_for_different_log_filters_are_refused() {
+        // one process, one subscriber: the last file read would otherwise
+        // decide what every source logs at
+        let dir = TempDir::new("log");
+        dir.write(
+            "a.toml",
+            &format!("{}\n[log]\nfilter = \"debug\"\n", config("", "orders")),
+        );
+        dir.write(
+            "b.toml",
+            &format!(
+                "{}\n[log]\nfilter = \"warn\"\n",
+                config("slot_name = \"b\"", "invoices")
+            ),
+        );
+        let why = refused(Workspace::load_dir(dir.path()));
+        assert!(
+            why.contains("[log] differs between a.toml and b.toml"),
+            "{why}"
+        );
     }
 
     #[test]

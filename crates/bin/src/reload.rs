@@ -26,6 +26,11 @@ use tokio::sync::watch;
 use crate::config::AppConfig;
 
 /// The configuration file, and the signals asking for it to be read again.
+///
+/// Cloneable because the signal is the process's and the file is the source's:
+/// one handler feeds every pipeline, each re-reading the file it was loaded
+/// from.
+#[derive(Clone)]
 pub struct ReloadSource {
     pub path: PathBuf,
     /// A generation counter rather than a bare notification: two SIGHUPs a

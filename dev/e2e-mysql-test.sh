@@ -216,7 +216,7 @@ synced
 check "same process recovered" "$(pgrep -f "pg2osync run" | head -1)" "$before_pid"
 check "row written while disconnected arrived" "$(os_field e2e_mysql_users 9 name)" "written-while-disconnected"
 metrics=$(curl -s http://127.0.0.1:9112/metrics)
-reconnects=$(awk '$1 == "pg2osync_reconnects_total" {print $2}' <<< "$metrics")
+reconnects=$(awk '/^pg2osync_reconnects_total\{/ {print $2}' <<< "$metrics")
 if [ "${reconnects:-0}" -ge 1 ]; then ok "reconnects_total counted it ($reconnects)"; else bad "reconnects_total still zero"; fi
 
 say "8. read-your-writes"
@@ -236,7 +236,7 @@ my "INSERT INTO shop_users (id,name,email,drift_probe) VALUES (91,'drift','d@tes
 synced
 metrics=$(curl -s http://127.0.0.1:9112/metrics)
 check "the shape change is counted" \
-  "$(awk '/^pg2osync_schema_drift_total\{table="sourcedb.shop_users"\} /{print $2}' <<< "$metrics")" "1"
+  "$(awk '/^pg2osync_schema_drift_total\{source="[^"]*",table="sourcedb.shop_users"\} /{print $2}' <<< "$metrics")" "1"
 check "and the row after it still lands" "$(os_field e2e_mysql_users 91 drift_probe)" "later"
 my "DELETE FROM shop_users WHERE id=91;"
 synced
@@ -1391,7 +1391,7 @@ RLCONFIG=$(mktemp /tmp/pg2osync-mysql-reload.XXXXXX)
 RLSID=990011
 RLLOG=/tmp/pg2osync-mysql-e2e-reload.log
 : > "$RLLOG"
-rl_metric() { curl -s 127.0.0.1:9124/metrics | grep -v '^#' | grep -F "$1" | awk '{print $2}' | head -1; }
+rl_metric() { curl -s 127.0.0.1:9124/metrics | grep -v '^#' | grep -E "$1" | awk '{print $2}' | head -1; }
 rl_write_config() {
   cat > "$RLCONFIG" <<TOML
 [source]
@@ -1436,8 +1436,8 @@ RLPID=$!
 disown
 await_count e2e_mysql_reload 1
 check "the pipeline is up on the batch_size it started with" "$(os_count e2e_mysql_reload)" "1"
-batches_before=$(rl_metric "pg2osync_batches_flushed ")
-reconnects_before=$(rl_metric "pg2osync_reconnects_total ")
+batches_before=$(rl_metric '^pg2osync_batches_flushed\{')
+reconnects_before=$(rl_metric '^pg2osync_reconnects_total\{')
 
 # One transaction of 200 rows: no commit boundary cuts it, so the only thing
 # that can split it into batches is the size the engine is reading now.
@@ -1461,14 +1461,14 @@ check "the process is the same process" "$(kill -0 "$RLPID" 2> /dev/null && echo
 my "INSERT INTO reload_probe VALUES (999, 'sentinel');"
 await_count e2e_mysql_reload 2
 check "the sentinel row went through on the old turn" "$(os_count e2e_mysql_reload)" "2"
-batches_before=$(rl_metric "pg2osync_batches_flushed ")
+batches_before=$(rl_metric '^pg2osync_batches_flushed\{')
 
 # one statement, so the binlog carries one transaction of two hundred rows
 rows=$(python3 -c "print(','.join(\"(%d,'v%d')\" % (n, n) for n in range(1000, 1200)))")
 my "INSERT INTO reload_probe VALUES $rows;"
 await_count e2e_mysql_reload 201
 check "every row of the transaction is indexed" "$(os_count e2e_mysql_reload)" "202"
-batches_after=$(rl_metric "pg2osync_batches_flushed ")
+batches_after=$(rl_metric '^pg2osync_batches_flushed\{')
 grew=$((batches_after - batches_before))
 # 200 rows at 5 a batch is around forty requests; at 500 it would have been one
 if [ "$grew" -ge 20 ]; then
@@ -1476,9 +1476,9 @@ if [ "$grew" -ge 20 ]; then
 else
   bad "the batch boundary did not move: $grew batches for 200 rows"
 fi
-check "and nothing reconnected to do it" "$(rl_metric 'pg2osync_reconnects_total ')" "$reconnects_before"
+check "and nothing reconnected to do it" "$(rl_metric '^pg2osync_reconnects_total\{')" "$reconnects_before"
 check "the reload is counted as applied" \
-  "$(rl_metric 'pg2osync_config_reloads_total{result="applied"}')" "1"
+  "$(rl_metric '^pg2osync_config_reloads_total\{source="[^"]*",result="applied"\}')" "1"
 
 # An identity change is refused in place: the section keeps running as it was,
 # because every document already written is filed the old way.
@@ -1495,7 +1495,7 @@ else
   bad "the identity change was not refused clearly: $(grep -i 'id changed' "$RLLOG" | tail -1)"
 fi
 check "and it is counted as refused" \
-  "$(rl_metric 'pg2osync_config_reloads_total{result="refused"}')" "1"
+  "$(rl_metric '^pg2osync_config_reloads_total\{source="[^"]*",result="refused"\}')" "1"
 
 my "INSERT INTO reload_probe VALUES (2001,'after-the-refusal');"
 for _ in $(seq 1 60); do
@@ -1523,7 +1523,7 @@ else
 fi
 check "the process is still alive" "$(kill -0 "$RLPID" 2> /dev/null && echo alive)" "alive"
 check "and the broken read is counted as invalid" \
-  "$(rl_metric 'pg2osync_config_reloads_total{result="invalid"}')" "1"
+  "$(rl_metric '^pg2osync_config_reloads_total\{source="[^"]*",result="invalid"\}')" "1"
 
 my "INSERT INTO reload_probe VALUES (2002,'still-streaming');"
 for _ in $(seq 1 60); do
