@@ -29,12 +29,19 @@ cargo test --workspace
 cargo build --release
 ./dev/e2e-test.sh                    # PostgreSQL -> OpenSearch, full pipeline
 ./dev/e2e-mysql-test.sh              # MySQL source, engine or sink (needs a MySQL container)
+./dev/e2e-meili-smoke.sh             # the Meilisearch sink (needs a Meilisearch)
 ./dev/failover-probe.sh              # MySQL failover; builds its own primary and replica
 ./dev/mtls-probe.sh                  # client certificates; builds its own PostgreSQL with a CA
 ./dev/db-load-impact.sh              # what the source database pays while busy
 ./dev/many-tables.sh                 # what a table costs, apart from its rows
 ./dev/resource-limits.sh             # how many cores it needs (needs the container image)
 ```
+
+`e2e-meili-smoke.sh` is the suite to run when the Meilisearch sink changes.
+The full PostgreSQL suite cannot cover that target — it asserts over mappings,
+join fields and per-row indices, none of which Meilisearch has — so the smoke
+suite is the only place its load, its file checkpoint and its rebuild are
+exercised.
 
 `failover-probe.sh` is separate because it is the only check that needs two
 servers: it promotes a replica and asserts that the stream resumes *and* that

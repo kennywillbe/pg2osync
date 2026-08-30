@@ -27,6 +27,15 @@ pub struct MeilisearchSinkConfig {
     pub state_dir: String,
 }
 
+/// The body of a `POST /swap-indexes`: one swap, of the two uids named.
+///
+/// The endpoint takes a list of swaps and each swap a pair, so the shape is two
+/// levels deeper than the one operation it expresses — which is why it is built
+/// in one place and asserted on.
+fn swap_body(left: &str, right: &str) -> Value {
+    json!([{ "indexes": [left, right] }])
+}
+
 impl MeilisearchSink {
     pub fn new(cfg: MeilisearchSinkConfig) -> Result<Self, CoreError> {
         let mut headers = reqwest::header::HeaderMap::new();
@@ -110,6 +119,52 @@ impl MeilisearchSink {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         Err(CoreError::Sink("task timed out after 30s".into()))
+    }
+
+    /// The alias step of a rebuild, in the only form this target has.
+    ///
+    /// There is no alias namespace here: the name readers use is an index uid,
+    /// so what makes it resolve to freshly built documents is `swap-indexes`,
+    /// which exchanges the contents of two uids in a single task. The exchange
+    /// runs both ways, so `index` ends up holding what `alias` held — the
+    /// previous documents, which is exactly what a rollback wants.
+    async fn swap_indexes(&self, alias: &str, index: &str) -> Result<(), CoreError> {
+        if alias == index {
+            return Err(CoreError::Sink(format!(
+                "swapping {alias} with itself would leave every document where it is"
+            )));
+        }
+        // both uids have to exist for a swap, and the live name does not yet on
+        // the first rebuild of an index nothing ever wrote to
+        self.ensure_ready(&[IndexSpec {
+            name: alias.to_string(),
+            mapping: None,
+            pattern: false,
+        }])
+        .await?;
+        let (status, body) = self
+            .send(
+                reqwest::Method::POST,
+                "/swap-indexes",
+                Some(swap_body(alias, index)),
+            )
+            .await?;
+        if status != 202 {
+            return Err(CoreError::Sink(format!(
+                "swap of {alias} with {index}: {status} {body}"
+            )));
+        }
+        let Some(uid) = body["taskUid"].as_u64() else {
+            return Err(CoreError::Sink(format!(
+                "swap of {alias} with {index} was accepted without a task: {body}"
+            )));
+        };
+        // the swap either happened or it did not, and a caller told only that
+        // "a task failed" cannot tell which two names are now in doubt
+        self.wait_task(uid).await.map_err(|e| match e {
+            CoreError::Sink(why) => CoreError::Sink(format!("swap of {alias} with {index}: {why}")),
+            other => other,
+        })
     }
 
     /// Named after the stream, so two pipelines sharing a state directory do
@@ -355,6 +410,45 @@ impl Sink for MeilisearchSink {
         }
     }
 
+    async fn index_exists(&self, name: &str) -> Result<bool, CoreError> {
+        let (status, body) = self
+            .send(reqwest::Method::GET, &format!("/indexes/{name}"), None)
+            .await?;
+        match status {
+            200 => Ok(true),
+            404 => Ok(false),
+            other => Err(CoreError::Sink(format!(
+                "does index {name} exist: {other} {body}"
+            ))),
+        }
+    }
+
+    async fn delete_index(&self, name: &str) -> Result<(), CoreError> {
+        let (status, body) = self
+            .send(reqwest::Method::DELETE, &format!("/indexes/{name}"), None)
+            .await?;
+        match status {
+            // gone already is the state the caller asked for
+            404 => Ok(()),
+            202 => match body["taskUid"].as_u64() {
+                // and an index another caller removed between the request and
+                // the task reaches us the same way every other outcome does
+                Some(uid) => {
+                    self.wait_task_tolerating(uid, Some("index_not_found"))
+                        .await
+                }
+                None => Ok(()),
+            },
+            other => Err(CoreError::Sink(format!(
+                "delete index {name}: {other} {body}"
+            ))),
+        }
+    }
+
+    async fn switch_alias(&self, alias: &str, index: &str) -> Result<(), CoreError> {
+        self.swap_indexes(alias, index).await
+    }
+
     async fn read_state(&self, key: &str) -> Result<Option<Value>, CoreError> {
         match std::fs::read(self.state_path(key)) {
             Ok(bytes) => serde_json::from_slice::<Value>(&bytes)
@@ -577,6 +671,61 @@ mod tests {
             .await
             .expect("an index someone else created in the meantime");
         assert_eq!(target.seen().len(), 3, "{:?}", target.seen());
+    }
+
+    #[test]
+    fn a_swap_is_one_pair_inside_a_list_of_swaps() {
+        assert_eq!(
+            swap_body("users", "users-1756512345"),
+            json!([{"indexes": ["users", "users-1756512345"]}])
+        );
+    }
+
+    #[tokio::test]
+    async fn switching_a_name_onto_a_rebuilt_index_swaps_the_two_uids() {
+        let target = FakeTarget::start(|line| match line {
+            "GET /indexes/users" => (200, r#"{"uid":"users","primaryKey":"id"}"#),
+            "POST /swap-indexes" => (202, r#"{"taskUid":11,"status":"enqueued"}"#),
+            "GET /tasks/11" => (200, r#"{"status":"succeeded"}"#),
+            _ => (500, r#"{"code":"internal"}"#),
+        })
+        .await;
+        target
+            .sink()
+            .switch_alias("users", "users-1756512345")
+            .await
+            .expect("the live name now holds the rebuilt documents");
+        assert_eq!(
+            target.seen(),
+            vec![
+                "GET /indexes/users".to_string(),
+                "POST /swap-indexes".to_string(),
+                "GET /tasks/11".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_swap_task_names_both_uids() {
+        let target = FakeTarget::start(|line| match line {
+            "GET /indexes/users" => (200, r#"{"uid":"users","primaryKey":"id"}"#),
+            "POST /swap-indexes" => (202, r#"{"taskUid":12,"status":"enqueued"}"#),
+            "GET /tasks/12" => (
+                200,
+                r#"{"status":"failed","error":{"code":"index_not_found"}}"#,
+            ),
+            _ => (500, r#"{"code":"internal"}"#),
+        })
+        .await;
+        let result = target
+            .sink()
+            .switch_alias("users", "users-1756512345")
+            .await;
+        let Err(CoreError::Sink(message)) = result else {
+            panic!("a swap that did not happen looked like one that did: {result:?}");
+        };
+        assert!(message.contains("users"), "{message}");
+        assert!(message.contains("users-1756512345"), "{message}");
     }
 
     #[tokio::test]

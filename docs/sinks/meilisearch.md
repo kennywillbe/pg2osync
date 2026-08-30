@@ -42,11 +42,42 @@ Operational consequences:
 - Meilisearch has no mappings; searchable and filterable attributes are yours to
   configure on the index.
 
+## Rebuilding an index
+
+There are no mappings here, so a rebuild is never about a field type. What it is
+for is an index settings change that only applies to documents indexed after it,
+or a decoding bug whose wrong values are already written — cases where the
+documents have to be built again while the live name keeps answering.
+
+```sh
+pg2osync reindex -c pg2osync.toml --table public.users --alias users
+```
+
+- **`--alias` must be the index the section already writes to.** There is no
+  alias namespace on this target: the name readers use *is* an index uid, so
+  there is nothing to point somewhere else. Any other value is refused rather
+  than filling an index nothing reads.
+- **The switch is `POST /swap-indexes`,** which exchanges the contents of two
+  uids in a single task — atomic in the same sense an alias move is, and the
+  reason a rebuild is possible here at all.
+- **Afterwards `<index>-<unix seconds>` holds the *previous* documents,** not
+  the new ones: the swap runs both ways. That index is the rollback — swap it
+  back to undo the rebuild — and `--drop-old` deletes it instead.
+- **No config edit follows,** unlike the other targets: the section's `index`
+  never changed, so the only step left is starting the pipeline again.
+- **Stop the pipeline first;** the command refuses to run beside it. The
+  checkpoint file in `state_dir` does not move, so the restart replays
+  everything committed since the rebuild started, which is what proves the
+  contents — the count only proves how many.
+- The checkpoint lives outside the uid namespace entirely, so no swap can touch
+  it.
+
 ## Version targeting
 
 `dev/e2e-meili-smoke.sh` runs nightly against Meilisearch v1.53.1 (see
 [compatibility](../compatibility.md)). It is a smoke suite rather than the
 full `dev/e2e-test.sh`, because that suite asserts over mappings, join fields
 and per-row indices — the three things this target does not have. What it does
-cover is the initial load, live INSERT/UPDATE/DELETE and the file checkpoint
-resuming after a restart.
+cover is the initial load, live INSERT/UPDATE/DELETE, the file checkpoint
+resuming after a restart, and a rebuild swapping a fresh index into the live
+name.

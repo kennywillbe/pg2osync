@@ -582,6 +582,34 @@ it is the rollback — one alias flip back — and a `--keep-old` that defaults 
 on would be an option that does nothing. The count proves the number of rows,
 not their contents; what proves the contents is the replay the restart runs.
 
+**An alias is a contract, not an API call.** (#108.) `Sink::switch_alias` names
+an outcome — after it returns, the name readers use resolves to the documents
+the rebuild wrote, and it never resolved to nothing in between — and leaves the
+mechanism to the target. OpenSearch and Elasticsearch have an alias namespace
+and move a pointer inside it. Meilisearch has none: the name readers use *is*
+an index uid, and its atomic operation is `POST /swap-indexes`, which exchanges
+the contents of two uids in one task. Modelling that as "this target has no
+aliases" was the easy reading and the wrong one; the contract holds there, so
+the sink implements it.
+
+Two things follow from the swap, and the command says both out loud.
+`--alias` on Meilisearch has to be the index the section already writes to,
+because that is the only name a reader is using; any other value is refused
+rather than quietly creating an index nobody reads. And the exchange runs both
+ways, so once it is done the timestamped `<index>-<unix seconds>` holds the
+*previous* documents, not the new ones — it is the rollback, `--drop-old`
+deletes it, and the kept-index message says which name it is. No config edit
+follows a rebuild here, only the restart, because the section's `index` never
+changed. The checkpoint is a file in `state_dir` rather than a document in the
+target, so it sits outside the uid namespace entirely and no swap can touch it.
+
+A rebuild on this target is therefore never about a mapping — Meilisearch has
+no field types to declare, and `ensure_ready` refuses a spec that carries a
+mapping. What it is for is an index settings change that only applies to
+documents indexed after it, or a decoding bug whose wrong values are already
+written: both need the documents built again, and both want the live name to
+keep answering until they are.
+
 **Children resolve in the source, once per transaction.** The engine is
 source-agnostic and runs no SQL against the source, so the only place that can
 group child lookups is the source's own decode loop — which already knows where a

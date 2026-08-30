@@ -389,8 +389,14 @@ rollback — one alias flip away.
   left for you to look at.
 - **Refused for** a [templated](#per-row-indices) index, a
   [shared](#sharing-an-index) index or a join pair, a [fanned](#fan-out)
-  table, an `--alias` equal to the index the section already writes to, and
-  Meilisearch, which has no aliases to move (#108).
+  table, and an `--alias` equal to the index the section already writes to.
+- **On Meilisearch the alias *is* the index,** so `--alias` there must be the
+  name the section already writes to and every other value is refused. There is
+  no alias namespace on that target; the rebuilt index is swapped into the live
+  name with `POST /swap-indexes` instead, which is atomic in the same way. Two
+  things differ afterwards: no config edit is needed, only the restart, and it
+  is `<index>-<unix seconds>` that ends up holding the documents from before the
+  rebuild — see [the Meilisearch sink](sinks/meilisearch.md#rebuilding-an-index).
 - **A live cutover with no freshness gap at all is still two instances,** as
   [operations.md](operations.md) describes. A rebuild trades the gap for one
   command.

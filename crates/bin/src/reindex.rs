@@ -4,7 +4,10 @@
 //! until now — edit the config to a new index name, `resnapshot`, `switch-alias`
 //! — are one command here. The new index is `<index>-<unix seconds>`, filled by
 //! the same chunked reader the initial load uses, counted against the source,
-//! and given the alias in one atomic request.
+//! and given the alias in one atomic request. On a target with no alias
+//! namespace the last step is a swap of the two names instead, so `--alias` has
+//! to be the index the section already writes to and the fresh name is left
+//! holding the documents from before the rebuild.
 //!
 //! What it will not do is run beside a live stream, and that is the one place it
 //! parts company with a re-snapshot. A re-snapshot is safe beside the stream
@@ -100,6 +103,7 @@ pub async fn run_for(
     let (key, tbl) = (key.clone(), tbl.clone());
     let index = tbl.index_name(&key);
     refuse_unsupported(cfg, &key, &tbl, alias)?;
+    let swapped = alias_is_the_index(cfg);
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -166,30 +170,47 @@ pub async fn run_for(
         Verdict::Mismatch => {
             bail!(
                 "{fresh} holds {documents} document(s), which {qualified_table} does not \
-                 explain: {before} row(s) before the load, {after} after. The alias has not \
-                 been moved and {index} is untouched. Investigate, then remove the rebuilt \
-                 index with a DELETE of /{fresh}"
+                 explain: {before} row(s) before the load, {after} after. Nothing was switched \
+                 and {index} is untouched. Investigate, then remove the rebuilt index with a \
+                 {}",
+                delete_hint(swapped, &fresh)
             );
         }
     }
 
     sink.switch_alias(alias, &fresh).await?;
-    println!(
-        "alias {alias} now points at {fresh} ({documents} documents, {:.1}s)",
-        started.elapsed().as_secs_f64()
-    );
+    let elapsed = started.elapsed().as_secs_f64();
+    // The swap runs both ways, so on a target whose alias is an index the
+    // previous documents end up under the fresh name rather than the old one.
+    let previous = if swapped { &fresh } else { &index };
+    if swapped {
+        println!(
+            "{index} now holds the rebuilt documents ({documents} documents, {elapsed:.1}s); \
+             the ones it held before are now {fresh}"
+        );
+    } else {
+        println!("alias {alias} now points at {fresh} ({documents} documents, {elapsed:.1}s)");
+    }
     if drop_old {
-        sink.delete_index(&index).await?;
-        println!("{index} deleted");
+        sink.delete_index(previous).await?;
+        println!("{previous} deleted");
     }
     println!("Next:");
-    println!("  1. set index = \"{fresh}\" in [sync.{key}]");
+    let mut step = 1;
+    if !swapped {
+        println!("  1. set index = \"{fresh}\" in [sync.{key}]");
+        step = 2;
+    }
     println!(
-        "  2. start the pipeline again; the checkpoint did not move, so it replays everything \
-         committed since the rebuild started"
+        "  {step}. start the pipeline again; the checkpoint did not move, so it replays \
+         everything committed since the rebuild started"
     );
     if !drop_old {
-        println!("  3. once satisfied, delete the old index: DELETE /{index}");
+        println!(
+            "  {}. once satisfied, delete the documents from before the rebuild: {}",
+            step + 1,
+            delete_hint(swapped, previous)
+        );
     }
     Ok(())
 }
@@ -231,19 +252,42 @@ fn refuse_unsupported(
              the source's row count, and one row here is many documents"
         );
     }
-    if cfg.target.flavor == "meilisearch" {
-        bail!(
-            "a rebuild moves an alias onto a fresh index, which Meilisearch has no equivalent \
-             for yet (#108); rebuild it by pointing a copy of this config at a new index"
-        );
-    }
-    if alias == index {
+    if alias_is_the_index(cfg) {
+        if alias != index {
+            bail!(
+                "--alias {alias}: this target has no aliases, so a rebuild swaps the fresh index \
+                 into the name readers already use, and that name is {index} for [sync.{key}]. \
+                 Any other value would build an index nothing reads"
+            );
+        }
+    } else if alias == index {
         bail!(
             "--alias {alias} is the index [sync.{key}] already writes to: an alias and an index \
              cannot share a name, and the rebuild would have nowhere to point it"
         );
     }
     Ok(())
+}
+
+/// Whether the name readers use is an index of the target rather than a pointer
+/// to one.
+///
+/// Meilisearch has no alias namespace: `switch_alias` there exchanges the
+/// contents of the two names, so the live index uid *is* the alias, and after
+/// the swap the fresh name holds the documents from before the rebuild. Nothing
+/// about the rebuild itself changes — only which name `--alias` may be, which
+/// name holds the rollback, and what there is left to do afterwards.
+fn alias_is_the_index(cfg: &AppConfig) -> bool {
+    cfg.target.flavor == "meilisearch"
+}
+
+/// How a reader of a printed message would remove `index` by hand.
+fn delete_hint(swapped: bool, index: &str) -> String {
+    if swapped {
+        format!("DELETE /indexes/{index}")
+    } else {
+        format!("DELETE /{index}")
+    }
 }
 
 /// Refuse unless the stream is demonstrably stopped.
@@ -417,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn meilisearch_and_an_alias_that_is_the_index_are_refused() {
+    fn where_the_alias_is_the_index_only_that_name_is_accepted() {
         let plain = "[sync.users]\ntable = \"public.users\"\nindex = \"users\"\n";
         let meili = toml::from_str::<AppConfig>(&format!(
             "[source]\nurl = \"postgres://u@h/db\"\n\
@@ -426,8 +470,17 @@ mod tests {
         .expect("parses");
         let err =
             refuse_unsupported(&meili, "users", &meili.sync["users"], "live").expect_err("refused");
-        assert!(err.to_string().contains("#108"), "{err}");
+        assert!(err.to_string().contains("nothing reads"), "{err}");
+        // and the value the other targets refuse is the only one this one takes
+        refuse_unsupported(&meili, "users", &meili.sync["users"], "users")
+            .expect("the live index uid is the name a swap moves the documents into");
+        assert_eq!(delete_hint(true, "users-1"), "DELETE /indexes/users-1");
+        assert_eq!(delete_hint(false, "users-1"), "DELETE /users-1");
+    }
 
+    #[test]
+    fn an_alias_that_is_the_index_is_refused() {
+        let plain = "[sync.users]\ntable = \"public.users\"\nindex = \"users\"\n";
         let cfg = config(plain);
         let err =
             refuse_unsupported(&cfg, "users", &cfg.sync["users"], "users").expect_err("refused");

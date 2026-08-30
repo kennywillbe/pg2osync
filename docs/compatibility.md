@@ -32,8 +32,8 @@ every cell. Three scripts do the work:
 - `dev/e2e-meili-smoke.sh` — Meilisearch. Not the full suite: that one
   asserts over mappings, join fields and per-row indices, none of which
   Meilisearch has. The smoke suite covers the initial load, live
-  INSERT/UPDATE/DELETE, and the file-based checkpoint resuming after a
-  restart.
+  INSERT/UPDATE/DELETE, the file-based checkpoint resuming after a restart,
+  and a `reindex` swapping a rebuilt index into the live name.
 
 Two cells are marked advisory, because the first nightly matrix found a bug
 in each of them. The Elasticsearch suite reaches `reconcile`, which that sink
