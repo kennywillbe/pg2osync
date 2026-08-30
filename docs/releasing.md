@@ -8,14 +8,23 @@ automatically: the version, the changelog and the tag are each an explicit act.
 Every push to `main` runs [release-please](https://github.com/googleapis/release-please),
 which reads the [Conventional Commits](https://www.conventionalcommits.org/)
 since the last release and keeps **one open pull request** up to date — the
-release PR. The binary crate is the one thing release-please versions: it
-bumps `crates/bin/Cargo.toml`, keeps `Cargo.lock` in step, and writes the entry
-into `crates/bin/CHANGELOG.md`. The file lives inside the crate rather than at
-the repository root because release-please writes only within the package it
-releases from — a `changelog-path` that climbs out with `../` is refused. The
-library crates are internal to the workspace and are not published, so their
-versions are not tracked at all: one package, one tag, one release, one
-changelog.
+release PR. The package it releases is **the repository itself** — the `.` key
+in `release-please-config.json`. That is the whole point of the `.`: a package
+configured with a path only ever sees the commits that touched files under that
+path, so pointing it at `crates/bin` silently dropped every change made in
+`crates/source`, `crates/sink`, `crates/engine`, `deploy/` or `docs/` — half a
+release's worth of `feat:` and `fix:` commits, absent from the notes without a
+warning anywhere.
+
+What that package versions still lives in the binary crate. `extra-files` bumps
+`crates/bin/Cargo.toml` and the `pg2osync` entry of `Cargo.lock` — the lock has
+to move with it, because every release build runs `--locked` and a bump without
+the lock fails the build — and the entry is written into
+`crates/bin/CHANGELOG.md`, next to the crate whose version it describes rather
+than at the repository root, so the version, the notes and the code that was
+released sit together. The library crates are internal to the workspace and are
+not published, so their versions are not tracked at all: one package, one tag,
+one release, one changelog.
 
 ```
 merge a feature PR   →  release PR updated. Nothing released.
