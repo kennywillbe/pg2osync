@@ -393,6 +393,10 @@ figure above is what a single open write request buys. `write_concurrency` opens
 more of them, which is why it roughly doubles the load and does almost nothing
 past four.
 
+Every figure here is what the load does when nothing holds it back.
+`[engine] load_max_rows_per_sec` is the ceiling for when that is not what you
+want on a production primary — load rows only, never the stream.
+
 The two latency rows measure different things on purpose. "Commit to indexed" is
 what pg2osync controls, taken from its own `pg2osync_latency_ms`. "Commit to
 searchable" adds your client's round-trip and the target's refresh interval,

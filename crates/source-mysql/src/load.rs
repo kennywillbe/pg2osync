@@ -51,6 +51,9 @@ pub async fn run(
     // Tables declared `append_only`: read without a primary key, whole, and
     // with no key on their rows.
     append_only: &std::collections::HashSet<(String, String)>,
+    // The engine enforces this; the loader only reports it, so a rate far below
+    // what the server could give is explained on the line that shows it.
+    rate_cap: Option<u32>,
 ) -> Result<()> {
     // No explicit transaction, and READ COMMITTED so that an implicit one
     // cannot outlive its statement either. A read view held for the length of a
@@ -254,8 +257,9 @@ pub async fn run(
         let secs = started.elapsed().as_secs_f64();
         tracing::info!(target: "pg2osync::load",
             "loaded {count} rows from {qualified} in {secs:.1}s \
-             (~{:.0} rows/s) over {chunks} chunk(s)",
-            count as f64 / secs.max(f64::EPSILON));
+             (~{:.0} rows/s) over {chunks} chunk(s){}",
+            count as f64 / secs.max(f64::EPSILON),
+            pg2osync_core::load::rate_cap_note(rate_cap));
     }
 
     // Nothing left to resume, so nothing should claim otherwise on the next

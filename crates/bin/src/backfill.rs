@@ -502,8 +502,9 @@ pub async fn run(
         }
         let secs = started.elapsed().as_secs_f64();
         tracing::info!(target: "pg2osync::backfill",
-            "read {} rows from {} in {:.1}s (~{:.0} rows/s) over {} range(s)",
-            count, tbl.table, secs, count as f64 / secs.max(f64::EPSILON), ranges.len());
+            "read {} rows from {} in {:.1}s (~{:.0} rows/s) over {} range(s){}",
+            count, tbl.table, secs, count as f64 / secs.max(f64::EPSILON), ranges.len(),
+            pg2osync_core::load::rate_cap_note(cfg.engine.load_max_rows_per_sec));
     }
     // Nothing left to resume, so nothing should claim otherwise on the next
     // start. Left behind, a finished document is merely a wasted read.

@@ -1919,6 +1919,7 @@ async fn attempt_mysql(
                     &load_children,
                     base,
                     &src_cfg.append_only,
+                    cfg.engine.load_max_rows_per_sec,
                 )
                 .await?;
                 Ok(())
