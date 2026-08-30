@@ -1190,7 +1190,7 @@ stop_sync
 bid_cleanup
 
 echo -e "\n\033[1m== 22. named transforms reshape a column, and leave alone what they cannot ==\033[0m"
-# Six named ops, no expression language (#63). Row 1 converts on every column;
+# Seven named ops, no expression language (#63, #142). Row 1 converts on every column;
 # row 2 converts on none of them and has to land exactly as it arrived, counted,
 # rather than halt the pipeline or be nulled.
 SCONFIG=$(mktemp /tmp/pg2osync-e2e-shape.XXXXXX)
@@ -1219,6 +1219,7 @@ payload = "json"
 price = "number"
 tags = { op = "split", by = "," }
 born = { op = "date", from = "%d/%m/%Y" }
+status = { op = "lookup", map = { "1" = "active", "2" = "suspended" } }
 TOML
 # Row 2 keeps `price` and `born` as the strings they arrived as, so under dynamic
 # mapping the second document would be a mapping rejection — the quarantine
@@ -1234,8 +1235,8 @@ shape_cleanup() {
 }
 trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup; init_cleanup; fan_cleanup; bid_cleanup; shape_cleanup' EXIT
 
-pg "DROP TABLE IF EXISTS shape_probe; CREATE TABLE shape_probe(id bigint primary key, tags text, price text, born text, payload text);" > /dev/null 2>&1
-pg "INSERT INTO shape_probe VALUES (1,'a, b ,c','19.99','01/03/2024','{\"k\":1}'), (2,'x','abc','not-a-date','{\"k\":2}');" > /dev/null
+pg "DROP TABLE IF EXISTS shape_probe; CREATE TABLE shape_probe(id bigint primary key, tags text, price text, born text, payload text, status text);" > /dev/null 2>&1
+pg "INSERT INTO shape_probe VALUES (1,'a, b ,c','19.99','01/03/2024','{\"k\":1}','1'), (2,'x','abc','not-a-date','{\"k\":2}','9');" > /dev/null
 pg "DROP PUBLICATION IF EXISTS ${SSLOT}_pub; CREATE PUBLICATION ${SSLOT}_pub FOR TABLE shape_probe;" > /dev/null 2>&1
 curl -s -XDELETE "$OS/e2e_shape" > /dev/null
 # a split with nothing to split by is a config mistake, refused where it can
@@ -1257,15 +1258,16 @@ check "a delimited string became an array" "$(os_field e2e_shape 1 tags)" "['a',
 check "a numeric string became a number" "$(curl -s "$OS/e2e_shape/_doc/1" | jqf "type(d['_source']['price']).__name__")" "float"
 check "a formatted date became ISO 8601" "$(os_field e2e_shape 1 born)" "2024-03-01"
 check "a JSON string became an object" "$(curl -s "$OS/e2e_shape/_doc/1" | jqf "type(d['_source']['payload']).__name__")" "dict"
+check "a code became the label the dictionary names" "$(os_field e2e_shape 1 status)" "active"
 check "an unconvertible value is indexed as it was" "$(os_field e2e_shape 2 price)" "abc"
 check "and so is an unparseable date" "$(os_field e2e_shape 2 born)" "not-a-date"
 # -ge rather than =: at-least-once delivery may hand row 2 over more than once,
 # and every pass counts what it left alone again
 left=$(curl -s 127.0.0.1:9123/metrics | awk '/^pg2osync_transform_unconverted_total /{print $2}')
-if [ "${left:-0}" -ge 2 ]; then
+if [ "${left:-0}" -ge 3 ]; then
   ok "the counter reports the values left as they were ($left)"
 else
-  bad "the counter reports ${left:-0} values left as they were, want at least 2"
+  bad "the counter reports ${left:-0} values left as they were, want at least 3"
 fi
 stop_sync
 

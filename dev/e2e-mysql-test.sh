@@ -94,6 +94,7 @@ exclude_columns = ["password_hash"]
 [sync.shop_users.transform]
 email = "redact"
 balance = "number"
+status = { op = "lookup", map = { "1" = "active", "2" = "suspended" }, default = "unknown" }
 
 [sync.shop_users.fields]
 balance = "credit"
@@ -108,10 +109,13 @@ my "TRUNCATE shop_users;"
 # a run killed part way through leaves the drift probe's column behind, and the
 # shape change it exists to cause would then not happen
 my "ALTER TABLE shop_users DROP COLUMN drift_probe;" || true
-my "INSERT INTO shop_users (id,name,email,password_hash,balance,metadata) VALUES
-      (1,'alice','alice@test.io','secret-1',10.25,'{\"role\":\"admin\"}'),
-      (2,'bob','bob@test.io','secret-2',0.00,'{\"role\":\"user\"}'),
-      (3,'carol','carol@test.io','secret-3',99.99,NULL);"
+# the lookup's code column; added here rather than in the seed so a stack
+# seeded before this test has it too
+my "ALTER TABLE shop_users ADD COLUMN status varchar(8);" || true
+my "INSERT INTO shop_users (id,name,email,password_hash,balance,metadata,status) VALUES
+      (1,'alice','alice@test.io','secret-1',10.25,'{\"role\":\"admin\"}','1'),
+      (2,'bob','bob@test.io','secret-2',0.00,'{\"role\":\"user\"}','2'),
+      (3,'carol','carol@test.io','secret-3',99.99,NULL,'9');"
 curl -s -XDELETE "$OS/e2e_mysql_users,.pg2osync_meta?ignore_unavailable=true" > /dev/null
 ok "seeded 3 rows, indices cleared"
 
@@ -134,6 +138,8 @@ check "the source name is gone after the rename" "$(os_has e2e_mysql_users 3 bal
 check "the origin placeholder is rendered" "$(os_field e2e_mysql_users 1 origin)" "sourcedb.shop_users"
 check "excluded column absent" "$(os_has e2e_mysql_users 1 password_hash)" "False"
 check "transform applied" "$(os_field e2e_mysql_users 1 email)" "***"
+check "lookup maps a code to its label" "$(os_field e2e_mysql_users 1 status)" "active"
+check "and a code it does not know takes the default" "$(os_field e2e_mysql_users 3 status)" "unknown"
 
 say "3. live binlog streaming"
 my "INSERT INTO shop_users (id,name,email,balance) VALUES (4,'dave','dave@test.io',7.00);"

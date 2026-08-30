@@ -405,6 +405,11 @@ pub struct TransformTable {
     pub by: Option<String>,
     #[serde(default)]
     pub from: Option<String>,
+    /// `lookup`'s dictionary: the value's text form to the label it becomes.
+    #[serde(default)]
+    pub map: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(default)]
+    pub default: Option<String>,
 }
 
 /// Hand-written for the same reason `Constant` is: an untagged enum reports
@@ -443,11 +448,25 @@ impl TransformSpec {
     /// startup check and the run-time build go through here, so one grammar
     /// decides what a transform is.
     pub fn parse(&self) -> std::result::Result<TransformOp, String> {
-        let (op, by, from) = match self {
-            Self::Op(op) => (op.as_str(), None, None),
-            Self::Table(t) => (t.op.as_str(), t.by.as_deref(), t.from.as_deref()),
+        let (op, by, from, map, default) = match self {
+            Self::Op(op) => (op.as_str(), None, None, None, None),
+            Self::Table(t) => (
+                t.op.as_str(),
+                t.by.as_deref(),
+                t.from.as_deref(),
+                t.map.as_ref(),
+                t.default.as_deref(),
+            ),
         };
         let refuse = |param: &str| format!("{op:?} takes no {param:?}");
+        if op != "lookup" {
+            if map.is_some() {
+                return Err(refuse("map"));
+            }
+            if default.is_some() {
+                return Err(refuse("default"));
+            }
+        }
         match op {
             "hash" | "redact" | "json" | "number" => {
                 if by.is_some() {
@@ -487,9 +506,27 @@ impl TransformSpec {
                     }),
                 }
             }
+            "lookup" => {
+                if by.is_some() {
+                    return Err(refuse("by"));
+                }
+                if from.is_some() {
+                    return Err(refuse("from"));
+                }
+                match map {
+                    None => Err("lookup needs \"map\": \
+                                 { op = \"lookup\", map = { \"1\" = \"active\" } }"
+                        .into()),
+                    Some(m) if m.is_empty() => Err("lookup needs a non-empty \"map\"".into()),
+                    Some(m) => Ok(TransformOp::Lookup {
+                        map: m.clone(),
+                        default: default.map(str::to_string),
+                    }),
+                }
+            }
             other => Err(format!(
                 "{other:?} is not a transform; expected one of \"hash\", \"redact\", \"json\", \
-                 \"split\", \"number\", \"date\""
+                 \"split\", \"number\", \"date\", \"lookup\""
             )),
         }
     }
@@ -1908,7 +1945,9 @@ id = "user-{id}"
         let cfg = parse(&format!(
             "{MINIMAL}[sync.users.transform]\nemail = \"redact\"\nprice = \"number\"\n\
              payload = {{ op = \"json\" }}\ntags = {{ op = \"split\", by = \",\" }}\n\
-             born = {{ op = \"date\", from = \"%d/%m/%Y\" }}\n"
+             born = {{ op = \"date\", from = \"%d/%m/%Y\" }}\n\
+             status = {{ op = \"lookup\", map = {{ \"1\" = \"active\" }}, \
+             default = \"unknown\" }}\n"
         ))
         .expect("both forms load");
         let t = &cfg.sync["users"].transform;
@@ -1919,6 +1958,15 @@ id = "user-{id}"
             t["born"].parse(),
             Ok(TransformOp::Date {
                 from: "%d/%m/%Y".into()
+            })
+        );
+        assert_eq!(
+            t["status"].parse(),
+            Ok(TransformOp::Lookup {
+                map: [("1".to_string(), "active".to_string())]
+                    .into_iter()
+                    .collect(),
+                default: Some("unknown".into()),
             })
         );
 
@@ -1942,6 +1990,19 @@ id = "user-{id}"
                 "a parameter split does not take",
             ),
             ("price = 3", "neither a name nor a table"),
+            ("status = { op = \"lookup\" }", "lookup without a map"),
+            (
+                "status = { op = \"lookup\", map = {} }",
+                "a dictionary with no entries maps nothing",
+            ),
+            (
+                "status = { op = \"lookup\", map = { \"1\" = \"active\" }, by = \",\" }",
+                "a parameter lookup does not take",
+            ),
+            (
+                "email = { op = \"redact\", default = \"x\" }",
+                "only lookup has a default",
+            ),
         ];
         for (line, why) in refused {
             assert!(

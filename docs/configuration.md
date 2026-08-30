@@ -620,7 +620,7 @@ Two tables may map to the same index once each declares its `id`; see
 ### Transforms
 
 A column can be reshaped on its way into the document. `transform` maps a
-source column to one of six named operations: a string for an op that takes
+source column to one of seven named operations: a string for an op that takes
 no parameter, an inline table for one that does.
 
 ```toml
@@ -634,10 +634,12 @@ payload = "json"                             # or { op = "json" }
 price   = "number"
 tags    = { op = "split", by = "," }
 born    = { op = "date", from = "%d/%m/%Y" }
+status  = { op = "lookup", map = { "1" = "active", "2" = "closed" }, default = "unknown" }
 ```
 
 `hash` replaces the value with a truncated SHA-256 digest, stable across runs so
-it can still be grouped on. `redact` replaces it with `***`. The other four turn
+it can still be grouped on. `redact` replaces it with `***`. `lookup` maps a
+value through a dictionary the configuration declares. The other four turn
 a string into something more structured:
 
 | op | takes | turns | into |
@@ -648,6 +650,7 @@ a string into something more structured:
 | `split` | `by`, required and non-empty | a delimited string | an array of its trimmed, non-empty pieces: `"a, b ,c"` → `["a","b","c"]`, `""` → `[]` |
 | `number` | — | a string holding a number | a JSON number: an integer when it is one, otherwise a double |
 | `date` | `from`, a `strptime`-style format, required and non-empty | a string in that format | ISO 8601: `YYYY-MM-DD` for a date, `YYYY-MM-DDTHH:MM:SS` for a date-time, RFC 3339 with the offset kept when the format carries one |
+| `lookup` | `map`, required and non-empty; `default`, optional | a value whose text form is a key of `map` | that key's label; a value the map does not name keeps its own, or becomes `default` |
 
 NULL is left alone by every op, and so is a value already in the target shape:
 a parsed `json`/`jsonb`/`JSON` column under `json`, an array under `split`, a
@@ -658,8 +661,14 @@ explicit opt-out of the rule that `numeric`/`DECIMAL` arrive as strings to
 keep their precision — for an index that sorts or range-queries on the value
 and accepts the double.
 
-A value an op cannot convert — `"abc"` under `number`, a date that does not
-match `from` — is indexed **exactly as it arrived**, counted in
+`lookup` compares the value's text form against the keys, which are strings:
+the number `1`, the string `"1"` and — through `"true"`/`"false"` — a boolean
+all find their key, while an array or an object has no text form and misses.
+A miss is a value the dictionary does not cover, so it is counted like any
+other unconverted value, whether it keeps its own value or takes `default`.
+
+A value an op cannot convert — `"abc"` under `number`, a code no `lookup` map
+names — is indexed **exactly as it arrived** (or as `default`), counted in
 `pg2osync_transform_unconverted_total`, and logged once per table and column.
 The pipeline never halts on it: the target's mapping is the arbiter of what a
 field holds, and a document the mapping refuses takes the ordinary rejection
@@ -676,8 +685,8 @@ document.
   transform, so it needs a real array column.
 
 Refused at load: an unknown op, a parameter the op does not take, `split`
-without a non-empty `by`, `date` without a non-empty `from`, and a transform
-on the `fan_out.field`.
+without a non-empty `by`, `date` without a non-empty `from`, `lookup` without a
+non-empty `map`, and a transform on the `fan_out.field`.
 
 ### Field names
 
