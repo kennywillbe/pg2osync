@@ -48,6 +48,10 @@ pub struct EngineConfig {
     pub txn_buffer_cap_mb: usize,
     pub retry_max: u32,
     pub retry_backoff_ms: u64,
+    /// Ceiling on the time one request may spend being retried, measured from
+    /// its first failure. Unset leaves the attempt count as the only limit.
+    #[serde(default)]
+    pub retry_max_elapsed_ms: Option<u64>,
     pub checkpoint_interval_ms: u64,
     /// What to do about a document the target will never accept.
     #[serde(default)]
@@ -95,6 +99,7 @@ impl Default for EngineConfig {
             txn_buffer_cap_mb: 256,
             retry_max: 10,
             retry_backoff_ms: 500,
+            retry_max_elapsed_ms: None,
             checkpoint_interval_ms: 500,
             on_permanent_rejection: RejectionPolicy::Halt,
             max_rejects: default_max_rejects(),

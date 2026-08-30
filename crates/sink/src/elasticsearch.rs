@@ -562,20 +562,7 @@ impl ElasticsearchSink {
         &self,
         batch: &[LsnOp],
     ) -> Result<(Lsn, Vec<(usize, String)>), CoreError> {
-        let mut attempt = 0u32;
-        loop {
-            attempt += 1;
-            match self.bulk_once(batch).await {
-                Ok(done) => return Ok(done),
-                Err(e) if attempt < self.retry.max_attempts && is_retryable(&e) => {
-                    let backoff = self.retry.base_backoff_ms * 2u64.saturating_pow(attempt - 1);
-                    tracing::warn!(target: "pg2osync::sink",
-                        "bulk attempt {attempt} failed ({e}); backing off {backoff}ms");
-                    tokio::time::sleep(std::time::Duration::from_millis(backoff.min(30_000))).await;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        crate::retry_transient(&self.retry, || self.bulk_once(batch)).await
     }
 }
 
@@ -1223,10 +1210,6 @@ impl Sink for ElasticsearchSink {
             ))),
         }
     }
-}
-
-fn is_retryable(e: &CoreError) -> bool {
-    matches!(e, CoreError::SinkTransient(_))
 }
 
 #[cfg(test)]

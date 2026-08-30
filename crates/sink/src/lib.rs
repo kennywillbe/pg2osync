@@ -135,11 +135,18 @@ pub struct OpenSearchSinkConfig {
     pub require_alias: bool,
 }
 
+/// Backoff is capped so a long outage settles into a steady retry rhythm
+/// instead of drifting into hours.
+const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Retry policy for transient failures; tunable via `[engine]` config.
 #[derive(Debug, Clone)]
 pub struct RetryPolicy {
     pub max_attempts: u32,
     pub base_backoff_ms: u64,
+    /// Ceiling on the time spent retrying one request, measured from its first
+    /// failure. `None` leaves the attempt count as the only limit.
+    pub max_elapsed_ms: Option<u64>,
 }
 
 impl Default for RetryPolicy {
@@ -147,7 +154,104 @@ impl Default for RetryPolicy {
         Self {
             max_attempts: 10,
             base_backoff_ms: 500,
+            max_elapsed_ms: None,
         }
+    }
+}
+
+/// Which of the two limits ended a retry loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryLimit {
+    Attempts,
+    Elapsed,
+}
+
+impl RetryPolicy {
+    /// How long to wait before the try that follows `failures` consecutive
+    /// failures, or which limit ends the retrying instead.
+    ///
+    /// The wait is clipped to what is left of the ceiling, so the worst case a
+    /// runbook has to reason about really is `min(attempts × backoff schedule,
+    /// elapsed ceiling)` rather than that plus one last backoff.
+    pub fn backoff_after(
+        &self,
+        failures: u32,
+        elapsed: std::time::Duration,
+    ) -> Result<std::time::Duration, RetryLimit> {
+        if failures >= self.max_attempts {
+            return Err(RetryLimit::Attempts);
+        }
+        let doubled = self
+            .base_backoff_ms
+            .saturating_mul(2u64.saturating_pow(failures.saturating_sub(1).min(16)));
+        let backoff = std::time::Duration::from_millis(doubled).min(MAX_BACKOFF);
+        let Some(ceiling) = self.max_elapsed_ms else {
+            return Ok(backoff);
+        };
+        let remaining = std::time::Duration::from_millis(ceiling)
+            .checked_sub(elapsed)
+            .filter(|left| !left.is_zero())
+            .ok_or(RetryLimit::Elapsed)?;
+        Ok(backoff.min(remaining))
+    }
+}
+
+/// Run one request until it succeeds, fails permanently, or hits a limit.
+///
+/// Shared by both bulk sinks so the two answer to the same policy. The clock is
+/// tokio's, which a paused-time test can drive without waiting for it.
+pub(crate) async fn retry_transient<T, F, Fut>(
+    retry: &RetryPolicy,
+    mut attempt: F,
+) -> Result<T, CoreError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, CoreError>>,
+{
+    let mut failures = 0u32;
+    let mut first_failure = None;
+    loop {
+        let error = match attempt().await {
+            Ok(done) => return Ok(done),
+            Err(e) if is_retryable(&e) => e,
+            Err(e) => return Err(e),
+        };
+        failures += 1;
+        let since = *first_failure.get_or_insert_with(tokio::time::Instant::now);
+        let elapsed = since.elapsed();
+        match retry.backoff_after(failures, elapsed) {
+            Ok(backoff) => {
+                tracing::warn!(target: "pg2osync::sink",
+                    "bulk attempt {failures} failed ({error}); backing off {}ms",
+                    backoff.as_millis());
+                tokio::time::sleep(backoff).await;
+            }
+            Err(limit) => return Err(gave_up(&error, limit, failures, elapsed)),
+        }
+    }
+}
+
+/// The error that ends the pipeline, saying which limit ended the retrying and
+/// how long it went on — the two things a runbook asks first.
+fn gave_up(
+    error: &CoreError,
+    limit: RetryLimit,
+    attempts: u32,
+    elapsed: std::time::Duration,
+) -> CoreError {
+    let reason = match limit {
+        RetryLimit::Attempts => "the attempt limit [engine] retry_max",
+        RetryLimit::Elapsed => "the elapsed ceiling [engine] retry_max_elapsed_ms",
+    };
+    let message = format!(
+        "bulk gave up after {attempts} attempts over {:.1}s, ended by {reason} ({error})",
+        elapsed.as_secs_f64()
+    );
+    // the classification survives the wrapping: whoever reads this error still
+    // has to tell a target that was merely unreachable from one that refused
+    match error {
+        CoreError::SinkTransient(_) => CoreError::SinkTransient(message),
+        _ => CoreError::Sink(message),
     }
 }
 
@@ -695,19 +799,7 @@ impl OpenSearchSink {
         batch: &[LsnOp],
         retry: &RetryPolicy,
     ) -> Result<(Lsn, Vec<(usize, String)>), CoreError> {
-        let mut attempt = 0u32;
-        loop {
-            attempt += 1;
-            match self.bulk_once(batch).await {
-                Ok((lsn, perm)) => return Ok((lsn, perm)),
-                Err(e) if attempt < retry.max_attempts && is_retryable(&e) => {
-                    let backoff = retry.base_backoff_ms * 2u64.saturating_pow(attempt - 1);
-                    tracing::warn!(target: "pg2osync::sink", "bulk attempt {attempt} failed ({e}); backing off {backoff}ms");
-                    tokio::time::sleep(std::time::Duration::from_millis(backoff.min(30_000))).await;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        retry_transient(retry, || self.bulk_once(batch)).await
     }
 }
 
@@ -2208,5 +2300,111 @@ mod tests {
     async fn a_target_nobody_asked_to_require_an_alias_sends_what_it_always_sent() {
         let lines = request_lines_of_a_write(false, an_upsert_and_a_delete()).await;
         assert_eq!(lines, vec!["POST /_bulk".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    fn policy(max_attempts: u32, max_elapsed_ms: Option<u64>) -> RetryPolicy {
+        RetryPolicy {
+            max_attempts,
+            base_backoff_ms: 500,
+            max_elapsed_ms,
+        }
+    }
+
+    #[test]
+    fn without_a_ceiling_the_attempt_count_is_the_only_limit() {
+        let policy = policy(3, None);
+        assert_eq!(
+            policy.backoff_after(1, Duration::from_secs(3600)),
+            Ok(Duration::from_millis(500))
+        );
+        assert_eq!(
+            policy.backoff_after(2, Duration::ZERO),
+            Ok(Duration::from_secs(1))
+        );
+        assert_eq!(
+            policy.backoff_after(3, Duration::ZERO),
+            Err(RetryLimit::Attempts)
+        );
+    }
+
+    #[test]
+    fn the_ceiling_ends_the_loop_while_attempts_are_left() {
+        let policy = policy(100, Some(2_000));
+        assert_eq!(
+            policy.backoff_after(1, Duration::ZERO),
+            Ok(Duration::from_millis(500))
+        );
+        assert_eq!(
+            policy.backoff_after(4, Duration::from_millis(1_900)),
+            Ok(Duration::from_millis(100)),
+            "the last wait is clipped to what is left of the ceiling"
+        );
+        assert_eq!(
+            policy.backoff_after(5, Duration::from_millis(2_000)),
+            Err(RetryLimit::Elapsed)
+        );
+    }
+
+    #[test]
+    fn a_huge_backoff_cannot_overflow_into_a_short_wait() {
+        let policy = RetryPolicy {
+            max_attempts: 100,
+            base_backoff_ms: u64::MAX,
+            max_elapsed_ms: None,
+        };
+        assert_eq!(policy.backoff_after(5, Duration::ZERO), Ok(MAX_BACKOFF));
+    }
+
+    /// A request that never succeeds, so only the policy can end the loop.
+    async fn always_transient(retry: &RetryPolicy) -> CoreError {
+        let tries = Cell::new(0u32);
+        let error = retry_transient(retry, || {
+            tries.set(tries.get() + 1);
+            std::future::ready(Err::<(), _>(CoreError::SinkTransient(
+                "target unreachable".into(),
+            )))
+        })
+        .await
+        .expect_err("nothing ever succeeds");
+        assert!(tries.get() > 1, "it did retry");
+        error
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn attempts_run_out_first_and_the_error_says_so() {
+        let error = always_transient(&policy(4, Some(3_600_000))).await;
+        let message = error.to_string();
+        assert!(message.contains("retry_max"), "{message}");
+        assert!(!message.contains("retry_max_elapsed_ms"), "{message}");
+        assert!(message.contains("after 4 attempts"), "{message}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_ceiling_runs_out_first_and_the_error_says_so() {
+        let error = always_transient(&policy(1_000, Some(4_000))).await;
+        let message = error.to_string();
+        assert!(message.contains("retry_max_elapsed_ms"), "{message}");
+        assert!(message.contains("over 4.0s"), "{message}");
+        assert!(
+            matches!(error, CoreError::SinkTransient(_)),
+            "the failure is still a transient one"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_permanent_failure_is_returned_untouched() {
+        let error = retry_transient(&policy(10, Some(10_000)), || {
+            std::future::ready(Err::<(), _>(CoreError::Sink("mapping refuses it".into())))
+        })
+        .await
+        .expect_err("it cannot succeed");
+        assert_eq!(error.to_string(), "sink error: mapping refuses it");
     }
 }
