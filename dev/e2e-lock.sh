@@ -44,5 +44,8 @@ e2e_lock() {
 e2e_unlock() {
   if [ "$(cat "$E2E_LOCK/pid" 2>/dev/null)" = "$$" ]; then
     rm -rf "$E2E_LOCK"
+    # otherwise a suite this process starts later would inherit the claim and
+    # run into whoever holds the lock by then
+    unset E2E_LOCK_OWNER
   fi
 }
