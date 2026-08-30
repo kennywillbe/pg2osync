@@ -16,6 +16,32 @@ What a major version promises here: the **configuration file** and the
 make an existing `pg2osync.toml` stop loading, or make a running pipeline
 re-read a table from the start, is a major version.
 
+## [1.4.0](https://github.com/kennywillbe/pg2osync/compare/v1.3.0...v1.4.0) (2026-08-30)
+
+
+### Features
+
+* a Grafana dashboard ([#121](https://github.com/kennywillbe/pg2osync/issues/121)) ([ff4a56e](https://github.com/kennywillbe/pg2osync/commit/ff4a56e92f6d8771aaccbca4a2047f6dccf4398a)), closes [#105](https://github.com/kennywillbe/pg2osync/issues/105)
+* a schema drift metric, reported on MySQL too ([#126](https://github.com/kennywillbe/pg2osync/issues/126)) ([149af68](https://github.com/kennywillbe/pg2osync/commit/149af681c4f7e5d4e2c0ecd8b506591da566c4b8)), closes [#104](https://github.com/kennywillbe/pg2osync/issues/104)
+* an atomic full rebuild on Meilisearch through swap-indexes ([#136](https://github.com/kennywillbe/pg2osync/issues/136)) ([353f3d9](https://github.com/kennywillbe/pg2osync/commit/353f3d95d9ec67f5e5f51eaa1310b150135c527e)), closes [#108](https://github.com/kennywillbe/pg2osync/issues/108)
+* client-certificate authentication for the source connections ([#125](https://github.com/kennywillbe/pg2osync/issues/125)) ([2ef18e0](https://github.com/kennywillbe/pg2osync/commit/2ef18e09ac96ea1ef8130044b7c3c5311dfb1653)), closes [#103](https://github.com/kennywillbe/pg2osync/issues/103)
+* column projection inside a child collection ([#132](https://github.com/kennywillbe/pg2osync/issues/132)) ([e5d09e3](https://github.com/kennywillbe/pg2osync/commit/e5d09e308f17dcc1d06b3942d9aa34bee811ad9f)), closes [#111](https://github.com/kennywillbe/pg2osync/issues/111)
+* embed a one-to-one child as an object ([#134](https://github.com/kennywillbe/pg2osync/issues/134)) ([1dae947](https://github.com/kennywillbe/pg2osync/commit/1dae9478327bc997b0316e464e13ca5deace8b8f)), closes [#110](https://github.com/kennywillbe/pg2osync/issues/110) [#128](https://github.com/kennywillbe/pg2osync/issues/128)
+* JSON log lines ([#130](https://github.com/kennywillbe/pg2osync/issues/130)) ([331c21c](https://github.com/kennywillbe/pg2osync/commit/331c21cba2e26ebcf79c02c89bd98b2d5248a07d)), closes [#102](https://github.com/kennywillbe/pg2osync/issues/102)
+* per-document routing from a column ([#129](https://github.com/kennywillbe/pg2osync/issues/129)) ([89946a5](https://github.com/kennywillbe/pg2osync/commit/89946a53ffcb478a8d881e5e909aa2c0eaf90791)), closes [#109](https://github.com/kennywillbe/pg2osync/issues/109)
+* rebuild one table's index and flip an alias onto it ([#135](https://github.com/kennywillbe/pg2osync/issues/135)) ([ada1cef](https://github.com/kennywillbe/pg2osync/commit/ada1cefff433896d7906eba27a35175bc2940212)), closes [#107](https://github.com/kennywillbe/pg2osync/issues/107)
+
+
+### Bug Fixes
+
+* a DDL replayed after a crash no longer wedges the MySQL stream ([#137](https://github.com/kennywillbe/pg2osync/issues/137)) ([593ffab](https://github.com/kennywillbe/pg2osync/commit/593ffab34ea6c1663716c6d862badf19c422054b)), closes [#133](https://github.com/kennywillbe/pg2osync/issues/133)
+* a Meilisearch pipeline can be restarted ([#124](https://github.com/kennywillbe/pg2osync/issues/124)) ([67825c5](https://github.com/kennywillbe/pg2osync/commit/67825c5ced06102b4859af5efcf3e98def6aee5e)), closes [#122](https://github.com/kennywillbe/pg2osync/issues/122)
+* a quoted "NULL" array element stays a string ([#113](https://github.com/kennywillbe/pg2osync/issues/113)) ([3b255fe](https://github.com/kennywillbe/pg2osync/commit/3b255fee4c2a20164e584bebd44d58ebf7ba3536)), closes [#96](https://github.com/kennywillbe/pg2osync/issues/96)
+* reassemble MySQL messages that span more than one packet ([#114](https://github.com/kennywillbe/pg2osync/issues/114)) ([8826e14](https://github.com/kennywillbe/pg2osync/commit/8826e148a893e08977d520940ffa0c1ce0366070)), closes [#95](https://github.com/kennywillbe/pg2osync/issues/95)
+* reconcile and switch-alias work on Elasticsearch ([#127](https://github.com/kennywillbe/pg2osync/issues/127)) ([6237b53](https://github.com/kennywillbe/pg2osync/commit/6237b533f7f24e9d977c71bf8dafe30a51687225)), closes [#118](https://github.com/kennywillbe/pg2osync/issues/118)
+* SIGTERM drains and checkpoints like SIGINT ([#119](https://github.com/kennywillbe/pg2osync/issues/119)) ([475a12d](https://github.com/kennywillbe/pg2osync/commit/475a12d4d6686e443701d6edf3f43beba13e6d74)), closes [#98](https://github.com/kennywillbe/pg2osync/issues/98)
+* the Elasticsearch sink no longer ignores a failed refresh ([#115](https://github.com/kennywillbe/pg2osync/issues/115)) ([a7aa7d9](https://github.com/kennywillbe/pg2osync/commit/a7aa7d99943d9645ccb63f1e5bd930ec2e54dfa9)), closes [#97](https://github.com/kennywillbe/pg2osync/issues/97)
+
 ## [1.3.0](https://github.com/kennywillbe/pg2osync/compare/v1.2.0...v1.3.0) (2026-08-29)
 
 
