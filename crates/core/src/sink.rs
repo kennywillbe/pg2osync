@@ -295,6 +295,14 @@ pub trait Sink: Send + Sync {
     /// The swap has to be atomic: a reader that resolves the alias between a
     /// remove and an add gets an error, and this is the moment a zero-downtime
     /// reindex exists to avoid.
+    ///
+    /// What is contracted is that outcome, not the mechanism. A target with an
+    /// alias namespace moves a pointer inside it. A target without one — where
+    /// the name readers use *is* an index — reaches the same end by exchanging
+    /// the contents of the two names, which leaves `index` holding what `alias`
+    /// held. So a caller keeping the previous documents as a rollback must look
+    /// for them under whichever name the target left them in, and must not
+    /// assume `index` still holds what was just written into it.
     async fn switch_alias(&self, _alias: &str, _index: &str) -> Result<(), CoreError> {
         Err(CoreError::Sink(
             "this target has no aliases to switch".into(),

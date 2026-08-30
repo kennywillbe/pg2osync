@@ -133,11 +133,13 @@ enum Command {
         /// Qualified table name, as it appears in the config.
         #[arg(long, value_name = "SCHEMA.TABLE")]
         table: String,
-        /// The alias to point at the rebuilt index.
+        /// The alias to point at the rebuilt index. On Meilisearch, which has
+        /// no aliases, this is the configured index itself: the rebuilt one is
+        /// swapped into that name.
         #[arg(long)]
         alias: String,
-        /// Delete the index the alias came off. Kept by default: it is the
-        /// rollback, one alias flip away.
+        /// Delete whichever index is left holding the documents from before the
+        /// rebuild. Kept by default: it is the rollback, one switch away.
         #[arg(long)]
         drop_old: bool,
     },

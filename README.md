@@ -304,7 +304,7 @@ needs no flag at all.
 | `resnapshot --table T` | Read one table again into its index, without reloading the rest |
 | `reconcile` | Name index documents whose row is gone; `--delete` removes them |
 | `rejects` | What the target refused, and `--replay` to submit it again |
-| `reindex --table T --alias A` | Rebuild the table's index under a fresh name and flip the alias onto it |
+| `reindex --table T --alias A` | Rebuild the table's index under a fresh name and flip the alias onto it (a swap of the two names on Meilisearch, which has no aliases) |
 | `switch-alias --alias A` | Point an alias at this config's index, atomically |
 | `drop-slot` | Drop the slot and publication when decommissioning |
 
