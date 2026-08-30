@@ -33,7 +33,9 @@ drift from CI. Push on a green `RESULT` line; CI should never be the first to
 tell you a change is red.
 
 It covers `fmt + clippy + unit tests`, the MSRV check, `e2e PostgreSQL to
-OpenSearch`, `e2e MySQL to OpenSearch`, the container image build, the helm
+OpenSearch`, `e2e MySQL to OpenSearch`, `e2e several sources in one process`
+(both databases in one `run --config-dir`, which is where per-source metrics,
+health and isolation are proved), the container image build, the helm
 lints, the book (`docs.yml`), your pull request title (`pr-title.yml`),
 `cargo audit` when a Cargo file moved, and the six compatibility cells when
 CI would run them — that is, when you touched `.github/workflows/compat.yml`

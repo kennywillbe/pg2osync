@@ -78,6 +78,7 @@ What it covers, job by job:
 | `minimum supported Rust version` | `ci.yml` |
 | `e2e PostgreSQL to OpenSearch` | `ci.yml` |
 | `e2e MySQL to OpenSearch` | `ci.yml` |
+| `e2e several sources in one process` | `ci.yml` |
 | `container image builds` | `ci.yml` |
 | `helm chart lints` | `ci.yml` |
 | `the book builds` | `docs.yml` |

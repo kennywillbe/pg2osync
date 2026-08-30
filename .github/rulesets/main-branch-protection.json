@@ -19,6 +19,7 @@
       "fmt + clippy + unit tests",
       "e2e PostgreSQL to OpenSearch",
       "e2e MySQL to OpenSearch",
+      "e2e several sources in one process",
       "minimum supported Rust version",
       "container image builds",
       "helm chart lints",

@@ -21,6 +21,7 @@
 #   msrv                 minimum supported Rust version        (ci.yml)
 #   e2e-postgres         e2e PostgreSQL to OpenSearch          (ci.yml)
 #   e2e-mysql            e2e MySQL to OpenSearch               (ci.yml)
+#   e2e-multi-source     e2e several sources in one process    (ci.yml)
 #   docker               container image builds                (ci.yml)
 #   helm                 helm chart lints                      (ci.yml)
 #   docs                 the book builds                       (docs.yml)
@@ -68,7 +69,8 @@ MATRIX=auto
 PR_TITLE=""
 PR_TITLE_GIVEN=0
 
-ALL_JOBS="lint msrv e2e-postgres e2e-mysql docker helm docs pr-title audit
+ALL_JOBS="lint msrv e2e-postgres e2e-mysql e2e-multi-source docker helm docs
+pr-title audit
 compat-postgres15 compat-elasticsearch compat-meilisearch compat-mysql84
 compat-mariadb106 compat-mariadb118"
 
@@ -377,6 +379,14 @@ job_e2e_mysql() {
   E2E_LOG=$RUN_DIR/e2e-mysql-pipeline.log ./dev/e2e-mysql-test.sh || return 1
 }
 
+job_e2e_multi_source() {
+  no_pipeline_running || return 1
+  dev_stack_up || return 1
+  mysql_stack_up || return 1
+  release_build || return 1
+  E2E_LOG=$RUN_DIR/e2e-multi-source-pipeline.log ./dev/e2e-multi-source.sh || return 1
+}
+
 job_docker() {
   # docker/build-push-action with push: false and no build args; its caches are
   # GitHub's and have no local equivalent.
@@ -570,7 +580,7 @@ if [ "$FAST" = 1 ]; then
   warn "--fast: the e2e suites, the image build and the matrix are skipped."
   warn "It is a quick loop, not the definition of done. Run the whole script"
   warn "before you push, or CI finds what this one did not look at."
-  SKIP="$SKIP e2e-postgres e2e-mysql docker"
+  SKIP="$SKIP e2e-postgres e2e-mysql e2e-multi-source docker"
 fi
 if [ "$MATRIX" = never ]; then
   warn "--no-matrix: the compatibility cells are skipped. If they would have run,"
@@ -582,6 +592,7 @@ run_job lint "fmt + clippy + unit tests"
 run_job msrv "minimum supported Rust version"
 run_job e2e-postgres "e2e PostgreSQL to OpenSearch"
 run_job e2e-mysql "e2e MySQL to OpenSearch"
+run_job e2e-multi-source "e2e several sources in one process"
 run_job docker "container image builds"
 run_job helm "helm chart lints"
 run_job docs "the book builds"

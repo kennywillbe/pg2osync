@@ -66,9 +66,9 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "pg2osync_source_connected{instance=~\"$instance\"}",
+          "expr": "pg2osync_source_connected{instance=~\"$instance\", source=~\"$source\"}",
           "instant": true,
-          "legendFormat": "{{instance}}",
+          "legendFormat": "{{instance}} {{source}}",
           "range": false,
           "refId": "A"
         }
@@ -110,8 +110,8 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "pg2osync_position_lag{instance=~\"$instance\"}",
-          "legendFormat": "{{instance}}",
+          "expr": "pg2osync_position_lag{instance=~\"$instance\", source=~\"$source\"}",
+          "legendFormat": "{{instance}} {{source}}",
           "range": true,
           "refId": "A"
         }
@@ -163,9 +163,9 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "max by (slot) (\n    (pg2osync_slot_wal_status{instance=~\"$instance\", status=\"reserved\"} == 1) * 0\n  or (pg2osync_slot_wal_status{instance=~\"$instance\", status=\"extended\"} == 1) * 1\n  or (pg2osync_slot_wal_status{instance=~\"$instance\", status=\"unreserved\"} == 1) * 2\n  or (pg2osync_slot_wal_status{instance=~\"$instance\", status=\"lost\"} == 1) * 3\n)",
+          "expr": "max by (source, slot) (\n    (pg2osync_slot_wal_status{instance=~\"$instance\", source=~\"$source\", status=\"reserved\"} == 1) * 0\n  or (pg2osync_slot_wal_status{instance=~\"$instance\", source=~\"$source\", status=\"extended\"} == 1) * 1\n  or (pg2osync_slot_wal_status{instance=~\"$instance\", source=~\"$source\", status=\"unreserved\"} == 1) * 2\n  or (pg2osync_slot_wal_status{instance=~\"$instance\", source=~\"$source\", status=\"lost\"} == 1) * 3\n)",
           "instant": true,
-          "legendFormat": "{{slot}}",
+          "legendFormat": "{{source}} {{slot}}",
           "range": false,
           "refId": "A"
         }
@@ -210,16 +210,16 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "pg2osync_slot_retained_bytes{instance=~\"$instance\"}",
-          "legendFormat": "{{slot}} retained",
+          "expr": "pg2osync_slot_retained_bytes{instance=~\"$instance\", source=~\"$source\"}",
+          "legendFormat": "{{source}} {{slot}} retained",
           "range": true,
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "pg2osync_slot_safe_wal_size_bytes{instance=~\"$instance\"}",
-          "legendFormat": "{{slot}} headroom",
+          "expr": "pg2osync_slot_safe_wal_size_bytes{instance=~\"$instance\", source=~\"$source\"}",
+          "legendFormat": "{{source}} {{slot}} headroom",
           "range": true,
           "refId": "B"
         }
@@ -261,8 +261,8 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "increase(pg2osync_reconnects_total{instance=~\"$instance\"}[15m])",
-          "legendFormat": "{{instance}}",
+          "expr": "increase(pg2osync_reconnects_total{instance=~\"$instance\", source=~\"$source\"}[15m])",
+          "legendFormat": "{{instance}} {{source}}",
           "range": true,
           "refId": "A"
         }
@@ -323,8 +323,8 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "rate(pg2osync_events_total{instance=~\"$instance\"}[5m])",
-          "legendFormat": "{{type}}",
+          "expr": "rate(pg2osync_events_total{instance=~\"$instance\", source=~\"$source\"}[5m])",
+          "legendFormat": "{{source}} {{type}}",
           "range": true,
           "refId": "A"
         }
@@ -377,8 +377,8 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "rate(pg2osync_batches_flushed{instance=~\"$instance\"}[5m])",
-          "legendFormat": "{{instance}} batches",
+          "expr": "rate(pg2osync_batches_flushed{instance=~\"$instance\", source=~\"$source\"}[5m])",
+          "legendFormat": "{{instance}} {{source}} batches",
           "range": true,
           "refId": "A"
         }
@@ -439,8 +439,8 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "pg2osync_latency_ms{instance=~\"$instance\"}",
-          "legendFormat": "{{instance}} q{{quantile}}",
+          "expr": "pg2osync_latency_ms{instance=~\"$instance\", source=~\"$source\"}",
+          "legendFormat": "{{instance}} {{source}} q{{quantile}}",
           "range": true,
           "refId": "A"
         }
@@ -493,8 +493,8 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "rate(pg2osync_latency_ms_count{instance=~\"$instance\"}[5m])",
-          "legendFormat": "{{instance}}",
+          "expr": "rate(pg2osync_latency_ms_count{instance=~\"$instance\", source=~\"$source\"}[5m])",
+          "legendFormat": "{{instance}} {{source}}",
           "range": true,
           "refId": "A"
         }
@@ -561,8 +561,8 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "rate(pg2osync_sink_errors_total{instance=~\"$instance\"}[5m])",
-          "legendFormat": "{{instance}}",
+          "expr": "rate(pg2osync_sink_errors_total{instance=~\"$instance\", source=~\"$source\"}[5m])",
+          "legendFormat": "{{instance}} {{source}}",
           "range": true,
           "refId": "A"
         }
@@ -603,16 +603,16 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "pg2osync_rejected_total{instance=~\"$instance\"}",
-          "legendFormat": "quarantined",
+          "expr": "pg2osync_rejected_total{instance=~\"$instance\", source=~\"$source\"}",
+          "legendFormat": "{{source}} quarantined",
           "range": true,
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "pg2osync_transform_unconverted_total{instance=~\"$instance\"}",
-          "legendFormat": "unconverted",
+          "expr": "pg2osync_transform_unconverted_total{instance=~\"$instance\", source=~\"$source\"}",
+          "legendFormat": "{{source}} unconverted",
           "range": true,
           "refId": "B"
         }
@@ -687,16 +687,16 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "pg2osync_slot_retained_bytes{instance=~\"$instance\"}",
-          "legendFormat": "{{slot}} retained",
+          "expr": "pg2osync_slot_retained_bytes{instance=~\"$instance\", source=~\"$source\"}",
+          "legendFormat": "{{source}} {{slot}} retained",
           "range": true,
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "pg2osync_slot_safe_wal_size_bytes{instance=~\"$instance\"}",
-          "legendFormat": "{{slot}} headroom",
+          "expr": "pg2osync_slot_safe_wal_size_bytes{instance=~\"$instance\", source=~\"$source\"}",
+          "legendFormat": "{{source}} {{slot}} headroom",
           "range": true,
           "refId": "B"
         }
@@ -749,8 +749,8 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "pg2osync_position_lag{instance=~\"$instance\"}",
-          "legendFormat": "{{instance}} lag",
+          "expr": "pg2osync_position_lag{instance=~\"$instance\", source=~\"$source\"}",
+          "legendFormat": "{{instance}} {{source}} lag",
           "range": true,
           "refId": "A"
         }
@@ -798,9 +798,9 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "pg2osync_slot_active{instance=~\"$instance\"}",
+          "expr": "pg2osync_slot_active{instance=~\"$instance\", source=~\"$source\"}",
           "instant": true,
-          "legendFormat": "{{slot}}",
+          "legendFormat": "{{source}} {{slot}}",
           "range": false,
           "refId": "A"
         }
@@ -853,8 +853,8 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "rate(pg2osync_toast_readbacks_total{instance=~\"$instance\"}[5m])",
-          "legendFormat": "{{instance}}",
+          "expr": "rate(pg2osync_toast_readbacks_total{instance=~\"$instance\", source=~\"$source\"}[5m])",
+          "legendFormat": "{{instance}} {{source}}",
           "range": true,
           "refId": "A"
         }
@@ -907,8 +907,8 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "increase(pg2osync_transform_unconverted_total{instance=~\"$instance\"}[5m])",
-          "legendFormat": "{{instance}}",
+          "expr": "increase(pg2osync_transform_unconverted_total{instance=~\"$instance\", source=~\"$source\"}[5m])",
+          "legendFormat": "{{instance}} {{source}}",
           "range": true,
           "refId": "A"
         }
@@ -951,6 +951,28 @@
         "query": {
           "qryType": 1,
           "query": "label_values(pg2osync_source_connected, instance)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 2,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {},
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "definition": "label_values(pg2osync_source_state{instance=~\"$instance\"}, source)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Source",
+        "multi": true,
+        "name": "source",
+        "options": [],
+        "query": {
+          "qryType": 1,
+          "query": "label_values(pg2osync_source_state{instance=~\"$instance\"}, source)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
         "refresh": 2,

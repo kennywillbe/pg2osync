@@ -912,11 +912,50 @@ checkpoint document they would have collided in. The
 within one file; they simply run over the whole directory as well, because an
 index does not know which file a document came from.
 
-The runtime half of this — one metrics exposition with a `source` label on
-every series, health per source, and a supervisor in which one halted source
-does not stop the others — follows in the next change. Until it lands, `run`
-takes exactly one config file, and `--config-dir` is read by `validate` and
-`status`.
+`run --config-dir` then runs all of them, and `--source <name>` narrows it to
+one. What the process shares is itself and its two listeners; what it does not
+share is anything a pipeline is made of. Each source gets its own sink, engine,
+checkpoint, retry policy and initial load, which is why a target outage on one
+source is not one on another and why the sum of the configurations is what the
+process costs. There is deliberately no global write budget: a shared semaphore
+would make every source wait on every other one's slowest write, which is
+precisely the coupling that running them apart avoided and that running them
+together must not reintroduce. The sum of `[engine] write_concurrency` and
+`batch_size` across the directory is the operator's to size.
+
+Concatenating one exposition per source is not valid exposition — a family's
+`# HELP` and `# TYPE` may appear once and its series must be contiguous — so
+the sources write into one shared exposition and every series, including the
+`pg2osync_slot_*` gauges, carries `source="<name>"`. A single `--config` run
+gets the label too, so a dashboard written for one source keeps working when a
+second one is added rather than silently summing the two. New with it is
+`pg2osync_source_state{source,state}`, a state set over
+starting/loading/streaming/reconnecting/halted/stopped: with several pipelines
+in one process, "is it up" stopped being a question with one answer.
+
+Health follows from that. `/healthz` stays an unconditional liveness answer:
+returning 503 because one source of thirty is halted would have the kubelet
+restart the twenty-nine that are working, in a loop that cannot fix a
+configuration the source will keep rejecting. Readiness per source is
+`/healthz/<name>` — 200 while starting, loading, streaming or reconnecting, 503
+once halted or stopped, 404 with the known names for anything else — and
+aggregation is the alert's job, not the probe's. `/synced` takes `?source=`:
+one source and no parameter is exactly today's behaviour, several and no
+parameter is a 400 naming them, because answering for whichever pipeline came
+first would tell a caller its write is visible when the pipeline carrying it
+has written nothing. Sources register with the endpoint as they connect rather
+than before the listener opens, since MySQL cannot render a position until it
+has read the binlog prefix off the server; one that has not registered yet
+answers 503 rather than being mistaken for a name that does not exist.
+
+A halted source is a state, not an exit. One source failing — a permanent
+rejection, an exhausted quarantine, a `reconnect_max` run out — is logged
+against its name, sets its state and leaves the others streaming; the process
+exits non-zero only when every source has halted, which for a single source is
+bit-identical to what it always did. What is not retried is the setup before
+streaming begins, so a source unreachable at boot halts rather than waiting for
+its database to come back; that is [#172](https://github.com/kennywillbe/pg2osync/issues/172),
+not this change.
 
 ## Scope
 

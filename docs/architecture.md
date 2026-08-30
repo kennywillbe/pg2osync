@@ -71,6 +71,47 @@ Every `checkpoint_interval_ms` it persists the highest acknowledged position.
 Only after that write succeeds does the *durable position* advance — and that
 value is what the source is allowed to acknowledge upstream.
 
+## Several sources in one process
+
+`run --config-dir` starts the pipeline above once per file, in one process:
+
+```
+                    ┌─ one process ──────────────────────────────────────┐
+  orders.toml  ───► │  source ─► engine ─► sink ─► checkpoint            │
+  users.toml   ───► │  source ─► engine ─► sink ─► checkpoint            │
+  tenant-42.toml ─► │  source ─► engine ─► sink ─► checkpoint            │
+                    │                                                    │
+                    │  /metrics  /healthz  /healthz/<name>  one listener │
+                    │  /synced?source=<name>                one listener │
+                    └────────────────────────────────────────────────────┘
+```
+
+Each row is the whole pipeline: its own channels, its own engine and sink
+tasks, its own checkpoint document, its own slot or `server_id`, its own retry
+policy and its own initial load. Nothing a pipeline is made of is shared,
+which is what keeps the failure modes above local — a target outage on one
+source is not one on another, the bounded channels of one never block the
+source task of another, and a source that halts (a permanent rejection, an
+exhausted quarantine, a `reconnect_max` run out) is a state rather than an
+exit: it sets `pg2osync_source_state{state="halted"}`, `/healthz/<name>`
+turns 503, and the rest keep streaming. The process exits non-zero only when
+every source has halted, which for one config is what it always did.
+
+There is deliberately no shared write budget either. A semaphore across the
+sources would make every pipeline wait on the slowest target, which is
+precisely the coupling that running them apart avoided; what the process
+costs is the sum of the configurations, and sizing that is the operator's.
+
+What is shared is the process and its two listeners. One exposition, because
+concatenating one per source is not valid Prometheus text — a family's `HELP`
+and `TYPE` may appear once — so every series carries `source="<name>"`
+instead. `/healthz` stays an unconditional liveness answer, since failing it
+for one halted source would restart the healthy ones. `/synced` names its
+source per request, and a source registers with it once it can render a
+position rather than before the listener opens. [operations](operations.md#health)
+has the endpoints; [decisions.md](decisions.md#operating-limits) has the reasoning
+behind a directory of files rather than one file of sources.
+
 ## Positions
 
 The engine treats a source position as an opaque, monotonically increasing

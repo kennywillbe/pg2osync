@@ -17,32 +17,87 @@ and they compose:
 - A `NetworkPolicy` that admits only the Prometheus namespace to port 9100.
   This is the baseline Kubernetes pattern and is worth having either way.
 
-Probes use `/healthz`, which is never authenticated.
+Probes use `/healthz`, which is never authenticated — see [Health](#health)
+for what it does and does not answer for.
 
 | Series | Type | Meaning |
 |---|---|---|
-| `pg2osync_events_total{type}` | counter | Change events received from the source |
-| `pg2osync_batches_flushed` | counter | Requests the target accepted |
-| `pg2osync_toast_readbacks_total` | counter | Reads of the target to complete unchanged TOASTed columns |
-| `pg2osync_sink_errors_total` | counter | Requests that failed permanently |
-| `pg2osync_schema_drift_total{table}` | counter | Times a table changed shape under the running pipeline. The change is never applied, so the index and the table disagree until the index is rebuilt |
-| `pg2osync_reconnects_total` | counter | Source reconnect attempts |
-| `pg2osync_source_connected` | gauge | 1 while streaming, 0 while reconnecting |
-| `pg2osync_latency_ms{quantile}` | summary | Source commit to indexed |
-| `pg2osync_position_current` | gauge | Highest source position received |
-| `pg2osync_position_confirmed` | gauge | Highest position durably checkpointed |
-| `pg2osync_position_lag` | gauge | Difference between the two |
-| `pg2osync_slot_retained_bytes{slot}` | gauge | WAL a slot forbids the source from recycling — the number that fills a disk |
-| `pg2osync_slot_safe_wal_size_bytes{slot}` | gauge | WAL that may still be written before the slot is lost; **absent** when `max_slot_wal_keep_size` is unlimited |
-| `pg2osync_slot_wal_status{slot,status}` | gauge | 1 for the server's own verdict: `reserved`, `extended`, `unreserved`, `lost` |
-| `pg2osync_slot_active{slot}` | gauge | 1 while something is streaming that slot |
+| `pg2osync_events_total{source,type}` | counter | Change events received from the source |
+| `pg2osync_batches_flushed{source}` | counter | Requests the target accepted |
+| `pg2osync_toast_readbacks_total{source}` | counter | Reads of the target to complete unchanged TOASTed columns |
+| `pg2osync_sink_errors_total{source}` | counter | Requests that failed permanently |
+| `pg2osync_schema_drift_total{source,table}` | counter | Times a table changed shape under the running pipeline. The change is never applied, so the index and the table disagree until the index is rebuilt |
+| `pg2osync_reconnects_total{source}` | counter | Source reconnect attempts |
+| `pg2osync_source_connected{source}` | gauge | 1 while streaming, 0 while reconnecting |
+| `pg2osync_source_state{source,state}` | gauge | Exactly one `1` per source, on the state it is in: `starting`, `loading`, `streaming`, `reconnecting`, `halted`, `stopped` |
+| `pg2osync_latency_ms{source,quantile}` | summary | Source commit to indexed |
+| `pg2osync_position_current{source}` | gauge | Highest source position received |
+| `pg2osync_position_confirmed{source}` | gauge | Highest position durably checkpointed |
+| `pg2osync_position_lag{source}` | gauge | Difference between the two |
+| `pg2osync_slot_retained_bytes{source,slot}` | gauge | WAL a slot forbids the source from recycling — the number that fills a disk |
+| `pg2osync_slot_safe_wal_size_bytes{source,slot}` | gauge | WAL that may still be written before the slot is lost; **absent** when `max_slot_wal_keep_size` is unlimited |
+| `pg2osync_slot_wal_status{source,slot,status}` | gauge | 1 for the server's own verdict: `reserved`, `extended`, `unreserved`, `lost` |
+| `pg2osync_slot_active{source,slot}` | gauge | 1 while something is streaming that slot |
+
+### The `source` label
+
+Every series carries `source="<name>"`: the `[source] name` of the config it
+came from, or the file's stem when the key is left out — `orders.toml` is
+`orders`. A process started with `--config-dir` runs one pipeline per file and
+serves them all from this one endpoint, so the label is what tells the
+pipelines apart. The `pg2osync_slot_*` gauges carry it too, because the same
+slot name on two hosts is two slots, and without the label it would be one
+series overwriting itself.
+
+A single-`--config` process gets the label as well. That changes nothing for a
+query that does not mention it — a label is additive, and
+`pg2osync_position_lag > 1e8` still matches — but it does change what an
+aggregate means: `sum(rate(pg2osync_events_total[5m]))` over a multi-source
+process is every pipeline in it added together, which is rarely the question.
+Add `by (source)` to anything that sums, and `source=~"$source"` to a dashboard
+variable, and a dashboard written for one source keeps working when a second
+file is dropped into the directory. The [dashboard](#dashboard) below already
+does both.
+
+### Health
+
+Two endpoints on the metrics listener, neither ever authenticated, because a
+kubelet probe has nowhere to keep a token.
+
+`/healthz` is liveness and nothing more: `200` while the process is up and its
+port answers, whatever its sources are doing. It deliberately does **not**
+aggregate the sources — a `503` because one source of thirty is halted would
+have the kubelet restart the twenty-nine that are streaming, in a loop that
+cannot fix the configuration the thirtieth keeps rejecting.
+
+`/healthz/<name>` is readiness for one source, and the body is its state:
+
+| Response | When |
+|---|---|
+| `200` | `starting`, `loading`, `streaming`, `reconnecting` — the source is still expected to produce data |
+| `503` | `halted` or `stopped` |
+| `404` | no source of that name; the body lists the names this process runs |
+
+A halted source is a state, not an exit. A permanent rejection, an exhausted
+quarantine or a `reconnect_max` that ran out is logged as
+`source <name> halted: …`, sets `pg2osync_source_state{state="halted"}` to 1
+for that name, and leaves the other sources streaming; the process exits
+non-zero only once **every** source has halted, which for a single config is
+what it always did. Whether one halted source of several is worth a page is
+therefore the alert's decision, not the probe's, and the alert for it is
+below. `SIGTERM` drains every source and exits 0.
+
+`/synced?source=<name>` is the same shape on the API listener — one process,
+one endpoint, the source named per request — and is described with the rest
+of [`[api]`](configuration.md#get-synced).
 
 ### Dashboard
 
 [`deploy/grafana/pg2osync.json`](https://github.com/kennywillbe/pg2osync/blob/main/deploy/grafana/pg2osync.json)
 is a Grafana dashboard built from the series above: Dashboards → New → Import,
 paste the file, pick a Prometheus data source. It asks for nothing else — the
-data source and the instance are dashboard variables.
+data source, the instance and the source are dashboard variables, the last
+two defaulting to all of them.
 
 Five rows, in the order an incident is read: overview (connected, lag, the
 slot's `wal_status`, retained WAL against its safe size, reconnects), throughput,
@@ -58,9 +113,14 @@ helm upgrade pg2osync deploy/helm/pg2osync --set grafanaDashboard.enabled=true
 ### What to alert on
 
 ```promql
-# nothing has been checkpointed for five minutes while events keep arriving
-increase(pg2osync_events_total[5m]) > 0
+# nothing has been checkpointed for five minutes while events keep arriving,
+# judged per source: a busy pipeline beside a stuck one must not mask it
+sum without (type) (increase(pg2osync_events_total[5m])) > 0
   and increase(pg2osync_position_confirmed[5m]) == 0
+
+# one source of several has halted: the process is still up and /healthz
+# still answers 200, so neither `up` nor the liveness probe will say so
+max by (source) (pg2osync_source_state{state="halted"}) == 1
 
 # the pipeline is falling behind instead of catching up
 deriv(pg2osync_position_lag[10m]) > 0
@@ -362,7 +422,8 @@ retried in process. The pipeline is rebuilt from the last checkpoint each time,
 with exponential backoff capped at 30 seconds, and the attempt counter resets
 once a connection has lasted longer than that cap. After
 `[source] reconnect_max` consecutive failures (10 by default, roughly five
-minutes) the process exits and hands over.
+minutes) the source halts; once every source the process runs has halted, the
+process exits and hands over.
 
 A target that is down is retried the same way, one request at a time, on
 `[engine] retry_max` attempts with `retry_backoff_ms` doubling between them and
@@ -391,7 +452,7 @@ costume.
 | Exit code | Meaning |
 |---|---|
 | 0 | Clean shutdown — `SIGINT`/`SIGTERM`, or `bootstrap`/`validate` finishing |
-| non-zero | Fatal: bad configuration, insufficient privileges, a permanent document rejection, or reconnection gave up |
+| non-zero | Fatal: bad configuration, insufficient privileges, a permanent document rejection, or reconnection gave up — for every source the process runs. One halted source of several is a state (`/healthz/<name>`, `pg2osync_source_state`), not an exit |
 
 A clean shutdown finishes the requests already sent to the target, writes a
 final checkpoint at the last acknowledged position, and exits; the next start

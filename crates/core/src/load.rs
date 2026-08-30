@@ -79,10 +79,10 @@ fn strings(src: &Value) -> Option<Vec<String>> {
 /// A checkpoint says where streaming got to, which with a load recording its
 /// own progress is a separate fact; trusting it alone is what silently skips a
 /// load.
-pub async fn unfinished<'a>(
+pub async fn unfinished(
     sink: &dyn crate::sink::Sink,
     stream: &crate::checkpoint::StreamId,
-    tables: impl IntoIterator<Item = &'a str>,
+    tables: &[String],
 ) -> Result<bool, crate::error::CoreError> {
     for table in tables {
         let stored = sink

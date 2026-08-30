@@ -2494,9 +2494,9 @@ mod pipeline_tests {
             Vec::new(),
         )
         .await;
-        let out = metrics.render();
+        let out = metrics.render("orders");
         assert!(
-            out.contains("pg2osync_schema_drift_total{table=\"public.users\"} 1"),
+            out.contains("pg2osync_schema_drift_total{source=\"orders\",table=\"public.users\"} 1"),
             "{out}"
         );
         // The event carries no position and no data on purpose: applying the

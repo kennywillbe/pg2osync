@@ -12,7 +12,7 @@ use pg2osync_engine::mapping::{
     Constants, DurableLsn, IndexTarget, JoinParent, JoinRule, Joins, ParentId, Projection,
     Projections, Rename, Renames, TableMapping, Transforms,
 };
-use pg2osync_engine::metrics::SharedMetrics;
+use pg2osync_engine::metrics::{SharedMetrics, SourceState};
 use pg2osync_engine::{PipelineCtx, PositionRenderer};
 use pg2osync_source::reconnect::ReconnectPolicy;
 use std::collections::HashMap;
@@ -21,7 +21,8 @@ use std::sync::atomic::Ordering;
 use tokio::sync::{mpsc, watch};
 
 use crate::backfill::split_qualified;
-use crate::config::AppConfig;
+use crate::config::{AppConfig, ResolvedSecrets};
+use crate::supervisor::SourceRuntime;
 
 /// How far the CLI takes the pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,18 +45,17 @@ const EVENT_CHANNEL_DEPTH: usize = 10_000;
 /// events jump this queue regardless, so its depth costs the stream nothing.
 pub const COPY_CHANNEL_DEPTH: usize = 2_000;
 
-#[allow(clippy::too_many_arguments)]
+/// One source's pipeline, from its own configuration.
+///
+/// Everything process-wide — the listeners, the exit code, the decision that a
+/// failure here is one source's — belongs to [`crate::supervisor`]. What
+/// arrives in `rt` is this source's share of it.
 pub async fn run_pipeline(
     cfg: AppConfig,
-    source_url: String,
-    admin_url: String,
-    target_password: Option<String>,
-    shutdown_rx: watch::Receiver<bool>,
-    durable: DurableLsn,
-    mode: Mode,
-    reload: crate::reload::ReloadSource,
+    secrets: ResolvedSecrets,
+    rt: SourceRuntime,
 ) -> Result<()> {
-    let sink = build_sink(&cfg, target_password)?;
+    let sink = build_sink(&cfg, secrets.target_password)?;
     check_rejection_policy(&cfg, sink.as_ref())?;
     for note in embedded_children_with_own_section(&cfg) {
         tracing::warn!(target: "pg2osync::run", "{note}");
@@ -63,30 +63,15 @@ pub async fn run_pipeline(
     let index_specs = index_specs(&cfg)?;
 
     match cfg.source.flavor.as_str() {
-        "mysql" => {
-            run_mysql(
-                cfg,
-                source_url,
-                sink,
-                index_specs,
-                shutdown_rx,
-                durable,
-                mode,
-                reload,
-            )
-            .await
-        }
+        "mysql" => run_mysql(cfg, secrets.source_url, sink, index_specs, rt).await,
         "postgres" | "postgresql" => {
             run_postgres(
                 cfg,
-                source_url,
-                admin_url,
+                secrets.source_url,
+                secrets.admin_url,
                 sink,
                 index_specs,
-                shutdown_rx,
-                durable,
-                mode,
-                reload,
+                rt,
             )
             .await
         }
@@ -572,19 +557,6 @@ async fn key_columns_for(
     Ok(out)
 }
 
-/// Metrics outlive any one attempt: they are created once and the endpoint is
-/// served once, so a reconnect does not reset every counter or re-bind the port.
-fn start_metrics(cfg: &AppConfig) -> Result<SharedMetrics> {
-    let metrics = Arc::new(pg2osync_engine::metrics::Metrics::default());
-    if cfg.metrics.enabled {
-        let bind = cfg.metrics.bind.clone();
-        let token = read_token(cfg.metrics.token_env.as_deref(), "metrics")?;
-        let m = metrics.clone();
-        tokio::spawn(async move { pg2osync_engine::metrics::serve(&bind, m, token).await });
-    }
-    Ok(metrics)
-}
-
 /// Report what the source's replication slots are holding, for as long as this
 /// process runs.
 ///
@@ -650,7 +622,7 @@ async fn slot_snapshot(
 ///
 /// The token is named by variable rather than written in the config so it never
 /// has to live in a file that gets committed or mounted as a ConfigMap.
-fn read_token(var: Option<&str>, endpoint: &str) -> Result<Option<String>> {
+pub fn read_token(var: Option<&str>, endpoint: &str) -> Result<Option<String>> {
     match var {
         Some(key) => std::env::var(key).map(Some).map_err(|_| {
             anyhow::anyhow!("{endpoint}.token_env={key:?} is set but the variable is missing")
@@ -866,29 +838,27 @@ async fn check_fan_out_column(
     }
 }
 
-/// Start the read-your-writes endpoint, if the operator asked for one.
+/// Tell the read-your-writes endpoint what this source answers with.
 ///
-/// Like the metrics endpoint it is started once, outside the retry loop: the
-/// acknowledged-position channel it watches has to survive a reconnect.
-fn start_api(cfg: &AppConfig, deps: pg2osync_engine::api::ApiDeps) -> Result<()> {
+/// The listener belongs to the process and is already accepting requests; a
+/// source joins it as soon as it can render a position. Sent once, outside the
+/// retry loop: the acknowledged-position channel has to survive a reconnect.
+fn publish_endpoints(
+    cfg: &AppConfig,
+    rt: &SourceRuntime,
+    endpoints: pg2osync_engine::api::SourceEndpoints,
+) {
     if !cfg.api.enabled {
-        return Ok(());
+        return;
     }
-    let token = read_token(cfg.api.token_env.as_deref(), "api")?;
-    if token.is_none() && !pg2osync_engine::http::is_loopback(&cfg.api.bind) {
-        tracing::warn!(target: "pg2osync::api",
-            "the endpoint is bound to {} without a token; anything that can \
-             reach it can query the pipeline position", cfg.api.bind);
-    }
-    // a templated section's glob is refreshed as one: OpenSearch and
-    // Elasticsearch take a wildcard, and Meilisearch never sees a template
-    let api_cfg = pg2osync_engine::api::ApiConfig {
-        bind: cfg.api.bind.clone(),
-        token,
-        indices: index_names(cfg)?,
-    };
-    tokio::spawn(async move { pg2osync_engine::api::serve(api_cfg, deps).await });
-    Ok(())
+    let sender = rt.endpoints.clone();
+    let name = rt.name.clone();
+    tokio::spawn(async move {
+        if sender.send((name.clone(), endpoints)).await.is_err() {
+            tracing::warn!(target: "pg2osync::api",
+                "the endpoint is not listening; /synced will not answer for {name}");
+        }
+    });
 }
 
 /// How one streaming attempt ended.
@@ -906,23 +876,27 @@ enum AttemptEnd {
 /// is deliberate rather than wasteful: a partially buffered transaction is
 /// invalid once the stream repositions, and tearing the pipeline down is what
 /// discards it.
-async fn stream_with_reconnect<A, F>(
+async fn stream_with_reconnect<A>(
     policy: ReconnectPolicy,
     metrics: SharedMetrics,
     shutdown: &watch::Receiver<bool>,
     mut attempt: A,
 ) -> Result<()>
 where
-    A: FnMut() -> F,
-    F: std::future::Future<Output = Result<AttemptEnd>>,
+    // A boxed future rather than an opaque one: the supervisor spawns this
+    // whole pipeline, and an attempt future that borrows the configuration is
+    // only provably Send where its lifetime is written down.
+    A: FnMut() -> futures::future::BoxFuture<'static, Result<AttemptEnd>>,
 {
     let mut failures = 0u32;
     loop {
         metrics.set_source_connected(true);
+        metrics.set_state(SourceState::Streaming);
         let outcome = attempt().await;
         metrics.set_source_connected(false);
 
         if *shutdown.borrow() {
+            metrics.set_state(SourceState::Stopped);
             return Ok(());
         }
 
@@ -956,6 +930,7 @@ where
         let delay = policy.delay_for(failures);
         failures += 1;
         metrics.reconnects_total.fetch_add(1, Ordering::Relaxed);
+        metrics.set_state(SourceState::Reconnecting);
         tracing::warn!(target: "pg2osync::run",
             "source stream failed ({error:#}); reconnecting in {:.1}s (attempt {failures})",
             delay.as_secs_f64());
@@ -1000,12 +975,18 @@ async fn run_postgres(
     admin_url: String,
     sink: Arc<dyn Sink>,
     index_specs: Vec<IndexSpec>,
-    shutdown_rx: watch::Receiver<bool>,
-    durable: DurableLsn,
-    mode: Mode,
-    reload: crate::reload::ReloadSource,
+    rt: SourceRuntime,
 ) -> Result<()> {
     use pg2osync_source::runner::{WalSource, WalSourceConfig};
+
+    let SourceRuntime {
+        metrics,
+        shutdown: shutdown_rx,
+        durable,
+        mode,
+        reload,
+        ..
+    } = rt.clone();
 
     let polling = cfg.source.mode == "poll";
     let tls = cfg.tls_settings(&source_url)?;
@@ -1072,7 +1053,6 @@ async fn run_postgres(
     let render: PositionRenderer = Arc::new(|token| Lsn(token).to_string());
     let parse: pg2osync_engine::PositionParser =
         Arc::new(|text| text.trim().parse::<Lsn>().ok().map(|lsn| lsn.0));
-    let metrics = start_metrics(&cfg)?;
     start_slot_watch(&cfg, admin_url.clone(), metrics.clone())?;
     // Reloads are watched from here rather than from `main`, because this is
     // where the settings channel and the sink they reach into exist, and only
@@ -1114,35 +1094,45 @@ async fn run_postgres(
     } else {
         None
     };
-    start_api(
+    publish_endpoints(
         &cfg,
-        pg2osync_engine::api::ApiDeps {
+        &rt,
+        pg2osync_engine::api::SourceEndpoints {
             acked: ack_rx,
             parse_position: parse,
             render_position: render.clone(),
             sink: sink.clone(),
             nudge,
             current_position,
-            trace_link: crate::trace_link(),
+            // a templated section's glob is refreshed as one: OpenSearch and
+            // Elasticsearch take a wildcard, and Meilisearch never sees a
+            // template
+            indices: index_names(&cfg)?,
         },
-    )?;
+    );
 
     // setup is done; each attempt opens the SQL connection it needs, so holding
     // this one open would be a third connection doing nothing
     drop(admin);
+
+    // shared with every attempt rather than borrowed by it
+    let cfg = Arc::new(cfg);
+    let source_url: Arc<str> = Arc::from(source_url);
+    let admin_url: Arc<str> = Arc::from(admin_url);
+    let children = Arc::new(children);
 
     stream_with_reconnect(
         cfg.source.reconnect_policy(),
         metrics.clone(),
         &shutdown_rx,
         || {
-            attempt_postgres(
-                &cfg,
-                &source_url,
-                &admin_url,
-                &tls,
-                &children,
-                &src_cfg,
+            Box::pin(attempt_postgres(
+                cfg.clone(),
+                source_url.clone(),
+                admin_url.clone(),
+                tls.clone(),
+                children.clone(),
+                src_cfg.clone(),
                 sink.clone(),
                 metrics.clone(),
                 ack_tx.clone(),
@@ -1152,7 +1142,7 @@ async fn run_postgres(
                 shutdown_rx.clone(),
                 polling,
                 settings_rx.clone(),
-            )
+            ))
         },
     )
     .await
@@ -1209,12 +1199,12 @@ where
 /// resumes from wherever the last attempt actually got to.
 #[allow(clippy::too_many_arguments)]
 async fn attempt_postgres(
-    cfg: &AppConfig,
-    source_url: &str,
-    admin_url: &str,
-    tls: &pg2osync_source::tls::TlsSettings,
-    children: &HashMap<(String, String), Vec<pg2osync_source::children::ChildSpec>>,
-    src_cfg: &pg2osync_source::runner::WalSourceConfig,
+    cfg: Arc<AppConfig>,
+    source_url: Arc<str>,
+    admin_url: Arc<str>,
+    tls: pg2osync_source::tls::TlsSettings,
+    children: Arc<HashMap<(String, String), Vec<pg2osync_source::children::ChildSpec>>>,
+    src_cfg: pg2osync_source::runner::WalSourceConfig,
     sink: Arc<dyn Sink>,
     metrics: SharedMetrics,
     ack_tx: watch::Sender<Option<Lsn>>,
@@ -1226,6 +1216,17 @@ async fn attempt_postgres(
     settings: watch::Receiver<pg2osync_engine::EngineSettings>,
 ) -> Result<AttemptEnd> {
     use pg2osync_source::runner::WalSource;
+
+    // Everything an attempt needs is owned by the attempt. A future that
+    // borrows the caller's locals cannot be proven `Send`, and this one is
+    // spawned: the process runs a pipeline per source, on whatever thread the
+    // runtime has free.
+    let cfg = &*cfg;
+    let source_url = &*source_url;
+    let admin_url = &*admin_url;
+    let tls = &tls;
+    let children = &*children;
+    let src_cfg = &src_cfg;
 
     // One SQL connection per attempt, shared by the checkpoint check, the
     // initial load and child re-fetch. Opening it here rather than once at
@@ -1250,12 +1251,12 @@ async fn attempt_postgres(
     // A checkpoint is not proof that the load finished: it says where streaming
     // got to, and with a load recording its own progress the two are separate
     // facts. Trusting the checkpoint alone is what silently skips a load.
-    let load_pending = pg2osync_core::load::unfinished(
-        sink.as_ref(),
-        &stream_id,
-        cfg.sync.values().map(|t| t.table.as_str()),
-    )
-    .await?;
+    // Collected rather than mapped inline: a closure borrowing the config
+    // across this await leaves the whole attempt future un-provably Send, and
+    // the attempt is what the supervisor spawns.
+    let synced_tables: Vec<String> = cfg.sync.values().map(|t| t.table.clone()).collect();
+    let load_pending =
+        pg2osync_core::load::unfinished(sink.as_ref(), &stream_id, &synced_tables).await?;
     match (&resume_from, load_pending) {
         (Some(lsn), false) => {
             tracing::info!(target: "pg2osync::run", "resuming from checkpoint {lsn}")
@@ -1270,6 +1271,7 @@ async fn attempt_postgres(
     let (load_done_tx, load_done_rx) = watch::channel(0u64);
     let load_sink = sink.clone();
     let load_stream_id = stream_id.clone();
+    let load_metrics = metrics.clone();
     let ctx = pipeline_ctx(cfg, sink, metrics, ack_tx, load_done_tx, settings)?;
     let engine = spawn_engine(
         events_rx,
@@ -1293,7 +1295,11 @@ async fn attempt_postgres(
         // engine can tell the difference between "paused" and "finished"
         let copy_tx = copy_tx;
         if resume_from.is_none() || load_pending {
-            with_bulk_load_settings(&load_sink, cfg, async {
+            // The stream is already running beside this; what the state says
+            // is that a whole table has still to arrive, which is the
+            // difference between "behind" and "caught up".
+            load_metrics.set_state(SourceState::Loading);
+            let copied = with_bulk_load_settings(&load_sink, cfg, async {
                 crate::backfill::run(
                     cfg,
                     admin_url,
@@ -1309,7 +1315,9 @@ async fn attempt_postgres(
                 )
                 .await
             })
-            .await
+            .await;
+            load_metrics.set_state(SourceState::Streaming);
+            copied
         } else {
             Ok(())
         }
@@ -1577,12 +1585,18 @@ async fn run_mysql(
     source_url: String,
     sink: Arc<dyn Sink>,
     index_specs: Vec<IndexSpec>,
-    shutdown_rx: watch::Receiver<bool>,
-    durable: DurableLsn,
-    mode: Mode,
-    reload: crate::reload::ReloadSource,
+    rt: SourceRuntime,
 ) -> Result<()> {
     use pg2osync_source_mysql::runner::MySqlSource;
+
+    let SourceRuntime {
+        metrics,
+        shutdown: shutdown_rx,
+        durable,
+        mode,
+        reload,
+        ..
+    } = rt.clone();
 
     let src_cfg = mysql_config_for(&cfg, &source_url)?;
     let source = MySqlSource::new(src_cfg);
@@ -1596,7 +1610,6 @@ async fn run_mysql(
     }
 
     let stream_id = cfg.stream_id();
-    let metrics = start_metrics(&cfg)?;
     // Reloads are watched from here rather than from `main`, because this is
     // where the settings channel and the sink they reach into exist, and only
     // a pipeline that is actually running has anything to reload.
@@ -1648,28 +1661,35 @@ async fn run_mysql(
         } else {
             None
         };
-        start_api(
+        publish_endpoints(
             &cfg,
-            pg2osync_engine::api::ApiDeps {
+            &rt,
+            pg2osync_engine::api::SourceEndpoints {
                 acked: ack_rx,
                 parse_position: parse,
                 render_position: render,
                 sink: sink.clone(),
+                // MySQL has nothing to write that the binlog would carry
+                // without touching a synced table
                 nudge: None,
                 current_position,
-                trace_link: crate::trace_link(),
+                indices: index_names(&cfg)?,
             },
-        )?;
+        );
     }
+
+    // shared with every attempt rather than borrowed by it
+    let cfg = Arc::new(cfg);
+    let source_url: Arc<str> = Arc::from(source_url);
 
     stream_with_reconnect(
         cfg.source.reconnect_policy(),
         metrics.clone(),
         &shutdown_rx,
         || {
-            attempt_mysql(
-                &cfg,
-                &source_url,
+            Box::pin(attempt_mysql(
+                cfg.clone(),
+                source_url.clone(),
                 AttemptWiring {
                     sink: sink.clone(),
                     metrics: metrics.clone(),
@@ -1680,7 +1700,7 @@ async fn run_mysql(
                     version_base: version_base.clone(),
                     settings: settings_rx.clone(),
                 },
-            )
+            ))
         },
     )
     .await
@@ -1736,10 +1756,14 @@ fn version_base_for(base: u64, stored_token: u64, current_coordinate: u64) -> Ve
 }
 
 async fn attempt_mysql(
-    cfg: &AppConfig,
-    source_url: &str,
+    cfg: Arc<AppConfig>,
+    source_url: Arc<str>,
     wiring: AttemptWiring,
 ) -> Result<AttemptEnd> {
+    // owned for the same reason as the PostgreSQL attempt: the pipeline is
+    // spawned, so nothing it holds may borrow the caller
+    let cfg = &*cfg;
+    let source_url = &*source_url;
     use pg2osync_source_mysql::catalog as mysql_catalog;
     use pg2osync_source_mysql::runner::MySqlSource;
 
@@ -1763,12 +1787,12 @@ async fn attempt_mysql(
     let resume = stored_position.as_ref().map(|p| (p.file.clone(), p.pos));
     // A checkpoint says where streaming got to; a load records its own progress.
     // Trusting the checkpoint alone is what silently skips an unfinished load.
-    let load_pending = pg2osync_core::load::unfinished(
-        sink.as_ref(),
-        &stream_id,
-        cfg.sync.values().map(|t| t.table.as_str()),
-    )
-    .await?;
+    // Collected rather than mapped inline: a closure borrowing the config
+    // across this await leaves the whole attempt future un-provably Send, and
+    // the attempt is what the supervisor spawns.
+    let synced_tables: Vec<String> = cfg.sync.values().map(|t| t.table.clone()).collect();
+    let load_pending =
+        pg2osync_core::load::unfinished(sink.as_ref(), &stream_id, &synced_tables).await?;
     // The position token is now a document version as well as a checkpoint, and
     // a version at the target only ever goes up. So a history that restarted —
     // RESET BINARY LOGS AND GTIDS, or a different server behind the same
@@ -1929,6 +1953,7 @@ async fn attempt_mysql(
     let (load_done_tx, load_done_rx) = watch::channel(0u64);
     let load_sink = sink.clone();
     let load_stream_id = stream_id.clone();
+    let load_metrics = metrics.clone();
     let ctx = pipeline_ctx(cfg, sink, metrics, ack_tx, load_done_tx, settings)?;
     let engine = spawn_engine(
         events_rx,
@@ -1959,7 +1984,10 @@ async fn attempt_mysql(
             let tables = src_cfg.tables.clone();
             let scope = pg2osync_core::load::LoadScope::initial_load()
                 .with_table_filters(table_filters(cfg)?);
-            with_bulk_load_settings(&load_sink, cfg, async {
+            // as on PostgreSQL: the stream is already running, and the state
+            // says a whole table has still to arrive
+            load_metrics.set_state(SourceState::Loading);
+            let copied = with_bulk_load_settings(&load_sink, cfg, async {
                 pg2osync_source_mysql::load::run(
                     &mut admin,
                     &tables,
@@ -1977,7 +2005,9 @@ async fn attempt_mysql(
                 .await?;
                 Ok(())
             })
-            .await
+            .await;
+            load_metrics.set_state(SourceState::Streaming);
+            copied
         } else {
             Ok(())
         }

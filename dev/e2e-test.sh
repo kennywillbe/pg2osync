@@ -368,15 +368,15 @@ fi
 # poller runs on its own interval, so this waits for the first sample.
 for _ in $(seq 1 40); do
   metrics=$(curl -s http://127.0.0.1:9111/metrics)
-  grep -q "pg2osync_slot_retained_bytes{slot=\"pg2osync_e2e\"}" <<< "$metrics" && break
+  grep -qE "^pg2osync_slot_retained_bytes\{source=\"[^\"]*\",slot=\"pg2osync_e2e\"\}" <<< "$metrics" && break
   sleep 1
 done
-if grep -q "pg2osync_slot_retained_bytes{slot=\"pg2osync_e2e\"}" <<< "$metrics"; then
+if grep -qE "^pg2osync_slot_retained_bytes\{source=\"[^\"]*\",slot=\"pg2osync_e2e\"\}" <<< "$metrics"; then
   ok "the configured slot's retained WAL is reported"
 else
   bad "no retained-WAL series for the configured slot"
 fi
-if grep -q "pg2osync_slot_wal_status{slot=\"pg2osync_e2e\",status=\"lost\"} 0" <<< "$metrics"; then
+if grep -qE "^pg2osync_slot_wal_status\{source=\"[^\"]*\",slot=\"pg2osync_e2e\",status=\"lost\"\} 0" <<< "$metrics"; then
   ok "and the server's own verdict on it"
 else
   bad "no wal_status series for the configured slot"
@@ -406,7 +406,7 @@ pg "INSERT INTO users (id,name,email,drift_probe) VALUES (91,'drift','drift@test
 synced
 metrics=$(curl -s http://127.0.0.1:9111/metrics)
 check "the shape change is counted" \
-  "$(awk '/^pg2osync_schema_drift_total\{table="public.users"\} /{print $2}' <<< "$metrics")" "1"
+  "$(awk '/^pg2osync_schema_drift_total\{source="[^"]*",table="public.users"\} /{print $2}' <<< "$metrics")" "1"
 check "and the row after it still lands" "$(os_field e2e_users 91 drift_probe)" "later"
 pg "DELETE FROM users WHERE id=91;" > /dev/null
 synced
@@ -439,9 +439,9 @@ synced
 check "same process recovered" "$(pgrep -f "pg2osync run" | head -1)" "$before_pid"
 check "row written while disconnected arrived" "$(os_field e2e_users 9 name)" "written-while-disconnected"
 metrics=$(curl -s http://127.0.0.1:9111/metrics)
-reconnects=$(awk '$1 == "pg2osync_reconnects_total" {print $2}' <<< "$metrics")
+reconnects=$(awk '/^pg2osync_reconnects_total\{/ {print $2}' <<< "$metrics")
 if [ "${reconnects:-0}" -ge 1 ]; then ok "reconnects_total counted it ($reconnects)"; else bad "reconnects_total still zero"; fi
-check "source reports connected again" "$(awk '$1 == "pg2osync_source_connected" {print $2}' <<< "$metrics")" "1"
+check "source reports connected again" "$(awk '/^pg2osync_source_connected\{/ {print $2}' <<< "$metrics")" "1"
 
 say "11. read-your-writes"
 pg "INSERT INTO users (id,name,email) VALUES (11,'ryw','r@test.io');" > /dev/null
@@ -675,7 +675,7 @@ check "it is in the quarantine store instead" \
 # at least one, not exactly one: the store is keyed by document id, while the
 # counter counts arrivals — and a restart replays the row, so the same refusal
 # is legitimately filed again under at-least-once
-if curl -s http://127.0.0.1:9115/metrics | grep -qE "^pg2osync_rejected_total [1-9]"; then
+if curl -s http://127.0.0.1:9115/metrics | grep -qE "^pg2osync_rejected_total\{source=\"[^\"]*\"\} [1-9]"; then
   ok "pg2osync_rejected_total reports it"
 else
   bad "pg2osync_rejected_total did not move"
@@ -1263,7 +1263,7 @@ check "an unconvertible value is indexed as it was" "$(os_field e2e_shape 2 pric
 check "and so is an unparseable date" "$(os_field e2e_shape 2 born)" "not-a-date"
 # -ge rather than =: at-least-once delivery may hand row 2 over more than once,
 # and every pass counts what it left alone again
-left=$(curl -s 127.0.0.1:9123/metrics | awk '/^pg2osync_transform_unconverted_total /{print $2}')
+left=$(curl -s 127.0.0.1:9123/metrics | awk '/^pg2osync_transform_unconverted_total\{/{print $2}')
 if [ "${left:-0}" -ge 3 ]; then
   ok "the counter reports the values left as they were ($left)"
 else
@@ -1502,7 +1502,7 @@ check "a deleted parent is gone" "$(os_status e2e_shop customer-1)" "404"
 check "and so is the child it still had" "$(os_rstatus e2e_shop order-11 customer-1)" "404"
 check "the child that had moved to another parent is untouched" "$(os_rstatus e2e_shop order-10 customer-2)" "200"
 check "and so is the other parent" "$(os_status e2e_shop customer-2)" "200"
-if curl -s 127.0.0.1:9125/metrics | grep -qE '^pg2osync_events_total\{type="join_cascade"\} [1-9]'; then
+if curl -s 127.0.0.1:9125/metrics | grep -qE '^pg2osync_events_total\{source="[^"]*",type="join_cascade"\} [1-9]'; then
   ok "the cascade is counted"
 else
   bad "pg2osync_events_total{type=\"join_cascade\"} did not move"
@@ -1650,7 +1650,7 @@ check "the other table's document survived the TRUNCATE" "$(os_status e2e_union 
 pg "INSERT INTO user_probe VALUES (2,'still-streaming');" > /dev/null
 for _ in $(seq 1 30); do refresh; [ "$(os_status e2e_union user-2)" = "200" ] && break; sleep 1; done
 check "and the pipeline is still streaming after it" "$(os_status e2e_union user-2)" "200"
-check "the skip is counted" "$(curl -s 127.0.0.1:9126/metrics | awk '/^pg2osync_events_total\{type="truncate_skipped"\} /{print $2}')" "1"
+check "the skip is counted" "$(curl -s 127.0.0.1:9126/metrics | awk '/^pg2osync_events_total\{source="[^"]*",type="truncate_skipped"\} /{print $2}')" "1"
 stop_sync
 
 echo -e "\n\033[1m== 26. a row chooses the index it lands in ==\033[0m"
@@ -2690,7 +2690,7 @@ RLSLOT=pg2osync_e2e_reload
 RLLOG=/tmp/pg2osync-e2e-reload.log
 : > "$RLLOG"
 drop_idle_probe_slots
-rl_metric() { curl -s 127.0.0.1:9136/metrics | grep -v '^#' | grep -F "$1" | awk '{print $2}' | head -1; }
+rl_metric() { curl -s 127.0.0.1:9136/metrics | grep -v '^#' | grep -E "$1" | awk '{print $2}' | head -1; }
 rl_write_config() {
   cat > "$RLCONFIG" <<TOML
 [source]
@@ -2738,8 +2738,8 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 check "the pipeline is up on the batch_size it started with" "$(os_count e2e_reload)" "1"
-batches_before=$(rl_metric "pg2osync_batches_flushed ")
-reconnects_before=$(rl_metric "pg2osync_reconnects_total ")
+batches_before=$(rl_metric '^pg2osync_batches_flushed\{')
+reconnects_before=$(rl_metric '^pg2osync_reconnects_total\{')
 
 # batch_size 500 -> 5. One transaction of 200 rows is the proof: no commit
 # boundary cuts it, so the only thing that can split it into batches is the
@@ -2768,7 +2768,7 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 check "the sentinel row went through on the old turn" "$(os_count e2e_reload)" "2"
-batches_before=$(rl_metric "pg2osync_batches_flushed ")
+batches_before=$(rl_metric '^pg2osync_batches_flushed\{')
 
 pg "BEGIN; INSERT INTO reload_probe SELECT g, 'v' || g FROM generate_series(1000, 1199) g; COMMIT;" > /dev/null
 for _ in $(seq 1 90); do
@@ -2777,7 +2777,7 @@ for _ in $(seq 1 90); do
   sleep 1
 done
 check "every row of the transaction is indexed" "$(os_count e2e_reload)" "202"
-batches_after=$(rl_metric "pg2osync_batches_flushed ")
+batches_after=$(rl_metric '^pg2osync_batches_flushed\{')
 grew=$((batches_after - batches_before))
 # 200 rows at 5 a batch is around forty requests; at 500 it would have been one
 if [ "$grew" -ge 20 ]; then
@@ -2785,8 +2785,8 @@ if [ "$grew" -ge 20 ]; then
 else
   bad "the batch boundary did not move: $grew batches for 200 rows"
 fi
-check "and nothing reconnected to do it" "$(rl_metric 'pg2osync_reconnects_total ')" "$reconnects_before"
-check "the reload is counted as applied" "$(rl_metric 'pg2osync_config_reloads_total{result="applied"}')" "1"
+check "and nothing reconnected to do it" "$(rl_metric '^pg2osync_reconnects_total\{')" "$reconnects_before"
+check "the reload is counted as applied" "$(rl_metric '^pg2osync_config_reloads_total\{source="[^"]*",result="applied"\}')" "1"
 
 # An identity change is refused in place: the section keeps running as it was,
 # because every document already written is filed the old way.
@@ -2802,7 +2802,7 @@ if grep -qF '[sync.reload] id changed from None to Some("reload-{id}")' "$RLLOG"
 else
   bad "the identity change was not refused clearly: $(grep -i 'id changed' "$RLLOG" | tail -1)"
 fi
-check "and it is counted as refused" "$(rl_metric 'pg2osync_config_reloads_total{result="refused"}')" "1"
+check "and it is counted as refused" "$(rl_metric '^pg2osync_config_reloads_total\{source="[^"]*",result="refused"\}')" "1"
 
 pg "INSERT INTO reload_probe VALUES (2001,'after-the-refusal');" > /dev/null
 for _ in $(seq 1 60); do
@@ -2830,7 +2830,7 @@ else
 fi
 check "the process is still alive" "$(kill -0 "$RLPID" 2> /dev/null && echo alive)" "alive"
 check "and the broken read is counted as invalid" \
-  "$(rl_metric 'pg2osync_config_reloads_total{result="invalid"}')" "1"
+  "$(rl_metric '^pg2osync_config_reloads_total\{source="[^"]*",result="invalid"\}')" "1"
 
 pg "INSERT INTO reload_probe VALUES (2002,'still-streaming');" > /dev/null
 for _ in $(seq 1 60); do
