@@ -272,14 +272,23 @@ mysql_enable_gtid() {
 
 # The suites stop a pipeline by killing every pg2osync process, so a second one
 # running anywhere on this machine makes them report failures that are not real.
+# The suites queue on dev/e2e-lock.sh themselves; waiting here as well keeps a
+# run from starting its e2e jobs into someone else's pipeline and reporting a
+# red that was never about the change.
 no_pipeline_running() {
-  if pgrep -f "pg2osync run" > /dev/null 2>&1; then
-    echo "a 'pg2osync run' process is already running. The e2e suites stop the"
-    echo "pipeline with pkill, so they take each other down and report failures"
-    echo "that have nothing to do with the change. Stop it and run again:"
-    echo "  pkill -f 'pg2osync run'"
-    return 1
-  fi
+  local waited=0 wait_max=${E2E_LOCK_WAIT:-5400}
+  while pgrep -f "pg2osync run" > /dev/null 2>&1 || [ -d "${E2E_LOCK:-/tmp/pg2osync-e2e.lock}" ]; do
+    if [ "$waited" -eq 0 ]; then
+      echo "another pg2osync pipeline or e2e suite is running on this machine; waiting for it"
+    fi
+    if [ "$waited" -ge "$wait_max" ]; then
+      echo "gave up after ${waited}s: a 'pg2osync run' process is still alive. Stop it and run again:"
+      echo "  pkill -f 'pg2osync run'"
+      return 1
+    fi
+    sleep 10
+    waited=$((waited + 10))
+  done
 }
 
 # CI gets PostgreSQL and OpenSearch as service containers; locally they are the
