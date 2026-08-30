@@ -628,6 +628,19 @@ pub async fn run(
                     break Err(e);
                 }
             }
+            ChangeEvent::SchemaDrift {
+                schema,
+                table,
+                detail,
+            } => {
+                // Counted and dropped: the change is never applied, and the
+                // event carries no position, so nothing may be flushed,
+                // acknowledged or buffered here. The source has already warned
+                // in full; this line only says the report reached the counter.
+                ctx.metrics.incr_schema_drift(&format!("{schema}.{table}"));
+                tracing::debug!(target: "pg2osync::engine",
+                    "counted schema drift on {schema}.{table}: {detail}");
+            }
             ChangeEvent::TableTruncated {
                 schema,
                 table,
@@ -2004,6 +2017,25 @@ mod pipeline_tests {
         script: Vec<ChangeEvent>,
         copy_script: Vec<ChangeEvent>,
     ) -> (Arc<RecordingSink>, u64) {
+        drive_metrics(
+            Arc::new(crate::metrics::Metrics::default()),
+            sink,
+            cfg,
+            script,
+            copy_script,
+        )
+        .await
+    }
+
+    /// As `drive_sink`, over metrics the caller keeps a handle to — for the
+    /// tests that are about what the run counted rather than what it wrote.
+    async fn drive_metrics(
+        metrics: crate::metrics::SharedMetrics,
+        sink: Arc<RecordingSink>,
+        cfg: EngineConfig,
+        script: Vec<ChangeEvent>,
+        copy_script: Vec<ChangeEvent>,
+    ) -> (Arc<RecordingSink>, u64) {
         let (events_tx, events_rx) = mpsc::channel(1024);
         let (copy_tx, copy_rx) = mpsc::channel(1024);
         let (ack_tx, _ack_rx) = watch::channel(None);
@@ -2028,7 +2060,7 @@ mod pipeline_tests {
             cfg,
             ack_tx,
             load_done_tx,
-            metrics: Arc::new(crate::metrics::Metrics::default()),
+            metrics,
         });
         let stream = StreamId {
             source: SOURCE_POSTGRES.into(),
@@ -2061,6 +2093,43 @@ mod pipeline_tests {
         engine.await.expect("task joined").expect("engine ran");
         let mark = *load_done_rx.borrow();
         (sink, mark)
+    }
+
+    #[tokio::test]
+    async fn schema_drift_is_counted_and_moves_nothing() {
+        let metrics = Arc::new(crate::metrics::Metrics::default());
+        let (sink, mark) = drive_metrics(
+            metrics.clone(),
+            Arc::new(RecordingSink::default()),
+            EngineConfig {
+                batch_size: 500,
+                checkpoint_interval_ms: 100,
+                ..EngineConfig::default()
+            },
+            vec![ChangeEvent::SchemaDrift {
+                schema: "public".into(),
+                table: "users".into(),
+                detail: "added later_col".into(),
+            }],
+            Vec::new(),
+        )
+        .await;
+        let out = metrics.render();
+        assert!(
+            out.contains("pg2osync_schema_drift_total{table=\"public.users\"} 1"),
+            "{out}"
+        );
+        // The event carries no position and no data on purpose: applying the
+        // change is refused, so a drift that wrote, acknowledged or reported
+        // progress would be claiming something that did not happen.
+        assert!(sink.events().is_empty(), "{:?}", sink.events());
+        assert_eq!(mark, 0);
+        assert_eq!(
+            metrics
+                .position_current
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
     }
 
     #[tokio::test]

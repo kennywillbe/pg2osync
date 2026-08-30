@@ -306,8 +306,9 @@ needs no flag at all.
 ## Operating it
 
 **Metrics** — `GET http://127.0.0.1:9100/metrics`: events by type, batches
-flushed, sink errors, reconnects, commit-to-indexed latency quantiles, and the
-current/confirmed source position with the lag between them. Import
+flushed, sink errors, reconnects, tables that changed shape under the running
+pipeline, commit-to-indexed latency quantiles, and the current/confirmed source
+position with the lag between them. Import
 [deploy/grafana/pg2osync.json](deploy/grafana/pg2osync.json) for the dashboard
 built from those series.
 

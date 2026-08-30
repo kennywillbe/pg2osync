@@ -237,6 +237,15 @@ impl WalSource {
                                     "{}.{} changed shape: {drift}. Documents already in \
                                      the index keep the old shape until it is rebuilt",
                                     rel.schema, rel.name);
+                                // A log line is not alertable; the engine
+                                // counts this one.
+                                tx.send(ChangeEvent::SchemaDrift {
+                                    schema: rel.schema.clone(),
+                                    table: rel.name.clone(),
+                                    detail: drift,
+                                })
+                                .await
+                                .context("change channel closed")?;
                             }
                             relations.insert(rel.rel_id, rel.clone());
                         }
