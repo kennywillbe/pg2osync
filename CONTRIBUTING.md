@@ -103,10 +103,10 @@ decoders (`pgoutput.rs`, `binlog.rs`) are tested with byte-level vectors — add
 one for the case you fix rather than only testing through the pipeline.
 
 
-Merges go through the branch's merge queue: `gh pr merge --squash --auto`
-adds a pull request to it once its checks are green, the queue rebuilds the
-candidate `main` with everything ahead of it, runs CI once on that, and lands
-the batch. Nobody has to rebase behind a merge that just happened.
+A pull request merges once its checks are green; `gh pr merge --squash --auto`
+lands it the moment they are. The branch does not have to be up to date with
+`main` — what guards a batch of pull requests landing together is that they are
+verified locally as one stack (see AGENTS.md), not a re-run per merge.
 
 ## Architecture rules
 
