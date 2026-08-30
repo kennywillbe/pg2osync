@@ -243,7 +243,7 @@ async fn mysql(
         .and_then(|c| pg2osync_source_mysql::catalog::parse_stored_position(&c.position))
         .map(|p| p.base)
         .unwrap_or(0);
-    pg2osync_source_mysql::load::run(
+    Ok(pg2osync_source_mysql::load::run(
         &mut conn,
         &tables,
         cfg.source.load_chunk_rows.max(1) as u64,
@@ -256,5 +256,5 @@ async fn mysql(
         version_base,
         &append_only,
     )
-    .await
+    .await?)
 }

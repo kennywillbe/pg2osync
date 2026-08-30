@@ -7,8 +7,8 @@
 //! the password never crosses the wire in the clear either way.
 
 use crate::auth;
+use crate::error::{Context as _, MySqlError, Result};
 use crate::packet::{MAX_PAYLOAD, frame_all, parse_greeting};
-use anyhow::{Context as _, Result, bail};
 use pg2osync_tls::{SslMode, TlsSettings};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -66,24 +66,27 @@ impl MySqlConnection {
     pub async fn connect(cfg: &MySqlConfig) -> Result<Self> {
         let tcp = TcpStream::connect((cfg.host.as_str(), cfg.port))
             .await
-            .context("mysql tcp connect failed")?;
+            .connect_ctx(|| "mysql tcp connect failed".into())?;
         tcp.set_nodelay(true).ok();
         let mut stream: Box<dyn Stream> = Box::new(tcp);
 
         let greeting_payload = read_one(&mut stream).await?;
-        let greeting = parse_greeting(&greeting_payload).context("cannot parse mysql greeting")?;
+        let greeting = parse_greeting(&greeting_payload)
+            .ok_or_else(|| MySqlError::protocol("cannot parse mysql greeting"))?;
         if greeting.capabilities & CLIENT_PLUGIN_AUTH == 0 {
-            bail!("server lacks CLIENT_PLUGIN_AUTH");
+            return Err(MySqlError::protocol("server lacks CLIENT_PLUGIN_AUTH"));
         }
         let server_supports_tls = greeting.capabilities & CLIENT_SSL != 0;
 
         let use_tls = match cfg.tls.mode {
             SslMode::Disable => false,
             SslMode::Prefer => server_supports_tls,
-            _ if !server_supports_tls => bail!(
-                "sslmode={} was requested but the server does not offer TLS",
-                cfg.tls.mode.as_str()
-            ),
+            _ if !server_supports_tls => {
+                return Err(MySqlError::Config(format!(
+                    "sslmode={} was requested but the server does not offer TLS",
+                    cfg.tls.mode.as_str()
+                )));
+            }
             _ => true,
         };
 
@@ -159,12 +162,14 @@ impl MySqlConnection {
                     }
                     // any other AuthMoreData at this point is the public key,
                     // which only arrives after we asked for it
-                    _ => bail!("unexpected auth data from the server"),
+                    _ => return Err(MySqlError::auth("unexpected auth data from the server")),
                 },
-                other => bail!("unexpected auth reply {other:?}"),
+                other => return Err(MySqlError::auth(format!("unexpected auth reply {other:?}"))),
             }
         }
-        bail!("authentication did not complete after 8 exchanges")
+        Err(MySqlError::auth(
+            "authentication did not complete after 8 exchanges",
+        ))
     }
 
     /// caching_sha2_password full authentication.
@@ -187,7 +192,9 @@ impl MySqlConnection {
         self.write_at(seq + 1, &[REQUEST_PUBLIC_KEY]).await?;
         let key_packet = self.read_seq().await?;
         if key_packet.payload.first() != Some(&0x01) {
-            bail!("server did not return a public key for full authentication");
+            return Err(MySqlError::auth(
+                "server did not return a public key for full authentication",
+            ));
         }
         let encrypted =
             auth::rsa_encrypted_password(cfg.password.as_bytes(), nonce, &key_packet.payload[1..])?;
@@ -337,7 +344,7 @@ where
         stream
             .read_exact(&mut head)
             .await
-            .context("connection closed mid-packet")?;
+            .connect_ctx(|| "connection closed mid-packet".into())?;
         let len = u32::from_le_bytes([head[0], head[1], head[2], 0]) as usize;
         let seq = head[3];
         // Only continuation packets are checked: the first packet of a
@@ -347,14 +354,16 @@ where
         if let Some(expected) = expected_seq
             && seq != expected
         {
-            bail!("packet sequence {seq} arrived where {expected} was expected");
+            return Err(MySqlError::protocol(format!(
+                "packet sequence {seq} arrived where {expected} was expected"
+            )));
         }
         let start = payload.len();
         payload.resize(start + len, 0);
         stream
             .read_exact(&mut payload[start..])
             .await
-            .context("connection closed mid-payload")?;
+            .connect_ctx(|| "connection closed mid-payload".into())?;
         if len < MAX_PAYLOAD {
             return Ok(SeqPacket { seq, payload });
         }
@@ -367,9 +376,15 @@ where
     S: AsyncWrite + Unpin,
 {
     for f in frame_all(start_seq, payload) {
-        stream.write_all(&f).await.context("mysql write failed")?;
+        stream
+            .write_all(&f)
+            .await
+            .connect_ctx(|| "mysql write failed".into())?;
     }
-    stream.flush().await.context("mysql flush failed")
+    stream
+        .flush()
+        .await
+        .connect_ctx(|| "mysql flush failed".into())
 }
 
 /// The 32-byte prelude that asks the server to start TLS.
@@ -405,10 +420,10 @@ fn auth_token(plugin: &str, password: &[u8], nonce: &[u8]) -> Result<Vec<u8>> {
     match plugin {
         NATIVE_PASSWORD => Ok(auth::native_password(password, nonce)),
         CACHING_SHA2 => Ok(auth::caching_sha2_fast(password, nonce)),
-        other => bail!(
+        other => Err(MySqlError::Config(format!(
             "unsupported authentication plugin {other:?}; this client speaks \
              mysql_native_password and caching_sha2_password"
-        ),
+        ))),
     }
 }
 
@@ -430,11 +445,11 @@ fn parse_auth_switch(payload: &[u8]) -> (String, Vec<u8>) {
 async fn upgrade_to_tls(stream: Box<dyn Stream>, cfg: &MySqlConfig) -> Result<Box<dyn Stream>> {
     let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg.tls.client_config()?));
     let server_name = rustls::pki_types::ServerName::try_from(cfg.host.clone())
-        .with_context(|| format!("{} is not a valid TLS server name", cfg.host))?;
+        .connect_ctx(|| format!("{} is not a valid TLS server name", cfg.host))?;
     let tls = connector
         .connect(server_name, stream)
         .await
-        .with_context(|| {
+        .connect_ctx(|| {
             format!(
                 "mysql TLS handshake failed (sslmode={})",
                 cfg.tls.mode.as_str()
@@ -443,16 +458,19 @@ async fn upgrade_to_tls(stream: Box<dyn Stream>, cfg: &MySqlConfig) -> Result<Bo
     Ok(Box::new(tls))
 }
 
-fn auth_error(payload: &[u8], cfg: &MySqlConfig) -> anyhow::Error {
+fn auth_error(payload: &[u8], cfg: &MySqlConfig) -> MySqlError {
     let msg = String::from_utf8_lossy(payload.get(9..).unwrap_or(&[])).into_owned();
     let code = u16::from_le_bytes([*payload.get(1).unwrap_or(&0), *payload.get(2).unwrap_or(&0)]);
-    let err = anyhow::anyhow!("auth failed ({code}): {msg}");
+    let err = MySqlError::auth(format!("auth failed ({code}): {msg}"));
     // ER_ACCESS_DENIED_ERROR is also what a REQUIRE X509 account answers when
     // the client offered no certificate, with nothing in the message to say so
     if code == 1045 && cfg.tls.mode.requires_tls() && !cfg.tls.presents_client_certificate() {
-        return err.context(
-            "if the account is REQUIRE X509 or REQUIRE SUBJECT, set [source] sslcert and sslkey",
-        );
+        return MySqlError::Auth {
+            context: "if the account is REQUIRE X509 or REQUIRE SUBJECT, set [source] sslcert \
+                      and sslkey"
+                .into(),
+            source: Some(Box::new(err)),
+        };
     }
     err
 }
@@ -486,10 +504,16 @@ impl MySqlConnection {
         self.send_query(sql).await?;
         let head = read_one(&mut self.stream).await?;
         let ncols = match head.first() {
-            Some(0xFF) => bail!("query failed: {}", error_message(&head)),
+            Some(0xFF) => {
+                return Err(MySqlError::Catalog {
+                    context: format!("query failed: {}", error_message(&head)),
+                    source: None,
+                });
+            }
             // OK packet: a statement with no resultset at all
             Some(0x00) | None => 0,
-            _ => lenenc_at(&head, &mut 0).context("resultset header is not a column count")?,
+            _ => lenenc_at(&head, &mut 0)
+                .ok_or_else(|| MySqlError::protocol("resultset header is not a column count"))?,
         };
         // column definitions, then the EOF that closes them
         if ncols > 0 {
@@ -545,7 +569,10 @@ impl TextRows<'_> {
         }
         let pkt = read_one(&mut self.conn.stream).await?;
         match pkt.first() {
-            Some(0xFF) => bail!("query failed mid-resultset: {}", error_message(&pkt)),
+            Some(0xFF) => Err(MySqlError::Catalog {
+                context: format!("query failed mid-resultset: {}", error_message(&pkt)),
+                source: None,
+            }),
             // EOF packet: 0xFE with a short payload, and CLIENT_DEPRECATE_EOF
             // is not negotiated so it stays five bytes. A row whose first value
             // is 8-byte length-encoded also starts with 0xFE, but its marker
@@ -603,8 +630,10 @@ fn parse_text_row(pkt: &[u8], ncols: usize) -> Result<Vec<Option<Vec<u8>>>> {
             vals.push(None);
             continue;
         }
-        let len = lenenc_at(pkt, &mut pos).context("row truncated")?;
-        let raw = pkt.get(pos..pos + len).context("row value truncated")?;
+        let len = lenenc_at(pkt, &mut pos).ok_or_else(|| MySqlError::protocol("row truncated"))?;
+        let raw = pkt
+            .get(pos..pos + len)
+            .ok_or_else(|| MySqlError::protocol("row value truncated"))?;
         pos += len;
         vals.push(Some(raw.to_vec()));
     }

@@ -1200,7 +1200,7 @@ impl AppConfig {
 impl AppConfig {
     /// Effective TLS settings for a resolved source URL.
     pub fn tls_settings(&self, source_url: &str) -> Result<pg2osync_source::tls::TlsSettings> {
-        pg2osync_source::tls::TlsSettings::resolve(
+        Ok(pg2osync_source::tls::TlsSettings::resolve(
             source_url,
             pg2osync_source::tls::ConfiguredTls {
                 sslmode: self.source.sslmode.as_deref(),
@@ -1208,7 +1208,7 @@ impl AppConfig {
                 sslcert: self.source.sslcert.as_deref(),
                 sslkey: self.source.sslkey.as_deref(),
             },
-        )
+        )?)
     }
 }
 

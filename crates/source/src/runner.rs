@@ -5,8 +5,8 @@
 //! task never reconnects on its own.
 
 use crate::catalog;
+use crate::error::{Context as _, Result, SourceError};
 use crate::transport::to_core_lsn;
-use anyhow::{Context as _, Result};
 use pg2osync_core::Lsn;
 use pg2osync_core::event::ChangeEvent;
 use std::collections::HashMap;
@@ -142,7 +142,7 @@ impl WalSource {
             .with_tls(crate::tls::replication_config(&self.cfg.tls)),
         )
         .await
-        .context("replication connect failed")?;
+        .connect_ctx(|| "replication connect failed".into())?;
 
         // RELATION messages arrive after every relcache invalidation, so the
         // registry is upserted rather than built once at startup.
@@ -160,7 +160,9 @@ impl WalSource {
         let needs_admin = !self.cfg.children.is_empty() || !self.cfg.child_parents.is_empty();
         let admin_client = needs_admin.then_some(admin).flatten();
         if needs_admin && admin_client.is_none() {
-            anyhow::bail!("nested children are configured but no SQL connection was provided");
+            return Err(SourceError::Config(
+                "nested children are configured but no SQL connection was provided".into(),
+            ));
         }
         tracing::info!(target: "pg2osync::source", "stream loop starting");
 
@@ -178,7 +180,7 @@ impl WalSource {
                         tracing::warn!(target: "pg2osync::source", "stream ended normally");
                         return Ok(());
                     }
-                    Err(e) => return Err(e).context("replication stream failed"),
+                    Err(e) => return Err(e).connect_ctx(|| "replication stream failed".into()),
                 },
             };
             tracing::trace!(target: "pg2osync::source", "raw event");
@@ -195,7 +197,7 @@ impl WalSource {
                         },
                     ))
                     .await
-                    .context("change channel closed")?;
+                    .map_err(|_| SourceError::ChannelClosed)?;
                 }
                 ReplicationEvent::Commit {
                     end_lsn,
@@ -220,11 +222,11 @@ impl WalSource {
                         },
                     ))
                     .await
-                    .context("change channel closed")?;
+                    .map_err(|_| SourceError::ChannelClosed)?;
                 }
                 ReplicationEvent::XLogData { data, .. } => {
                     let msg = crate::pgoutput::parse(&data)
-                        .map_err(|e| anyhow::anyhow!("pgoutput decode failed: {e}"))?;
+                        .protocol_ctx(|| "pgoutput decode failed".into())?;
                     match msg {
                         crate::pgoutput::Message::Relation(rel) => {
                             if let Some(previous) = relations.get(&rel.rel_id)
@@ -245,7 +247,7 @@ impl WalSource {
                                     detail: drift,
                                 })
                                 .await
-                                .context("change channel closed")?;
+                                .map_err(|_| SourceError::ChannelClosed)?;
                             }
                             relations.insert(rel.rel_id, rel.clone());
                         }
@@ -254,9 +256,9 @@ impl WalSource {
                             // mapped index independently
                             for rel_id in &tr.rel_ids {
                                 let Some(rel) = relations.get(rel_id) else {
-                                    return Err(anyhow::anyhow!(
+                                    return Err(SourceError::protocol(format!(
                                         "TRUNCATE for unknown relation oid {rel_id}"
-                                    ));
+                                    )));
                                 };
                                 tx.send(ChangeEvent::TableTruncated {
                                     schema: rel.schema.clone(),
@@ -264,7 +266,7 @@ impl WalSource {
                                     version: txn_version,
                                 })
                                 .await
-                                .context("change channel closed")?;
+                                .map_err(|_| SourceError::ChannelClosed)?;
                             }
                         }
                         msg @ (crate::pgoutput::Message::Insert(_)
@@ -311,7 +313,7 @@ impl WalSource {
                         },
                     ))
                     .await
-                    .context("change channel closed")?;
+                    .map_err(|_| SourceError::ChannelClosed)?;
                 }
                 ReplicationEvent::KeepAlive { wal_end, .. } => {
                     // A keepalive means the server has sent everything up to
@@ -327,7 +329,7 @@ impl WalSource {
                             },
                         ))
                         .await
-                        .context("change channel closed")?;
+                        .map_err(|_| SourceError::ChannelClosed)?;
                     }
                     // clamp feedback to the durable position: acknowledging
                     // ahead of it would allow PG to discard WAL we cannot
@@ -389,7 +391,9 @@ impl WalSource {
         let Some(rel) = relations.get(&rel_id) else {
             // PG always sends RELATION before the first row of a relation on a
             // fresh stream; missing entries mean our own bookkeeping is broken
-            return Err(anyhow::anyhow!("row for unknown relation oid {rel_id}"));
+            return Err(SourceError::protocol(format!(
+                "row for unknown relation oid {rel_id}"
+            )));
         };
         let table = (rel.schema.clone(), rel.name.clone());
 
@@ -400,33 +404,28 @@ impl WalSource {
                 .iter()
                 .find(|s| s.schema == rel.schema && s.table == rel.name)
                 .ok_or_else(|| {
-                    anyhow::anyhow!(
+                    SourceError::protocol(format!(
                         "child {}.{} has no matching children entry",
-                        rel.schema,
-                        rel.name
-                    )
+                        rel.schema, rel.name
+                    ))
                 })?;
             // the parent is located by the FOREIGN KEY value carried in the
             // row; deletes only carry it under REPLICA IDENTITY FULL
             let fk_idx =
                 super::docbuild::column_index(rel, &cspec.foreign_key).ok_or_else(|| {
-                    anyhow::anyhow!(
+                    SourceError::protocol(format!(
                         "fk column {} missing on {}.{}",
-                        cspec.foreign_key,
-                        rel.schema,
-                        rel.name
-                    )
+                        cspec.foreign_key, rel.schema, rel.name
+                    ))
                 })?;
             let fk_json = super::docbuild::convert_column_at(rel, fk_idx, incoming.tuple())
-                .map_err(|e| anyhow::anyhow!("fk decode: {e}"))?;
+                .protocol_ctx(|| "fk decode".into())?;
             if fk_json.is_null() {
-                return Err(anyhow::anyhow!(
+                return Err(SourceError::protocol(format!(
                     "child row carries NULL {}; cannot locate parent. \
                      Consider ALTER TABLE {}.{} REPLICA IDENTITY FULL",
-                    cspec.foreign_key,
-                    rel.schema,
-                    rel.name
-                ));
+                    cspec.foreign_key, rel.schema, rel.name
+                )));
             }
             return Ok(Classified::NamesParent {
                 parent: parent.clone(),
@@ -555,7 +554,7 @@ async fn send_change(
 ) -> Result<()> {
     tx.send(ChangeEvent::Row(change))
         .await
-        .context("change channel closed")
+        .map_err(|_| SourceError::ChannelClosed)
 }
 
 impl WalSourceConfig {

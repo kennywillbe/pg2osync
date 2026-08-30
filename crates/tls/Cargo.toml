@@ -8,8 +8,8 @@ repository.workspace = true
 description = "Shared TLS configuration for pg2osync sources"
 
 [dependencies]
-anyhow.workspace = true
 rustls = { version = "0.23.43", features = ["ring"] }
+thiserror.workspace = true
 tracing.workspace = true
 url = "2.5.8"
 webpki-roots = "1.0.9"

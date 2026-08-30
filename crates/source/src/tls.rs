@@ -4,7 +4,7 @@
 //! source; what lives here is how a PostgreSQL connection and the replication
 //! transport consume them.
 
-use anyhow::{Context as _, Result};
+use crate::error::{Context as _, Result, SourceError};
 use tokio_postgres::Client;
 
 pub use pg2osync_tls::{ConfiguredTls, SslMode, TlsSettings};
@@ -14,12 +14,14 @@ pub async fn connect(tls: &TlsSettings, url: &str) -> Result<Client> {
     if tls.mode == SslMode::Disable {
         let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls)
             .await
-            .context("connection failed")?;
+            .connect_ctx(|| "connection failed".into())?;
         spawn_connection_task(connection);
         return Ok(client);
     }
 
-    let mut config: tokio_postgres::Config = url.parse().context("invalid connection url")?;
+    let mut config: tokio_postgres::Config = url
+        .parse()
+        .connect_ctx(|| "invalid connection url".into())?;
     // tokio-postgres only distinguishes "must be encrypted" from "try";
     // certificate and hostname checking is the connector's job.
     config.ssl_mode(if tls.mode.requires_tls() {
@@ -32,16 +34,30 @@ pub async fn connect(tls: &TlsSettings, url: &str) -> Result<Client> {
     let (client, connection) = match config.connect(connector).await {
         Ok(pair) => pair,
         Err(e) => {
-            let mut err = anyhow::Error::new(e);
-            if let Some(hint) = client_certificate_hint(tls, &format!("{:#}", err)) {
-                err = err.context(hint);
-            }
-            return Err(err)
-                .with_context(|| format!("connection failed (sslmode={})", tls.mode.as_str()));
+            let context = match client_certificate_hint(tls, &whole_chain(&e)) {
+                Some(hint) => format!("connection failed (sslmode={}): {hint}", tls.mode.as_str()),
+                None => format!("connection failed (sslmode={})", tls.mode.as_str()),
+            };
+            return Err(SourceError::connect(context, e));
         }
     };
     spawn_connection_task(connection);
     Ok(client)
+}
+
+/// One line holding every layer of a failure.
+///
+/// tokio-postgres summarises a rejected login as "db error" and leaves the
+/// server's own sentence in the cause, so anything that reads the reason has
+/// to walk the chain rather than trust the outermost message.
+fn whole_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = error.to_string();
+    let mut cause = error.source();
+    while let Some(next) = cause {
+        out.push_str(&format!(": {next}"));
+        cause = next.source();
+    }
+    out
 }
 
 /// What to try next when the server rejected us over a client certificate.

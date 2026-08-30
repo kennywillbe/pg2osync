@@ -1,7 +1,7 @@
 //! Catalog inspection and management: wal_level checks, publication/slot
 //! lifecycle, replica-identity and primary-key discovery.
 
-use anyhow::{Context, Result, bail};
+use crate::error::{Context as _, Result, SourceError};
 use pg2osync_core::Lsn;
 use tokio_postgres::Client;
 
@@ -16,13 +16,14 @@ pub async fn check_wal_level(client: &Client) -> Result<()> {
             "SELECT setting FROM pg_settings WHERE name = 'wal_level'",
             &[],
         )
-        .await?
+        .await
+        .catalog_ctx(|| "cannot read wal_level".into())?
         .get(0);
     if level != "logical" {
-        bail!(
+        return Err(SourceError::Config(format!(
             "wal_level is '{level}' but must be 'logical'; \
              set `wal_level = logical` in postgresql.conf and restart PostgreSQL"
-        );
+        )));
     }
     Ok(())
 }
@@ -49,7 +50,7 @@ pub async fn table_info(client: &Client, schema: &str, name: &str) -> Result<Tab
             &[&schema, &name],
         )
         .await
-        .with_context(|| format!("table {schema}.{name} not found or not inspectable"))?;
+        .catalog_ctx(|| format!("table {schema}.{name} not found or not inspectable"))?;
     let repl: String = row.get::<_, String>(0);
     Ok(TableCatalogInfo {
         // pg_class.relreplident arrives as a 1-byte "char"; via text protocol
@@ -197,7 +198,7 @@ pub async fn preflight(
             &[&publication, &slot_name],
         )
         .await
-        .context("cannot inspect the current role's privileges")?;
+        .catalog_ctx(|| "cannot inspect the current role's privileges".into())?;
 
     let mut tables_not_owned = Vec::new();
     let mut tables_not_readable = Vec::new();
@@ -212,7 +213,7 @@ pub async fn preflight(
                 &[&table],
             )
             .await
-            .with_context(|| format!("cannot inspect table {table}"))?;
+            .catalog_ctx(|| format!("cannot inspect table {table}"))?;
         if !checks.get::<_, bool>("owns") {
             tables_not_owned.push(table.clone());
         }
@@ -246,7 +247,8 @@ pub async fn ensure_publication(
             "SELECT pubname FROM pg_publication WHERE pubname = $1",
             &[&publication],
         )
-        .await?
+        .await
+        .catalog_ctx(|| format!("cannot read publication {publication}"))?
         .map(|r| r.get(0));
 
     match existing {
@@ -261,7 +263,7 @@ pub async fn ensure_publication(
                     &[],
                 )
                 .await
-                .with_context(|| format!("CREATE PUBLICATION {publication} failed"))?;
+                .catalog_ctx(|| format!("CREATE PUBLICATION {publication} failed"))?;
             tracing::info!(target: "pg2osync::catalog", "created publication {publication}");
         }
         Some(_) => {
@@ -273,7 +275,8 @@ pub async fn ensure_publication(
                      WHERE pubname = $1",
                     &[&publication],
                 )
-                .await?;
+                .await
+                .catalog_ctx(|| format!("cannot read the tables of publication {publication}"))?;
             let mut current = std::collections::BTreeSet::new();
             for r in rows {
                 let s: String = r.get(0);
@@ -281,10 +284,10 @@ pub async fn ensure_publication(
                 current.insert(format!("{s}.{t}"));
             }
             if current != configured {
-                return Err(anyhow::anyhow!(
+                return Err(SourceError::Config(format!(
                     "publication {publication} covers {current:?} but config wants {configured:?}; \
                      drop and recreate it or align the config (drift is never auto-applied)"
-                ));
+                )));
             }
             tracing::debug!(target: "pg2osync::catalog", "publication {publication} matches config");
         }
@@ -341,7 +344,7 @@ pub async fn all_slots(client: &Client) -> Result<Vec<SlotInfo>> {
             &[],
         )
         .await
-        .context("listing replication slots failed")?;
+        .catalog_ctx(|| "listing replication slots failed".into())?;
     Ok(rows
         .iter()
         .map(|r| SlotInfo {
@@ -395,12 +398,15 @@ pub async fn ensure_slot(client: &Client, slot_name: &str) -> Result<Option<Stri
             "SELECT plugin FROM pg_replication_slots WHERE slot_name = $1",
             &[&slot_name],
         )
-        .await?
+        .await
+        .catalog_ctx(|| format!("cannot read replication slot {slot_name}"))?
     {
         Some(row) => {
             let plugin: String = row.get(0);
             if plugin != "pgoutput" {
-                bail!("slot {slot_name} uses plugin '{plugin}', expected pgoutput");
+                return Err(SourceError::Config(format!(
+                    "slot {slot_name} uses plugin '{plugin}', expected pgoutput"
+                )));
             }
             Ok(None)
         }
@@ -411,7 +417,7 @@ pub async fn ensure_slot(client: &Client, slot_name: &str) -> Result<Option<Stri
                     &[&slot_name],
                 )
                 .await
-                .with_context(|| format!("creating slot {slot_name} failed"))?;
+                .catalog_ctx(|| format!("creating slot {slot_name} failed"))?;
             tracing::info!(target: "pg2osync::catalog", "created replication slot {slot_name}");
             Ok(None)
         }
@@ -424,7 +430,8 @@ pub async fn drop_slot(client: &Client, slot_name: &str) -> Result<()> {
             "SELECT 1 FROM pg_replication_slots WHERE slot_name = $1",
             &[&slot_name],
         )
-        .await?;
+        .await
+        .catalog_ctx(|| format!("cannot read replication slot {slot_name}"))?;
     if exists.is_none() {
         tracing::info!(target: "pg2osync::catalog", "slot {slot_name} already absent");
         return Ok(());
@@ -432,7 +439,7 @@ pub async fn drop_slot(client: &Client, slot_name: &str) -> Result<()> {
     client
         .execute("SELECT pg_drop_replication_slot($1)", &[&slot_name])
         .await
-        .with_context(|| format!("dropping slot {slot_name} failed"))?;
+        .catalog_ctx(|| format!("dropping slot {slot_name} failed"))?;
     tracing::info!(target: "pg2osync::catalog", "dropped replication slot {slot_name}");
     Ok(())
 }
@@ -445,7 +452,7 @@ pub async fn drop_publication(client: &Client, publication: &str) -> Result<()> 
     client
         .execute(&format!("DROP PUBLICATION IF EXISTS {publication}"), &[])
         .await
-        .with_context(|| format!("dropping publication {publication} failed"))?;
+        .catalog_ctx(|| format!("dropping publication {publication} failed"))?;
     tracing::info!(target: "pg2osync::catalog", "dropped publication {publication}");
     Ok(())
 }
@@ -495,7 +502,7 @@ pub async fn slot_pressure(client: &Client, slot_name: &str) -> Result<Option<Sl
             &[&slot_name],
         )
         .await
-        .context("cannot read replication slot pressure")?;
+        .catalog_ctx(|| "cannot read replication slot pressure".into())?;
     Ok(row.map(|r| SlotPressure {
         // restart_lsn, not confirmed_flush_lsn: the former is what actually
         // pins WAL, and the two can be far apart during a load
@@ -520,7 +527,7 @@ pub async fn all_slot_pressure(client: &Client) -> Result<Vec<(String, bool, Slo
             &[],
         )
         .await
-        .context("cannot read replication slots")?;
+        .catalog_ctx(|| "cannot read replication slots".into())?;
     Ok(rows
         .iter()
         .map(|r| {
@@ -544,10 +551,11 @@ pub async fn confirmed_flush_lsn(client: &Client, slot_name: &str) -> Result<Opt
             "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
             &[&slot_name],
         )
-        .await?;
+        .await
+        .catalog_ctx(|| format!("cannot read replication slot {slot_name}"))?;
     // a freshly created slot has a NULL confirmed_flush_lsn until first use
     match row.and_then(|r| r.get::<_, Option<String>>(0)) {
-        Some(text) => Ok(Some(text.parse()?)),
+        Some(text) => Ok(Some(text.parse().map_err(pg2osync_core::CoreError::from)?)),
         None => Ok(None),
     }
 }

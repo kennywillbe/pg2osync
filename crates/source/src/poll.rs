@@ -8,7 +8,7 @@
 //! No source position exists to checkpoint, so the caller re-runs the backfill
 //! on every start; at-least-once semantics make the replay harmless.
 
-use anyhow::{Context as _, Result};
+use crate::error::{Context as _, Result, SourceError};
 use pg2osync_core::event::{ChangeEvent, RowKind, TransactionBoundary};
 use pg2osync_core::lsn::Lsn;
 use serde_json::Value;
@@ -67,7 +67,7 @@ impl PollSource {
             let wm: Option<String> = client
                 .query_one(&sql, &[])
                 .await
-                .with_context(|| {
+                .catalog_ctx(|| {
                     format!(
                         "poll column {}.{} is not readable",
                         t.qualified, t.poll_column
@@ -93,7 +93,7 @@ impl PollSource {
                     Some(w) => client.query(&sql, &[w]).await,
                     None => client.query(&sql, &[]).await,
                 }
-                .with_context(|| {
+                .catalog_ctx(|| {
                     format!(
                         "poll query failed for {} (needs column {})",
                         t.qualified, t.poll_column
@@ -112,7 +112,7 @@ impl PollSource {
                 for change in cycle.changes {
                     tx.send(ChangeEvent::Row(change))
                         .await
-                        .context("change channel closed")?;
+                        .map_err(|_| SourceError::ChannelClosed)?;
                     sent_any = true;
                 }
                 if let Some(m) = cycle.watermark {
@@ -127,7 +127,7 @@ impl PollSource {
                     commit_ts_micros: 0,
                 }))
                 .await
-                .context("change channel closed")?;
+                .map_err(|_| SourceError::ChannelClosed)?;
             }
             tokio::time::sleep(Duration::from_secs(self.cfg.interval_secs.max(1))).await;
         }
