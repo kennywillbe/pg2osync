@@ -20,12 +20,15 @@
 #   MEILI_URL         Meilisearch base URL  (default http://localhost:7700)
 #   MEILI_MASTER_KEY  master key            (default e2e-master-key)
 #   PG_CONTAINER      psql container name   (default dev-postgres-1)
+#   PG_PORT           source port           (default 15432)
+#   E2E_LOG           pipeline log file     (default /tmp/pg2osync-meili-smoke.log)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 BIN=./target/release/pg2osync
 MEILI=${MEILI_URL:-http://localhost:7700}
 PG_CONTAINER=${PG_CONTAINER:-dev-postgres-1}
+PG_PORT=${PG_PORT:-15432}
 # the sink reads the key from this variable's name, so it has to be exported
 export MEILI_MASTER_KEY=${MEILI_MASTER_KEY:-e2e-master-key}
 SLOT=pg2osync_e2e_meili
@@ -35,8 +38,9 @@ INDEX=e2e_meili_users
 # then breaks every later one with "File exists".
 CONFIG=$(mktemp /tmp/pg2osync-meili.XXXXXX)
 STATE_DIR=$(mktemp -d /tmp/pg2osync-meili-state.XXXXXX)
-LOG=/tmp/pg2osync-meili-smoke.log
-export PG2OSYNC_SOURCE_URL="postgres://postgres:postgres@localhost:15432/sourcedb"
+# a file of this run's own, so two suites do not read each other's log lines
+LOG=${E2E_LOG:-/tmp/pg2osync-meili-smoke.log}
+export PG2OSYNC_SOURCE_URL="postgres://postgres:postgres@localhost:$PG_PORT/sourcedb"
 PASS=0; FAIL=0
 
 say()   { printf "\n\033[1m== %s ==\033[0m\n" "$1"; }

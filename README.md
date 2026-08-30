@@ -438,6 +438,9 @@ cargo build --release
 ./dev/e2e-mysql-test.sh    # MySQL/MariaDB source
 ```
 
+Before pushing, run `./dev/ci-local.sh`: it runs on your machine exactly what
+CI runs on the pull request, so CI is never the first to find a red.
+
 Workspace layout:
 
 ```
