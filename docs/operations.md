@@ -201,6 +201,16 @@ RUST_LOG=pg2osync::sink=debug,pg2osync=info   # narrow to one component
 Targets: `pg2osync::source`, `::engine`, `::sink`, `::checkpoint`, `::backfill`,
 `::catalog`, `::config`, `::metrics`, `::run`. Credentials are never logged.
 
+`PG2OSYNC_LOG_FORMAT=json` writes one JSON object per line instead of the
+default `text`, with the timestamp, level, target and the event's own fields as
+top-level keys — what Loki, Datadog and CloudWatch parse without a regex. Any
+other value is refused at startup.
+
+```sh
+PG2OSYNC_LOG_FORMAT=json pg2osync run -c pg2osync.toml
+{"timestamp":"2026-08-30T09:12:44.318271Z","level":"INFO","message":"streaming from 0/1A2B3C8","target":"pg2osync::run"}
+```
+
 ## Failure modes
 
 | Symptom | Cause | What to do |

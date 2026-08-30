@@ -143,14 +143,48 @@ enum Command {
     },
 }
 
+/// How log lines are written. An environment variable rather than a config key
+/// because the format belongs to whoever collects the logs of a deployment, not
+/// to the pipeline the config describes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LogFormat {
+    Text,
+    Json,
+}
+
+impl LogFormat {
+    fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "text" => Ok(Self::Text),
+            "json" => Ok(Self::Json),
+            other => bail!("PG2OSYNC_LOG_FORMAT is \"{other}\": expected \"text\" or \"json\""),
+        }
+    }
+
+    fn from_env() -> Result<Self> {
+        match std::env::var("PG2OSYNC_LOG_FORMAT") {
+            Ok(value) => Self::parse(&value),
+            Err(_) => Ok(Self::Text),
+        }
+    }
+}
+
+fn init_logging(format: LogFormat) {
+    let builder = tracing_subscriber::fmt().with_env_filter(
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "pg2osync=info".into()),
+    );
+    match format {
+        LogFormat::Text => builder.init(),
+        // Flattened, so a collector reads the event's own fields as top-level
+        // keys beside level and target rather than under a nested object.
+        LogFormat::Json => builder.json().flatten_event(true).init(),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "pg2osync=info".into()),
-        )
-        .init();
+    init_logging(LogFormat::from_env()?);
 
     match Cli::parse().command {
         Command::Run { config } => pipeline(&config, run::Mode::Run).await,
@@ -1521,6 +1555,16 @@ fn mysql_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_log_format_is_named_in_any_case_and_nothing_else_is_accepted() {
+        assert_eq!(LogFormat::parse("json").expect("json"), LogFormat::Json);
+        assert_eq!(LogFormat::parse("JSON").expect("JSON"), LogFormat::Json);
+        assert_eq!(LogFormat::parse(" Text ").expect("Text"), LogFormat::Text);
+        assert_eq!(LogFormat::parse("text").expect("text"), LogFormat::Text);
+        assert!(LogFormat::parse("jsonl").is_err());
+        assert!(LogFormat::parse("").is_err());
+    }
 
     fn found() -> Vec<String> {
         vec![
