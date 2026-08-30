@@ -46,7 +46,7 @@ jobs:
           curl -sSfL "$url" | tar -xz --directory="$RUNNER_TEMP/mdbook"
           echo "$RUNNER_TEMP/mdbook" >> "$GITHUB_PATH"
       - run: mdbook build
-      - uses: actions/configure-pages@v5
+      - uses: actions/configure-pages@v6
         if: github.ref == 'refs/heads/main' && github.event.repository.private == false
       - uses: actions/upload-pages-artifact@v4
         if: github.ref == 'refs/heads/main' && github.event.repository.private == false
@@ -70,4 +70,4 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
