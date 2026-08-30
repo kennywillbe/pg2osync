@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
+use tracing::Instrument;
 
 /// A caller cannot hold a connection open indefinitely.
 const MAX_TIMEOUT: Duration = Duration::from_secs(30);
@@ -41,6 +42,15 @@ pub type StreamNudge = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> 
 pub type CurrentPosition =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Option<u64>> + Send>> + Send + Sync>;
 
+/// Continues a caller's trace inside the wait, given the span and the W3C
+/// `traceparent` header the request carried.
+///
+/// A closure the binary injects, like the two above it, because linking a
+/// header to a span means naming a tracing backend's types and the engine may
+/// not: it emits `tracing` spans and nothing else. Absent — which is the case
+/// whenever nothing is exporting traces — a `traceparent` is simply ignored.
+pub type TraceLink = Arc<dyn Fn(&tracing::Span, &str) + Send + Sync>;
+
 pub struct ApiConfig {
     pub bind: String,
     /// Optional bearer token. The endpoint is application-facing, so it may sit
@@ -50,28 +60,30 @@ pub struct ApiConfig {
     pub indices: Vec<String>,
 }
 
+/// What the endpoint borrows from the running pipeline.
+///
+/// Named fields rather than a row of positional arguments: half of them are
+/// interchangeable `Option<Arc<dyn Fn…>>` closures the binary injects, and at a
+/// call site two of those in the wrong order would still compile.
+pub struct ApiDeps {
+    pub acked: watch::Receiver<Option<Lsn>>,
+    pub parse_position: PositionParser,
+    pub render_position: crate::PositionRenderer,
+    pub sink: Arc<dyn Sink>,
+    pub nudge: Option<StreamNudge>,
+    pub current_position: Option<CurrentPosition>,
+    pub trace_link: Option<TraceLink>,
+}
+
 /// Everything the handler needs, shared across connections.
 struct ApiState {
     cfg: ApiConfig,
-    acked: watch::Receiver<Option<Lsn>>,
-    parse_position: PositionParser,
-    render_position: crate::PositionRenderer,
-    sink: Arc<dyn Sink>,
-    nudge: Option<StreamNudge>,
-    current_position: Option<CurrentPosition>,
+    deps: ApiDeps,
 }
 
 /// Serve until the process exits. Failures are logged, never fatal: losing this
 /// endpoint must not take replication down with it.
-pub async fn serve(
-    cfg: ApiConfig,
-    acked: watch::Receiver<Option<Lsn>>,
-    parse_position: PositionParser,
-    render_position: crate::PositionRenderer,
-    sink: Arc<dyn Sink>,
-    nudge: Option<StreamNudge>,
-    current_position: Option<CurrentPosition>,
-) {
+pub async fn serve(cfg: ApiConfig, deps: ApiDeps) {
     let listener = match tokio::net::TcpListener::bind(&cfg.bind).await {
         Ok(l) => l,
         Err(e) => {
@@ -82,15 +94,7 @@ pub async fn serve(
     tracing::info!(target: "pg2osync::api",
         "read-your-writes endpoint on http://{}/synced", cfg.bind);
 
-    let state = Arc::new(ApiState {
-        cfg,
-        acked,
-        parse_position,
-        render_position,
-        sink,
-        nudge,
-        current_position,
-    });
+    let state = Arc::new(ApiState { cfg, deps });
 
     loop {
         let Ok((mut sock, _)) = listener.accept().await else {
@@ -132,7 +136,7 @@ async fn handle(state: &ApiState, request: &str) -> (&'static str, String) {
     // pg2osync reads the source's position itself, so the caller needs neither
     // the privilege to read it nor any knowledge of LSN or binlog syntax.
     let (requested, raw_position) = match query_param(query, "position") {
-        Some(raw) => match (state.parse_position)(&raw) {
+        Some(raw) => match (state.deps.parse_position)(&raw) {
             Some(token) => (token, raw),
             None => {
                 return (
@@ -141,9 +145,9 @@ async fn handle(state: &ApiState, request: &str) -> (&'static str, String) {
                 );
             }
         },
-        None => match &state.current_position {
+        None => match &state.deps.current_position {
             Some(read) => match read().await {
-                Some(token) => (token, (state.render_position)(token)),
+                Some(token) => (token, (state.deps.render_position)(token)),
                 None => {
                     return (
                         "503 Service Unavailable",
@@ -162,12 +166,30 @@ async fn handle(state: &ApiState, request: &str) -> (&'static str, String) {
     let timeout = requested_timeout(query);
     let refresh = query_param(query, "refresh").as_deref() == Some("true");
 
+    // The caller's own trace continues into the write they are waiting for,
+    // which is the point of the endpoint: their request and the batch that
+    // satisfies it belong to one timeline rather than two unrelated ones.
+    let wait = tracing::info_span!(
+        target: "pg2osync::api",
+        "synced",
+        position = %raw_position,
+        synced = tracing::field::Empty,
+    );
+    if let Some(link) = &state.deps.trace_link
+        && let Some(traceparent) = crate::http::header(request, "traceparent")
+    {
+        link(&wait, traceparent);
+    }
+
     let started = Instant::now();
-    let reached = wait_for_position(state, requested, timeout).await;
+    let reached = wait_for_position(state, requested, timeout)
+        .instrument(wait.clone())
+        .await;
+    wait.record("synced", reached);
     if reached && refresh {
         // an accepted write is not searchable until the target refreshes, so
         // without this the guarantee would stop one step short of useful
-        if let Err(e) = state.sink.refresh(&state.cfg.indices).await {
+        if let Err(e) = state.deps.sink.refresh(&state.cfg.indices).await {
             tracing::warn!(target: "pg2osync::api", "refresh failed: {e}");
             return (
                 "503 Service Unavailable",
@@ -176,7 +198,7 @@ async fn handle(state: &ApiState, request: &str) -> (&'static str, String) {
         }
     }
 
-    let confirmed = (*state.acked.borrow()).map(|lsn| (state.render_position)(lsn.0));
+    let confirmed = (*state.deps.acked.borrow()).map(|lsn| (state.deps.render_position)(lsn.0));
     let body = format!(
         r#"{{"synced":{reached},"requested":{},"confirmed":{},"waited_ms":{}}}"#,
         json_string(&raw_position),
@@ -201,14 +223,14 @@ async fn handle(state: &ApiState, request: &str) -> (&'static str, String) {
 /// is written once and the wait resumes.
 async fn wait_for_position(state: &ApiState, requested: u64, timeout: Duration) -> bool {
     let grace = GRACE_BEFORE_NUDGE.min(timeout);
-    if wait_for(state.acked.clone(), requested, grace).await {
+    if wait_for(state.deps.acked.clone(), requested, grace).await {
         return true;
     }
-    if let Some(nudge) = &state.nudge {
+    if let Some(nudge) = &state.deps.nudge {
         nudge().await;
     }
     wait_for(
-        state.acked.clone(),
+        state.deps.acked.clone(),
         requested,
         timeout.saturating_sub(grace),
     )

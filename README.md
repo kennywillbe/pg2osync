@@ -323,7 +323,10 @@ pipeline, commit-to-indexed latency quantiles, and the current/confirmed source
 position with the lag between them. Import
 [deploy/grafana/pg2osync.json](deploy/grafana/pg2osync.json) for the dashboard
 built from those series. `PG2OSYNC_LOG_FORMAT=json` writes one JSON object per
-log line for the collector alongside it.
+log line for the collector alongside it. Set `PG2OSYNC_OTLP_ENDPOINT` and one
+trace per batch — decode, transform, write, checkpoint — goes to Jaeger, Tempo
+or any OTLP collector, continuing your application's own trace when it calls
+`/synced`; unset, nothing is built or sent.
 
 **Read-your-writes** — the pipeline is asynchronous, so a page that writes and
 then reads from search can race it. Enable `[api]` and call `GET /synced` after

@@ -30,7 +30,13 @@ serde_json.workspace = true
 toml.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "json"] }
+# Traces only, and only from this crate: the engine and the sources emit
+# `tracing` spans, so the whole OpenTelemetry dependency stops here.
+tracing-opentelemetry = { version = "0.33.0", default-features = false }
+opentelemetry = { version = "0.32.0", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.32.1", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["trace", "grpc-tonic"] }
 futures = "0.3.34"
 bytes = "1.12.1"
 url = "2.5.8"

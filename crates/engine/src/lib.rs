@@ -26,6 +26,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::sync::{mpsc, watch};
+use tracing::Instrument;
 
 /// `[engine]` config section.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,7 +168,10 @@ impl DurableLsn {
 /// would let writes still queued ahead of it land afterwards and resurrect
 /// documents the source has already dropped.
 enum SinkCommand {
-    Write(Vec<LsnOp>),
+    /// The batch, and the span it was built under. The span travels with the
+    /// work so the write is a child of the batch that caused it rather than a
+    /// span of its own, and stays open until the write is done.
+    Write(Vec<LsnOp>, tracing::Span),
     /// Clearing an index, carrying the position it happened at so a versioned
     /// target can order it against the writes around it, and — for one half of
     /// a join pair — the relation the clear is scoped to.
@@ -232,6 +236,36 @@ pub struct PipelineCtx {
     /// records its progress behind this and nothing else.
     pub load_done_tx: watch::Sender<u64>,
     pub metrics: Arc<crate::metrics::Metrics>,
+}
+
+/// One span per batch: the unit an operator follows from the replication log
+/// to the target, and the parent every stage of it hangs off.
+///
+/// A `tracing` span and nothing more. Whether anything collects it — and what
+/// it is turned into — is the binary's business; the engine has to stay
+/// source-agnostic, and a telemetry dependency here would be a second thing it
+/// knew about the world.
+fn new_batch_span() -> tracing::Span {
+    tracing::info_span!(
+        target: "pg2osync::engine",
+        "pg2osync.batch",
+        rows = tracing::field::Empty,
+        bytes = tracing::field::Empty,
+        position = tracing::field::Empty,
+    )
+}
+
+/// Describe the batch now that it is known, and hand its span over with it.
+fn seal_batch_span(
+    span: &mut Option<tracing::Span>,
+    batch: &[LsnOp],
+    bytes: usize,
+) -> tracing::Span {
+    let span = span.take().unwrap_or_else(new_batch_span);
+    span.record("rows", batch.len());
+    span.record("bytes", bytes);
+    span.record("position", batch.last().map_or(0, |op| op.lsn.0));
+    span
 }
 
 /// Run the engine + sink + checkpoint side of the pipeline.
@@ -306,7 +340,16 @@ pub async fn run(
                     token: lsn.0,
                     position: ckpt_render(lsn.0),
                 };
-                match ckpt_sink.write_checkpoint(&checkpoint).await {
+                let span = tracing::info_span!(
+                    target: "pg2osync::checkpoint",
+                    "checkpoint",
+                    position = %checkpoint.position,
+                );
+                match ckpt_sink
+                    .write_checkpoint(&checkpoint)
+                    .instrument(span)
+                    .await
+                {
                     Ok(()) => {
                         // `durable` gates what the source may acknowledge, so it
                         // must advance only after the checkpoint is persisted
@@ -327,6 +370,10 @@ pub async fn run(
 
     let mut txn_buffer: Vec<LsnOp> = Vec::new();
     let mut txn_bytes: usize = 0;
+    // Opened by the first row that goes into the buffer and closed when the
+    // batch reaches the sink, so decoding, transforming and writing one set of
+    // rows share a timeline.
+    let mut batch_span: Option<tracing::Span> = None;
     // an event pulled off the channel while gathering rows, to be handled on
     // the next turn rather than dropped
     let mut deferred: Option<ChangeEvent> = None;
@@ -465,10 +512,12 @@ pub async fn run(
                     if waiting && !overdue {
                         coalescing_since.get_or_insert_with(std::time::Instant::now);
                     } else {
-                        txn_bytes = 0;
                         coalescing_since = None;
+                        let batch = std::mem::take(&mut txn_buffer);
+                        let span = seal_batch_span(&mut batch_span, &batch, txn_bytes);
+                        txn_bytes = 0;
                         if batch_tx
-                            .send(SinkCommand::Write(std::mem::take(&mut txn_buffer)))
+                            .send(SinkCommand::Write(batch, span))
                             .await
                             .is_err()
                         {
@@ -507,10 +556,12 @@ pub async fn run(
                     continue;
                 }
                 if !txn_buffer.is_empty() {
-                    txn_bytes = 0;
                     coalescing_since = None;
+                    let batch = std::mem::take(&mut txn_buffer);
+                    let span = seal_batch_span(&mut batch_span, &batch, txn_bytes);
+                    txn_bytes = 0;
                     if batch_tx
-                        .send(SinkCommand::Write(std::mem::take(&mut txn_buffer)))
+                        .send(SinkCommand::Write(batch, span))
                         .await
                         .is_err()
                     {
@@ -538,6 +589,7 @@ pub async fn run(
                     }
                 }
                 ctx.metrics.incr_event_by("row", rows.len() as u64);
+                let batch = batch_span.get_or_insert_with(new_batch_span).clone();
                 let rules = Rules {
                     projections: &ctx.projections,
                     transforms: &ctx.transforms,
@@ -551,6 +603,16 @@ pub async fn run(
                     routings: &ctx.routings,
                     append_only: &ctx.append_only,
                 };
+                // The engine's share of decoding a change: the source hands over
+                // what the replication protocol carried, and what it could not —
+                // an unchanged TOASTed column — is read back from the target
+                // here, before anything can be built from the row.
+                let decode = tracing::info_span!(
+                    target: "pg2osync::engine",
+                    parent: &batch,
+                    "decode",
+                    rows = rows.len(),
+                );
                 let completions = match fetch_completions(
                     &rows,
                     &ctx.mapping,
@@ -558,12 +620,22 @@ pub async fn run(
                     &ctx.metrics,
                     &rules,
                 )
+                .instrument(decode)
                 .await
                 {
                     Ok(map) => map,
                     Err(e) => break Err(e),
                 };
 
+                // Entered around each row rather than held across the loop: the
+                // loop awaits when an oversized transaction has to be split, and
+                // a span guard may not cross an await point.
+                let transform = tracing::info_span!(
+                    target: "pg2osync::engine",
+                    parent: &batch,
+                    "transform",
+                    rows = rows.len(),
+                );
                 for row in &rows {
                     // Defence in depth rather than a second filter: the source
                     // drops what it cannot map, and a panic in a worker thread
@@ -580,15 +652,17 @@ pub async fn run(
                             .and_then(|(key, _)| completions.get(&key))
                             .and_then(Option::as_ref);
                     let mut left_as_is = Vec::new();
-                    let ops = match materialize(
-                        target,
-                        (&row.schema, &row.table),
-                        &row.kind,
-                        &rules,
-                        previous,
-                        row.version,
-                        &mut left_as_is,
-                    ) {
+                    let ops = match transform.in_scope(|| {
+                        materialize(
+                            target,
+                            (&row.schema, &row.table),
+                            &row.kind,
+                            &rules,
+                            previous,
+                            row.version,
+                            &mut left_as_is,
+                        )
+                    }) {
                         Ok(ops) => ops,
                         Err(e) => {
                             break_err = Some(e);
@@ -710,8 +784,10 @@ pub async fn run(
                     {
                         // oversized transaction split: safe because every op is
                         // idempotent and the commit LSN lands on the final piece
+                        let piece = std::mem::take(&mut txn_buffer);
+                        let span = seal_batch_span(&mut batch_span, &piece, txn_bytes);
                         if batch_tx
-                            .send(SinkCommand::Write(std::mem::take(&mut txn_buffer)))
+                            .send(SinkCommand::Write(piece, span))
                             .await
                             .is_err()
                         {
@@ -769,13 +845,16 @@ pub async fn run(
                     continue;
                 }
                 // rows buffered before the TRUNCATE belong before it
-                if !txn_buffer.is_empty()
-                    && batch_tx
-                        .send(SinkCommand::Write(std::mem::take(&mut txn_buffer)))
+                if !txn_buffer.is_empty() {
+                    let batch = std::mem::take(&mut txn_buffer);
+                    let span = seal_batch_span(&mut batch_span, &batch, txn_bytes);
+                    if batch_tx
+                        .send(SinkCommand::Write(batch, span))
                         .await
                         .is_err()
-                {
-                    break Err(CoreError::Other("batch channel closed".into()));
+                    {
+                        break Err(CoreError::Other("batch channel closed".into()));
+                    }
                 }
                 txn_bytes = 0;
                 // A truncate removes every key at once, so one floor per index
@@ -1051,13 +1130,36 @@ async fn sink_loop(
             }
         };
         let result = match command {
-            SinkCommand::Write(batch) => {
+            SinkCommand::Write(batch, batch_span) => {
                 let sink = sink.clone();
+                let write = tracing::info_span!(
+                    target: "pg2osync::sink",
+                    parent: &batch_span,
+                    "write",
+                    docs = batch.len(),
+                    status = tracing::field::Empty,
+                );
                 // Spawned rather than merely awaited concurrently, so building
                 // one request's body does not hold up sending another: past the
                 // target's own limit that serialization is the next cost.
                 inflight.push_back(tokio::spawn(
-                    async move { sink.write(batch).await.map(Some) },
+                    async move {
+                        let result = sink.write(batch).await;
+                        tracing::Span::current().record(
+                            "status",
+                            match &result {
+                                Ok(ack) if ack.rejected.is_empty() => "ok",
+                                Ok(_) => "rejected",
+                                Err(_) => "error",
+                            },
+                        );
+                        // Held until the write is done rather than dropped at
+                        // the hand-over, so the batch's span covers the request
+                        // it caused instead of ending before it.
+                        drop(batch_span);
+                        result.map(Some)
+                    }
+                    .instrument(write),
                 ));
                 continue;
             }
@@ -3161,7 +3263,7 @@ mod pipeline_tests {
         for lsn in [100, 200, 300] {
             writer
                 .commands
-                .send(SinkCommand::Write(batch_at(lsn)))
+                .send(SinkCommand::Write(batch_at(lsn), tracing::Span::none()))
                 .await
                 .expect("writer running");
         }
@@ -3179,7 +3281,7 @@ mod pipeline_tests {
         for lsn in [100, 200] {
             writer
                 .commands
-                .send(SinkCommand::Write(batch_at(lsn)))
+                .send(SinkCommand::Write(batch_at(lsn), tracing::Span::none()))
                 .await
                 .expect("writer running");
         }
@@ -3199,7 +3301,7 @@ mod pipeline_tests {
         for lsn in [100, 200, 300] {
             writer
                 .commands
-                .send(SinkCommand::Write(batch_at(lsn)))
+                .send(SinkCommand::Write(batch_at(lsn), tracing::Span::none()))
                 .await
                 .expect("writer running");
         }
@@ -3248,7 +3350,7 @@ mod pipeline_tests {
         for lsn in [100, 200] {
             writer
                 .commands
-                .send(SinkCommand::Write(batch_at(lsn)))
+                .send(SinkCommand::Write(batch_at(lsn), tracing::Span::none()))
                 .await
                 .expect("writer running");
         }
@@ -3283,7 +3385,7 @@ mod pipeline_tests {
         for lsn in [100, 200, 300] {
             writer
                 .commands
-                .send(SinkCommand::Write(batch_at(lsn)))
+                .send(SinkCommand::Write(batch_at(lsn), tracing::Span::none()))
                 .await
                 .expect("writer running");
         }
@@ -5544,5 +5646,139 @@ mod pipeline_tests {
 
         intake.set_rate(None);
         assert!(intake.limit.is_none(), "the cap was removed");
+    }
+
+    /// What the engine says about a batch, without anything collecting it.
+    ///
+    /// A subscriber of our own rather than a live collector: the spans are the
+    /// contract, and whether they reach a tracing backend is the binary's business.
+    mod spans {
+        use super::*;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        struct Captured {
+            name: &'static str,
+            fields: HashMap<String, String>,
+        }
+
+        /// Every span the run opened, and where in that list each *live* id is.
+        ///
+        /// Two collections rather than one map keyed by id, because the registry
+        /// hands a closed span's id straight back to the next one: keyed by id,
+        /// a checkpoint opened after the batch closed would silently replace it.
+        #[derive(Default)]
+        struct Capture {
+            spans: Vec<Captured>,
+            live: HashMap<u64, usize>,
+        }
+
+        struct CaptureLayer {
+            capture: Arc<Mutex<Capture>>,
+            /// Only this test's own spans are captured. The subscriber is the
+            /// process's, so every other test in the binary opens spans through
+            /// it too, and each `#[tokio::test]` runs on a thread of its own.
+            thread: std::thread::ThreadId,
+        }
+
+        /// Every field lands as its `Debug` rendering, which is enough to compare
+        /// against and saves a visitor arm per primitive type.
+        struct Fields<'a>(&'a mut HashMap<String, String>);
+
+        impl tracing::field::Visit for Fields<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0
+                    .insert(field.name().to_string(), format!("{value:?}"));
+            }
+        }
+
+        impl<S> tracing_subscriber::Layer<S> for CaptureLayer
+        where
+            S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+        {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                id: &tracing::Id,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if std::thread::current().id() != self.thread {
+                    return;
+                }
+                let mut span = Captured {
+                    name: attrs.metadata().name(),
+                    fields: HashMap::new(),
+                };
+                attrs.record(&mut Fields(&mut span.fields));
+                let mut capture = self.capture.lock().expect("not poisoned");
+                capture.spans.push(span);
+                let at = capture.spans.len() - 1;
+                capture.live.insert(id.into_u64(), at);
+            }
+
+            fn on_record(
+                &self,
+                id: &tracing::Id,
+                values: &tracing::span::Record<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut capture = self.capture.lock().expect("not poisoned");
+                let Some(at) = capture.live.get(&id.into_u64()).copied() else {
+                    return;
+                };
+                values.record(&mut Fields(&mut capture.spans[at].fields));
+            }
+        }
+
+        #[tokio::test]
+        async fn a_batch_span_describes_the_batch_and_the_stages_that_built_it() {
+            let capture: Arc<Mutex<Capture>> = Arc::default();
+            let subscriber = tracing_subscriber::registry().with(CaptureLayer {
+                capture: capture.clone(),
+                thread: std::thread::current().id(),
+            });
+            // The process's subscriber, not this thread's, because whether a
+            // callsite is worth telling anyone about is decided once for the
+            // whole process: the other tests in this binary reach these
+            // callsites with nothing installed, and a thread-scoped subscriber
+            // races them for a decision that has already been made.
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("the only test in this binary that installs a subscriber");
+            tracing::callsite::rebuild_interest_cache();
+
+            run_script(500, vec![begin(0x10), row(1), row(2), commit(0x2A)]).await;
+
+            let capture = capture.lock().expect("not poisoned");
+            let spans = &capture.spans;
+            let batch = spans
+                .iter()
+                .find(|s| s.name == "pg2osync.batch")
+                .expect("the batch has a span");
+            assert_eq!(
+                batch.fields.get("rows").map(String::as_str),
+                Some("2"),
+                "one operation per row of the transaction"
+            );
+            assert_eq!(
+                batch.fields.get("position").map(String::as_str),
+                Some("42"),
+                "the commit position the batch carries, which is what an ack rests on"
+            );
+            assert!(
+                batch
+                    .fields
+                    .get("bytes")
+                    .is_some_and(|bytes| bytes != "0" && bytes.parse::<usize>().is_ok()),
+                "the size the sink is about to send: {:?}",
+                batch.fields.get("bytes")
+            );
+            for stage in ["decode", "transform"] {
+                assert!(
+                    spans.iter().any(|s| s.name == stage),
+                    "the batch's {stage} stage has a span of its own"
+                );
+            }
+        }
     }
 }

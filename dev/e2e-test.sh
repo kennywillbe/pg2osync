@@ -2842,5 +2842,88 @@ check "the stream is still advancing after the bad file" \
   "$(os_field e2e_reload 2002 v)" "still-streaming"
 stop_sync
 
+echo -e "\n\033[1m== 36. traces are opt-in and cannot break the pipeline ==\033[0m"
+# The point of the feature is that it costs nothing when it fails: an endpoint
+# nothing is listening on is the worst case, and rows still have to reach the
+# index while the export failure is reported once and not once per batch (#152).
+drop_idle_probe_slots
+OTCONFIG=$(mktemp /tmp/pg2osync-e2e-otel.XXXXXX)
+OTSLOT=pg2osync_e2e_otel
+otel_cleanup() {
+  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  pg "SELECT pg_drop_replication_slot('$OTSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$OTSLOT');" > /dev/null 2>&1 || true
+  rm -f "$OTCONFIG"
+}
+trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup; init_cleanup; fan_cleanup; bid_cleanup; shape_cleanup; where_cleanup; join_cleanup; union_cleanup; events_cleanup; pipe_cleanup; append_cleanup; routing_cleanup; reindex_cleanup; rate_cleanup; through_cleanup; ra_cleanup; pseudo_cleanup; rl_cleanup; otel_cleanup' EXIT
+
+cat > "$OTCONFIG" <<TOML
+[source]
+url_env = "PG2OSYNC_SOURCE_URL"
+slot_name = "$OTSLOT"
+publication = "${OTSLOT}_pub"
+
+[target]
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
+
+[metrics]
+bind = "127.0.0.1:9137"
+
+[sync.users]
+table = "public.users"
+index = "e2e_otel"
+exclude_columns = ["password_hash"]
+TOML
+
+curl -s -XDELETE "$OS/e2e_otel?ignore_unavailable=true" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/postgres-$OTSLOT" > /dev/null
+# nothing listens on 4417; the exporter can only fail, which is the case under test
+drops_before=$(grep -c "spans are not reaching the OTLP endpoint" "$LOG" || true)
+PG2OSYNC_OTLP_ENDPOINT=http://127.0.0.1:4417 \
+PG2OSYNC_OTLP_SAMPLE_RATIO=1.0 \
+PG2OSYNC_OTLP_SERVICE_NAME=e2e-otel \
+  nohup $BIN run -c "$OTCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_count e2e_otel)" -gt 0 ] && break
+  sleep 1
+done
+loaded=$(os_count e2e_otel)
+if [ "$loaded" -gt 0 ]; then
+  ok "the initial load indexed rows with an unreachable collector configured ($loaded)"
+else
+  bad "an unreachable collector stopped the initial load"
+fi
+pg "INSERT INTO users (id, email, name) VALUES (9152, 'otel@example.com', 'otel') ON CONFLICT (id) DO UPDATE SET name = 'otel';" > /dev/null
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_status e2e_otel 9152)" = "200" ] && break
+  sleep 1
+done
+check "and a streamed row reaches the index too" "$(os_field e2e_otel 9152 name)" "otel"
+# the drain flushes the exporter, so by the time the process is gone the failure
+# has been reported if it is going to be
+stop_sync
+dropped=$(($(grep -c "spans are not reaching the OTLP endpoint" "$LOG" || true) - drops_before))
+if [ "$dropped" = "1" ]; then
+  ok "the export failure is reported exactly once, not once per batch"
+else
+  bad "the export failure was reported $dropped times, want 1"
+fi
+if grep -q "replication is unaffected" "$LOG"; then
+  ok "and the line says the pipeline is unaffected"
+else
+  bad "the export failure does not say what it means for replication"
+fi
+
+# a bad ratio is a refusal at startup rather than a pipeline that runs on a
+# value nobody chose
+refusal=$(PG2OSYNC_OTLP_ENDPOINT=http://127.0.0.1:4417 PG2OSYNC_OTLP_SAMPLE_RATIO=7 \
+  $BIN validate -c "$OTCONFIG" 2>&1 || true)
+case "$refusal" in
+  *PG2OSYNC_OTLP_SAMPLE_RATIO*) ok "a sampling ratio outside 0.0-1.0 is refused, naming the variable" ;;
+  *) bad "a bad sampling ratio was accepted: $refusal" ;;
+esac
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

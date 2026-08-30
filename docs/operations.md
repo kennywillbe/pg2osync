@@ -237,6 +237,66 @@ PG2OSYNC_LOG_FORMAT=json pg2osync run -c pg2osync.toml
 {"timestamp":"2026-08-30T09:12:44.318271Z","level":"INFO","message":"streaming from 0/1A2B3C8","target":"pg2osync::run"}
 ```
 
+## Traces
+
+Off unless `PG2OSYNC_OTLP_ENDPOINT` names a collector. With it set, pg2osync
+exports OpenTelemetry spans over OTLP/gRPC; with it unset nothing is built — no
+exporter, no batch thread, no connection attempt.
+
+```sh
+PG2OSYNC_OTLP_ENDPOINT=http://localhost:4317 pg2osync run -c pg2osync.toml
+```
+
+| Variable | Default | What it does |
+|---|---|---|
+| `PG2OSYNC_OTLP_ENDPOINT` | unset | OTLP/gRPC collector. Unset means no traces at all |
+| `PG2OSYNC_OTLP_SAMPLE_RATIO` | `1.0` | Fraction of traces kept, `0.0` to `1.0`. Anything else is refused at startup |
+| `PG2OSYNC_OTLP_SERVICE_NAME` | `pg2osync` | `service.name` on every span |
+
+One trace per batch — the unit the pipeline actually writes, which is one
+transaction unless several small ones coalesced or one large one was split:
+
+```
+pg2osync.batch   rows=120 bytes=48213 position=42
+├─ decode        rows=120     source rows read, TOASTed columns completed
+├─ transform     rows=120     projections, transforms, renames, ids, fan-out
+└─ write         docs=120 status=ok   the bulk request against the target
+```
+
+`checkpoint` is a trace of its own, with the position it persisted: it runs on
+its own interval and belongs to no single batch. `status` on a write is `ok`,
+`rejected` when the target refused documents, or `error`.
+
+Sampling is parent-based: a caller who sampled their own request has decided
+for the write it waits on too, whatever the ratio says. So the ratio is what to
+turn down on a busy pipeline — `0.01` on a stream of thousands of small
+transactions is plenty to see shape and latency — and a request that arrives
+through `/synced` with a sampled `traceparent` is kept regardless.
+
+**Linking your application's trace.** `GET /synced` reads the W3C `traceparent`
+header and continues that trace, so the wait appears inside the request that
+performed the write rather than as an unrelated span:
+
+```sh
+curl -H "traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01" \
+     "http://127.0.0.1:9131/synced?refresh=true"
+```
+
+**Somewhere to send it.** Jaeger accepts OTLP directly, which is one container
+between you and a first trace:
+
+```sh
+docker run --rm -p 16686:16686 -p 4317:4317 jaegertracing/all-in-one:1.62
+# then PG2OSYNC_OTLP_ENDPOINT=http://localhost:4317, and open http://localhost:16686
+```
+
+Grafana Tempo, an OpenTelemetry Collector and every hosted backend that speaks
+OTLP take the same variable; point it at their gRPC endpoint.
+
+A collector that is unreachable costs one warning under `pg2osync::traces` and
+nothing else: the spans are dropped and replication carries on. Traces never
+gate a write.
+
 ## Failure modes
 
 | Symptom | Cause | What to do |

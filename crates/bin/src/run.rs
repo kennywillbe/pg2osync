@@ -870,15 +870,7 @@ async fn check_fan_out_column(
 ///
 /// Like the metrics endpoint it is started once, outside the retry loop: the
 /// acknowledged-position channel it watches has to survive a reconnect.
-fn start_api(
-    cfg: &AppConfig,
-    acked: watch::Receiver<Option<Lsn>>,
-    parse_position: pg2osync_engine::PositionParser,
-    render_position: PositionRenderer,
-    sink: Arc<dyn Sink>,
-    nudge: Option<pg2osync_engine::api::StreamNudge>,
-    current_position: Option<pg2osync_engine::api::CurrentPosition>,
-) -> Result<()> {
+fn start_api(cfg: &AppConfig, deps: pg2osync_engine::api::ApiDeps) -> Result<()> {
     if !cfg.api.enabled {
         return Ok(());
     }
@@ -895,18 +887,7 @@ fn start_api(
         token,
         indices: index_names(cfg)?,
     };
-    tokio::spawn(async move {
-        pg2osync_engine::api::serve(
-            api_cfg,
-            acked,
-            parse_position,
-            render_position,
-            sink,
-            nudge,
-            current_position,
-        )
-        .await
-    });
+    tokio::spawn(async move { pg2osync_engine::api::serve(api_cfg, deps).await });
     Ok(())
 }
 
@@ -1135,12 +1116,15 @@ async fn run_postgres(
     };
     start_api(
         &cfg,
-        ack_rx,
-        parse,
-        render.clone(),
-        sink.clone(),
-        nudge,
-        current_position,
+        pg2osync_engine::api::ApiDeps {
+            acked: ack_rx,
+            parse_position: parse,
+            render_position: render.clone(),
+            sink: sink.clone(),
+            nudge,
+            current_position,
+            trace_link: crate::trace_link(),
+        },
     )?;
 
     // setup is done; each attempt opens the SQL connection it needs, so holding
@@ -1666,12 +1650,15 @@ async fn run_mysql(
         };
         start_api(
             &cfg,
-            ack_rx,
-            parse,
-            render,
-            sink.clone(),
-            None,
-            current_position,
+            pg2osync_engine::api::ApiDeps {
+                acked: ack_rx,
+                parse_position: parse,
+                render_position: render,
+                sink: sink.clone(),
+                nudge: None,
+                current_position,
+                trace_link: crate::trace_link(),
+            },
         )?;
     }
 
