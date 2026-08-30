@@ -14,9 +14,11 @@ first. The rules below are the ones that must never be violated.
 4. **English** for code, comments, commits and documentation.
 5. Contradicting [docs/decisions.md](docs/decisions.md) is a bug: update the
    decision record first, then the code.
-6. Before calling a change done: `cargo fmt --all`,
-   `cargo clippy --workspace --all-targets -- -D warnings`,
-   `cargo test --workspace`, plus `./dev/e2e-test.sh` when the pipeline changed,
-   `./dev/e2e-mysql-test.sh` when the MySQL source, the engine or a sink
-   changed, and `./dev/failover-probe.sh` when the MySQL checkpoint or version
-   logic changed.
+6. **Before every push, run `./dev/ci-local.sh`** and get a green `RESULT`
+   line. It runs locally exactly what GitHub Actions runs on a pull request —
+   fmt, clippy, unit tests, the MSRV check, both e2e suites, the image build,
+   the helm lints, the book, the title check, `cargo audit` and the
+   compatibility cells when CI would run them. CI must never be the first to
+   find a red. `--fast` is a quick loop, not the definition of done; see
+   [AGENTS.md](AGENTS.md). `./dev/failover-probe.sh` stays manual when the MySQL
+   checkpoint or version logic changed.

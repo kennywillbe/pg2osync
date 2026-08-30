@@ -19,17 +19,56 @@ docker exec -i dev-postgres-1 psql -U postgres -d sourcedb < dev/seed.sql
 Rust stable is required; the MSRV is pinned in `Cargo.toml` (`rust-version`)
 and enforced by CI.
 
-## Before opening a pull request
+## Before every push
 
 ```sh
-cargo fmt --all
-cargo clippy --workspace --all-targets -- -D warnings   # must be clean
-cargo test --workspace
+./dev/ci-local.sh
+```
 
-cargo build --release
-./dev/e2e-test.sh                    # PostgreSQL -> OpenSearch, full pipeline
-./dev/e2e-mysql-test.sh              # MySQL source, engine or sink (needs a MySQL container)
-./dev/e2e-meili-smoke.sh             # the Meilisearch sink (needs a Meilisearch)
+One script, and it is the only thing you have to remember: it runs on your
+machine exactly what GitHub Actions runs on your pull request — the same
+commands, under the same job names, with the same pinned versions, which it
+reads out of `.github/workflows/*` and `Cargo.toml` at run time so it cannot
+drift from CI. Push on a green `RESULT` line; CI should never be the first to
+tell you a change is red.
+
+It covers `fmt + clippy + unit tests`, the MSRV check, `e2e PostgreSQL to
+OpenSearch`, `e2e MySQL to OpenSearch`, the container image build, the helm
+lints, the book (`docs.yml`), your pull request title (`pr-title.yml`),
+`cargo audit` when a Cargo file moved, and the six compatibility cells when
+CI would run them — that is, when you touched `.github/workflows/compat.yml`
+or `dev/e2e-*.sh`. `--matrix` runs those cells anyway; `--no-matrix` skips
+them, which is worth it only when you know they cannot be affected. They are
+throwaway containers on ports of their own (PostgreSQL 15433, OpenSearch 9201,
+Elasticsearch 9202, Meilisearch 7701, MySQL/MariaDB 13307), so the dev stack
+keeps running beside them.
+
+The Elasticsearch and Meilisearch cells are advisory — `compat.yml` marks them
+`continue-on-error` while [#118](https://github.com/kennywillbe/pg2osync/issues/118)
+and [#122](https://github.com/kennywillbe/pg2osync/issues/122) are open — so a
+failure there prints `!` and does not make your run red.
+
+The script starts the dev stack and the `mysql-test` container if they are
+down, seeds both, and refuses to run an e2e suite while another `pg2osync run`
+is alive — the suites stop a pipeline by killing every one of them, so two at
+once report failures that are not real. Logs go to a directory of this run's
+own, `/tmp/pg2osync-ci-local/<timestamp>`: one file per job, and the pipeline
+log of each suite beside it (the suites take that path in `E2E_LOG`, so two
+runs never read each other's log lines).
+
+While you are still working, `./dev/ci-local.sh --fast` skips the e2e suites,
+the image build and the matrix, which is about a minute instead of the better
+part of an hour. It is a loop, not a definition of done: run the whole script
+before you push.
+
+You need Docker, `helm`, `kubectl`, `mdbook`, `rustup`/`cargo`, `curl` and
+`python3`. `gh` is optional — without it, pass your title as
+`--title "fix: ..."`. `cargo-audit` and the MSRV toolchain are installed on
+demand.
+
+Deeper probes are not part of CI and stay manual:
+
+```sh
 ./dev/failover-probe.sh              # MySQL failover; builds its own primary and replica
 ./dev/mtls-probe.sh                  # client certificates; builds its own PostgreSQL with a CA
 ./dev/db-load-impact.sh              # what the source database pays while busy

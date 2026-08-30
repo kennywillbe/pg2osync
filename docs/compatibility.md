@@ -46,6 +46,13 @@ cells are kept red rather than trimmed: the gap is the finding.
 The matrix also runs on a pull request that touches the workflow or those
 scripts, so a change to the matrix is tested before the night it would break.
 
+`./dev/ci-local.sh` runs the same six cells on your machine, and runs them
+automatically for exactly the changes a pull request would; `--matrix` forces
+them. Each cell is a throwaway container on a port of its own — PostgreSQL
+15433, OpenSearch 9201, Elasticsearch 9202, Meilisearch 7701, MySQL/MariaDB
+13307 — so the dev stack on 15432/9200/13306 keeps running beside it, and the
+containers are removed however the cell ends.
+
 ## When a nightly run fails
 
 The workflow opens one issue labelled `nightly-compat` and comments the run

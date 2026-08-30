@@ -12,6 +12,9 @@
 # Usage: ./dev/e2e-test.sh
 #   OS_URL         target base URL          (default http://localhost:9200)
 #   TARGET_FLAVOR  opensearch|elasticsearch (default opensearch)
+#   PG_CONTAINER   psql container name      (default dev-postgres-1)
+#   PG_PORT        source port on localhost (default 15432)
+#   E2E_LOG        pipeline log file        (default /tmp/pg2osync-e2e.log)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -19,13 +22,17 @@ BIN=./target/release/pg2osync
 OS=${OS_URL:-http://localhost:9200}
 TARGET_FLAVOR=${TARGET_FLAVOR:-opensearch}
 PG_CONTAINER=${PG_CONTAINER:-dev-postgres-1}
+PG_PORT=${PG_PORT:-15432}
 # BSD mktemp only substitutes X's at the *end* of the template: with a
 # suffix after them it creates the literal name instead, and one killed run
 # then breaks every later one with "File exists".
 CONFIG=$(mktemp /tmp/pg2osync-e2e.XXXXXX)
 MAPPING=$(dirname "$CONFIG")/pg2osync-e2e-mapping.json
-LOG=/tmp/pg2osync-e2e.log
-export PG2OSYNC_SOURCE_URL="postgres://postgres:postgres@localhost:15432/sourcedb"
+# The suite counts lines it wrote to this log, so a second run appending to
+# the same file makes those assertions read another run's output. E2E_LOG
+# gives a caller running suites back to back a file of its own.
+LOG=${E2E_LOG:-/tmp/pg2osync-e2e.log}
+export PG2OSYNC_SOURCE_URL="postgres://postgres:postgres@localhost:$PG_PORT/sourcedb"
 PASS=0; FAIL=0
 
 say()   { printf "\n\033[1m== %s ==\033[0m\n" "$1"; }
@@ -1974,7 +1981,7 @@ slot_name = "$RTSLOT"
 publication = "${RTSLOT}_pub"
 
 [target]
-url = "http://localhost:9200"
+url = "$OS"
 
 [metrics]
 bind = "127.0.0.1:9130"

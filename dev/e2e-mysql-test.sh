@@ -11,6 +11,7 @@
 # Usage: MYSQL_PORT=13306 MYSQL_CONTAINER=mysql-test ./dev/e2e-mysql-test.sh
 #   OS_URL         target base URL          (default http://localhost:9200)
 #   TARGET_FLAVOR  opensearch|elasticsearch (default opensearch)
+#   E2E_LOG        pipeline log file        (default /tmp/pg2osync-mysql-e2e.log)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -28,7 +29,8 @@ CLIENT=${MYSQL_CLIENT:-mysql}
 # suffix after them it creates the literal name instead, and one killed run
 # then breaks every later one with "File exists".
 CONFIG=$(mktemp /tmp/pg2osync-mysql.XXXXXX)
-LOG=/tmp/pg2osync-mysql-e2e.log
+# a file of this run's own, so two suites do not read each other's log lines
+LOG=${E2E_LOG:-/tmp/pg2osync-mysql-e2e.log}
 export PG2OSYNC_MYSQL_URL="mysql://$USER:$PASSWORD@localhost:$PORT/sourcedb"
 PASS=0; FAIL=0
 

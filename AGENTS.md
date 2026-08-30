@@ -56,13 +56,49 @@ document in the same change and say why.
 ## Definition of done
 
 ```sh
-cargo fmt --all
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-./dev/e2e-test.sh          # when the pipeline changed
-./dev/e2e-mysql-test.sh    # when the MySQL source, the engine or a sink changed
-./dev/failover-probe.sh    # when the MySQL checkpoint or version logic changed
+./dev/ci-local.sh          # before every push, no exceptions
+./dev/failover-probe.sh    # when the MySQL checkpoint or version logic changed; not part of CI
 ```
+
+That one script runs, locally, exactly what GitHub Actions runs on a pull
+request: the same commands, the same job names, and the same pinned versions —
+it reads the images, the mdBook version and the MSRV out of the workflow files
+at run time, so it cannot drift from CI. CI must never be the first thing that
+finds a red.
+
+What it covers, job by job:
+
+| Job | Workflow |
+|---|---|
+| `fmt + clippy + unit tests` | `ci.yml` |
+| `minimum supported Rust version` | `ci.yml` |
+| `e2e PostgreSQL to OpenSearch` | `ci.yml` |
+| `e2e MySQL to OpenSearch` | `ci.yml` |
+| `container image builds` | `ci.yml` |
+| `helm chart lints` | `ci.yml` |
+| `the book builds` | `docs.yml` |
+| `the title is a conventional commit` | `pr-title.yml` |
+| `dependencies have no known advisories` | `audit.yml`, when a Cargo file moved |
+| the six compatibility cells | `compat.yml`, when it or `dev/e2e-*.sh` changed |
+
+The two cells `compat.yml` marks `continue-on-error` are reported as advisory
+(`!`) here too: a known gap being tracked does not make the run red.
+
+It brings the dev stack up if it is down, seeds it, and refuses to start an
+e2e suite while another `pg2osync run` is alive, because the suites stop a
+pipeline by killing every one of them. Logs land in
+`/tmp/pg2osync-ci-local/<timestamp>`, one file per job plus the pipeline log of
+each suite, and the run ends in a `RESULT` line.
+
+Selectors: `--only <job>` / `--skip <job>` for one job, `--matrix` /
+`--no-matrix` for the compatibility cells, `--title "..."` to check a pull
+request title before it exists. `--fast` skips the e2e suites, the image build
+and the matrix — it is a quick loop while you work, **not** the definition of
+done.
+
+Tools it needs: Docker, `helm`, `kubectl`, `mdbook`, `rustup`/`cargo`, `curl`,
+`python3`. `gh` is optional (only to read the title of an existing pull
+request); `cargo-audit` and a missing MSRV toolchain are installed on demand.
 
 Every bug fix ships with a regression test that fails without the fix. For
 protocol decoders, that means a byte-level test vector.
