@@ -233,6 +233,20 @@ so every op is idempotent under at-least-once replay. `split` cannot feed
 row, as the id paragraph says. `chrono`, already in the build through the
 OpenSearch client, parses the dates: a strptime calendar is not protocol code.
 
+A seventh op, `lookup` (#142), maps a status code to the label it is searched
+by. A dictionary is data, not a language: the table is closed, written out in
+the configuration, and evaluated as one hash lookup on the value's text form —
+nothing is parsed, nothing is computed, and no key can name another column, so
+there is still no expression to evaluate at run time. The alternative is a view
+or an application-side label column, the same DDL-on-someone-else's-table
+objection `constants` answers. A value the dictionary does not know is counted
+under `pg2osync_transform_unconverted_total` rather than halting the pipeline,
+for the reason the paragraph above gives: a code nobody declared a label for is
+a data-quality problem, and halting would make it an availability one. It keeps
+the original value, or `default` when the configuration would rather every
+document carry a label; either way it is counted, because the counter measures
+what the dictionary failed to cover, not what was written.
+
 **A row filter is SQL the database also runs, evaluated once more in the
 engine.** (`where`, #64.) A subset, because a stream has no query to push a
 predicate into: the engine evaluates it on every WAL, binlog and polled row, and

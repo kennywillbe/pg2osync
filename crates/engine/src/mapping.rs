@@ -82,6 +82,11 @@ pub enum TransformOp {
     Date {
         from: String,
     },
+    /// A value whose text form is a key of `map` becomes that key's label.
+    Lookup {
+        map: std::collections::BTreeMap<String, String>,
+        default: Option<String>,
+    },
 }
 
 impl TransformOp {
@@ -95,6 +100,7 @@ impl TransformOp {
             Self::Split { .. } => "split",
             Self::Number => "number",
             Self::Date { .. } => "date",
+            Self::Lookup { .. } => "lookup",
         }
     }
 }
@@ -108,6 +114,10 @@ enum Applied {
     Converted(serde_json::Value),
     AlreadyShaped,
     Unconvertible,
+    /// Unconvertible, but with a value to write in place of the original: a
+    /// `lookup` miss that has a `default`. Still counted — the dictionary did
+    /// not know the value, and that is what the counter exists to make visible.
+    Defaulted(serde_json::Value),
 }
 
 fn apply_op(op: &TransformOp, v: &serde_json::Value) -> Applied {
@@ -186,6 +196,28 @@ fn apply_op(op: &TransformOp, v: &serde_json::Value) -> Applied {
             }
             _ => Applied::Unconvertible,
         },
+        // The dictionary is closed and its keys are strings, so a value is
+        // matched by its text form: a JSON number 1 and the string "1" are the
+        // same key, and a bool matches through "true"/"false". An array or an
+        // object has no such form and simply misses. Like `date`, this op is
+        // not idempotent — a label is rarely a key of the same map — and for
+        // the same reason it never meets a value twice: a completed TOAST
+        // column is skipped.
+        TransformOp::Lookup { map, default } => {
+            let key = match v {
+                Value::String(s) => Some(s.clone()),
+                Value::Number(n) => Some(n.to_string()),
+                Value::Bool(b) => Some(b.to_string()),
+                _ => None,
+            };
+            match key.and_then(|k| map.get(&k)) {
+                Some(label) => Applied::Converted(Value::String(label.clone())),
+                None => match default {
+                    Some(d) => Applied::Defaulted(Value::String(d.clone())),
+                    None => Applied::Unconvertible,
+                },
+            }
+        }
     }
 }
 
@@ -243,6 +275,10 @@ impl Transforms {
                     Applied::Converted(new) => *v = new,
                     Applied::AlreadyShaped => {}
                     Applied::Unconvertible => left.push(col.as_str()),
+                    Applied::Defaulted(new) => {
+                        *v = new;
+                        left.push(col.as_str());
+                    }
                 }
             }
         }
@@ -1353,14 +1389,73 @@ mod tests {
             ("d", TransformOp::Split { by: ",".into() }),
             ("e", TransformOp::Number),
             ("f", TransformOp::Date { from: "%Y".into() }),
+            ("g", lookup(&[("1", "active")], Some("unknown"))),
         ]);
-        let mut doc = json!({"a": null, "b": null, "c": null, "d": null, "e": null, "f": null});
+        let mut doc = json!({
+            "a": null, "b": null, "c": null, "d": null, "e": null, "f": null, "g": null,
+        });
         let left = t.apply_except("public", "users", &mut doc, &[]);
         assert_eq!(
             doc,
-            json!({"a": null, "b": null, "c": null, "d": null, "e": null, "f": null})
+            json!({
+                "a": null, "b": null, "c": null, "d": null, "e": null, "f": null, "g": null,
+            }),
+            "not even a lookup default displaces a NULL"
         );
         assert!(left.is_empty());
+    }
+
+    fn lookup(entries: &[(&str, &str)], default: Option<&str>) -> TransformOp {
+        TransformOp::Lookup {
+            map: entries
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            default: default.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn lookup_matches_a_value_by_its_text_form() {
+        let dict = || {
+            lookup(
+                &[("1", "active"), ("2", "suspended"), ("true", "yes")],
+                None,
+            )
+        };
+        let t = users_transforms(&[
+            ("num", dict()),
+            ("str", dict()),
+            ("flag", dict()),
+            ("arr", dict()),
+        ]);
+        let mut doc = json!({"num": 1, "str": "2", "flag": true, "arr": ["1"]});
+        let left = t.apply_except("public", "users", &mut doc, &[]);
+        assert_eq!(doc["num"], json!("active"), "a number matches its digits");
+        assert_eq!(doc["str"], json!("suspended"));
+        assert_eq!(doc["flag"], json!("yes"));
+        assert_eq!(doc["arr"], json!(["1"]), "an array has no text form");
+        assert_eq!(left, vec!["arr"]);
+    }
+
+    #[test]
+    fn a_lookup_miss_keeps_the_value_or_takes_the_default_and_counts_either_way() {
+        let t = users_transforms(&[
+            ("kept", lookup(&[("1", "active")], None)),
+            ("labelled", lookup(&[("1", "active")], Some("unknown"))),
+            ("hit", lookup(&[("1", "active")], Some("unknown"))),
+        ]);
+        let mut doc = json!({"kept": "9", "labelled": "9", "hit": "1"});
+        let mut left = t.apply_except("public", "users", &mut doc, &[]);
+        left.sort_unstable();
+        assert_eq!(doc["kept"], json!("9"), "no default: indexed as it arrived");
+        assert_eq!(doc["labelled"], json!("unknown"));
+        assert_eq!(doc["hit"], json!("active"));
+        assert_eq!(
+            left,
+            vec!["kept", "labelled"],
+            "a default is still a value the dictionary did not know"
+        );
     }
 
     #[test]
