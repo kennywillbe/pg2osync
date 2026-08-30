@@ -33,6 +33,10 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
+          # one cache for the whole workflow: four jobs building the same
+          # workspace kept four near-identical copies, and the repository's
+          # cache quota is what evicts them
+          shared-key: ci
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
@@ -50,6 +54,7 @@ jobs:
           toolchain: "1.90.0"
       - uses: Swatinem/rust-cache@v2
         with:
+          shared-key: ci
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo check --workspace --locked
 
@@ -86,6 +91,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
+          shared-key: ci
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # the service container needs logical replication, which the image's
       # default command does not enable
@@ -131,6 +137,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
+          shared-key: ci
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Create the replication user
         run: |
