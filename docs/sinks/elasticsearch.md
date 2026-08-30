@@ -21,6 +21,11 @@ Identical contract to the [OpenSearch sink](opensearch.md):
 - TRUNCATE runs as `_delete_by_query?refresh=true&conflicts=proceed`, after an
   explicit refresh so unrefreshed writes cannot outlive it.
 - Retries follow `[engine] retry_max` and `retry_backoff_ms`.
+- `reconcile` walks an index with `search_after` in primary-key order, keeping
+  each hit's `_routing` so a stray join child is deleted from the shard it
+  lives on.
+- `switch-alias` reads the alias's current holders and swaps them in a single
+  `_aliases` request, so the alias never resolves to nothing mid-swap.
 
 Differences from OpenSearch are limited to REST dialect details (error
 response shapes, refresh semantics) that the sink abstracts away — config and

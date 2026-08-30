@@ -815,6 +815,100 @@ impl Sink for ElasticsearchSink {
         Ok(())
     }
 
+    async fn scan_keys(
+        &self,
+        index: &str,
+        key_field: &str,
+        only: Option<(&str, &str)>,
+        after: Option<&Value>,
+        size: usize,
+    ) -> Result<Vec<(String, Value, Option<String>)>, CoreError> {
+        let mut query = json!({
+            "size": size,
+            "sort": [{ key_field: "asc" }],
+            "_source": [key_field],
+        });
+        if let Some((field, value)) = only {
+            query["query"] = json!({"term": {field: value}});
+        }
+        if let Some(after) = after {
+            query["search_after"] = json!([after]);
+        }
+        let (status, body) = self
+            .send(
+                reqwest::Method::POST,
+                &format!("/{index}/_search"),
+                Some(query.to_string()),
+            )
+            .await?;
+        if status != 200 {
+            return Err(CoreError::Sink(format!("scan {index}: {status} {body}")));
+        }
+        Ok(body["hits"]["hits"]
+            .as_array()
+            .map(|hits| {
+                hits.iter()
+                    .filter_map(|hit| {
+                        let id = hit["_id"].as_str()?.to_string();
+                        // the sort value rather than _source: it is what
+                        // search_after needs back, in the form the index holds
+                        let key = hit["sort"].as_array()?.first()?.clone();
+                        // present only on a routed document, which is where a
+                        // delete of it has to be routed too
+                        let routing = hit["_routing"].as_str().map(str::to_string);
+                        Some((id, key, routing))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    async fn switch_alias(&self, alias: &str, index: &str) -> Result<(), CoreError> {
+        // where it points now, so the remove names real indices: a remove
+        // against a wildcard errors when the alias does not exist yet
+        let (status, current) = self
+            .send(reqwest::Method::GET, &format!("/_alias/{alias}"), None)
+            .await?;
+        let current = match status {
+            // the body of a 404 is an error document whose keys are not index
+            // names; reading them would ask the target to remove the alias
+            // from an index called "error"
+            200 => current,
+            404 => json!({}),
+            other => {
+                return Err(CoreError::Sink(format!(
+                    "read alias {alias}: {other} {current}"
+                )));
+            }
+        };
+
+        let mut actions: Vec<Value> = current
+            .as_object()
+            .map(|indices| {
+                indices
+                    .keys()
+                    .filter(|name| name.as_str() != index)
+                    .map(|name| json!({"remove": {"index": name, "alias": alias}}))
+                    .collect()
+            })
+            .unwrap_or_default();
+        actions.push(json!({"add": {"index": index, "alias": alias}}));
+
+        let (status, body) = self
+            .send(
+                reqwest::Method::POST,
+                "/_aliases",
+                Some(json!({"actions": actions}).to_string()),
+            )
+            .await?;
+        if !(200..300).contains(&status) {
+            return Err(CoreError::Sink(format!(
+                "point alias {alias} at {index}: {status} {body}"
+            )));
+        }
+        Ok(())
+    }
+
     async fn read_state(&self, key: &str) -> Result<Option<Value>, CoreError> {
         let (status, body) = self
             .send(
@@ -1163,20 +1257,20 @@ mod tests {
         );
     }
 
-    /// A stand-in for Elasticsearch: `answer` maps each request line
-    /// (`"POST /orders/_refresh"`) to the status and body it replies with, and
-    /// `seen` records every request line in the order it arrived.
+    /// A stand-in for Elasticsearch: `answer` maps each request — its line
+    /// (`"POST /orders/_refresh"`) and its body — to the status and body it
+    /// replies with, and `seen` records every request in the order it arrived.
     ///
     /// Hand-rolled over the TCP listener tokio already ships rather than a
     /// mocking crate: the sink speaks plain HTTP/1.1 through reqwest, and a
     /// canned status per path is all a refresh test needs.
     struct FakeTarget {
         url: String,
-        seen: Arc<Mutex<Vec<String>>>,
+        seen: Arc<Mutex<Vec<(String, String)>>>,
     }
 
     impl FakeTarget {
-        async fn start(answer: fn(&str) -> (u16, &'static str)) -> Self {
+        async fn start(answer: fn(&str, &str) -> (u16, &'static str)) -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind a loopback port");
@@ -1187,11 +1281,11 @@ mod tests {
                 while let Ok((mut stream, _)) = listener.accept().await {
                     let record = Arc::clone(&record);
                     tokio::spawn(async move {
-                        let Some(line) = read_request(&mut stream).await else {
+                        let Some((line, sent)) = read_request(&mut stream).await else {
                             return;
                         };
-                        crate::lock(&record).push(line.clone());
-                        let (status, body) = answer(&line);
+                        crate::lock(&record).push((line.clone(), sent.clone()));
+                        let (status, body) = answer(&line, &sent);
                         let response = format!(
                             "HTTP/1.1 {status} Fake\r\nContent-Type: application/json\r\n\
                              Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -1218,14 +1312,26 @@ mod tests {
         }
 
         fn seen(&self) -> Vec<String> {
-            crate::lock(&self.seen).clone()
+            crate::lock(&self.seen)
+                .iter()
+                .map(|(line, _)| line.clone())
+                .collect()
+        }
+
+        /// The bodies of the requests whose line is `line`, parsed as JSON.
+        fn bodies(&self, line: &str) -> Vec<Value> {
+            crate::lock(&self.seen)
+                .iter()
+                .filter(|(seen, _)| seen == line)
+                .map(|(_, sent)| serde_json::from_str(sent).unwrap_or(Value::Null))
+                .collect()
         }
     }
 
-    /// The request line of one HTTP/1.1 request, once the whole request —
-    /// headers and the body Content-Length announces — has been read, so the
-    /// reply never races the client's own write.
-    async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<String> {
+    /// The request line and body of one HTTP/1.1 request, once the whole
+    /// request — headers and the body Content-Length announces — has been
+    /// read, so the reply never races the client's own write.
+    async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<(String, String)> {
         let mut buf = Vec::new();
         let mut chunk = [0u8; 4096];
         loop {
@@ -1248,16 +1354,18 @@ mod tests {
                 .unwrap_or(0);
             if buf.len() - end - 4 >= announced {
                 let mut words = head.lines().next().unwrap_or_default().split_whitespace();
-                return Some(format!(
+                let line = format!(
                     "{} {}",
                     words.next().unwrap_or_default(),
                     words.next().unwrap_or_default()
-                ));
+                );
+                let body = String::from_utf8_lossy(&buf[end + 4..end + 4 + announced]).into_owned();
+                return Some((line, body));
             }
         }
     }
 
-    fn refresh_is_refused(line: &str) -> (u16, &'static str) {
+    fn refresh_is_refused(line: &str, _sent: &str) -> (u16, &'static str) {
         if line.ends_with("/_refresh") {
             (503, r#"{"error":{"type":"unavailable_shards_exception"}}"#)
         } else {
@@ -1304,7 +1412,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_rejects_index_that_was_never_created_lists_nothing() {
-        let target = FakeTarget::start(|line| {
+        let target = FakeTarget::start(|line, _sent| {
             if line.ends_with("/_refresh") {
                 (404, r#"{"error":{"type":"index_not_found_exception"}}"#)
             } else {
@@ -1341,7 +1449,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_rejects_index_that_cannot_be_created_fails_the_quarantine() {
-        let target = FakeTarget::start(|line| match line {
+        let target = FakeTarget::start(|line, _sent| match line {
             "PUT /.pg2osync_rejects" => (500, r#"{"error":{"type":"illegal_state_exception"}}"#),
             _ => (201, "{}"),
         })
@@ -1356,7 +1464,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_rejects_index_that_already_exists_is_not_created_twice() {
-        let target = FakeTarget::start(|line| match line {
+        let target = FakeTarget::start(|line, _sent| match line {
             "PUT /.pg2osync_rejects" => (
                 400,
                 r#"{"error":{"type":"resource_already_exists_exception"}}"#,
@@ -1370,5 +1478,94 @@ mod tests {
             .await
             .expect("the existing index takes the document");
         assert_eq!(target.seen().len(), 2, "{:?}", target.seen());
+    }
+
+    #[tokio::test]
+    async fn an_alias_nobody_holds_yet_is_only_added() {
+        let target = FakeTarget::start(|line, _sent| match line {
+            "GET /_alias/live" => (404, r#"{"error":{"type":"alias_not_found_exception"}}"#),
+            _ => (200, r#"{"acknowledged":true}"#),
+        })
+        .await;
+        target
+            .sink()
+            .switch_alias("live", "orders_v2")
+            .await
+            .expect("the alias is pointed at the new index");
+        assert_eq!(
+            target.bodies("POST /_aliases"),
+            vec![json!({"actions": [{"add": {"index": "orders_v2", "alias": "live"}}]})]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_alias_someone_holds_is_removed_and_added_in_one_request() {
+        let target = FakeTarget::start(|line, _sent| match line {
+            "GET /_alias/live" => (200, r#"{"orders_v1":{"aliases":{"live":{}}}}"#),
+            _ => (200, r#"{"acknowledged":true}"#),
+        })
+        .await;
+        target
+            .sink()
+            .switch_alias("live", "orders_v2")
+            .await
+            .expect("the alias moves to the new index");
+        assert_eq!(
+            target.bodies("POST /_aliases"),
+            vec![json!({"actions": [
+                {"remove": {"index": "orders_v1", "alias": "live"}},
+                {"add": {"index": "orders_v2", "alias": "live"}}
+            ]})],
+            "the swap has to be one atomic request: {:?}",
+            target.seen()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scan_walks_every_page_and_keeps_the_routing_of_each_hit() {
+        let target = FakeTarget::start(|_line, sent| {
+            if sent.contains("search_after") {
+                (
+                    200,
+                    r#"{"hits":{"hits":[
+                        {"_id":"3","sort":[3],"_routing":"7"},
+                        {"_id":"4","sort":[4]}
+                    ]}}"#,
+                )
+            } else {
+                (
+                    200,
+                    r#"{"hits":{"hits":[
+                        {"_id":"1","sort":[1],"_routing":"7"},
+                        {"_id":"2","sort":[2]}
+                    ]}}"#,
+                )
+            }
+        })
+        .await;
+        let sink = target.sink();
+        let mut seen: Vec<(String, Value, Option<String>)> = Vec::new();
+        let mut after: Option<Value> = None;
+        for _ in 0..2 {
+            let page = sink
+                .scan_keys("orders", "id", None, after.as_ref(), 2)
+                .await
+                .expect("a page of keys");
+            after = page.last().map(|(_, key, _)| key.clone());
+            seen.extend(page);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                ("1".to_string(), json!(1), Some("7".to_string())),
+                ("2".to_string(), json!(2), None),
+                ("3".to_string(), json!(3), Some("7".to_string())),
+                ("4".to_string(), json!(4), None),
+            ]
+        );
+        let sent = target.bodies("POST /orders/_search");
+        assert_eq!(sent[0]["sort"], json!([{"id": "asc"}]));
+        assert_eq!(sent[0].get("search_after"), None);
+        assert_eq!(sent[1]["search_after"], json!([2]));
     }
 }
