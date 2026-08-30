@@ -49,6 +49,10 @@ document in the same change and say why.
 - Async everywhere with tokio; never block the runtime.
 - Secrets never appear in logs, errors, or fixtures.
 - English for all code, comments, commits and documentation.
+- Issues and pull requests use the forms in `.github/` — an issue follows
+  the matching template's headings and labels, a PR description keeps
+  `pull_request_template.md`'s structure. CLI tools do not apply them for
+  you.
 - Never edit `crates/bin/CHANGELOG.md` by hand: release-please writes it from
   the commit subjects at release time, so the commit message is where a change
   explains itself.
