@@ -53,6 +53,13 @@ env:
   RUST_LOG: pg2osync=info
 extraEnv: []
 
+# Entrypoint and arguments. Empty means the image's own
+# `pg2osync run -c /etc/pg2osync/pg2osync.toml`. Override both when the
+# credentials arrive as a file a shell has to source first, as with the Vault
+# Agent Injector; see docs/deployment.md.
+command: []
+args: []
+
 # "text" or "json". Set it to json where a collector (Loki, Datadog,
 # CloudWatch) parses the log stream instead of a human reading it.
 logFormat: text
@@ -134,6 +141,13 @@ persistence:
   size: 1Gi
   storageClass: ""
   mountPath: /var/lib/pg2osync
+
+# Volumes the pod mounts on top of the config (and the state volume when
+# persistence is on). A Secrets Store CSI volume goes here: the driver only
+# syncs a SecretProviderClass's secretObjects into a Kubernetes Secret while a
+# pod actually mounts the volume.
+extraVolumes: []
+extraVolumeMounts: []
 
 nodeSelector: {}
 tolerations: []
