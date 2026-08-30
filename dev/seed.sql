@@ -37,10 +37,18 @@ CREATE TABLE IF NOT EXISTS tickets (
     subject     text NOT NULL
 );
 
+-- A one-to-one child: at most one row per customer, embedded as an object.
+CREATE TABLE IF NOT EXISTS profiles (
+    id          bigint PRIMARY KEY,
+    customer_id bigint NOT NULL REFERENCES customers(id),
+    bio         text
+);
+
 -- Child deletes carry the foreign key only under REPLICA IDENTITY FULL, which
 -- is what lets the parent document be refreshed.
 ALTER TABLE orders REPLICA IDENTITY FULL;
 ALTER TABLE tickets REPLICA IDENTITY FULL;
+ALTER TABLE profiles REPLICA IDENTITY FULL;
 
 INSERT INTO users (id, name, email, password_hash, metadata)
 VALUES

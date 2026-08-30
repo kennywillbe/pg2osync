@@ -551,6 +551,12 @@ field = "items"
 foreign_key = "parent_id"
 exclude_columns = ["internal_notes"]
 
+[[sync.kid_parent.children]]
+table = "sourcedb.kid_profile"
+field = "profile"
+foreign_key = "parent_id"
+single = true
+
 # the same child table as its own index, so an embedded object can be compared
 # against the very row it came from
 [sync.kid_item]
@@ -559,12 +565,12 @@ index = "e2e_mysql_kid_item"
 TOML
 child_cleanup() {
   pkill -9 -f "pg2osync run" 2> /dev/null || true
-  my "DROP TABLE IF EXISTS kid_item; DROP TABLE IF EXISTS kid_parent;" > /dev/null 2>&1 || true
+  my "DROP TABLE IF EXISTS kid_item; DROP TABLE IF EXISTS kid_profile; DROP TABLE IF EXISTS kid_parent;" > /dev/null 2>&1 || true
   rm -f "$CCONFIG"
 }
 trap 'cleanup; resume_cleanup; types_cleanup; child_cleanup' EXIT
 
-my "DROP TABLE IF EXISTS kid_item; DROP TABLE IF EXISTS kid_parent;"
+my "DROP TABLE IF EXISTS kid_item; DROP TABLE IF EXISTS kid_profile; DROP TABLE IF EXISTS kid_parent;"
 my "CREATE TABLE kid_parent(id bigint PRIMARY KEY, name varchar(32));"
 # the types MySQL's own JSON functions render differently from this pipeline:
 # varbinary, bit, set and decimal. Embedding them is the case that would break
@@ -573,7 +579,12 @@ my "CREATE TABLE kid_item(id bigint PRIMARY KEY, parent_id bigint,
                           b varbinary(8), d decimal(10,2), bt bit(16),
                           s set('a','b','c'), label varchar(32),
                           internal_notes varchar(64), INDEX(parent_id));"
+# a one-to-one child: its own key, so a second row for the same parent is
+# something the test can actually create
+my "CREATE TABLE kid_profile(id bigint PRIMARY KEY, parent_id bigint,
+                             bio varchar(64), INDEX(parent_id));"
 my "INSERT INTO kid_parent VALUES (1,'one'),(2,'two');"
+my "INSERT INTO kid_profile VALUES (30,1,'first profile');"
 my "INSERT INTO kid_item VALUES (10,1,0x00FF10,12.34,b'0000000011111111','a,c','i10','do not index'),
                                 (11,1,0x01,0.10,b'1','','i11','nor this');"
 curl -s -XDELETE "$OS/e2e_mysql_kid,e2e_mysql_kid_item?ignore_unavailable=true" > /dev/null
@@ -591,6 +602,12 @@ check "and has the field at all" "$(os_has e2e_mysql_kid 2 items)" "True"
 check "an excluded child column is not in the array" \
   "$(curl -s "$OS/e2e_mysql_kid/_doc/1" | jqf "'internal_notes' in ((d.get('_source') or {}).get('items') or [{}])[0]")" \
   "False"
+check "a one-to-one child is an object" \
+  "$(curl -s "$OS/e2e_mysql_kid/_doc/1" | jqf "(d['_source']['profile'] or {}).get('bio')")" \
+  "first profile"
+check "a parent with no one-to-one child gets null" \
+  "$(curl -s "$OS/e2e_mysql_kid/_doc/2" | jqf "d['_source']['profile']")" "None"
+check "and still has the field" "$(os_has e2e_mysql_kid 2 profile)" "True"
 
 my "INSERT INTO kid_item VALUES (12,1,0x02,1.00,b'10','b','i12','nor that');"
 sleep 3; refresh
@@ -608,6 +625,27 @@ sleep 3; refresh
 check "the excluded child column stays out on the stream" \
   "$(curl -s "$OS/e2e_mysql_kid/_doc/1" | jqf "'internal_notes' in ((d.get('_source') or {}).get('items') or [{}])[0]")" \
   "False"
+
+# a one-to-one child that goes away leaves the field present and null
+my "DELETE FROM kid_profile WHERE id = 30;"
+sleep 3; refresh
+check "a deleted one-to-one child becomes null" \
+  "$(curl -s "$OS/e2e_mysql_kid/_doc/1" | jqf "d['_source']['profile']")" "None"
+check "the field is still there" "$(os_has e2e_mysql_kid 1 profile)" "True"
+
+# a second matching row is a warning, not a halt: the lowest-keyed row stands
+dup_lines=$(wc -l < "$LOG")
+my "INSERT INTO kid_profile VALUES (31,1,'kept'),(32,1,'extra');"
+sleep 3; refresh
+check "the lowest-keyed row stands" \
+  "$(curl -s "$OS/e2e_mysql_kid/_doc/1" | jqf "(d['_source']['profile'] or {}).get('bio')")" "kept"
+if tail -n +$((dup_lines + 1)) "$LOG" | grep -q "sourcedb.kid_profile"; then
+  ok "the run warns that a one-to-one child matched twice"
+else
+  bad "a second matching row was embedded without a word"
+fi
+my "DELETE FROM kid_profile WHERE id IN (31,32);"
+sleep 3; refresh
 
 # many children of one parent in one statement: deduplicated to one document
 my "INSERT INTO kid_item SELECT 1000+seq, 2, 0x03, 2.00, b'11', 'c', CONCAT('m',seq), 'nope'

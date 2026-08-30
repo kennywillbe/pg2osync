@@ -281,6 +281,7 @@ async fn attach_to_chunk(
     for spec in specs {
         let by_key = crate::children::fetch_many(spec, conn, &keys).await?;
         let mut cut = 0usize;
+        let mut duplicates = pg2osync_core::children::Duplicates::default();
         for change in held.iter_mut() {
             let key = change.pk().clone();
             let Some(doc) = change.doc_mut() else {
@@ -290,9 +291,14 @@ async fn attach_to_chunk(
                 Some((arr, total)) => (arr.clone(), *total),
                 None => (serde_json::Value::Array(Vec::new()), 0),
             };
-            if pg2osync_core::children::apply_collection(doc, spec, arr, total) {
+            let applied = pg2osync_core::children::apply_collection(doc, spec, arr, total);
+            if applied.truncated {
                 cut += 1;
             }
+            duplicates.record(spec, &key, applied.matched);
+        }
+        if let Some(message) = duplicates.message(spec) {
+            tracing::warn!(target: "pg2osync::load", "{message}");
         }
         if cut > 0 {
             tracing::warn!(target: "pg2osync::load",

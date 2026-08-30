@@ -134,6 +134,14 @@ email = "redact"                     # "redact" -> "***", "hash" -> SHA-256 pref
 #
 # [sync.customers.children.fields]
 # order_dt = "ordered_at"
+#
+# A one-to-one relation: the field holds the element itself, null when there is
+# none. Map it as `object`, not `nested`; max_rows is refused with it.
+# [[sync.customers.children]]
+# table = "public.profiles"
+# field = "profile"
+# foreign_key = "customer_id"
+# single = true
 
 # Fan-out: one document per element of an array column (PostgreSQL array or
 # jsonb holding one; needs REPLICA IDENTITY FULL). The element id renders from

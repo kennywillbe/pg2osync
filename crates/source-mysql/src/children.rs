@@ -32,6 +32,14 @@ use std::collections::HashMap;
 /// Fill in what the catalogue knows: the child's key, to order by.
 pub async fn resolve_order(spec: &mut ChildSpec, conn: &mut MySqlConnection) -> Result<()> {
     let resolved = catalog::table_schema(conn, &spec.schema, &spec.table, false).await?;
+    if resolved.pk_columns.is_empty() && spec.single {
+        anyhow::bail!(
+            "[[sync.*.children]] single is set on {}, which has no primary key to order \
+             by — with no order there is no first row, so two runs could embed different \
+             ones. Add a primary key or drop single",
+            spec.qualified()
+        );
+    }
     if resolved.pk_columns.is_empty() && spec.max_rows.is_some() {
         anyhow::bail!(
             "[[sync.*.children]] max_rows is set on {}, which has no primary key to order \

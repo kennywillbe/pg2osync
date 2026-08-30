@@ -1484,6 +1484,7 @@ pub fn child_specs_for(
             spec.max_rows = child.max_rows;
             spec.columns = child.columns.clone();
             spec.exclude_columns = child.exclude_columns.clone();
+            spec.single = child.single;
             map.entry((schema.to_string(), table.to_string()))
                 .or_default()
                 .push(spec);
