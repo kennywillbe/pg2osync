@@ -574,6 +574,16 @@ async fn read_range(
     // this size — the target's indexing rate dominates — but the quadratic
     // shape is gone and there is one allocation less per row.
     let mut pending: Vec<u8> = Vec::new();
+    // One line per collection for the whole range rather than per row: a range
+    // where every parent has a duplicate would otherwise be one line each.
+    let mut collections: Vec<Collection<'_>> = plan
+        .child_specs
+        .iter()
+        .map(|spec| Collection {
+            spec,
+            duplicates: pg2osync_core::children::Duplicates::default(),
+        })
+        .collect();
     let mut stream = std::pin::pin!(copy_stream);
     while let Some(chunk) = stream.next().await {
         let chunk: bytes::Bytes = chunk.context("copy stream failed")?;
@@ -598,7 +608,7 @@ async fn read_range(
                     plan.cols,
                     &fields,
                     chunk_lsn,
-                    plan.child_specs,
+                    &mut collections,
                     plan.append_only,
                 )?
             };
@@ -611,6 +621,11 @@ async fn read_range(
         }
         // one compaction per network chunk, not one per row
         pending.drain(..consumed);
+    }
+    for collection in &collections {
+        if let Some(message) = collection.duplicates.message(collection.spec) {
+            tracing::warn!(target: "pg2osync::backfill", "{message}");
+        }
     }
     Ok(count)
 }
@@ -688,13 +703,22 @@ async fn send_boundary(tx: &Sender<ChangeEvent>) -> Result<()> {
     .map_err(|_| anyhow::anyhow!("engine closed during backfill"))
 }
 
+/// One collection as a range reads it: its spec, and what it has seen of it.
+///
+/// Held together rather than in two parallel slices, so a range cannot count one
+/// collection's duplicates against another's name.
+struct Collection<'a> {
+    spec: &'a ChildSpec,
+    duplicates: pg2osync_core::children::Duplicates,
+}
+
 fn build_change(
     schema: &str,
     table: &str,
     cols: &[ColMeta],
     fields: &[Option<Vec<u8>>],
     version: Option<u64>,
-    children: &[ChildSpec],
+    collections: &mut [Collection<'_>],
     append_only: bool,
 ) -> Result<pg2osync_core::event::RowChange> {
     let mut doc = serde_json::Map::new();
@@ -724,30 +748,28 @@ fn build_change(
         _ => serde_json::Value::Object(pk_map),
     };
     // The collection totals ride at the end of the row, one per child in
-    // configuration order. A collection cut short says so, in the same two
-    // fields the streaming path writes.
-    for (nth, child) in children.iter().enumerate() {
-        let Some(raw) = fields.get(cols.len() + nth).and_then(|f| f.as_deref()) else {
-            continue;
-        };
-        let total: i64 = String::from_utf8_lossy(raw).parse().unwrap_or(0);
-        let embedded = doc
+    // configuration order. Shaping goes through the core helper so a loaded
+    // document and a streamed one cannot disagree about what a collection is.
+    let mut doc = serde_json::Value::Object(doc);
+    for (nth, collection) in collections.iter_mut().enumerate() {
+        let child = collection.spec;
+        let array = doc
             .get(&child.field)
-            .and_then(|v| v.as_array())
-            .map(Vec::len)
-            .unwrap_or(0) as i64;
-        if total > embedded {
-            doc.insert(child.truncated_field(), serde_json::Value::Bool(true));
-            doc.insert(child.total_field(), serde_json::Value::from(total));
-        }
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+        // A row without its total column is one nothing can call cut short,
+        // so the array stands as the whole collection.
+        let total = match fields.get(cols.len() + nth).and_then(|f| f.as_deref()) {
+            Some(raw) => String::from_utf8_lossy(raw).parse().unwrap_or(0),
+            None => array.as_array().map(Vec::len).unwrap_or(0) as i64,
+        };
+        let applied = pg2osync_core::children::apply_collection(&mut doc, child, array, total);
+        collection.duplicates.record(child, &pk, applied.matched);
     }
     Ok(pg2osync_core::event::RowChange {
         schema: schema.to_string(),
         table: table.to_string(),
-        kind: RowKind::Insert {
-            pk,
-            doc: serde_json::Value::Object(doc),
-        },
+        kind: RowKind::Insert { pk, doc },
         version,
     })
 }
@@ -1157,6 +1179,66 @@ mod tests {
         assert!(sql.contains("\"we\"\"ird\""), "{sql}");
         assert!(sql.contains("\"od\"\"d\""), "{sql}");
         assert!(sql.contains("\"fk\"\"y\""), "{sql}");
+    }
+
+    #[test]
+    fn a_one_to_one_child_loads_as_an_object_and_counts_a_duplicate() {
+        let mut spec = child("profile", "public.profiles", "user_id", "id");
+        spec.single = true;
+        let pk = ColMeta {
+            name: "id".into(),
+            type_oid: 23,
+            is_pk: true,
+        };
+        let load = |agg: &str, total: &str| {
+            let fields: Vec<Option<Vec<u8>>> = [b"1".to_vec(), agg.into(), total.into()]
+                .into_iter()
+                .map(Some)
+                .collect();
+            let mut collections = vec![Collection {
+                spec: &spec,
+                duplicates: pg2osync_core::children::Duplicates::default(),
+            }];
+            let mut change = build_change(
+                "public",
+                "users",
+                &[pk.clone(), child_column(&spec)],
+                &fields,
+                None,
+                &mut collections,
+                false,
+            )
+            .expect("a row with one collection");
+            let doc = change
+                .doc_mut()
+                .expect("an insert carries its document")
+                .clone();
+            (doc, collections.remove(0).duplicates.message(&spec))
+        };
+
+        let (one, quiet) = load(r#"[{"bio": "hi"}]"#, "1");
+        assert_eq!(one["profile"], serde_json::json!({"bio": "hi"}));
+        assert!(one.get("profile_truncated").is_none());
+        assert!(quiet.is_none());
+
+        let (none, _) = load("[]", "0");
+        assert_eq!(
+            none["profile"],
+            serde_json::json!(null),
+            "the key stays, the value is null"
+        );
+
+        let (two, loud) = load(r#"[{"id": 4}, {"id": 9}]"#, "2");
+        assert_eq!(
+            two["profile"],
+            serde_json::json!({"id": 4}),
+            "the lowest key stands"
+        );
+        assert!(
+            loud.expect("a second row is reported")
+                .contains("public.profiles"),
+            "the load says which collection matched twice"
+        );
     }
 
     #[test]

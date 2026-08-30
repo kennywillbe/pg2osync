@@ -605,6 +605,20 @@ one, and handing over part of a collection as if it were all of it is worse than
 either extreme. Data Prepper's equivalent defaults to 1000 and documents no
 overflow behaviour at all, which is the version of this not worth copying.
 
+**A one-to-one child is an object, and a second row is a warning, not a choice.**
+`single = true` unwraps the collection *after* the aggregation, in core, rather
+than reading it with a `LIMIT 1` of its own: each source keeps exactly one
+aggregation builder, so the initial load and the per-transaction re-fetch cannot
+embed different shapes, and the ordering, counting and capping machinery is
+untouched. A second matching row does not fail the run — a duplicate that exists
+for the length of a migration must not halt an index — and it is not silently
+resolved either: the batch logs one line naming the collection, how many parents
+matched twice and the worst of them. The row that stands is the lowest-keyed one,
+not the newest: primary-key order is what both the load and the re-fetch already
+promise, so a re-snapshot embeds the same row rather than rewriting the document.
+No metric counts it: neither source crate holds a `Metrics` handle, and a warning
+already names what to fix.
+
 ## Checkpoints
 
 **State lives in the target.** A hidden `.pg2osync_meta` index holds one

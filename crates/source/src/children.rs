@@ -13,7 +13,8 @@
 //! answer it differently.
 
 pub use pg2osync_core::children::{
-    ChildSpec, Pending, UNBOUNDED_ARRAY_WARNING, apply_collection, key_lookup, keys_needing_refetch,
+    ChildSpec, Duplicates, Pending, UNBOUNDED_ARRAY_WARNING, apply_collection, key_lookup,
+    keys_needing_refetch,
 };
 
 use anyhow::{Context as _, Result};
@@ -24,6 +25,14 @@ use tokio_postgres::Client;
 /// Fill in what the catalogue knows: the child's key, to order by.
 pub async fn resolve_order(spec: &mut ChildSpec, client: &Client) -> Result<()> {
     let info = crate::catalog::table_info(client, &spec.schema, &spec.table).await?;
+    if info.pk_columns.is_empty() && spec.single {
+        anyhow::bail!(
+            "[[sync.*.children]] single is set on {}, which has no primary key to order \
+             by — with no order there is no first row, so two runs could embed different \
+             ones. Add a primary key or drop single",
+            spec.qualified()
+        );
+    }
     if info.pk_columns.is_empty() && spec.max_rows.is_some() {
         anyhow::bail!(
             "[[sync.*.children]] max_rows is set on {}, which has no primary key to \
@@ -207,22 +216,25 @@ pub async fn attach_children_batch(
         // where every parent is truncated would otherwise be one line each.
         let mut cut = 0usize;
         let mut largest: Option<(Value, i64)> = None;
+        let mut duplicates = Duplicates::default();
         for (key, doc) in docs.iter_mut() {
-            let Value::Object(map) = doc else { continue };
             let (arr, total) = match by_key.get(&key_lookup(key)) {
                 Some((arr, total)) => (arr.clone(), *total),
                 None => (Value::Array(vec![]), 0),
             };
-            let embedded = arr.as_array().map(Vec::len).unwrap_or(0) as i64;
-            map.insert(spec.field.clone(), arr);
-            if total > embedded {
-                map.insert(spec.truncated_field(), Value::Bool(true));
-                map.insert(spec.total_field(), Value::from(total));
+            // shaped by core rather than here, so the streamed document and the
+            // loaded one cannot differ about what a collection looks like
+            let applied = apply_collection(doc, spec, arr, total);
+            if applied.truncated {
                 cut += 1;
             }
+            duplicates.record(spec, key, applied.matched);
             if largest.as_ref().is_none_or(|(_, most)| total > *most) {
                 largest = Some((key.clone(), total));
             }
+        }
+        if let Some(message) = duplicates.message(spec) {
+            tracing::warn!(target: "pg2osync::source", "{message}");
         }
         match largest {
             Some((key, total)) if cut > 0 => tracing::warn!(target: "pg2osync::source",
@@ -310,6 +322,27 @@ mod tests {
         // send some keys as integers and the rest as text
         let (predicate, _) = any_predicate("\"k\"", &[json!(1), json!("two")]);
         assert_eq!(predicate, "\"k\"::text = ANY($1::text[])");
+    }
+
+    #[test]
+    fn a_one_to_one_child_is_read_by_the_same_aggregation() {
+        // The unwrapping belongs to core, so PostgreSQL keeps exactly one
+        // builder: a second `LIMIT 1` query is what would let the initial load
+        // and a streamed re-fetch drift apart.
+        let mut spec = ChildSpec::new("public.profiles", "profile", "customer_id", "id").unwrap();
+        spec.single = true;
+        spec.order_by = vec!["customer_id".into()];
+        let sql = agg_subquery(&spec, None);
+        assert!(sql.contains("jsonb_agg(doc ORDER BY rn)"), "{sql}");
+        assert!(!sql.contains("LIMIT"), "{sql}");
+
+        // and what the document ends up with is the element, with neither of
+        // the two fields a cut array writes
+        let mut doc = json!({"id": 1});
+        apply_collection(&mut doc, &spec, json!([{"bio": "hi"}]), 1);
+        assert_eq!(doc["profile"], json!({"bio": "hi"}));
+        assert!(doc.get("profile_truncated").is_none());
+        assert!(doc.get("profile_total").is_none());
     }
 
     #[test]

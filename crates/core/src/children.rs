@@ -40,6 +40,12 @@ pub struct ChildSpec {
     pub columns: Option<Vec<String>>,
     /// Child columns to leave out. Mutually exclusive with `columns`.
     pub exclude_columns: Vec<String>,
+    /// The relation is one-to-one: the field holds the element itself.
+    ///
+    /// Unwrapped here rather than in the read, so both sources keep exactly one
+    /// aggregation builder and the initial load and a streamed re-fetch cannot
+    /// produce different shapes.
+    pub single: bool,
 }
 
 impl ChildSpec {
@@ -64,6 +70,7 @@ impl ChildSpec {
             max_rows: None,
             columns: None,
             exclude_columns: Vec::new(),
+            single: false,
         })
     }
 
@@ -83,26 +90,94 @@ impl ChildSpec {
     }
 }
 
+/// What one collection turned into, so the caller can summarise a batch.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Applied {
+    /// The array is not the whole collection, and the document says so.
+    pub truncated: bool,
+    /// How many child rows matched this parent, before any unwrapping.
+    pub matched: usize,
+}
+
+/// The value one collection lands as, and how many rows it was made of.
+///
+/// A `single` collection is the element itself — `null` when the parent has no
+/// child — because a one-to-one relation that reads as `profile[0].bio` forces
+/// every query and every mapping to carry an index that is always zero.
+fn shape_collection(spec: &ChildSpec, array: Value) -> (Value, usize) {
+    let matched = array.as_array().map(Vec::len).unwrap_or(0);
+    if !spec.single {
+        return (array, matched);
+    }
+    // The read orders by the child's key, so the element is the lowest-keyed
+    // row: a re-snapshot keeps the same one.
+    let element = match array {
+        Value::Array(rows) => rows.into_iter().next().unwrap_or(Value::Null),
+        other => other,
+    };
+    (element, matched)
+}
+
 /// Put one collection on a parent document, saying so if it is not all of it.
 ///
 /// `total` is what the source holds before any cap. A consumer cannot otherwise
 /// tell a short array from a complete one, and handing over part of a collection
 /// as if it were the whole thing is worse than either embedding everything or
-/// refusing to.
-///
-/// Returns whether anything was left out, so the caller can count it.
-pub fn apply_collection(doc: &mut Value, spec: &ChildSpec, array: Value, total: i64) -> bool {
+/// refusing to. A `single` collection is never capped — `max_rows` is refused
+/// with it — so it writes neither field.
+pub fn apply_collection(doc: &mut Value, spec: &ChildSpec, array: Value, total: i64) -> Applied {
     let Value::Object(map) = doc else {
-        return false;
+        return Applied::default();
     };
-    let embedded = array.as_array().map(Vec::len).unwrap_or(0) as i64;
-    map.insert(spec.field.clone(), array);
-    let cut = total > embedded;
-    if cut {
+    let (value, matched) = shape_collection(spec, array);
+    map.insert(spec.field.clone(), value);
+    let truncated = !spec.single && total > matched as i64;
+    if truncated {
         map.insert(spec.truncated_field(), Value::Bool(true));
         map.insert(spec.total_field(), Value::from(total));
     }
-    cut
+    Applied { truncated, matched }
+}
+
+/// Parents whose one-to-one collection matched more than once, in one batch.
+///
+/// A second row does not fail the run: a duplicate that exists for the length of
+/// a migration must not halt an index. It is not silent either, so this collects
+/// the batch into the one line the truncation warnings are shaped like — the
+/// collection, how many parents, and the worst of them.
+#[derive(Debug, Default, Clone)]
+pub struct Duplicates {
+    parents: usize,
+    largest: Option<(Value, usize)>,
+}
+
+impl Duplicates {
+    /// Note what one parent matched. Only a `single` collection can have a row
+    /// too many; for any other one every row is embedded.
+    pub fn record(&mut self, spec: &ChildSpec, key: &Value, matched: usize) {
+        if !spec.single || matched < 2 {
+            return;
+        }
+        self.parents += 1;
+        if self
+            .largest
+            .as_ref()
+            .is_none_or(|(_, most)| matched > *most)
+        {
+            self.largest = Some((key.clone(), matched));
+        }
+    }
+
+    /// The line the batch logs, or nothing when every parent had at most one.
+    pub fn message(&self, spec: &ChildSpec) -> Option<String> {
+        let (key, most) = self.largest.as_ref()?;
+        Some(format!(
+            "{} document(s) embed only the lowest-keyed row of {}, which single = true \
+             declares one-to-one; the largest is parent {key} with {most} matching rows",
+            self.parents,
+            spec.qualified()
+        ))
+    }
 }
 
 /// Past this many embedded rows, say so.
@@ -222,10 +297,19 @@ mod tests {
         ("public".to_string(), "customers".to_string())
     }
 
+    fn single_spec() -> ChildSpec {
+        let mut spec =
+            ChildSpec::new("public.profiles", "profile", "customer_id", "id").expect("qualified");
+        spec.single = true;
+        spec
+    }
+
     #[test]
     fn a_complete_collection_says_nothing_extra() {
         let mut doc = json!({"id": 1});
-        assert!(!apply_collection(&mut doc, &spec(), json!([{"id": 9}]), 1));
+        let applied = apply_collection(&mut doc, &spec(), json!([{"id": 9}]), 1);
+        assert!(!applied.truncated);
+        assert_eq!(applied.matched, 1);
         assert_eq!(doc["orders"], json!([{"id": 9}]));
         assert!(doc.get("orders_truncated").is_none());
         assert!(doc.get("orders_total").is_none());
@@ -234,9 +318,62 @@ mod tests {
     #[test]
     fn a_cut_collection_says_how_much_it_is_missing() {
         let mut doc = json!({"id": 1});
-        assert!(apply_collection(&mut doc, &spec(), json!([{"id": 9}]), 500));
+        assert!(apply_collection(&mut doc, &spec(), json!([{"id": 9}]), 500).truncated);
         assert_eq!(doc["orders_truncated"], json!(true));
         assert_eq!(doc["orders_total"], json!(500));
+    }
+
+    #[test]
+    fn a_one_to_one_child_is_the_element_itself() {
+        let mut doc = json!({"id": 1});
+        let applied = apply_collection(&mut doc, &single_spec(), json!([{"bio": "hi"}]), 1);
+        assert_eq!(doc["profile"], json!({"bio": "hi"}));
+        assert_eq!(applied.matched, 1);
+        assert!(!applied.truncated);
+        assert!(doc.get("profile_truncated").is_none());
+        assert!(doc.get("profile_total").is_none());
+    }
+
+    #[test]
+    fn a_missing_one_to_one_child_is_null_under_its_own_name() {
+        // the field is present either way, so a query for it need not know
+        // whether the parent happens to have a child
+        let mut doc = json!({"id": 1});
+        assert_eq!(
+            apply_collection(&mut doc, &single_spec(), json!([]), 0).matched,
+            0
+        );
+        assert_eq!(doc["profile"], json!(null));
+        assert!(doc.as_object().expect("object").contains_key("profile"));
+    }
+
+    #[test]
+    fn a_second_matching_row_is_counted_not_chosen_between() {
+        let spec = single_spec();
+        let mut doc = json!({"id": 1});
+        let applied = apply_collection(&mut doc, &spec, json!([{"id": 4}, {"id": 9}]), 2);
+        assert_eq!(doc["profile"], json!({"id": 4}), "the lowest key stands");
+        assert_eq!(applied.matched, 2);
+        assert!(doc.get("profile_truncated").is_none(), "not a cap");
+
+        let mut tally = Duplicates::default();
+        tally.record(&spec, &json!(1), applied.matched);
+        tally.record(&spec, &json!(2), 5);
+        tally.record(&spec, &json!(3), 1);
+        let message = tally.message(&spec).expect("two parents matched twice");
+        assert!(message.contains("2 document(s)"), "{message}");
+        assert!(message.contains("public.profiles"), "{message}");
+        assert!(
+            message.contains("parent 2 with 5"),
+            "the worst offender names itself: {message}"
+        );
+    }
+
+    #[test]
+    fn an_array_collection_never_reports_a_duplicate() {
+        let mut tally = Duplicates::default();
+        tally.record(&spec(), &json!(1), 500);
+        assert!(tally.message(&spec()).is_none());
     }
 
     #[test]

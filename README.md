@@ -77,7 +77,7 @@ not expressions) — if you need those, you want Kafka.
 | **MySQL 8.0 / MariaDB 10.6+ → any of the above** | ✅ MySQL 8.0 on every pull request; MySQL 8.4 and MariaDB 10.6/11.8 nightly |
 | Consistent initial load, then live streaming | ✅ |
 | Crash recovery with no data loss (`kill -9` safe) | ✅ verified by the e2e suite |
-| Nested child collections (one level) | ✅ PostgreSQL and MySQL/MariaDB; the parent document embeds child arrays, resolved once per collection per transaction, with their own `columns` / `exclude_columns` projection |
+| Nested child collections (one level) | ✅ PostgreSQL and MySQL/MariaDB; the parent document embeds child arrays, resolved once per collection per transaction, with their own `columns` / `exclude_columns` projection, or `single = true` to embed a 1:1 relation as an object |
 | Parent-child as a join field (`join`) | ✅ OpenSearch and Elasticsearch; shared index, per-document routing, parent delete cascades to its children |
 | Per-document routing from a column (`routing = "tenant_id"`) | ✅ OpenSearch and Elasticsearch; co-locates a tenant on one shard; a changed value moves the document; non-key columns need `REPLICA IDENTITY FULL` |
 | One index fed by several tables | ✅ each section declares an explicit id; reconcile refuses it, a TRUNCATE is skipped and counted |
@@ -121,7 +121,8 @@ Stated up front, because finding these out in production is expensive:
   transaction rather than per changed row, ordered by the child's primary key.
   `max_rows` bounds a collection, and a document whose array was cut says so.
   A child collection projects its own columns, in the read, so the load and the
-  re-fetch cannot embed different shapes.
+  re-fetch cannot embed different shapes. `single = true` embeds a one-to-one
+  relation as the object itself, `null` when absent.
 - **Two tables share an index only as a join pair or when every section
   declares its id.** Otherwise document identity would be ambiguous, and
   even then the ids must be unique across the tables — `customer-{id}` and

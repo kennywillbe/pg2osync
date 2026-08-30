@@ -117,13 +117,19 @@ total = "amount"
 table = "public.tickets"
 field = "tickets"
 foreign_key = "customer_id"
+
+[[sync.customers.children]]
+table = "public.profiles"
+field = "profile"
+foreign_key = "customer_id"
+single = true
 TOML
 
 say "0. Reset state"
 stop_sync
 pg "DROP PUBLICATION IF EXISTS pg2osync_e2e_pub;" > /dev/null
 pg "SELECT pg_drop_replication_slot('pg2osync_e2e') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='pg2osync_e2e');" > /dev/null
-pg "TRUNCATE users; TRUNCATE tickets, orders, customers;" > /dev/null
+pg "TRUNCATE users; TRUNCATE tickets, orders, profiles, customers;" > /dev/null
 # a run killed part way through leaves the drift probe's column behind, and the
 # shape change it exists to cause would then not happen
 pg "ALTER TABLE users DROP COLUMN IF EXISTS drift_probe;" > /dev/null
@@ -135,6 +141,7 @@ pg "INSERT INTO customers (id,name) VALUES (1,'acme'),(2,'globex'),(3,'no-childr
 pg "INSERT INTO orders (id,customer_id,total,internal_notes) VALUES
       (10,1,99.90,'do not index'),(11,1,5.00,'nor this'),(12,2,42.00,'nor that');" > /dev/null
 pg "INSERT INTO tickets (id,customer_id,subject) VALUES (20,1,'late delivery');" > /dev/null
+pg "INSERT INTO profiles (id,customer_id,bio) VALUES (30,1,'first profile');" > /dev/null
 # ignore_unavailable, because a multi-index delete where one index is absent
 # returns 404 and deletes *none* of them — which silently leaves the previous
 # run's documents behind and fails the counts below by however many there were
@@ -210,6 +217,13 @@ check "second collection attached too" "$(os_len e2e_customers 1 tickets)" "1"
 # a parent with no children must get an empty array, never null
 check "childless parent gets an empty array" "$(os_len e2e_customers 3 orders)" "0"
 check "childless parent has the field at all" "$(os_has e2e_customers 3 orders)" "True"
+# single = true: the element itself, not an array of one
+check "a one-to-one child is an object" \
+  "$(curl -s "$OS/e2e_customers/_doc/1" | jqf "d['_source']['profile']['bio']")" \
+  "first profile"
+check "a parent with no one-to-one child gets null" \
+  "$(curl -s "$OS/e2e_customers/_doc/3" | jqf "d['_source']['profile']")" "None"
+check "and still has the field" "$(os_has e2e_customers 3 profile)" "True"
 
 say "4. live streaming"
 pg "INSERT INTO users (id,name,email,password_hash) VALUES (4,'dave','dave@test.io','secret-4');" > /dev/null
@@ -264,6 +278,28 @@ sleep 2; refresh
 check "the excluded child column stays out on the stream" \
   "$(curl -s "$OS/e2e_customers/_doc/2" | jqf "'internal_notes' in d['_source']['orders'][0]")" \
   "False"
+
+# a one-to-one child that goes away leaves the field present and null, so a
+# query for it need not know whether this parent ever had one
+pg "DELETE FROM profiles WHERE id=30;" > /dev/null
+sleep 2; refresh
+check "a deleted one-to-one child becomes null" \
+  "$(curl -s "$OS/e2e_customers/_doc/1" | jqf "d['_source']['profile']")" "None"
+check "the field is still there" "$(os_has e2e_customers 1 profile)" "True"
+
+# a second matching row is a warning, not a halt: the lowest-keyed row stands
+dup_lines=$(wc -l < "$LOG")
+pg "INSERT INTO profiles (id,customer_id,bio) VALUES (31,1,'kept'),(32,1,'extra');" > /dev/null
+sleep 2; refresh
+check "the lowest-keyed row stands" \
+  "$(curl -s "$OS/e2e_customers/_doc/1" | jqf "d['_source']['profile']['bio']")" "kept"
+if tail -n +$((dup_lines + 1)) "$LOG" | grep -q "public.profiles"; then
+  ok "the run warns that a one-to-one child matched twice"
+else
+  bad "a second matching row was embedded without a word"
+fi
+pg "DELETE FROM profiles WHERE id IN (31,32);" > /dev/null
+sleep 2; refresh
 
 # Many children of one parent in one transaction: the parent is re-read once for
 # the group, not once per row, and the array that lands is the whole collection.
@@ -633,7 +669,11 @@ if curl -s http://127.0.0.1:9115/metrics | grep -qE "^pg2osync_rejected_total [1
 else
   bad "pg2osync_rejected_total did not move"
 fi
-if $BIN rejects -c "$QCONFIG" 2>&1 | grep -q "e2e_reject/2 at .*mapper_parsing_exception"; then
+# Elasticsearch 8 names the same refusal document_parsing_exception, and the
+# listing is right either way: the assertion is about what rejects prints, not
+# about which word the target chose
+if $BIN rejects -c "$QCONFIG" 2>&1 \
+  | grep -qE "e2e_reject/2 at .*(mapper_parsing_exception|document_parsing_exception)"; then
   ok "rejects names the document, its position and why"
 else
   bad "rejects did not list the refused document"

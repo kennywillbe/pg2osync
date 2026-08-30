@@ -591,7 +591,8 @@ re-snapshot alike, and inside embedded child arrays through the child's own
 Refused at load: an empty name, renaming a column to itself, two columns to
 the same name, renaming an excluded column or one missing from `columns`, a
 target that equals a non-renamed column in `columns`, and a parent rename that
-names or targets a child `field` (or its `_truncated`/`_total`). `validate`
+names or targets a child `field` (or its `_truncated`/`_total`, which a
+`single` child does not write and so does not claim). `validate`
 warns when a renamed column does not exist — a stale config, as with
 `exclude_columns` — and refuses a target that equals a live column that is not
 itself renamed away.
@@ -631,7 +632,8 @@ column. Every fanned element document carries them; child arrays do not.
 
 Refused at load: a name that is a rename target, a surviving entry of
 `columns` (one not itself renamed away), a child `field` (or its
-`_truncated`/`_total`), or the `fan_out.field`. `validate` additionally
+`_truncated`/`_total`, which a `single` child does not claim), or the
+`fan_out.field`. `validate` additionally
 refuses a name that equals a live column the projection keeps. A name equal
 to a rename *key* is fine: that column leaves the document first. At write
 time the constant wins.
@@ -853,6 +855,7 @@ table = "public.orders"      # child table
 field = "orders"             # array field on the parent document
 foreign_key = "customer_id"  # column on the CHILD referencing the parent key
 # max_rows = 1000            # optional: embed at most this many, see below
+# single = true              # optional: a 1:1 relation, see below
 ```
 
 A child's columns are renamed the same way, on the child element rather than
@@ -910,6 +913,7 @@ the element, so leaving it out of the array changes nothing but the array.
   a later re-fetch embed it identically and a re-snapshot does not rewrite
   documents for no reason. A child table with no primary key has no such order,
   and says so at startup.
+
 #### How many children to embed
 
 `max_rows` is unset by default, so the whole collection is embedded however large
@@ -945,6 +949,45 @@ startup for the same reason.
 - MySQL/MariaDB: the child table is streamed from the binlog automatically;
   `binlog_row_image = FULL` (already required) is what lets a child DELETE
   carry its foreign key, so there is no REPLICA IDENTITY caveat.
+
+#### A one-to-one relation
+
+A `users` → `profiles` relation is one child, and an array of one makes every
+query and every mapping carry an index that is always zero. `single = true`
+embeds the element itself:
+
+```toml
+[[sync.customers.children]]
+table = "public.profiles"
+field = "profile"
+foreign_key = "customer_id"
+single = true
+```
+
+```json
+{ "id": 42, "profile": { "customer_id": 42, "bio": "..." } }
+```
+
+The field is always present: a parent with no child gets `"profile": null`, so a
+query need not know whether this parent happens to have one. `fields`, `columns`
+and `exclude_columns` work exactly as they do on an array child.
+
+**Map the field as `object`, not `nested`.** `nested` exists to keep the
+elements of an *array* from being flattened into one another; there is no array
+here, so it buys nothing and `index.mapping.nested_objects.limit` — the whole
+reason the array form has a cap — does not apply.
+
+- `max_rows` is refused with `single`: a relation declared one-to-one has
+  nothing to cap. `<field>_truncated` and `<field>_total` are never written, and
+  the two names are free for a column, a constant or a rename.
+- The child table needs a primary key, refused at startup otherwise: with no
+  order there is no first row, so two runs could embed different ones.
+- A **second** matching row does not fail the run — a duplicate that exists for
+  the length of a migration must not halt an index. The lowest-keyed row is
+  embedded, which is the same one a re-snapshot picks, and each batch logs one
+  warning naming the collection, how many parents matched twice and the worst of
+  them. Fix the data, or drop `single`, and the next change to those parents
+  rewrites them.
 
 ### Join fields
 

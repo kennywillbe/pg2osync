@@ -547,13 +547,25 @@ pub struct ChildJoin {
     /// Child columns to leave out of the embedded element.
     #[serde(default)]
     pub exclude_columns: Vec<String>,
+    /// The relation is one-to-one: embed the element itself, not an array.
+    ///
+    /// `null` when the parent has no child. Refused with `max_rows`: a cap on a
+    /// relation declared one-to-one contradicts it.
+    #[serde(default)]
+    pub single: bool,
 }
 
 impl ChildJoin {
     /// Every name this child writes on the parent document: the array, and
     /// the two fields a capped array reports itself with.
-    fn claimed_fields(&self) -> [String; 3] {
-        [
+    ///
+    /// A one-to-one child writes neither of those: it cannot be capped, so
+    /// claiming the names would refuse configuration that nothing collides with.
+    fn claimed_fields(&self) -> Vec<String> {
+        if self.single {
+            return vec![self.field.clone()];
+        }
+        vec![
             self.field.clone(),
             format!("{}_truncated", self.field),
             format!("{}_total", self.field),
@@ -1020,6 +1032,12 @@ impl AppConfig {
                 }
                 if child.columns.as_ref().is_some_and(|c| c.is_empty()) {
                     anyhow::bail!("[{child_key}] columns must not be empty");
+                }
+                if child.single && child.max_rows.is_some() {
+                    anyhow::bail!(
+                        "[{child_key}] single and max_rows contradict each other: a relation \
+                         declared one-to-one has nothing to cap"
+                    );
                 }
                 for (col, target) in &child.fields {
                     // a rename is a promise that the column reaches the target;
@@ -1931,6 +1949,35 @@ id = "user-{id}"
             "the exclusion attaches to that child, not to the parent"
         );
         assert!(cfg.sync["users"].exclude_columns.is_empty());
+    }
+
+    #[test]
+    fn a_one_to_one_child_embeds_the_element_and_claims_only_its_field() {
+        const CHILD: &str = "[[sync.users.children]]\ntable = \"public.profiles\"\n\
+                             field = \"profile\"\nforeign_key = \"user_id\"\nsingle = true\n";
+        assert!(
+            parse(&format!("{MINIMAL}{CHILD}max_rows = 5\n")).is_err(),
+            "a relation declared one-to-one has nothing to cap"
+        );
+
+        let cfg = parse(&format!(
+            "{MINIMAL}{CHILD}[sync.users.children.fields]\nbio = \"about\"\n"
+        ))
+        .expect("a one-to-one child renames its own columns like any other");
+        assert!(cfg.sync["users"].children[0].single);
+
+        // no array means no cap, so the two names a cap writes are free
+        parse(&format!(
+            "{MINIMAL}{CHILD}[sync.users.constants]\nprofile_total = \"v\"\n"
+        ))
+        .expect("a single child does not claim profile_total");
+        assert!(
+            parse(&format!(
+                "{MINIMAL}{CHILD}[sync.users.constants]\nprofile = \"v\"\n"
+            ))
+            .is_err(),
+            "the field itself is still claimed"
+        );
     }
 
     #[test]

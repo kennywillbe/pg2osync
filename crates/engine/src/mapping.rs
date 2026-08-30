@@ -266,7 +266,8 @@ pub struct Rename {
     /// Source column → target field on the document itself.
     pub columns: HashMap<String, String>,
     /// Child field on the parent document → (child column → target field),
-    /// applied to every object of that embedded array.
+    /// applied to every object of that embedded array, or to the element
+    /// itself when the child is `single`.
     pub nested: HashMap<String, HashMap<String, String>>,
 }
 
@@ -299,10 +300,16 @@ impl Renames {
         };
         rename_keys(obj, &rule.columns);
         for (field, columns) in &rule.nested {
-            if let Some(serde_json::Value::Array(rows)) = obj.get_mut(field) {
-                for row in rows.iter_mut().filter_map(serde_json::Value::as_object_mut) {
-                    rename_keys(row, columns);
+            match obj.get_mut(field) {
+                Some(serde_json::Value::Array(rows)) => {
+                    for row in rows.iter_mut().filter_map(serde_json::Value::as_object_mut) {
+                        rename_keys(row, columns);
+                    }
                 }
+                // a `single` child is the element itself, and an absent one is
+                // null: the rename has to reach the object either way
+                Some(serde_json::Value::Object(row)) => rename_keys(row, columns),
+                _ => {}
             }
         }
     }
@@ -1417,6 +1424,19 @@ mod tests {
             }),
             "objects are renamed, a null element and the cap fields are not"
         );
+    }
+
+    #[test]
+    fn renames_reach_into_a_one_to_one_child_object() {
+        let r = users_renames(&[], &[("profile", &[("bio", "about")])]);
+        let mut doc = json!({"id": 1, "profile": {"bio": "hi"}});
+        r.apply("public", "users", &mut doc);
+        assert_eq!(doc, json!({"id": 1, "profile": {"about": "hi"}}));
+
+        // an absent one-to-one child is null, and a rename has nothing to move
+        let mut none = json!({"id": 1, "profile": null});
+        r.apply("public", "users", &mut none);
+        assert_eq!(none, json!({"id": 1, "profile": null}));
     }
 
     #[test]
