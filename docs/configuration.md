@@ -1344,6 +1344,9 @@ pg2osync_position_lag                           # difference between the two
 | `PG2OSYNC_INSTANCE_ID` | Recorded in the checkpoint document; identifies the writer |
 | whatever `*_env` names | The credentials themselves |
 
+Filling those credentials from Vault, AWS Secrets Manager or the External
+Secrets Operator: [Deployment](deployment.md#secrets).
+
 ## Complete example
 
 ```toml

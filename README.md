@@ -204,7 +204,9 @@ but a toolchain.
 
 Kubernetes manifests are in [deploy/kubernetes](deploy/kubernetes)
 (`kubectl apply -k deploy/kubernetes`); see
-[docs/deployment.md](docs/deployment.md) for probes, scaling and systemd.
+[docs/deployment.md](docs/deployment.md) for probes, scaling, systemd and
+the recipes that feed the credentials from Vault, AWS Secrets Manager or the
+External Secrets Operator.
 
 ## Try it locally
 
@@ -424,7 +426,7 @@ from `docs/` on every change.
 - [Architecture](docs/architecture.md) — how the pipeline works
 - [Database impact](docs/database-impact.md) — connections, privileges and the load it puts on your source
 - [Configuration](docs/configuration.md) — every option
-- [Deployment](docs/deployment.md) — Docker, Kubernetes, systemd
+- [Deployment](docs/deployment.md) — Docker, Kubernetes, systemd, secrets managers
 - [Operations](docs/operations.md) — metrics, failure modes, recovery
 - [Design decisions](docs/decisions.md) — why it is built this way
 - Sources: [PostgreSQL](docs/sources/postgresql.md) · [MySQL/MariaDB](docs/sources/mysql.md)
