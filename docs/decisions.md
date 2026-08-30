@@ -842,6 +842,53 @@ that: only base tables are eligible (`relkind = 'r'` on PostgreSQL,
 `table_type = 'BASE TABLE'` on MySQL) because the WAL and the binlog carry
 base-table rows, and a view has none to stream.
 
+**Tables are named one by one; there is no pattern.** Debezium takes a regex in
+`table.include.list` and Airbyte discovers its streams, so a table created
+tomorrow that matches starts syncing on its own. Here a section names an index,
+an id rule, a mapping and what to exclude, and a table that arrived by pattern
+would take the default for all four — which is precisely the index that quietly
+disagrees with the configuration that the rest of these options exist to
+prevent. It is also a silent action on someone's data at three in the morning,
+by a process whose whole argument is that it does nothing the operator did not
+write down.
+
+Adding a table is one `[sync.<key>]` section and a `pg2osync resnapshot --table`
+— [configuration.md](configuration.md) has both. The cost people mean when they
+ask for a pattern is the restart, and that is #145's to remove; the
+explicitness is not what is expensive.
+
+**No data streams.** OpenSearch and Elasticsearch data streams give an
+append-only time series automatic rollover and a lifecycle policy attached to
+the stream rather than to each index, which is a real convenience. They also
+require `op_type: create`: a write that already landed comes back as a conflict
+instead of overwriting itself, which is the opposite of the versioned upsert
+[every write here relies on](#correctness), and a replay is the ordinary case
+rather than the exception.
+
+The one table shape that would fit is `append_only`, and it already has
+retention — a time-bucketed index template plus an ILM or ISM policy the
+operator PUTs once, as [the Retention section of
+configuration.md](configuration.md#retention) describes (#120). The same
+outcome, with one write path instead of two. Worth revisiting only if something
+a data stream alone can do turns up in practice: a `logs-*` convention that has
+to be honoured, or a managed service that refuses a plain index.
+
+**Sinks are search targets, and nothing else.** pgstream and Conduit fan the
+same change stream out to webhooks, and the request here was a `webhook` sink
+for cache invalidation and integrations. It is the first step toward the
+general CDC bus the README declines to be — "no fan-out to multiple consumers,
+no message replay … you want Kafka" — and the step is hard to take back once a
+second kind of consumer exists.
+
+The correctness argument is the stronger one. Every non-search sink brings its
+own delivery semantics, and they are not this one's: a 5xx from an HTTP
+endpoint is not a versioned write that a replay can repeat harmlessly, so
+at-least-once would have to mean something different per sink and the engine
+would be the place that knew the difference. What keeps this tool
+explainable is that a target is a document store with versions. Someone who
+needs a side effect per change has the database's own tools — LISTEN/NOTIFY, a
+trigger — or a CDC platform built to fan out.
+
 ## Implementation choices
 
 **Hand-rolled metrics endpoint.** Six counters and one summary do not justify a
