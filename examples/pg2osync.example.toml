@@ -59,6 +59,10 @@ write_concurrency = 1
 txn_buffer_cap_mb = 256
 retry_max = 10
 retry_backoff_ms = 500
+# Ceiling on the time one request spends being retried, measured from its
+# first failure. Unset, the attempt count is the only limit; with both, the
+# retrying stops at whichever is reached first.
+# retry_max_elapsed_ms = 120000
 checkpoint_interval_ms = 500
 
 # Read-your-writes: GET /synced blocks until your own commit is searchable.

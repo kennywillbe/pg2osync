@@ -1341,6 +1341,7 @@ Defaults are production-sane; tune only against measurements.
 | `txn_buffer_cap_mb` | `256` | Warning threshold for one open transaction |
 | `retry_max` | `10` | Attempts per request before the pipeline stops |
 | `retry_backoff_ms` | `500` | Initial backoff, doubled per attempt, capped at 30 s |
+| `retry_max_elapsed_ms` | — | Ceiling on the time one request spends being retried, measured from its first failure. Unset leaves the attempt count as the only limit; `0` is refused |
 | `checkpoint_interval_ms` | `500` | How often the position is persisted |
 | `on_permanent_rejection` | `"halt"` | `"halt"` stops the pipeline on a document the target will never accept. `"quarantine"` records it in a hidden `.pg2osync_rejects` index, with its position, and carries on |
 | `max_rejects` | `100` | Quarantined documents allowed before the pipeline halts anyway. Counted against what the store holds, so a restart does not reset it |
@@ -1369,7 +1370,10 @@ means the target briefly holds part of it. Everything is idempotent, so the end
 state is correct, but a reader can observe the transaction half-applied.
 
 Transient failures (HTTP 429, 5xx, connection resets) are retried with
-exponential backoff. A permanent rejection — a mapping conflict, for example —
+exponential backoff. `retry_max` bounds that by attempts and
+`retry_max_elapsed_ms` bounds it by wall clock; with both set, whichever is
+reached first ends the retrying, and the error says which one it was and how
+long the request had been retried. A permanent rejection — a mapping conflict, for example —
 stops the pipeline instead of skipping the document, because skipping is silent
 data loss. `on_permanent_rejection = "quarantine"` trades that for availability:
 the document is recorded with its position before the position is acknowledged,

@@ -17,3 +17,8 @@ tokio.workspace = true
 anyhow.workspace = true
 base64 = "0.23.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json"] }
+
+[dev-dependencies]
+# The retry loop is tested against a virtual clock rather than by waiting out
+# its backoffs.
+tokio = { workspace = true, features = ["test-util"] }

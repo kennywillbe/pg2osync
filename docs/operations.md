@@ -276,6 +276,18 @@ once a connection has lasted longer than that cap. After
 `[source] reconnect_max` consecutive failures (10 by default, roughly five
 minutes) the process exits and hands over.
 
+A target that is down is retried the same way, one request at a time, on
+`[engine] retry_max` attempts with `retry_backoff_ms` doubling between them and
+capped at 30 seconds — nine waits summing to about two minutes on the defaults.
+`[engine] retry_max_elapsed_ms` bounds the same wait by the clock instead,
+measured from the request's first failure and clipping the last backoff so it
+cannot overshoot, which makes the worst case computable:
+`min(attempts × backoff schedule, elapsed ceiling)`. Whichever is reached first
+stops the pipeline, and the error names it — the attempt limit or the elapsed
+ceiling — with how long the request had been retried. Nothing is lost either
+way: the position was never acknowledged, so the source replays the batch after
+a restart.
+
 A MySQL **failover** is the case where reconnecting is not enough by itself: the
 address may now point at a server whose binlog file names and offsets mean
 nothing here. With GTIDs on, the checkpoint carries a position that any member of

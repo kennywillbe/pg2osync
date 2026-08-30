@@ -174,6 +174,7 @@ pub fn build_sink(cfg: &AppConfig, target_password: Option<String>) -> Result<Ar
     let retry = pg2osync_sink::RetryPolicy {
         max_attempts: cfg.engine.retry_max.max(1),
         base_backoff_ms: cfg.engine.retry_backoff_ms.max(1),
+        max_elapsed_ms: cfg.engine.retry_max_elapsed_ms,
     };
     let sink: Arc<dyn Sink> = match cfg.target.flavor.as_str() {
         "elasticsearch" => Arc::new(pg2osync_sink::elasticsearch::ElasticsearchSink::new(

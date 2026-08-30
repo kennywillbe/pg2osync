@@ -784,6 +784,15 @@ impl AppConfig {
                 self.source.mode
             );
         }
+        // Zero would end the retrying before the first backoff, turning every
+        // transient blip into a stopped pipeline — which is what leaving the
+        // option out already expresses far more clearly.
+        if self.engine.retry_max_elapsed_ms == Some(0) {
+            anyhow::bail!(
+                "[engine] retry_max_elapsed_ms = 0 leaves no time to retry in; remove it to \
+                 retry by attempt count alone"
+            );
+        }
         if let Some(sslmode) = &self.source.sslmode {
             pg2osync_source::tls::SslMode::parse(sslmode)
                 .context("[source] sslmode is not a libpq ssl mode")?;
@@ -1639,6 +1648,32 @@ table = "public.users"
         )
         .expect_err("refused");
         assert!(err.to_string().contains("created on demand"), "{err}");
+    }
+
+    #[test]
+    fn a_retry_ceiling_of_zero_is_refused_and_leaving_it_out_is_not() {
+        let with_ceiling = |value: &str| {
+            parse(&format!(
+                "{MINIMAL}\n[engine]\nretry_max_elapsed_ms = {value}\n"
+            ))
+        };
+        let error = with_ceiling("0").expect_err("zero leaves no time to retry in");
+        assert!(
+            error.to_string().contains("retry_max_elapsed_ms"),
+            "{error}"
+        );
+        assert_eq!(
+            with_ceiling("60000")
+                .expect("a real ceiling is accepted")
+                .engine
+                .retry_max_elapsed_ms,
+            Some(60_000)
+        );
+        assert_eq!(
+            parse(MINIMAL).expect("valid").engine.retry_max_elapsed_ms,
+            None,
+            "unset means the attempt count is the only limit"
+        );
     }
 
     #[test]
