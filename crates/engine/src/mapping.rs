@@ -3,6 +3,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::pseudonym::PseudonymKey;
+
 #[derive(Clone, Default)]
 pub struct DurableLsn(pub Arc<std::sync::atomic::AtomicU64>);
 
@@ -64,6 +66,20 @@ impl Projections {
 pub struct Transforms {
     /// (schema, table) -> (column -> operation)
     map: HashMap<(String, String), HashMap<String, TransformOp>>,
+    /// Environment variable name -> the key it held, for every `pseudonym`.
+    /// `with_keys` is the only way in, and it refuses a set that does not
+    /// cover every rule.
+    keys: HashMap<String, PseudonymKey>,
+}
+
+/// A `pseudonym` rule whose `key_env` no entry of the key ring names.
+#[derive(Debug, thiserror::Error)]
+#[error("{schema}.{table}.{column}: pseudonym key_env={key_env:?} has no value")]
+pub struct MissingKey {
+    pub schema: String,
+    pub table: String,
+    pub column: String,
+    pub key_env: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -87,6 +103,19 @@ pub enum TransformOp {
         map: std::collections::BTreeMap<String, String>,
         default: Option<String>,
     },
+    /// A value becomes a deterministic, reversible token under the key named
+    /// by `key_env`, scoped so the token cannot be replayed elsewhere.
+    ///
+    /// The key material is deliberately absent: this enum is `Debug` and
+    /// `Clone`, and it lives in rule maps that are cloned per table and
+    /// printed when a configuration is dumped.
+    Pseudonym {
+        key_env: String,
+        /// The associated data. `None` means the column's own
+        /// `schema.table.column`, which two columns that must join have to
+        /// override with the same explicit label.
+        scope: Option<String>,
+    },
 }
 
 impl TransformOp {
@@ -101,6 +130,7 @@ impl TransformOp {
             Self::Number => "number",
             Self::Date { .. } => "date",
             Self::Lookup { .. } => "lookup",
+            Self::Pseudonym { .. } => "pseudonym",
         }
     }
 }
@@ -118,9 +148,21 @@ enum Applied {
     /// `lookup` miss that has a `default`. Still counted — the dictionary did
     /// not know the value, and that is what the counter exists to make visible.
     Defaulted(serde_json::Value),
+    /// Counted like `Unconvertible`, but the value does not survive: a
+    /// protective op that cannot render its input must not publish it.
+    Refused,
 }
 
-fn apply_op(op: &TransformOp, v: &serde_json::Value) -> Applied {
+/// What one op needs to know beyond the value: the key ring, and where the
+/// value came from, which is the default scope of a pseudonym.
+struct OpCtx<'a> {
+    keys: &'a HashMap<String, PseudonymKey>,
+    schema: &'a str,
+    table: &'a str,
+    column: &'a str,
+}
+
+fn apply_op(op: &TransformOp, v: &serde_json::Value, ctx: &OpCtx<'_>) -> Applied {
     use serde_json::Value;
     match op {
         TransformOp::Redact => Applied::Converted(Value::String("***".into())),
@@ -218,6 +260,36 @@ fn apply_op(op: &TransformOp, v: &serde_json::Value) -> Applied {
                 },
             }
         }
+        // `with_keys` refuses a rule whose key is absent, so the lookup here
+        // cannot miss; if it ever did, the honest answer is to redact rather
+        // than index the value the op exists to hide.
+        TransformOp::Pseudonym { key_env, scope } => {
+            let Some(key) = ctx.keys.get(key_env) else {
+                return Applied::Refused;
+            };
+            let default_scope;
+            let scope = match scope {
+                Some(s) => s.as_str(),
+                None => {
+                    default_scope = format!("{}.{}.{}", ctx.schema, ctx.table, ctx.column);
+                    default_scope.as_str()
+                }
+            };
+            // A number and a bool are rendered, not stringified as JSON the
+            // way `hash` does it: a bigint primary key and the foreign key
+            // pointing at it have to produce the same token, and one of the
+            // two may well arrive as a string.
+            let rendered = match v {
+                Value::String(s) => s.clone(),
+                Value::Number(n) => n.to_string(),
+                Value::Bool(b) => b.to_string(),
+                // An array or an object has no single value to tokenise, and
+                // indexing it as it arrived would publish the PII.
+                _ => return Applied::Refused,
+            };
+            key.token(scope, rendered.as_bytes())
+                .map_or(Applied::Refused, |t| Applied::Converted(Value::String(t)))
+        }
     }
 }
 
@@ -227,7 +299,33 @@ impl Transforms {
     ) -> Self {
         Self {
             map: pairs.into_iter().collect(),
+            keys: HashMap::new(),
         }
+    }
+
+    /// Attach the key ring, refusing any `pseudonym` it does not cover.
+    ///
+    /// Refusing here rather than at the row is the point: a key missing at run
+    /// time leaves only bad options, and the least bad of them — redacting the
+    /// column of every row — is a silent, total data loss that a start-up
+    /// error is strictly better than.
+    pub fn with_keys(mut self, keys: HashMap<String, PseudonymKey>) -> Result<Self, MissingKey> {
+        for ((schema, table), rules) in &self.map {
+            for (column, op) in rules {
+                if let TransformOp::Pseudonym { key_env, .. } = op
+                    && !keys.contains_key(key_env)
+                {
+                    return Err(MissingKey {
+                        schema: schema.clone(),
+                        table: table.clone(),
+                        column: column.clone(),
+                        key_env: key_env.clone(),
+                    });
+                }
+            }
+        }
+        self.keys = keys;
+        Ok(self)
     }
 
     pub fn for_table(&self, schema: &str, table: &str) -> Option<&HashMap<String, TransformOp>> {
@@ -244,10 +342,12 @@ impl Transforms {
     /// stored document was transformed when it was first written, and a hash
     /// of a hash would never match what a fresh write of the row produces.
     ///
-    /// Returns the columns whose value the operation could not convert. Those
-    /// values are written exactly as they arrived: the target's mapping is the
-    /// arbiter of what it will hold, and halting the pipeline on one row — or
-    /// nulling the field — would cost more than it saves.
+    /// Returns the columns whose value the operation could not convert. A
+    /// reshaping op leaves those values exactly as they arrived: the target's
+    /// mapping is the arbiter of what it will hold, and halting the pipeline
+    /// on one row — or nulling the field — would cost more than it saves. A
+    /// protective op (`pseudonym`) is the exception and writes `***`, because
+    /// publishing what it was asked to hide is worse than losing it.
     pub fn apply_except<'a>(
         &'a self,
         schema: &str,
@@ -271,12 +371,22 @@ impl Transforms {
                 if v.is_null() {
                     continue;
                 }
-                match apply_op(op, v) {
+                let ctx = OpCtx {
+                    keys: &self.keys,
+                    schema,
+                    table,
+                    column: col,
+                };
+                match apply_op(op, v, &ctx) {
                     Applied::Converted(new) => *v = new,
                     Applied::AlreadyShaped => {}
                     Applied::Unconvertible => left.push(col.as_str()),
                     Applied::Defaulted(new) => {
                         *v = new;
+                        left.push(col.as_str());
+                    }
+                    Applied::Refused => {
+                        *v = serde_json::Value::String("***".into());
                         left.push(col.as_str());
                     }
                 }
@@ -1390,17 +1500,22 @@ mod tests {
             ("e", TransformOp::Number),
             ("f", TransformOp::Date { from: "%Y".into() }),
             ("g", lookup(&[("1", "active")], Some("unknown"))),
-        ]);
+            ("h", pseudonym(None)),
+        ])
+        .with_keys(key_ring())
+        .expect("the ring covers the rule");
         let mut doc = json!({
             "a": null, "b": null, "c": null, "d": null, "e": null, "f": null, "g": null,
+            "h": null,
         });
         let left = t.apply_except("public", "users", &mut doc, &[]);
         assert_eq!(
             doc,
             json!({
                 "a": null, "b": null, "c": null, "d": null, "e": null, "f": null, "g": null,
+                "h": null,
             }),
-            "not even a lookup default displaces a NULL"
+            "neither a lookup default nor a pseudonym displaces a NULL"
         );
         assert!(left.is_empty());
     }
@@ -1456,6 +1571,106 @@ mod tests {
             vec!["kept", "labelled"],
             "a default is still a value the dictionary did not know"
         );
+    }
+
+    const KEY_VAR: &str = "PG2OSYNC_TEST_KEY";
+    const KEY_HEX: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\
+                           202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f";
+
+    fn key_ring() -> HashMap<String, PseudonymKey> {
+        HashMap::from([(
+            KEY_VAR.to_string(),
+            PseudonymKey::from_hex(KEY_HEX).expect("a valid key"),
+        )])
+    }
+
+    fn pseudonym(scope: Option<&str>) -> TransformOp {
+        TransformOp::Pseudonym {
+            key_env: KEY_VAR.to_string(),
+            scope: scope.map(str::to_string),
+        }
+    }
+
+    fn keyed_users(pairs: &[(&str, TransformOp)]) -> Transforms {
+        users_transforms(pairs)
+            .with_keys(key_ring())
+            .expect("the ring covers every rule")
+    }
+
+    #[test]
+    fn a_pseudonym_is_a_token_rather_than_the_value() {
+        let t = keyed_users(&[("email", pseudonym(None))]);
+        let mut doc = json!({"email": "alice@example.com"});
+        let left = t.apply_except("public", "users", &mut doc, &[]);
+        let token = doc["email"].as_str().expect("a string");
+        assert_ne!(token, "alice@example.com");
+        assert!(left.is_empty());
+        // 16-byte synthetic IV plus the 17-byte plaintext, base64url unpadded
+        assert_eq!(token.len(), 44);
+    }
+
+    #[test]
+    fn a_number_and_a_bool_are_rendered_before_being_tokenised() {
+        let t = keyed_users(&[("n", pseudonym(Some("s"))), ("b", pseudonym(Some("s")))]);
+        let mut doc = json!({"n": 123, "b": true});
+        assert!(t.apply_except("public", "users", &mut doc, &[]).is_empty());
+
+        let mut text = json!({"n": "123", "b": "true"});
+        assert!(t.apply_except("public", "users", &mut text, &[]).is_empty());
+        assert_eq!(
+            doc, text,
+            "a bigint key and a textual foreign key must agree"
+        );
+    }
+
+    #[test]
+    fn an_array_or_an_object_is_redacted_and_counted() {
+        let t = keyed_users(&[("tags", pseudonym(None)), ("meta", pseudonym(None))]);
+        let mut doc = json!({"tags": ["a", "b"], "meta": {"k": "v"}});
+        let mut left = t.apply_except("public", "users", &mut doc, &[]);
+        left.sort_unstable();
+        assert_eq!(doc, json!({"tags": "***", "meta": "***"}));
+        assert_eq!(left, vec!["meta", "tags"]);
+    }
+
+    #[test]
+    fn the_default_scope_separates_two_columns_of_one_value() {
+        let t = keyed_users(&[("a", pseudonym(None)), ("b", pseudonym(None))]);
+        let mut doc = json!({"a": "same", "b": "same"});
+        t.apply("public", "users", &mut doc);
+        assert_ne!(doc["a"], doc["b"]);
+    }
+
+    #[test]
+    fn one_explicit_scope_makes_a_foreign_key_join() {
+        let scope = Some("public.users.id");
+        let users = Transforms::from_pairs([(
+            ("public".into(), "users".into()),
+            HashMap::from([("id".to_string(), pseudonym(scope))]),
+        )])
+        .with_keys(key_ring())
+        .expect("keyed");
+        let orders = Transforms::from_pairs([(
+            ("public".into(), "orders".into()),
+            HashMap::from([("user_id".to_string(), pseudonym(scope))]),
+        )])
+        .with_keys(key_ring())
+        .expect("keyed");
+
+        let mut user = json!({"id": 7});
+        users.apply("public", "users", &mut user);
+        let mut order = json!({"user_id": 7});
+        orders.apply("public", "orders", &mut order);
+        assert_eq!(user["id"], order["user_id"]);
+    }
+
+    #[test]
+    fn with_keys_refuses_a_rule_whose_key_is_absent() {
+        let err = users_transforms(&[("email", pseudonym(None))])
+            .with_keys(HashMap::new())
+            .expect_err("no key, no rules");
+        assert_eq!(err.column, "email");
+        assert_eq!(err.key_env, KEY_VAR);
     }
 
     #[test]

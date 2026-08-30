@@ -12,6 +12,7 @@ pub mod api;
 pub mod http;
 pub mod mapping;
 pub mod metrics;
+pub mod pseudonym;
 
 use crate::mapping::{IdTemplate, IndexTarget, TableMapping};
 use pg2osync_core::checkpoint::{Checkpoint, StreamId};
@@ -540,15 +541,29 @@ pub async fn run(
                             .fetch_add(left_as_is.len() as u64, Ordering::Relaxed);
                         for col in left_as_is {
                             if transform_warned.insert((row.table.clone(), col.clone())) {
-                                let op = ctx
+                                let rule = ctx
                                     .transforms
                                     .for_table(&row.schema, &row.table)
-                                    .and_then(|rules| rules.get(&col))
-                                    .map_or("transform", crate::mapping::TransformOp::name);
-                                tracing::warn!(target: "pg2osync::engine",
-                                    "{}.{}: {op} cannot convert {col}; the value is being \
-                                     indexed as it is",
-                                    row.schema, row.table);
+                                    .and_then(|rules| rules.get(&col));
+                                let op =
+                                    rule.map_or("transform", crate::mapping::TransformOp::name);
+                                // A protective op redacts what it cannot
+                                // render, so the warning must not promise the
+                                // value is still there.
+                                if matches!(
+                                    rule,
+                                    Some(crate::mapping::TransformOp::Pseudonym { .. })
+                                ) {
+                                    tracing::warn!(target: "pg2osync::engine",
+                                        "{}.{}: pseudonym cannot render {col}; the field is \
+                                         redacted instead",
+                                        row.schema, row.table);
+                                } else {
+                                    tracing::warn!(target: "pg2osync::engine",
+                                        "{}.{}: {op} cannot convert {col}; the value is being \
+                                         indexed as it is",
+                                        row.schema, row.table);
+                                }
                             }
                         }
                     }

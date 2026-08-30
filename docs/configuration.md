@@ -620,7 +620,7 @@ Two tables may map to the same index once each declares its `id`; see
 ### Transforms
 
 A column can be reshaped on its way into the document. `transform` maps a
-source column to one of seven named operations: a string for an op that takes
+source column to one of eight named operations: a string for an op that takes
 no parameter, an inline table for one that does.
 
 ```toml
@@ -635,17 +635,20 @@ price   = "number"
 tags    = { op = "split", by = "," }
 born    = { op = "date", from = "%d/%m/%Y" }
 status  = { op = "lookup", map = { "1" = "active", "2" = "closed" }, default = "unknown" }
+ssn     = { op = "pseudonym", key_env = "PG2OSYNC_PSEUDONYM_KEY" }
 ```
 
 `hash` replaces the value with a truncated SHA-256 digest, stable across runs so
-it can still be grouped on. `redact` replaces it with `***`. `lookup` maps a
-value through a dictionary the configuration declares. The other four turn
-a string into something more structured:
+it can still be grouped on. `redact` replaces it with `***`. `pseudonym` is
+[keyed and reversible](#pseudonym). `lookup` maps a value through a dictionary
+the configuration declares. The other four turn a string into something more
+structured:
 
 | op | takes | turns | into |
 |---|---|---|---|
 | `hash` | — | any value | a truncated SHA-256 digest |
 | `redact` | — | any value | `***` |
+| `pseudonym` | `key_env`, required and non-empty; `scope`, optional | a string, number or bool | a deterministic base64url token under an AES-SIV key |
 | `json` | — | a string holding JSON | that JSON value, an object or a bare number alike |
 | `split` | `by`, required and non-empty | a delimited string | an array of its trimmed, non-empty pieces: `"a, b ,c"` → `["a","b","c"]`, `""` → `[]` |
 | `number` | — | a string holding a number | a JSON number: an integer when it is one, otherwise a double |
@@ -667,9 +670,13 @@ all find their key, while an array or an object has no text form and misses.
 A miss is a value the dictionary does not cover, so it is counted like any
 other unconverted value, whether it keeps its own value or takes `default`.
 
-A value an op cannot convert — `"abc"` under `number`, a code no `lookup` map
-names — is indexed **exactly as it arrived** (or as `default`), counted in
+A value a *reshaping* op cannot convert — `"abc"` under `number`, a code no
+`lookup` map names — is indexed **exactly as it arrived** (or as `default`),
+counted in
 `pg2osync_transform_unconverted_total`, and logged once per table and column.
+`pseudonym` is the exception: it is protective, so a value it cannot render is
+replaced with `***`, counted the same way and logged as redacted. Indexing the
+value that op was asked to hide would be worse than losing it.
 The pipeline never halts on it: the target's mapping is the arbiter of what a
 field holds, and a document the mapping refuses takes the ordinary rejection
 path (see `on_permanent_rejection`). A fanned row counts once per element
@@ -686,7 +693,76 @@ document.
 
 Refused at load: an unknown op, a parameter the op does not take, `split`
 without a non-empty `by`, `date` without a non-empty `from`, `lookup` without a
-non-empty `map`, and a transform on the `fan_out.field`.
+non-empty `map`, `pseudonym` without a non-empty `key_env`, and a transform on
+the `fan_out.field`. Refused at start-up: a `pseudonym` whose `key_env` names a
+variable that is unset or does not hold a well-formed key.
+
+#### Pseudonym
+
+`hash` is one-way and truncated: two values can collide, so it is unsafe on a
+unique or a foreign-key column, and nobody can get the value back. `pseudonym`
+encrypts the value with AES-SIV (RFC 5297) instead, which is deterministic — so
+equal values give equal tokens, across tables and across runs, and a join on the
+pseudonymised column still joins.
+
+```toml
+[sync.users.transform]
+email   = { op = "pseudonym", key_env = "PG2OSYNC_PSEUDONYM_KEY" }
+
+[sync.orders.transform]
+user_id = { op = "pseudonym", key_env = "PG2OSYNC_PSEUDONYM_KEY", scope = "public.users.id" }
+```
+
+**The key** comes only from the environment: `key_env` names a variable holding
+**128 hex characters** — a 64-byte AES-256-SIV key. There is no inline form, and
+the key never appears in a log, an error or a dump of the configuration.
+
+```sh
+export PG2OSYNC_PSEUDONYM_KEY=$(openssl rand -hex 64)
+pg2osync validate -c pg2osync.toml     # ✓ pseudonym key present (64 bytes) from PG2OSYNC_PSEUDONYM_KEY
+```
+
+**The scope** is the associated data, and it defaults to the column's own
+`schema.table.column`, so the same value in two columns gives two different
+tokens and one cannot be replayed into another context. That default is fully
+qualified, which is the trap a foreign key has to step around: for
+`orders.user_id` to produce the same token as `users.id`, it must name that
+column's scope explicitly, exactly as spelled above. Two columns that must join
+have to carry the same `scope`.
+
+**The construction**, for whoever holds the key and needs the value back:
+
+```
+token = base64url_nopad( AES-SIV-Encrypt(K, headers = [scope], plaintext) )
+  K:         64 bytes — the 128 hex characters. RFC 5297 order: K[0..32] is the
+             CMAC key, K[32..64] the CTR key. Some libraries take the halves the
+             other way round; check yours against a test vector.
+  headers:   exactly one item, the scope string as UTF-8
+  plaintext: the value's text as UTF-8 — the string itself, or "123" / "true"
+             for a number or a bool, never JSON-quoted
+  output:    the 16-byte synthetic IV, then the ciphertext (16 + len bytes)
+```
+
+There is deliberately no `decrypt` subcommand: it would want the key on a
+command line and the scope beside it, and the four lines above are all any RFC
+5297 library needs.
+
+**What it does and does not protect.** This is pseudonymisation, not
+anonymisation. It is reversible by the key holder, so under GDPR the index still
+holds personal data — keep the index and the key in different blast radii,
+because together they are the plaintext. Being deterministic is the point and
+also the cost: equal values are visibly equal, so a low-cardinality column
+(a country, a status, a gender) is de-anonymised by counting. Use it on
+high-cardinality identifiers. The token is not padded either, so its length
+reveals the plaintext's. Where none of that is acceptable and no one ever needs
+the value back, `hash` and `redact` remain.
+
+**Where it does not reach.** `_id` renders from the raw row, before transforms,
+so a pseudonymised column still appears in plaintext in the document id if `id`
+names it — pseudonymise the field and keep the identifier off it, or exclude the
+column. `where` and `fan_out` read the raw row for the same reason. And a
+TOAST-completed column is copied from the stored document rather than
+transformed again, the same rule that keeps `hash` stable.
 
 ### Field names
 

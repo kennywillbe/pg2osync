@@ -6,8 +6,9 @@
 use anyhow::{Context, Result};
 use pg2osync_core::sink::index_matches_pattern;
 use pg2osync_engine::mapping::{IdTemplate, IndexTarget, TransformOp, check_index_name};
+use pg2osync_engine::pseudonym::PseudonymKey;
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -410,6 +411,12 @@ pub struct TransformTable {
     pub map: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default)]
     pub default: Option<String>,
+    /// The environment variable holding a `pseudonym` key. There is no inline
+    /// form: a key in a config file is a key in version control.
+    #[serde(default)]
+    pub key_env: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 /// Hand-written for the same reason `Constant` is: an untagged enum reports
@@ -448,33 +455,40 @@ impl TransformSpec {
     /// startup check and the run-time build go through here, so one grammar
     /// decides what a transform is.
     pub fn parse(&self) -> std::result::Result<TransformOp, String> {
-        let (op, by, from, map, default) = match self {
-            Self::Op(op) => (op.as_str(), None, None, None, None),
-            Self::Table(t) => (
-                t.op.as_str(),
-                t.by.as_deref(),
-                t.from.as_deref(),
-                t.map.as_ref(),
-                t.default.as_deref(),
-            ),
+        let bare = TransformTable {
+            op: String::new(),
+            by: None,
+            from: None,
+            map: None,
+            default: None,
+            key_env: None,
+            scope: None,
         };
-        let refuse = |param: &str| format!("{op:?} takes no {param:?}");
-        if op != "lookup" {
-            if map.is_some() {
-                return Err(refuse("map"));
-            }
-            if default.is_some() {
-                return Err(refuse("default"));
-            }
-        }
+        let (op, t) = match self {
+            Self::Op(op) => (op.as_str(), &bare),
+            Self::Table(t) => (t.op.as_str(), t),
+        };
+        // One sweep over every optional parameter rather than a guard per op,
+        // so adding an op cannot forget to refuse one of the others and
+        // silently accept a misspelt key.
+        let only = |allowed: &[&str]| -> std::result::Result<(), String> {
+            [
+                ("by", t.by.is_some()),
+                ("from", t.from.is_some()),
+                ("map", t.map.is_some()),
+                ("default", t.default.is_some()),
+                ("key_env", t.key_env.is_some()),
+                ("scope", t.scope.is_some()),
+            ]
+            .into_iter()
+            .find(|(param, given)| *given && !allowed.contains(param))
+            .map_or(Ok(()), |(param, _)| {
+                Err(format!("{op:?} takes no {param:?}"))
+            })
+        };
         match op {
             "hash" | "redact" | "json" | "number" => {
-                if by.is_some() {
-                    return Err(refuse("by"));
-                }
-                if from.is_some() {
-                    return Err(refuse("from"));
-                }
+                only(&[])?;
                 Ok(match op {
                     "hash" => TransformOp::Hash,
                     "redact" => TransformOp::Redact,
@@ -483,20 +497,16 @@ impl TransformSpec {
                 })
             }
             "split" => {
-                if from.is_some() {
-                    return Err(refuse("from"));
-                }
-                match by {
+                only(&["by"])?;
+                match t.by.as_deref() {
                     None => Err("split needs \"by\": { op = \"split\", by = \",\" }".into()),
                     Some("") => Err("split needs a non-empty \"by\"".into()),
                     Some(by) => Ok(TransformOp::Split { by: by.to_string() }),
                 }
             }
             "date" => {
-                if by.is_some() {
-                    return Err(refuse("by"));
-                }
-                match from {
+                only(&["from"])?;
+                match t.from.as_deref() {
                     None => {
                         Err("date needs \"from\": { op = \"date\", from = \"%d/%m/%Y\" }".into())
                     }
@@ -507,26 +517,39 @@ impl TransformSpec {
                 }
             }
             "lookup" => {
-                if by.is_some() {
-                    return Err(refuse("by"));
-                }
-                if from.is_some() {
-                    return Err(refuse("from"));
-                }
-                match map {
+                only(&["map", "default"])?;
+                match t.map.as_ref() {
                     None => Err("lookup needs \"map\": \
                                  { op = \"lookup\", map = { \"1\" = \"active\" } }"
                         .into()),
                     Some(m) if m.is_empty() => Err("lookup needs a non-empty \"map\"".into()),
                     Some(m) => Ok(TransformOp::Lookup {
                         map: m.clone(),
-                        default: default.map(str::to_string),
+                        default: t.default.clone(),
+                    }),
+                }
+            }
+            "pseudonym" => {
+                only(&["key_env", "scope"])?;
+                if t.scope.as_deref() == Some("") {
+                    return Err("pseudonym needs a non-empty \"scope\"".into());
+                }
+                match t.key_env.as_deref() {
+                    None => Err(
+                        "pseudonym needs \"key_env\": { op = \"pseudonym\", key_env = \
+                                 \"PG2OSYNC_PSEUDONYM_KEY\" }"
+                            .into(),
+                    ),
+                    Some("") => Err("pseudonym needs a non-empty \"key_env\"".into()),
+                    Some(key_env) => Ok(TransformOp::Pseudonym {
+                        key_env: key_env.to_string(),
+                        scope: t.scope.clone(),
                     }),
                 }
             }
             other => Err(format!(
                 "{other:?} is not a transform; expected one of \"hash\", \"redact\", \"json\", \
-                 \"split\", \"number\", \"date\", \"lookup\""
+                 \"split\", \"number\", \"date\", \"lookup\", \"pseudonym\""
             )),
         }
     }
@@ -719,6 +742,10 @@ impl AppConfig {
 #[derive(Debug)]
 pub struct ResolvedSecrets {
     pub source_url: String,
+    /// The distinct `key_env` names every `pseudonym` transform asks for,
+    /// sorted. The names only: the keys themselves are read where they are
+    /// used and never stored beside a connection URL.
+    pub pseudonym_key_vars: Vec<String>,
     /// Separate connection for catalog and nested-child queries; defaults to
     /// `source_url`. A dedicated admin user keeps replication privileges apart.
     pub admin_url: String,
@@ -1310,12 +1337,52 @@ impl AppConfig {
             None => source_url.clone(),
         };
 
+        // Read and discard: every entry point resolves secrets first, so a
+        // missing or malformed key is a start-up error rather than a surprise
+        // when the first row of that table arrives.
+        let pseudonym_key_vars = self.pseudonym_keys()?.into_keys().collect::<Vec<_>>();
+        let mut pseudonym_key_vars = pseudonym_key_vars;
+        pseudonym_key_vars.sort();
+
         Ok(ResolvedSecrets {
             source_url,
+            pseudonym_key_vars,
             admin_url,
             target_password,
             warnings,
         })
+    }
+
+    /// Every `pseudonym` key the configuration names, read from the
+    /// environment and parsed.
+    ///
+    /// Recomputed rather than carried in `ResolvedSecrets`: the key ring is a
+    /// pure function of the config and the environment, and threading key
+    /// material through six pipeline signatures to reach the one builder that
+    /// wants it would widen its blast radius for nothing.
+    pub fn pseudonym_keys(&self) -> Result<HashMap<String, PseudonymKey>> {
+        let mut keys: HashMap<String, PseudonymKey> = HashMap::new();
+        for table in self.sync.values() {
+            for spec in table.transform.values() {
+                let Ok(TransformOp::Pseudonym { key_env, .. }) = spec.parse() else {
+                    continue;
+                };
+                if keys.contains_key(&key_env) {
+                    continue;
+                }
+                let raw = std::env::var(&key_env).map_err(|_| {
+                    anyhow::anyhow!(
+                        "pseudonym key_env={key_env:?} is set but the variable is missing"
+                    )
+                })?;
+                // The parse error never carries the value, so this is safe to
+                // print and safe to let anyhow attach context to.
+                let key = PseudonymKey::from_hex(&raw)
+                    .map_err(|e| anyhow::anyhow!("pseudonym key_env={key_env:?}: {e}"))?;
+                keys.insert(key_env, key);
+            }
+        }
+        Ok(keys)
     }
 }
 
@@ -2038,6 +2105,34 @@ id = "user-{id}"
                 "email = { op = \"redact\", default = \"x\" }",
                 "only lookup has a default",
             ),
+            (
+                "email = { op = \"pseudonym\" }",
+                "pseudonym without key_env",
+            ),
+            (
+                "email = { op = \"pseudonym\", key_env = \"\" }",
+                "pseudonym with an empty key_env",
+            ),
+            (
+                "email = { op = \"pseudonym\", key_env = \"K\", scope = \"\" }",
+                "pseudonym with an empty scope",
+            ),
+            (
+                "email = { op = \"pseudonym\", key_env = \"K\", by = \",\" }",
+                "a parameter pseudonym does not take",
+            ),
+            (
+                "email = { op = \"redact\", key_env = \"K\" }",
+                "a key on an op that has no key",
+            ),
+            (
+                "tags = { op = \"split\", by = \",\", scope = \"x\" }",
+                "a scope on an op that has no scope",
+            ),
+            (
+                "status = { op = \"lookup\", map = { \"1\" = \"a\" }, key_env = \"K\" }",
+                "a key on an op that takes no key",
+            ),
         ];
         for (line, why) in refused {
             assert!(
@@ -2045,6 +2140,37 @@ id = "user-{id}"
                 "{why}"
             );
         }
+        let cfg = parse(&format!(
+            "{MINIMAL}[sync.users.transform]\n\
+             email = {{ op = \"pseudonym\", key_env = \"PG2OSYNC_KEY\" }}\n\
+             user_id = {{ op = \"pseudonym\", key_env = \"PG2OSYNC_KEY\", \
+             scope = \"public.users.id\" }}\n"
+        ))
+        .expect("pseudonym loads in both shapes");
+        let t = &cfg.sync["users"].transform;
+        assert_eq!(
+            t["email"].parse(),
+            Ok(TransformOp::Pseudonym {
+                key_env: "PG2OSYNC_KEY".into(),
+                scope: None
+            })
+        );
+        assert_eq!(
+            t["user_id"].parse(),
+            Ok(TransformOp::Pseudonym {
+                key_env: "PG2OSYNC_KEY".into(),
+                scope: Some("public.users.id".into())
+            })
+        );
+        let missing = parse(&format!(
+            "{MINIMAL}[sync.users.transform]\nemail = {{ op = \"pseudonym\" }}\n"
+        ))
+        .expect_err("no key_env");
+        assert!(
+            format!("{missing:#}").contains("key_env = \"PG2OSYNC_PSEUDONYM_KEY\""),
+            "the error shows the fix: {missing:#}"
+        );
+
         let err = parse(&format!(
             "{MINIMAL}[sync.users.transform]\ntags = {{ op = \"split\", by = \",\", nope = 1 }}\n"
         ))
@@ -2756,6 +2882,60 @@ parent = "customer_id"
         let secrets = cfg.resolve_secrets().expect("resolved");
         assert_eq!(secrets.source_url, "postgres://u:p@localhost/db");
         assert_eq!(secrets.warnings.len(), 1, "plain-text url must warn");
+    }
+
+    /// `std::env::set_var` is unsafe in edition 2024 and the whole test binary
+    /// shares one environment, so every case gets its own variable name and
+    /// nothing is ever unset.
+    fn with_key(var: &str, value: &str) -> AppConfig {
+        unsafe { std::env::set_var(var, value) };
+        parse(&format!(
+            "{MINIMAL}[sync.users.transform]\nemail = {{ op = \"pseudonym\", key_env = \"{var}\" }}\n"
+        ))
+        .expect("valid")
+    }
+
+    const GOOD_KEY: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\
+                            202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f";
+
+    #[test]
+    fn a_pseudonym_key_resolves_and_is_reported_by_name_only() {
+        let cfg = with_key("PG2OSYNC_TEST_KEY_GOOD", GOOD_KEY);
+        let secrets = cfg.resolve_secrets().expect("resolved");
+        assert_eq!(secrets.pseudonym_key_vars, vec!["PG2OSYNC_TEST_KEY_GOOD"]);
+        assert_eq!(cfg.pseudonym_keys().expect("keys").len(), 1);
+    }
+
+    #[test]
+    fn a_missing_pseudonym_key_is_refused() {
+        let cfg = parse(&format!(
+            "{MINIMAL}[sync.users.transform]\n\
+             email = {{ op = \"pseudonym\", key_env = \"PG2OSYNC_TEST_KEY_ABSENT\" }}\n"
+        ))
+        .expect("valid");
+        let err = format!("{:#}", cfg.resolve_secrets().expect_err("must fail"));
+        assert!(err.contains("PG2OSYNC_TEST_KEY_ABSENT"), "{err}");
+        assert!(err.contains("missing"), "{err}");
+    }
+
+    #[test]
+    fn a_malformed_pseudonym_key_is_refused_without_echoing_it() {
+        let cases = [
+            ("PG2OSYNC_TEST_KEY_SHORT", &GOOD_KEY[..64], "128 hex"),
+            ("PG2OSYNC_TEST_KEY_NOTHEX", "z", "128 hex"),
+        ];
+        for (var, value, expected) in cases {
+            let cfg = with_key(var, value);
+            let err = format!("{:#}", cfg.resolve_secrets().expect_err("must fail"));
+            assert!(err.contains(expected), "{err}");
+            assert!(!err.contains(value), "the error echoes the key: {err}");
+        }
+
+        let bad_digit = format!("g{}", &GOOD_KEY[1..]);
+        let cfg = with_key("PG2OSYNC_TEST_KEY_BADDIGIT", &bad_digit);
+        let err = format!("{:#}", cfg.resolve_secrets().expect_err("must fail"));
+        assert!(err.contains("character 0 is not a hex digit"), "{err}");
+        assert!(!err.contains(&bad_digit), "the error echoes the key: {err}");
     }
 
     #[test]
