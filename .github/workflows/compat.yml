@@ -39,7 +39,7 @@ jobs:
         with:
           save-if: false
       - run: cargo build --release --locked -p pg2osync
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: pg2osync
           path: target/release/pg2osync
@@ -69,7 +69,7 @@ jobs:
           --health-interval 10s --health-timeout 5s --health-retries 30
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: pg2osync
           path: target/release
@@ -117,7 +117,7 @@ jobs:
           --health-interval 10s --health-timeout 10s --health-retries 30
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: pg2osync
           path: target/release
@@ -157,7 +157,7 @@ jobs:
         ports: ["7700:7700"]
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: pg2osync
           path: target/release
@@ -214,7 +214,7 @@ jobs:
           --health-interval 10s --health-timeout 5s --health-retries 30
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: pg2osync
           path: target/release
@@ -276,7 +276,7 @@ jobs:
           --health-interval 10s --health-timeout 5s --health-retries 30
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: pg2osync
           path: target/release
