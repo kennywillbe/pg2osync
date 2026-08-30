@@ -520,6 +520,19 @@ fn pipelines(cfg: &AppConfig) -> pg2osync_engine::mapping::Pipelines {
     }))
 }
 
+/// Each section's routing column keyed by (schema, table) for the engine.
+fn routings(cfg: &AppConfig) -> pg2osync_engine::mapping::Routings {
+    pg2osync_engine::mapping::Routings::from_pairs(cfg.sync.values().filter_map(|tbl| {
+        let column = tbl.routing.clone()?;
+        let (schema, table) = split_qualified(&tbl.table);
+        let key_column = pk_columns_for(tbl).contains(&column);
+        Some((
+            (schema.to_string(), table.to_string()),
+            pg2osync_engine::mapping::RoutingColumn { column, key_column },
+        ))
+    }))
+}
+
 /// Every synced table's primary key from the catalogue, for the decoder: under
 /// REPLICA IDENTITY FULL the WAL flags every column as identity, and the key
 /// the load filed a row under is the only thing a streamed change may address
@@ -671,6 +684,7 @@ pub fn pipeline_ctx(
         joins: joins(cfg)?,
         filters: filters(cfg)?,
         pipelines: pipelines(cfg),
+        routings: routings(cfg),
         append_only: append_only(cfg),
         cfg: cfg.engine.clone(),
         ack_tx,
@@ -690,7 +704,8 @@ pub fn pipeline_ctx(
 /// renders the delete of a row that left the filter from the key, and the
 /// other cases are the ones above. A join child is one more: its delete has
 /// to name its parent's shard, and its routing comes from the same place its
-/// id does.
+/// id does, and so is a section routed by a column: an update that changes
+/// that column has to delete the document under the routing it had before.
 async fn check_derived_identity_requirements(
     cfg: &AppConfig,
     admin: &tokio_postgres::Client,
@@ -712,7 +727,11 @@ async fn check_derived_identity_requirements(
         {
             declared.push(("index", "per-row index", spec));
         }
-        if declared.is_empty() && tbl.fan_out.is_none() && tbl.join.is_none() {
+        if declared.is_empty()
+            && tbl.fan_out.is_none()
+            && tbl.join.is_none()
+            && tbl.routing.is_none()
+        {
             continue;
         }
         let (schema, table) = split_qualified(&tbl.table);
@@ -775,6 +794,20 @@ async fn check_derived_identity_requirements(
                 ),
                 Some(_) => {}
             }
+        }
+        if let Some(column) = &tbl.routing
+            && !in_both_keys(column)
+            && info.relreplident != 'f'
+        {
+            bail!(
+                "[sync.{key}] {} has REPLICA IDENTITY '{}', but its routing column {column} is \
+                 not part of its key: a delete would carry no routing, and an update that \
+                 changes it could not remove the document from the shard it is on. \
+                 Run: ALTER TABLE {} REPLICA IDENTITY FULL",
+                tbl.table,
+                info.relreplident,
+                tbl.table
+            );
         }
         if needs.is_empty() {
             continue;

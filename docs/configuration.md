@@ -120,6 +120,9 @@ It re-reads rows whose timestamp column advanced since the last cycle.
 - Each start re-runs the initial load: there is no position to resume from, and
   re-indexing is harmless under idempotent writes. Existing WAL checkpoints are
   ignored in this mode so a gap can never be skipped.
+- A row whose `id`, index template or [`routing`](#routing) column changed
+  leaves its old document behind: a cycle sees the row's new state and has no
+  before-image to find the old one by.
 
 ## `[target]`
 
@@ -160,6 +163,7 @@ One section per table. `<key>` is the index name when `index` is omitted.
 | `soft_delete` | SQL predicate marking a row as deleted, e.g. `deleted_at IS NOT NULL` |
 | `mapping_file` | JSON mapping to create the index with, see below |
 | `pipeline` | Ingest pipeline the target runs on every document of this section, e.g. `"embed-products"`; OpenSearch and Elasticsearch only, see [Ingest pipelines](#ingest-pipelines) |
+| `routing` | Column whose value decides the shard this section's documents live on, e.g. `"tenant_id"`; OpenSearch and Elasticsearch only, see [Routing](#routing) |
 | `children` | Nested child collections, see below |
 
 Projection and transforms apply to every path — initial load, live streaming and
@@ -1021,6 +1025,60 @@ A table that is both an embedded child of another section and a section of
 its own is warned about at startup, not refused: the replication runner reads
 its rows only as a re-fetch of the owner, so its own index receives the initial
 load and no streamed change.
+
+### Routing
+
+A document's shard is chosen from its `_id` unless something says otherwise.
+`routing` says otherwise: it names a column whose value decides the shard, so
+every document sharing that value lands on one shard and a query for it reads
+one shard instead of all of them.
+
+```toml
+[sync.documents]
+table = "public.documents"
+index = "documents"
+routing = "tenant_id"
+```
+
+A tenant column is the usual case: hundreds of small tenants in one index,
+each query scoped to one of them. An index per tenant would be the
+alternative, and it is the wrong one when tenants are many and small — every
+index costs shards, and shards cost memory whether they hold ten documents or
+ten million.
+
+- **The value is the column's raw value**, read before projection and
+  transforms, like an `id` is: a projection must not be able to move a
+  document to another shard. The column stays an ordinary field of the
+  document; routing adds nothing to it.
+- **NULL, missing, or empty halts the pipeline.** The target rejects an empty
+  routing outright, and quietly writing the document to its default shard
+  would hide it from every routed query. `validate` refuses a column the
+  table does not have and warns when it is nullable.
+- **PostgreSQL: a routing column outside the key needs
+  `REPLICA IDENTITY FULL`.** A delete has to reach the shard that holds the
+  document, and the old value comes from the before-image — the same rule a
+  non-key `id` follows; `run` refuses to start otherwise. MySQL already
+  guarantees the before-image with `binlog_row_image = FULL`.
+- **A changed value moves the document**: written under the new routing
+  first, deleted under the old second, exactly as a changed `id` or a changed
+  index template moves it.
+- **Fanned-out elements inherit the row's routing**, and a row that changes
+  its routing takes them all with it.
+- **A routing column that is both projected away and TOASTable halts on an
+  update that does not resend it**, like a non-key `id` column: the read-back
+  fills the document, not the row the routing renders from.
+- **`reconcile` and `TRUNCATE` are unaffected.** Both work index-wide and
+  take each document's routing from the hit itself, so neither has to derive
+  one. A document duplicated under a stale routing is not something reconcile
+  collects: the row it belongs to is still there.
+- **Poll mode leaves the old copy.** A poll cycle sees the row's new state
+  and nothing else, so a changed routing value writes a second copy under the
+  new routing and never deletes the first — the same limitation a changed
+  `id` has in poll mode.
+
+Refused at config load: `routing` together with `join`, which already routes
+a child to its parent's shard, and `routing` against Meilisearch, which
+ignores routing entirely.
 
 ## `[engine]`
 

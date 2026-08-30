@@ -1898,5 +1898,147 @@ else
 fi
 stop_sync
 
+echo -e "\n\033[1m== 29. a column routes a section's documents to one shard ==\033[0m"
+# One tenant per shard (#109): `routing = "tenant"` puts every document of a
+# tenant on the shard that value hashes to, so a document is only found with
+# its routing, a changed tenant moves it, and everything that already carried
+# a routing for a join child — deletes, reconcile, TRUNCATE — has to keep
+# working for a section that has no join at all.
+RTCONFIG=$(mktemp /tmp/pg2osync-e2e-routing.XXXXXX)
+RTSLOT=pg2osync_e2e_routing
+drop_idle_probe_slots
+cat > "$RTCONFIG" <<TOML
+[source]
+url_env = "PG2OSYNC_SOURCE_URL"
+slot_name = "$RTSLOT"
+publication = "${RTSLOT}_pub"
+
+[target]
+url = "http://localhost:9200"
+
+[metrics]
+bind = "127.0.0.1:9130"
+
+[sync.tenanted]
+table = "public.tenanted"
+index = "e2e_routing"
+routing = "tenant"
+TOML
+routing_cleanup() {
+  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  pg "SELECT pg_drop_replication_slot('$RTSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$RTSLOT');" > /dev/null 2>&1 || true
+  pg "DROP PUBLICATION IF EXISTS ${RTSLOT}_pub; DROP TABLE IF EXISTS tenanted;" > /dev/null 2>&1 || true
+  curl -s -XDELETE "$OS/e2e_routing?ignore_unavailable=true" > /dev/null 2>&1 || true
+  rm -f "$RTCONFIG" /tmp/pg2osync-e2e-routing.log
+}
+trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup; init_cleanup; fan_cleanup; bid_cleanup; shape_cleanup; where_cleanup; join_cleanup; union_cleanup; events_cleanup; pipe_cleanup; append_cleanup; routing_cleanup' EXIT
+
+pg "DROP TABLE IF EXISTS tenanted; CREATE TABLE tenanted(id bigint primary key, tenant text, name text);" > /dev/null 2>&1
+pg "INSERT INTO tenanted VALUES (1,'acme','first'),(2,'globex','second');" > /dev/null
+pg "DROP PUBLICATION IF EXISTS ${RTSLOT}_pub; CREATE PUBLICATION ${RTSLOT}_pub FOR TABLE tenanted;" > /dev/null 2>&1
+curl -s -XDELETE "$OS/e2e_routing?ignore_unavailable=true" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/postgres-$RTSLOT" > /dev/null
+# Three shards rather than the default one: on a single shard every document
+# is reachable without its routing, and the assertions below would pass with
+# no routing at all.
+curl -s -XPUT "$OS/e2e_routing" -H 'Content-Type: application/json' \
+  -d '{"settings":{"number_of_shards":3}}' > /dev/null
+if $BIN validate -c "$RTCONFIG" 2>&1 | grep -q "all checks passed"; then
+  ok "validate accepts a routing column"
+else
+  bad "validate refused a routing column"
+fi
+# a join child is already routed to its parent; a second owner of the shard
+# has to be refused where it can still be fixed
+printf '[sync.tenanted.join]\nfield = "rel"\nname = "doc"\n' | cat "$RTCONFIG" - > "${RTCONFIG}.bad"
+out=$($BIN validate -c "${RTCONFIG}.bad" 2>&1 || true)
+if grep -q "routing and join cannot be combined" <<< "$out"; then
+  ok "validate refuses routing beside join"
+else
+  bad "validate accepted routing beside join: $out"
+fi
+rm -f "${RTCONFIG}.bad"
+# the routing column is not the key, so a delete carries it only under FULL:
+# the pipeline refuses to start rather than strand documents on their shards
+if $BIN run -c "$RTCONFIG" > /tmp/pg2osync-e2e-routing.log 2>&1 & then
+  sleep 3
+  pkill -f "pg2osync run" 2>/dev/null || true
+  wait 2> /dev/null || true
+fi
+if grep -q "REPLICA IDENTITY FULL" /tmp/pg2osync-e2e-routing.log; then
+  ok "a non-key routing column on a non-FULL table is refused with the ALTER to run"
+else
+  bad "the pipeline started despite a routing it could not derive on a delete"
+fi
+pg "ALTER TABLE tenanted REPLICA IDENTITY FULL;" > /dev/null 2>&1
+
+nohup $BIN run -c "$RTCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_count e2e_routing)" = "2" ] && break
+  sleep 1
+done
+check "the load writes both rows" "$(os_count e2e_routing)" "2"
+check "a document is found under its tenant's routing" "$(os_rstatus e2e_routing 1 acme)" "200"
+check "and not without it" "$(os_status e2e_routing 1)" "404"
+check "the target reports the routing it filed the document under" \
+  "$(curl -s "$OS/e2e_routing/_doc/1?routing=acme" | jqf "d.get('_routing','<missing>')")" "acme"
+check "the routing column stays an ordinary field" "$(os_routed e2e_routing 1 acme name)" "first"
+
+pg "INSERT INTO tenanted VALUES (3,'acme','third');" > /dev/null
+for _ in $(seq 1 30); do
+  [ "$(os_rstatus e2e_routing 3 acme)" = "200" ] && break
+  sleep 1
+done
+check "a streamed row lands under its tenant's routing" "$(os_rstatus e2e_routing 3 acme)" "200"
+
+# the acceptance test: the value that decides the shard can change, so the
+# document has to be written under the new routing and removed under the old
+pg "UPDATE tenanted SET tenant='globex' WHERE id=1;" > /dev/null
+for _ in $(seq 1 30); do
+  [ "$(os_rstatus e2e_routing 1 globex)" = "200" ] && [ "$(os_rstatus e2e_routing 1 acme)" = "404" ] && break
+  sleep 1
+done
+check "a moved document is found under its new routing" "$(os_rstatus e2e_routing 1 globex)" "200"
+check "and is gone from the old one" "$(os_rstatus e2e_routing 1 acme)" "404"
+refresh
+check "one copy, not two" "$(os_count e2e_routing)" "3"
+
+pg "DELETE FROM tenanted WHERE id=3;" > /dev/null
+for _ in $(seq 1 30); do
+  [ "$(os_rstatus e2e_routing 3 acme)" = "404" ] && break
+  sleep 1
+done
+check "a delete removes the document on the shard that holds it" "$(os_rstatus e2e_routing 3 acme)" "404"
+
+# reconcile reads each hit's own routing, so it needs none of this derived:
+# nothing is an orphan yet, and a row that goes while nothing is watching is
+# removed where it is
+refresh
+out=$($BIN reconcile -c "$RTCONFIG" 2>&1)
+if grep -q "Re-run with --delete" <<< "$out"; then
+  bad "reconcile found orphans in a consistent routed index: $out"
+else
+  ok "reconcile finds no orphan in a routed index"
+fi
+stop_sync
+sleep 1
+pg "DELETE FROM tenanted WHERE id=2;" > /dev/null
+refresh
+out=$($BIN reconcile -c "$RTCONFIG" --delete 2>&1)
+case "$out" in
+  *"1 removed with no row in public.tenanted"*) ok "reconcile --delete named the document whose row is gone" ;;
+  *) bad "reconcile --delete did not name exactly the missing document: $out" ;;
+esac
+check "and removed it under its own routing" "$(os_rstatus e2e_routing 2 globex)" "404"
+
+# a TRUNCATE is index-wide, so routing has nothing to do with it
+nohup $BIN run -c "$RTCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sleep 3
+pg "TRUNCATE tenanted;" > /dev/null
+for _ in $(seq 1 30); do refresh; [ "$(os_count e2e_routing)" = "0" ] && break; sleep 1; done
+check "a TRUNCATE clears the index whatever the documents were routed by" "$(os_count e2e_routing)" "0"
+stop_sync
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

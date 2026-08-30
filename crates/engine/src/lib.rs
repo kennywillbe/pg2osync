@@ -162,6 +162,8 @@ pub struct PipelineCtx {
     pub filters: crate::mapping::Filters,
     /// The target's ingest pipeline each table's documents go through.
     pub pipelines: crate::mapping::Pipelines,
+    /// Tables whose documents are routed by one of their columns.
+    pub routings: crate::mapping::Routings,
     /// Tables with no key: insert-only, filed under a content hash unless
     /// the section configures an id.
     pub append_only: crate::mapping::AppendOnly,
@@ -466,6 +468,7 @@ pub async fn run(
                     joins: &ctx.joins,
                     filters: &ctx.filters,
                     pipelines: &ctx.pipelines,
+                    routings: &ctx.routings,
                     append_only: &ctx.append_only,
                 };
                 let completions = match fetch_completions(
@@ -1108,6 +1111,7 @@ pub struct Rules<'a> {
     pub joins: &'a crate::mapping::Joins,
     pub filters: &'a crate::mapping::Filters,
     pub pipelines: &'a crate::mapping::Pipelines,
+    pub routings: &'a crate::mapping::Routings,
     pub append_only: &'a crate::mapping::AppendOnly,
 }
 
@@ -1337,13 +1341,21 @@ fn completion_key(
         None if target.is_pk_only() => target.render_from_pk(old_pk).ok()?,
         None => target.render(doc).ok()?,
     };
+    // a section is routed by a join or by a column, never by both, so the
+    // second lookup only runs where the first found nothing
     let routing = rules
         .joins
         .for_table(table.0, table.1)
         .map(|join| join.routing_for_key(before.as_ref(), old_pk))
         .transpose()
         .ok()?
-        .flatten();
+        .flatten()
+        .or_else(|| {
+            rules
+                .routings
+                .for_table(table.0, table.1)
+                .and_then(|rule| rule.render_from_key(before.as_ref(), old_pk).ok())
+        });
     let template = rules.id_templates.for_table(table.0, table.1);
     let Some(template) = template else {
         let id = pk_to_id(pk);
@@ -1454,12 +1466,28 @@ fn materialize(
             .transpose()
             .map_err(halt)
     };
+    // A configured routing column is refused together with `join`, so at most
+    // one of the two ever decides where a document lives.
+    let routed = rules.routings.for_table(table.0, table.1);
+    let route = |raw: &Value, filed: &Option<(Value, Option<String>)>| match (filed, routed) {
+        (Some((_, routing)), _) => Ok(routing.clone()),
+        (None, Some(rule)) => rule.render(raw).map(Some).map_err(halt),
+        (None, None) => Ok(None),
+    };
+    // The routing of the document the row already owns, for the events that
+    // carry a key and, at best, a before-image.
+    let key_routing = |before: Option<&Value>, pk: &Value| match (join, routed) {
+        (Some(rule), _) => rule.routing_for_key(before, pk).map_err(halt),
+        (None, Some(rule)) => rule.render_from_key(before, pk).map(Some).map_err(halt),
+        (None, None) => Ok(None),
+    };
     // `shaped` names the columns completed from the stored document: they
     // went through the transforms when they were first written, so they must
     // not go through them again
     let finish = |index: &str,
                   docs: Vec<(String, Value)>,
                   filed: Option<(Value, Option<String>)>,
+                  routing: Option<String>,
                   shaped: &[String],
                   left: &mut Vec<String>| {
         docs.into_iter()
@@ -1476,17 +1504,16 @@ fn materialize(
                 rules.renames.apply(table.0, table.1, &mut doc);
                 rules.constants.apply(table.0, table.1, &mut doc);
                 // last, like a constant: the join field is not a column, and
-                // a projection must not be able to strip it
-                let routing = match (&filed, join) {
-                    (Some((value, routing)), Some(rule)) => {
-                        if let Value::Object(map) = &mut doc {
-                            map.insert(rule.field.clone(), value.clone());
-                        }
-                        routing.clone()
-                    }
-                    _ => None,
-                };
-                upsert(index, id, routing, doc)
+                // a projection must not be able to strip it. A routing column
+                // adds nothing to the document: it is already one of its
+                // fields, unless the section projected it away, and then it
+                // was not wanted there.
+                if let (Some((value, _)), Some(rule)) = (&filed, join)
+                    && let Value::Object(map) = &mut doc
+                {
+                    map.insert(rule.field.clone(), value.clone());
+                }
+                upsert(index, id, routing.clone(), doc)
             })
             .collect()
     };
@@ -1517,7 +1544,15 @@ fn materialize(
             let base = derived_id(table, pk, Some(doc), None, rules)?;
             let index = rendered_index(target, table, pk, Some(doc), None)?;
             let filed = file(doc)?;
-            Ok(finish(&index, shape(&base, doc)?, filed, &[], left_as_is))
+            let routing = route(doc, &filed)?;
+            Ok(finish(
+                &index,
+                shape(&base, doc)?,
+                filed,
+                routing,
+                &[],
+                left_as_is,
+            ))
         }
         RowKind::Update {
             pk,
@@ -1537,9 +1572,17 @@ fn materialize(
             let base = derived_id(table, pk, Some(&doc), before, rules)?;
             let index = rendered_index(target, table, pk, Some(&doc), before)?;
             let filed = file(&doc)?;
-            let routing = filed.as_ref().and_then(|(_, routing)| routing.clone());
+            let routing = route(&doc, &filed)?;
+            let old_routing = key_routing(before, old_pk)?;
             let new_docs = shape(&base, &doc)?;
-            let mut ops = finish(&index, new_docs.clone(), filed, &completed, left_as_is);
+            let mut ops = finish(
+                &index,
+                new_docs.clone(),
+                filed,
+                routing.clone(),
+                &completed,
+                left_as_is,
+            );
             // write first, delete second: a crash between them leaves a
             // duplicate that the replay repairs, where the reverse order would
             // leave a gap that nothing repairs
@@ -1553,19 +1596,21 @@ fn materialize(
                 if let Some(before) = before {
                     let old_base = derived_id(table, old_pk, None, Some(before), rules)?;
                     let old_index = rendered_index(target, table, old_pk, None, Some(before))?;
-                    // One row, one index: every element document went where
-                    // the row did, so when the row moved index nothing in the
-                    // old one is held any more, whatever its id.
-                    let held: std::collections::HashSet<&str> = if old_index == index {
-                        new_docs.iter().map(|(id, _)| id.as_str()).collect()
-                    } else {
-                        std::collections::HashSet::new()
-                    };
+                    // One row, one index and one shard: every element
+                    // document went where the row did, so when the row moved
+                    // index or routing nothing it left behind is held any
+                    // more, whatever its id.
+                    let held: std::collections::HashSet<&str> =
+                        if old_index == index && old_routing == routing {
+                            new_docs.iter().map(|(id, _)| id.as_str()).collect()
+                        } else {
+                            std::collections::HashSet::new()
+                        };
                     for (id, _) in crate::mapping::fan_out_docs(rule, &old_base, before)
                         .map_err(|e| halt(format!("before-image of a fanned row: {e}")))?
                     {
                         if !held.contains(id.as_str()) {
-                            ops.push(delete(&old_index, id, None));
+                            ops.push(delete(&old_index, id, old_routing.clone()));
                         }
                     }
                 }
@@ -1592,11 +1637,6 @@ fn materialize(
                     None => None,
                 }
                 .unwrap_or_else(|| index.clone());
-                let old_routing = join
-                    .map(|rule| rule.routing_for_key(before, old_pk))
-                    .transpose()
-                    .map_err(halt)?
-                    .flatten();
                 if (&old_index, &old_id, &old_routing) != (&index, &base, &routing) {
                     ops.push(delete(&old_index, old_id, old_routing));
                 }
@@ -1609,13 +1649,9 @@ fn materialize(
             // the before-image names the index the document is in; a
             // template it cannot satisfy halts, as the startup check promised
             let index = rendered_index(target, table, pk, None, before)?;
+            let routing = key_routing(before, pk)?;
             match fan {
                 None => {
-                    let routing = join
-                        .map(|rule| rule.routing_for_key(before, pk))
-                        .transpose()
-                        .map_err(halt)?
-                        .flatten();
                     let mut ops = vec![delete(&index, base.clone(), routing)];
                     // A parent's children live on its shard and know nothing
                     // of its deletion; they go after the parent, at the same
@@ -1644,7 +1680,7 @@ fn materialize(
                     Ok(crate::mapping::fan_out_docs(rule, &base, row)
                         .map_err(halt)?
                         .into_iter()
-                        .map(|(id, _)| delete(&index, id, None))
+                        .map(|(id, _)| delete(&index, id, routing.clone()))
                         .collect())
                 }
             }
@@ -2056,6 +2092,7 @@ mod pipeline_tests {
             joins: crate::mapping::Joins::default(),
             filters: crate::mapping::Filters::default(),
             pipelines: crate::mapping::Pipelines::default(),
+            routings: Default::default(),
             append_only: Default::default(),
             cfg,
             ack_tx,
@@ -3047,6 +3084,7 @@ mod pipeline_tests {
             joins: crate::mapping::Joins::default(),
             filters,
             pipelines,
+            routings: Default::default(),
             append_only: Default::default(),
             cfg: EngineConfig {
                 batch_size,
@@ -3195,6 +3233,7 @@ mod pipeline_tests {
             joins: Default::default(),
             filters: Default::default(),
             pipelines: Default::default(),
+            routings: Default::default(),
             append_only: Default::default(),
             cfg: EngineConfig::default(),
             ack_tx,
@@ -3256,6 +3295,7 @@ mod pipeline_tests {
             joins: Default::default(),
             filters: Default::default(),
             pipelines: Default::default(),
+            routings: Default::default(),
             append_only: Default::default(),
             cfg: EngineConfig::default(),
             ack_tx,
@@ -3321,6 +3361,7 @@ mod pipeline_tests {
             joins: Default::default(),
             filters: Default::default(),
             pipelines: Default::default(),
+            routings: Default::default(),
             append_only: Default::default(),
             cfg: EngineConfig::default(),
             ack_tx,
@@ -3638,6 +3679,7 @@ mod pipeline_tests {
             joins: Default::default(),
             filters: Default::default(),
             pipelines: Default::default(),
+            routings: Default::default(),
             append_only: Default::default(),
             cfg: EngineConfig::default(),
             ack_tx,
@@ -3705,6 +3747,7 @@ mod pipeline_tests {
             joins,
             filters: Default::default(),
             pipelines: Default::default(),
+            routings: Default::default(),
             append_only: Default::default(),
             cfg: EngineConfig::default(),
             ack_tx: ack_tx.clone(),
@@ -4012,6 +4055,7 @@ mod pipeline_tests {
             joins: crate::mapping::Joins::default(),
             filters,
             pipelines: crate::mapping::Pipelines::default(),
+            routings: Default::default(),
             append_only: Default::default(),
             cfg: EngineConfig {
                 batch_size: 500,
@@ -4359,6 +4403,7 @@ mod pipeline_tests {
             joins: shop_joins(),
             filters: crate::mapping::Filters::default(),
             pipelines: crate::mapping::Pipelines::default(),
+            routings: Default::default(),
             append_only: Default::default(),
             cfg: EngineConfig {
                 batch_size: 500,
@@ -4587,6 +4632,259 @@ mod pipeline_tests {
         );
     }
 
+    /// `public.docs` routed by its `tenant` column and filed under
+    /// `doc-{id}`. `tenant` is not part of the key, so a key-only event has
+    /// nothing to route by — the shape the startup check demands
+    /// `REPLICA IDENTITY FULL` for.
+    async fn drive_routed_result(
+        fan_outs: crate::mapping::FanOuts,
+        script: Vec<ChangeEvent>,
+        sink: Arc<RecordingSink>,
+    ) -> Result<(), CoreError> {
+        let (events_tx, events_rx) = mpsc::channel(1024);
+        let (copy_tx, copy_rx) = mpsc::channel(1024);
+        drop(copy_tx);
+        let (ack_tx, _ack_rx) = watch::channel(None);
+        let (load_done_tx, _load_done_rx) = watch::channel(0u64);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let ctx = Arc::new(PipelineCtx {
+            sink,
+            mapping: TableMapping::from_pairs([(
+                ("public".to_string(), "docs".to_string()),
+                "docs".to_string(),
+            )]),
+            projections: crate::mapping::Projections::default(),
+            transforms: crate::mapping::Transforms::default(),
+            renames: crate::mapping::Renames::default(),
+            constants: crate::mapping::Constants::default(),
+            id_templates: crate::mapping::IdTemplates::from_pairs([(
+                ("public".to_string(), "docs".to_string()),
+                crate::mapping::IdTemplate::parse("doc-{id}", &["id".to_string()])
+                    .expect("valid template"),
+            )]),
+            fan_outs,
+            joins: Default::default(),
+            filters: Default::default(),
+            pipelines: Default::default(),
+            routings: crate::mapping::Routings::from_pairs([(
+                ("public".to_string(), "docs".to_string()),
+                crate::mapping::RoutingColumn {
+                    column: "tenant".into(),
+                    key_column: false,
+                },
+            )]),
+            append_only: Default::default(),
+            cfg: EngineConfig {
+                batch_size: 500,
+                checkpoint_interval_ms: 100,
+                ..EngineConfig::default()
+            },
+            ack_tx,
+            load_done_tx,
+            metrics: Arc::new(crate::metrics::Metrics::default()),
+        });
+        for event in script {
+            events_tx.send(event).await.expect("channel has room");
+        }
+        drop(events_tx);
+        run(
+            events_rx,
+            copy_rx,
+            ctx,
+            StreamId {
+                source: SOURCE_POSTGRES.into(),
+                stream: "slot".into(),
+                publication: "pub".into(),
+            },
+            Arc::new(|token| Lsn(token).to_string()),
+            crate::mapping::DurableLsn::default(),
+            shutdown_rx,
+        )
+        .await
+    }
+
+    async fn drive_routed(script: Vec<ChangeEvent>) -> Arc<RecordingSink> {
+        let sink = Arc::new(RecordingSink::default());
+        drive_routed_result(Default::default(), script, sink.clone())
+            .await
+            .expect("engine ran");
+        sink
+    }
+
+    fn routed_row(kind: RowKind, version: u64) -> ChangeEvent {
+        ChangeEvent::Row(RowChange {
+            schema: "public".into(),
+            table: "docs".into(),
+            kind,
+            version: Some(version),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_routed_row_is_written_under_its_column() {
+        let sink = drive_routed(vec![
+            routed_row(
+                RowKind::Insert {
+                    pk: json!(7),
+                    doc: json!({"id": 7, "tenant": "acme", "title": "a"}),
+                },
+                0x100,
+            ),
+            commit(0x100),
+        ])
+        .await;
+        assert_eq!(sink.events(), vec!["write[upsert:doc-7->acme@256]"]);
+        assert_eq!(
+            sink.doc("doc-7"),
+            Some(json!({"id": 7, "tenant": "acme", "title": "a"})),
+            "routing adds nothing to the document: the column is already in it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_changed_routing_column_moves_the_document() {
+        // same id, different shard: the target will not overwrite the old
+        // copy, so it has to be deleted where it is
+        let sink = drive_routed(vec![
+            routed_row(
+                RowKind::Update {
+                    pk: json!(7),
+                    previous_pk: None,
+                    doc: json!({"id": 7, "tenant": "globex"}),
+                    unchanged_toast_columns: vec![],
+                    before: Some(json!({"id": 7, "tenant": "acme"})),
+                },
+                0x200,
+            ),
+            commit(0x200),
+        ])
+        .await;
+        assert_eq!(
+            sink.events(),
+            vec!["write[upsert:doc-7->globex@512 delete:doc-7->acme]"],
+            "write at the new routing first, remove from the old one second"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_routed_delete_is_routed_from_its_before_image() {
+        let sink = drive_routed(vec![
+            routed_row(
+                RowKind::Delete {
+                    pk: json!(7),
+                    before: Some(json!({"id": 7, "tenant": "acme"})),
+                },
+                0x300,
+            ),
+            commit(0x300),
+        ])
+        .await;
+        assert_eq!(sink.events(), vec!["write[delete:doc-7->acme]"]);
+    }
+
+    #[tokio::test]
+    async fn a_routed_delete_without_a_before_image_halts_naming_replica_identity() {
+        let outcome = drive_routed_result(
+            Default::default(),
+            vec![
+                routed_row(
+                    RowKind::Delete {
+                        pk: json!(7),
+                        before: None,
+                    },
+                    0x300,
+                ),
+                commit(0x300),
+            ],
+            Arc::new(RecordingSink::default()),
+        )
+        .await;
+        let message = outcome
+            .expect_err("a delete that cannot be routed must stop the pipeline")
+            .to_string();
+        assert!(
+            message.contains("public.docs")
+                && message.contains("tenant")
+                && message.contains("REPLICA IDENTITY FULL"),
+            "the halt must name the table, the column and the remedy: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fanned_elements_inherit_the_rows_routing_and_leave_none_behind() {
+        let fan = crate::mapping::FanOuts::from_pairs([(
+            ("public".to_string(), "docs".to_string()),
+            crate::mapping::FanOut {
+                field: "tags".into(),
+                id: crate::mapping::IdTemplate::parse("doc-{id}-{tags}", &["id".to_string()])
+                    .expect("valid template"),
+            },
+        )]);
+        let sink = Arc::new(RecordingSink::default());
+        drive_routed_result(
+            fan,
+            vec![
+                routed_row(
+                    RowKind::Update {
+                        pk: json!(7),
+                        previous_pk: None,
+                        doc: json!({"id": 7, "tenant": "globex", "tags": ["a"]}),
+                        unchanged_toast_columns: vec![],
+                        before: Some(json!({"id": 7, "tenant": "acme", "tags": ["a", "b"]})),
+                    },
+                    0x200,
+                ),
+                commit(0x200),
+            ],
+            sink.clone(),
+        )
+        .await
+        .expect("engine ran");
+        assert_eq!(
+            sink.events(),
+            vec!["write[upsert:doc-7-a->globex@512 delete:doc-7-a->acme delete:doc-7-b->acme]"],
+            "the row moved shard, so nothing it left at the old routing is held"
+        );
+    }
+
+    #[tokio::test]
+    async fn toast_completion_of_a_routed_row_reads_back_at_its_old_routing() {
+        // the stored document is on the old tenant's shard until this update
+        // moves it, so that is where the read has to go
+        let sink = Arc::new(RecordingSink::default());
+        sink.store(json!({"note": "stored"}));
+        drive_routed_result(
+            Default::default(),
+            vec![
+                routed_row(
+                    RowKind::Update {
+                        pk: json!(7),
+                        previous_pk: None,
+                        doc: json!({"id": 7, "tenant": "globex", "note": null}),
+                        unchanged_toast_columns: vec!["note".into()],
+                        before: Some(json!({"id": 7, "tenant": "acme"})),
+                    },
+                    0x200,
+                ),
+                commit(0x200),
+            ],
+            sink.clone(),
+        )
+        .await
+        .expect("engine ran");
+        assert_eq!(
+            sink.events(),
+            vec![
+                "read(doc-7->acme)",
+                "write[upsert:doc-7->globex@512 delete:doc-7->acme]"
+            ]
+        );
+        assert_eq!(
+            sink.doc("doc-7"),
+            Some(json!({"id": 7, "tenant": "globex", "note": "stored"}))
+        );
+    }
+
     /// `public.users` declared append-only, with whatever id the section
     /// configures. Reports how the engine ended, for the tests about a halt.
     async fn drive_append_only(
@@ -4615,6 +4913,7 @@ mod pipeline_tests {
             joins: Default::default(),
             filters: Default::default(),
             pipelines: Default::default(),
+            routings: Default::default(),
             append_only: crate::mapping::AppendOnly::from_iter([(
                 "public".to_string(),
                 "users".to_string(),

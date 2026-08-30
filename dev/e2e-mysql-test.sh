@@ -43,6 +43,9 @@ os_field()  { curl -s "$OS/$1/_doc/$2" | jqf "d.get('_source',{}).get('$3','<mis
 os_has()    { curl -s "$OS/$1/_doc/$2" | jqf "'$3' in d.get('_source',{})"; }
 os_len()    { curl -s "$OS/$1/_doc/$2" | jqf "len(d.get('_source',{}).get('$3') or [])"; }
 os_status() { curl -s -o /dev/null -w "%{http_code}" "$OS/$1/_doc/$2"; }
+# a routed document lives on the shard its routing hashes to, so reading it
+# needs that routing
+os_rstatus() { curl -s -o /dev/null -w "%{http_code}" "$OS/$1/_doc/$2?routing=$3"; }
 my()        { docker exec "$CONTAINER" "$CLIENT" -uroot -p"$ROOT_PASSWORD" -N -B sourcedb -e "$1" 2>/dev/null; }
 refresh()   { curl -s -XPOST "$OS/_refresh" > /dev/null; }
 # Every table loads beside the stream, so one table reaching the source's count
@@ -1005,6 +1008,86 @@ if [ "$(grep -c 'an UPDATE arrived on an append-only table' "$LOG" || true)" -gt
 else
   bad "an UPDATE on an append-only table was not refused"
 fi
+stop_sync
+
+say "21. a column routes a section's documents to one shard"
+# The PostgreSQL suite's section 29 (#109) on the binlog path: routing is
+# derived in the engine from the row, so a moved document has to be written
+# under the new routing and removed under the old here too. Nothing to alter
+# first — binlog_row_image=FULL is already a prerequisite of this source.
+stop_sync
+RTCONFIG=$(mktemp /tmp/pg2osync-mysql-routing.XXXXXX)
+RTSID=990009
+cat > "$RTCONFIG" <<TOML
+[source]
+flavor = "mysql"
+url_env = "PG2OSYNC_MYSQL_URL"
+server_id = $RTSID
+
+[target]
+url = "$OS"
+
+[metrics]
+bind = "127.0.0.1:9121"
+
+[sync.tenanted]
+table = "sourcedb.tenanted"
+index = "e2e_mysql_routing"
+routing = "tenant"
+TOML
+routing_cleanup() {
+  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  my "DROP TABLE IF EXISTS tenanted;" > /dev/null 2>&1 || true
+  curl -s -XDELETE "$OS/e2e_mysql_routing?ignore_unavailable=true" > /dev/null 2>&1 || true
+  rm -f "$RTCONFIG"
+}
+trap 'cleanup; resume_cleanup; types_cleanup; child_cleanup; where_cleanup; events_cleanup; pipe_cleanup; append_cleanup; routing_cleanup' EXIT
+
+my "DROP TABLE IF EXISTS tenanted;"
+my "CREATE TABLE tenanted(id bigint primary key, tenant varchar(20), name varchar(20));"
+my "INSERT INTO tenanted VALUES (1,'acme','first'),(2,'globex','second');"
+curl -s -XDELETE "$OS/e2e_mysql_routing?ignore_unavailable=true" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/mysql-$RTSID" > /dev/null
+# Three shards rather than the default one: on a single shard every document
+# is reachable without its routing, and the assertions below would pass with
+# no routing at all.
+curl -s -XPUT "$OS/e2e_mysql_routing" -H 'Content-Type: application/json' \
+  -d '{"settings":{"number_of_shards":3}}' > /dev/null
+if $BIN validate -c "$RTCONFIG" 2>&1 | grep -q "all checks passed"; then
+  ok "validate accepts a routing column"
+else
+  bad "validate refused a routing column"
+fi
+nohup $BIN run -c "$RTCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+await_count e2e_mysql_routing 2
+check "the load writes both rows" "$(os_count e2e_mysql_routing)" "2"
+check "a document is found under its tenant's routing" "$(os_rstatus e2e_mysql_routing 1 acme)" "200"
+check "and not without it" "$(os_status e2e_mysql_routing 1)" "404"
+
+my "INSERT INTO tenanted VALUES (3,'acme','third');"
+for _ in $(seq 1 30); do
+  [ "$(os_rstatus e2e_mysql_routing 3 acme)" = "200" ] && break
+  sleep 1
+done
+check "a streamed row lands under its tenant's routing" "$(os_rstatus e2e_mysql_routing 3 acme)" "200"
+
+# the acceptance test: the value that decides the shard can change
+my "UPDATE tenanted SET tenant='globex' WHERE id=1;"
+for _ in $(seq 1 30); do
+  [ "$(os_rstatus e2e_mysql_routing 1 globex)" = "200" ] && [ "$(os_rstatus e2e_mysql_routing 1 acme)" = "404" ] && break
+  sleep 1
+done
+check "a moved document is found under its new routing" "$(os_rstatus e2e_mysql_routing 1 globex)" "200"
+check "and is gone from the old one" "$(os_rstatus e2e_mysql_routing 1 acme)" "404"
+refresh
+check "one copy, not two" "$(os_count e2e_mysql_routing)" "3"
+
+my "DELETE FROM tenanted WHERE id=3;"
+for _ in $(seq 1 30); do
+  [ "$(os_rstatus e2e_mysql_routing 3 acme)" = "404" ] && break
+  sleep 1
+done
+check "a delete removes the document on the shard that holds it" "$(os_rstatus e2e_mysql_routing 3 acme)" "404"
 stop_sync
 
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"

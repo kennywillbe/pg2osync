@@ -267,6 +267,12 @@ pub struct TableSync {
     /// still takes the one write path. OpenSearch and Elasticsearch only.
     #[serde(default)]
     pub pipeline: Option<String>,
+    /// Column whose value routes this section's documents, e.g. a tenant id,
+    /// so one tenant's documents share a shard. Co-location only: routing
+    /// does not name the document, and the column stays an ordinary field.
+    /// OpenSearch and Elasticsearch only.
+    #[serde(default)]
+    pub routing: Option<String>,
     /// Column transformations: `email = "redact"` for an operation without a
     /// parameter, `tags = { op = "split", by = "," }` for one with.
     #[serde(default)]
@@ -803,6 +809,24 @@ impl AppConfig {
                     anyhow::bail!(
                         "[sync.{key}] pipeline is an OpenSearch and Elasticsearch feature, which \
                          Meilisearch has no equivalent for; remove pipeline for this target"
+                    );
+                }
+            }
+            if let Some(routing) = &tbl.routing {
+                if routing.is_empty() {
+                    anyhow::bail!("[sync.{key}] routing must not be empty");
+                }
+                if tbl.join.is_some() {
+                    anyhow::bail!(
+                        "[sync.{key}] routing and join cannot be combined: a join child is \
+                         already routed to its parent, and a second rule would move it off \
+                         the shard its parent is on"
+                    );
+                }
+                if self.target.flavor == "meilisearch" {
+                    anyhow::bail!(
+                        "[sync.{key}] routing is an OpenSearch and Elasticsearch feature, which \
+                         Meilisearch has no equivalent for; remove routing for this target"
                     );
                 }
             }
@@ -2117,6 +2141,54 @@ parent = "customer_id"
             Some("embed-customers")
         );
         assert_eq!(cfg.sync["orders"].pipeline.as_deref(), Some("embed-orders"));
+    }
+
+    #[test]
+    fn a_routing_column_is_a_column_name_and_no_second_owner_of_the_shard() {
+        let routed = MINIMAL.replace(
+            "table = \"public.users\"",
+            "table = \"public.users\"\nrouting = \"tenant\"",
+        );
+        let cfg = parse(&routed).expect("a routing column is a valid section");
+        assert_eq!(cfg.sync["users"].routing.as_deref(), Some("tenant"));
+        parse(&format!("{routed}append_only = true\n"))
+            .expect("an append-only table only ever inserts, so it never needs the old routing");
+
+        let refusal = refused(
+            &MINIMAL.replace(
+                "table = \"public.users\"",
+                "table = \"public.users\"\nrouting = \"\"",
+            ),
+            "an empty routing column",
+        );
+        assert!(
+            refusal.contains("[sync.users] routing must not be empty"),
+            "{refusal}"
+        );
+
+        let refusal = refused(
+            &PAIR.replace(
+                "id = \"order-{id}\"",
+                "id = \"order-{id}\"\nrouting = \"tenant\"",
+            ),
+            "a second owner of a join child's shard",
+        );
+        assert!(
+            refusal.contains("[sync.orders] routing and join cannot be combined"),
+            "{refusal}"
+        );
+
+        let refusal = refused(
+            &routed.replace("[target]", "[target]\nflavor = \"meilisearch\""),
+            "a target that ignores routing",
+        );
+        assert!(
+            refusal.contains(
+                "[sync.users] routing is an OpenSearch and Elasticsearch feature, which \
+                 Meilisearch has no equivalent for; remove routing for this target"
+            ),
+            "{refusal}"
+        );
     }
 
     #[test]
