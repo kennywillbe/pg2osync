@@ -2315,5 +2315,155 @@ else
   bad "the summary line does not name the ceiling: $(grep 'rows from' "$RTLOG" || true)"
 fi
 
+echo -e "\n\033[1m== 32. a many-to-many relation embeds through its junction table ==\033[0m"
+# `through` (#141): the rows worth embedding are one table further than the one
+# carrying the parent's key, so the aggregation gains one join and both tables
+# are streamed. What has to hold: the junction keys the array, a junction row
+# makes and breaks the relation without REPLICA IDENTITY FULL on it (its key
+# carries the column that names the parent), a changed author reaches every one
+# of their books, and a transaction full of junction rows still costs a
+# constant number of reads.
+TCONFIG=$(mktemp /tmp/pg2osync-e2e-through.XXXXXX)
+TSLOT=pg2osync_e2e_through
+drop_idle_probe_slots
+cat > "$TCONFIG" <<TOML
+[source]
+url_env = "PG2OSYNC_SOURCE_URL"
+slot_name = "$TSLOT"
+publication = "${TSLOT}_pub"
+
+[target]
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
+
+[metrics]
+bind = "127.0.0.1:9133"
+
+[sync.books]
+table = "public.books"
+index = "e2e_through"
+
+[[sync.books.children]]
+table = "public.authors"
+field = "authors"
+through = "public.book_author"
+foreign_key = "book_id"
+through_key = "author_id"
+TOML
+through_cleanup() {
+  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  pg "SELECT pg_drop_replication_slot('$TSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$TSLOT');" > /dev/null 2>&1 || true
+  pg "DROP PUBLICATION IF EXISTS ${TSLOT}_pub; DROP TABLE IF EXISTS book_author; DROP TABLE IF EXISTS authors; DROP TABLE IF EXISTS books;" > /dev/null 2>&1 || true
+  curl -s -XDELETE "$OS/e2e_through,e2e_through_capped?ignore_unavailable=true" > /dev/null 2>&1 || true
+  rm -f "$TCONFIG" "${TCONFIG}.capped"
+}
+trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup; init_cleanup; fan_cleanup; bid_cleanup; shape_cleanup; where_cleanup; join_cleanup; union_cleanup; events_cleanup; pipe_cleanup; append_cleanup; routing_cleanup; reindex_cleanup; rate_cleanup; through_cleanup' EXIT
+
+pg "DROP TABLE IF EXISTS book_author; DROP TABLE IF EXISTS authors; DROP TABLE IF EXISTS books;" > /dev/null 2>&1
+pg "CREATE TABLE books(id bigint primary key, title text);
+    CREATE TABLE authors(id bigint primary key, name text);
+    CREATE TABLE book_author(book_id bigint, author_id bigint,
+                             PRIMARY KEY (book_id, author_id));
+    CREATE INDEX book_author_author_idx ON book_author(author_id);" > /dev/null
+pg "INSERT INTO books VALUES (1,'first'),(2,'second'),(3,'unwritten');" > /dev/null
+pg "INSERT INTO authors VALUES (7,'ada'),(8,'grace'),(9,'edsger');" > /dev/null
+pg "INSERT INTO book_author VALUES (1,7),(1,8),(2,7);" > /dev/null
+pg "DROP PUBLICATION IF EXISTS ${TSLOT}_pub;" > /dev/null 2>&1
+curl -s -XDELETE "$OS/e2e_through?ignore_unavailable=true" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/postgres-$TSLOT" > /dev/null
+
+vout=$($BIN validate -c "$TCONFIG" 2>&1 || true)
+if grep -q "all checks passed" <<< "$vout"; then
+  ok "validate accepts a many-to-many child"
+else
+  bad "validate refused a many-to-many child: $vout"
+fi
+if grep -q "child public.authors through public.book_author" <<< "$vout"; then
+  ok "validate names the junction and both of its columns"
+else
+  bad "validate says nothing about the junction: $vout"
+fi
+
+nohup $BIN run -c "$TCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_count e2e_through)" = "3" ] && break
+  sleep 1
+done
+# the junction carries half the relation, so it has to be published as well
+check "the junction joined the publication" \
+  "$(pg "SELECT count(*) FROM pg_publication_tables WHERE pubname='${TSLOT}_pub' AND tablename='book_author';")" "1"
+check "the load embeds both authors of a book" "$(os_len e2e_through 1 authors)" "2"
+check "a book nobody wrote gets an empty array" "$(os_len e2e_through 3 authors)" "0"
+check "and has the field at all" "$(os_has e2e_through 3 authors)" "True"
+check "the embedded element is the child row, not the junction row" \
+  "$(curl -s "$OS/e2e_through/_doc/2" | jqf "d['_source']['authors'][0]['name']")" "ada"
+
+# The junction row is the relation: inserting one is what adds an author, and
+# deleting one is what removes them. The junction is left on the default
+# replica identity on purpose — book_id is half of its primary key, so a delete
+# already carries what names the parent.
+check "the junction is on the default replica identity" \
+  "$(pg "SELECT relreplident FROM pg_class WHERE relname='book_author';")" "d"
+pg "INSERT INTO book_author VALUES (2,9);" > /dev/null
+sleep 2; refresh
+check "a junction INSERT adds the author to the book" "$(os_len e2e_through 2 authors)" "2"
+pg "DELETE FROM book_author WHERE book_id=2 AND author_id=9;" > /dev/null
+sleep 2; refresh
+check "a junction DELETE takes them away again" "$(os_len e2e_through 2 authors)" "1"
+
+# The other half: a changed CHILD row names no parent at all, so the junction is
+# asked which parents it belongs to — and every one of them is rewritten.
+pg "UPDATE authors SET name='ada lovelace' WHERE id=7;" > /dev/null
+sleep 3; refresh
+check "a renamed author reaches their first book" \
+  "$(curl -s "$OS/e2e_through/_doc/1" | jqf "sorted(a['name'] for a in d['_source']['authors'])[0]")" \
+  "ada lovelace"
+check "and their second one" \
+  "$(curl -s "$OS/e2e_through/_doc/2" | jqf "d['_source']['authors'][0]['name']")" "ada lovelace"
+
+# One transaction of many junction rows: the parent is read once for the group
+# and the collection aggregated once, not once per row.
+before_reads=$(pg "SELECT COALESCE(sum(calls),0) FROM pg_stat_statements
+                   WHERE query LIKE '%FROM \"public\".\"authors\"%'
+                     AND query NOT LIKE '%pg_stat_statements%';" 2>/dev/null || echo 0)
+pg "INSERT INTO authors SELECT 100 + g, 'writer ' || g FROM generate_series(1, 40) g;
+    INSERT INTO book_author SELECT 3, 100 + g FROM generate_series(1, 40) g;" > /dev/null
+sleep 4; refresh
+check "one transaction of 40 junction rows lands whole" "$(os_len e2e_through 3 authors)" "40"
+after_reads=$(pg "SELECT COALESCE(sum(calls),0) FROM pg_stat_statements
+                  WHERE query LIKE '%FROM \"public\".\"authors\"%'
+                    AND query NOT LIKE '%pg_stat_statements%';" 2>/dev/null || echo 0)
+if [ "$before_reads" = "0" ] && [ "$after_reads" = "0" ]; then
+  echo "    (pg_stat_statements unavailable; query count not asserted)"
+elif [ "$((after_reads - before_reads))" -lt 20 ]; then
+  ok "the collection is resolved per batch, not per junction row ($((after_reads - before_reads)) fetches for 40 rows)"
+else
+  bad "the collection is still resolved per row ($((after_reads - before_reads)) fetches for 40 rows)"
+fi
+stop_sync
+
+# max_rows caps a many-to-many collection the way it caps any other, and the
+# rows kept are the lowest-keyed ones, so a re-snapshot keeps the same forty.
+{ sed 's#^index = "e2e_through"$#index = "e2e_through_capped"#' "$TCONFIG"; echo 'max_rows = 2'; } > "${TCONFIG}.capped"
+curl -s -XDELETE "$OS/e2e_through_capped?ignore_unavailable=true" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/postgres-$TSLOT" > /dev/null
+nohup $BIN run -c "${TCONFIG}.capped" >> "$LOG" 2>&1 < /dev/null & disown
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_count e2e_through_capped)" = "3" ] && break
+  sleep 1
+done
+check "a capped collection embeds max_rows of them" "$(os_len e2e_through_capped 3 authors)" "2"
+check "and says it is not the whole collection" \
+  "$(os_field e2e_through_capped 3 authors_truncated)" "True"
+check "naming how many there are" "$(os_field e2e_through_capped 3 authors_total)" "40"
+check "the rows kept are the lowest-keyed ones" \
+  "$(curl -s "$OS/e2e_through_capped/_doc/3" | jqf "[a['id'] for a in d['_source']['authors']]")" \
+  "[101, 102]"
+check "an uncapped book says nothing extra" \
+  "$(os_has e2e_through_capped 1 authors_truncated)" "False"
+stop_sync
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

@@ -475,9 +475,24 @@ impl MySqlSource {
                     // Naming it rather than emitting it is what lets a thousand
                     // children of one parent cost one query and one document.
                     if let Some(parent) = self.cfg.child_parents.get(&table).cloned() {
+                        let spec = child_spec(&self.cfg, &parent, &table)?.clone();
+                        // Which half of a many-to-many relation this row is: the
+                        // junction carries the parent's key, the child only its
+                        // own, and the junction is asked for the rest at commit.
+                        let through = spec
+                            .through
+                            .as_ref()
+                            .filter(|_| spec.schema == table.0 && spec.table == table.1);
                         for row in &set.rows {
-                            let key = child_foreign_key(rt, &self.cfg, &table, row)?;
-                            pending.name_parent(parent.clone(), key);
+                            let column = match through {
+                                Some(through) => &through.child_key,
+                                None => &spec.foreign_key,
+                            };
+                            let key = row_column(rt, &table, row, column)?;
+                            match through {
+                                Some(_) => pending.name_through(parent.clone(), &spec.field, key),
+                                None => pending.name_parent(parent.clone(), key),
+                            }
                         }
                     } else if self.cfg.children.contains_key(&table) {
                         // a parent row: its document is here, only the arrays are
@@ -570,55 +585,79 @@ async fn report_drift(
     .map_err(|_| MySqlError::ChannelClosed)
 }
 
-/// The parent key a child row names.
-///
-/// `binlog_row_image = FULL` is a startup requirement, so a delete carries its
-/// whole before-image and the foreign key is always there — the case PostgreSQL
-/// needs `REPLICA IDENTITY FULL` for, and warns about, cannot arise here.
-fn child_foreign_key(
-    rt: &RegisteredTable,
-    cfg: &MySqlSourceConfig,
+/// The collection a streamed row belongs to, as either of the tables it reads.
+fn child_spec<'a>(
+    cfg: &'a MySqlSourceConfig,
+    parent: &(String, String),
     table: &(String, String),
-    row: &binlog::RowsRow,
-) -> Result<serde_json::Value> {
-    let parent = cfg.child_parents.get(table).ok_or_else(|| {
-        MySqlError::protocol(format!("{}.{} is not a configured child", table.0, table.1))
-    })?;
-    let spec = cfg
-        .children
+) -> Result<&'a pg2osync_core::children::ChildSpec> {
+    cfg.children
         .get(parent)
-        .and_then(|specs| {
-            specs
-                .iter()
-                .find(|s| s.schema == table.0 && s.table == table.1)
-        })
+        .and_then(|specs| specs.iter().find(|s| s.reads(&table.0, &table.1)))
         .ok_or_else(|| {
             MySqlError::protocol(format!(
                 "child {}.{} has no matching children entry",
                 table.0, table.1
             ))
-        })?;
+        })
+}
+
+/// One column of a child row, as the value that locates what it belongs to.
+///
+/// `binlog_row_image = FULL` is a startup requirement, so a delete carries its
+/// whole before-image and the column is always there — the case PostgreSQL
+/// needs `REPLICA IDENTITY FULL` for, and warns about, cannot arise here.
+fn row_column(
+    rt: &RegisteredTable,
+    table: &(String, String),
+    row: &binlog::RowsRow,
+    column: &str,
+) -> Result<serde_json::Value> {
     let values = row
         .after
         .as_ref()
         .or(row.before.as_ref())
         .ok_or_else(|| MySqlError::protocol("child row carries no image"))?;
-    let idx = rt
-        .columns
-        .iter()
-        .position(|c| c == &spec.foreign_key)
-        .ok_or_else(|| {
-            MySqlError::protocol(format!(
-                "fk column {} missing on {}.{}",
-                spec.foreign_key, table.0, table.1
-            ))
-        })?;
+    let idx = rt.columns.iter().position(|c| c == column).ok_or_else(|| {
+        MySqlError::protocol(format!(
+            "column {column} missing on {}.{}",
+            table.0, table.1
+        ))
+    })?;
     values.get(idx).and_then(|v| v.clone()).ok_or_else(|| {
         MySqlError::protocol(format!(
-            "child row of {}.{} carries no {}; cannot locate its parent",
-            table.0, table.1, spec.foreign_key
+            "child row of {}.{} carries no {column}; cannot locate its parent",
+            table.0, table.1
         ))
     })
+}
+
+/// Turn the group's changed many-to-many child rows into the parents they
+/// belong to, before anything else is resolved.
+///
+/// One `SELECT DISTINCT` per through collection, whatever the transaction
+/// touched, and the answer merges into the parents the group already names — so
+/// a parent named by both a junction row and one of its child rows is still read
+/// once and its collections aggregated once.
+async fn resolve_through(
+    cfg: &MySqlSourceConfig,
+    pending: &mut pg2osync_core::children::Pending,
+    conn: &mut MySqlConnection,
+) -> Result<()> {
+    for ((table, field), child_keys) in pending.take_through() {
+        let Some(spec) = cfg
+            .children
+            .get(&table)
+            .and_then(|specs| specs.iter().find(|s| s.field == field))
+            .cloned()
+        else {
+            continue;
+        };
+        for key in crate::children::parents_through(&spec, conn, &child_keys).await? {
+            pending.name_parent(table.clone(), key);
+        }
+    }
+    Ok(())
 }
 
 /// Resolve everything held and emit it.
@@ -635,6 +674,7 @@ async fn flush_pending(
     if pending.is_empty() {
         return Ok(());
     }
+    resolve_through(cfg, pending, conn).await?;
     for table in pending.tables() {
         let (mut emitted, named) = pending.take(&table);
         let specs = cfg.children.get(&table).cloned().unwrap_or_default();

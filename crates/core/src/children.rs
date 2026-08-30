@@ -15,6 +15,44 @@ use crate::event::RowChange;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
+/// The junction table a many-to-many child is reached through.
+///
+/// It holds the pair and nothing else: the child rows are what gets embedded,
+/// and the junction contributes no field to the document.
+#[derive(Debug, Clone)]
+pub struct Through {
+    pub schema: String,
+    pub table: String,
+    /// Junction column referencing the CHILD's primary key.
+    pub through_key: String,
+    /// The child's own primary key, resolved from the catalogue at startup.
+    ///
+    /// A through child needs exactly one, because it is both what the join
+    /// matches `through_key` against and what a changed child row is looked
+    /// back up by.
+    pub child_key: String,
+}
+
+impl Through {
+    pub fn new(qualified: &str, through_key: &str) -> Result<Self, crate::error::CoreError> {
+        let (schema, table) = qualified.split_once('.').ok_or_else(|| {
+            crate::error::CoreError::Other(format!(
+                "through table {qualified:?} must be schema-qualified"
+            ))
+        })?;
+        Ok(Self {
+            schema: schema.into(),
+            table: table.into(),
+            through_key: through_key.into(),
+            child_key: String::new(),
+        })
+    }
+
+    pub fn qualified(&self) -> String {
+        format!("{}.{}", self.schema, self.table)
+    }
+}
+
 /// One configured `[[sync.x.children]]` entry, fully qualified.
 #[derive(Debug, Clone)]
 pub struct ChildSpec {
@@ -46,6 +84,11 @@ pub struct ChildSpec {
     /// aggregation builder and the initial load and a streamed re-fetch cannot
     /// produce different shapes.
     pub single: bool,
+    /// The junction a many-to-many relation is reached through.
+    ///
+    /// With it set, `foreign_key` is a column of the junction rather than of
+    /// the child: the junction is what carries the parent's key.
+    pub through: Option<Through>,
 }
 
 impl ChildSpec {
@@ -71,11 +114,25 @@ impl ChildSpec {
             columns: None,
             exclude_columns: Vec::new(),
             single: false,
+            through: None,
         })
     }
 
     pub fn qualified(&self) -> String {
         format!("{}.{}", self.schema, self.table)
+    }
+
+    /// Whether this collection reads a table, as either of the two it watches.
+    ///
+    /// A through collection is fed by two tables — the junction carries the
+    /// parent's key, the child carries what is embedded — and a streamed row of
+    /// either one has to find its way back to this spec.
+    pub fn reads(&self, schema: &str, table: &str) -> bool {
+        (self.schema == schema && self.table == table)
+            || self
+                .through
+                .as_ref()
+                .is_some_and(|t| t.schema == schema && t.table == table)
     }
 
     /// The field naming how many children the source actually has, present only
@@ -195,6 +252,10 @@ pub fn key_lookup(key: &Value) -> String {
     key.to_string()
 }
 
+/// One through collection's changed child rows: the parent table and field they
+/// belong to, and the distinct keys they were filed under.
+pub type ThroughKeys = (((String, String), String), Vec<Value>);
+
 /// Rows held back until their children can be resolved for the whole group.
 ///
 /// A parent row keeps its decoded change, because its document comes from the
@@ -206,7 +267,9 @@ pub fn key_lookup(key: &Value) -> String {
 pub struct Pending {
     pub parents: HashMap<(String, String), Vec<RowChange>>,
     pub named: HashMap<(String, String), Vec<Value>>,
+    through: HashMap<((String, String), String), Vec<Value>>,
     seen: HashSet<(String, String, String)>,
+    seen_through: HashSet<((String, String), String, String)>,
 }
 
 impl Pending {
@@ -221,8 +284,32 @@ impl Pending {
         }
     }
 
+    /// A changed row of a through collection's CHILD table, which names no
+    /// parent: it is the junction that knows which parents it belongs to.
+    ///
+    /// Deduplicated the same way a named parent is, per collection, so a
+    /// transaction touching one child a thousand times asks about one key.
+    pub fn name_through(&mut self, table: (String, String), field: &str, child_key: Value) {
+        let id = (table.clone(), field.to_string(), key_lookup(&child_key));
+        if self.seen_through.insert(id) {
+            self.through
+                .entry((table, field.to_string()))
+                .or_default()
+                .push(child_key);
+        }
+    }
+
+    /// Every through collection's distinct child keys, to resolve to parents.
+    ///
+    /// Taken all at once and before anything else, because resolving them is
+    /// what turns them into named parents — after which the group is read
+    /// exactly as a group of changed junction rows would have been.
+    pub fn take_through(&mut self) -> Vec<ThroughKeys> {
+        self.through.drain().collect()
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.parents.is_empty() && self.named.is_empty()
+        self.parents.is_empty() && self.named.is_empty() && self.through.is_empty()
     }
 
     /// How much is held, for the cap that keeps one enormous transaction from
@@ -230,6 +317,7 @@ impl Pending {
     pub fn len(&self) -> usize {
         self.parents.values().map(Vec::len).sum::<usize>()
             + self.named.values().map(Vec::len).sum::<usize>()
+            + self.through.values().map(Vec::len).sum::<usize>()
     }
 
     /// Every parent table this group touches, from either direction.
@@ -253,6 +341,7 @@ impl Pending {
 
     pub fn clear_seen(&mut self) {
         self.seen.clear();
+        self.seen_through.clear();
     }
 }
 
@@ -394,6 +483,48 @@ mod tests {
         pending.name_parent(("public".into(), "invoices".into()), json!(1));
         assert_eq!(pending.len(), 2, "different documents, same key value");
         assert_eq!(pending.tables().len(), 2);
+    }
+
+    #[test]
+    fn many_changed_children_of_one_collection_hold_one_key_each() {
+        // A row of a through collection's child table names no parent, so it is
+        // held under its own key until the junction is asked at commit — and a
+        // transaction touching one author a hundred times asks about one.
+        let mut pending = Pending::default();
+        for _ in 0..100 {
+            pending.name_through(table(), "authors", json!(7));
+        }
+        pending.name_through(table(), "authors", json!(8));
+        // the same key on another collection of the same parent is another
+        // question, and another junction to ask it of
+        pending.name_through(table(), "editors", json!(7));
+        assert_eq!(pending.len(), 3);
+        assert!(!pending.is_empty(), "nothing has been resolved yet");
+
+        let mut taken = pending.take_through();
+        taken.sort_by_key(|((_, field), _)| field.clone());
+        assert_eq!(taken.len(), 2, "one lookup per collection");
+        assert_eq!(taken[0].0.1, "authors");
+        assert_eq!(taken[0].1, vec![json!(7), json!(8)]);
+        assert_eq!(taken[1].1, vec![json!(7)]);
+        assert!(pending.is_empty(), "taking them is what resolves them");
+    }
+
+    #[test]
+    fn a_parent_named_through_both_paths_is_read_once() {
+        // The junction row and the child row of the same relation land in one
+        // transaction all the time; what the resolved child key merges into is
+        // the same named set, so the parent is still read once.
+        let mut pending = Pending::default();
+        pending.name_parent(table(), json!(1));
+        pending.name_through(table(), "authors", json!(9));
+        for (_, child_keys) in pending.take_through() {
+            assert_eq!(child_keys, vec![json!(9)]);
+            // what the junction lookup answers, merged in as any other key
+            pending.name_parent(table(), json!(1));
+        }
+        let (_, named) = pending.take(&table());
+        assert_eq!(named, vec![json!(1)]);
     }
 
     #[test]

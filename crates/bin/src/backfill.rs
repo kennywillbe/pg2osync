@@ -1087,7 +1087,7 @@ mod tests {
             "a parent with no children must still get an empty array: {sql}"
         );
         assert!(
-            sql.contains("PARTITION BY \"customer_id\""),
+            sql.contains("PARTITION BY t.\"customer_id\""),
             "grouped by the foreign key: {sql}"
         );
         assert!(
@@ -1097,6 +1097,38 @@ mod tests {
         assert!(
             !sql.contains("::text = "),
             "no cast may appear on either side of the join: {sql}"
+        );
+    }
+
+    #[test]
+    fn a_many_to_many_collection_loads_through_the_same_aggregation() {
+        // The junction is the source crate's business, so the load must embed
+        // that aggregation verbatim rather than joining the junction itself:
+        // two builders is how a re-snapshot starts rewriting documents.
+        let mut spec = child("authors", "public.authors", "book_id", "id");
+        let mut through =
+            pg2osync_source::children::Through::new("public.book_author", "author_id")
+                .expect("qualified");
+        through.child_key = "id".into();
+        spec.through = Some(through);
+        spec.order_by = vec!["id".into()];
+        let sql = copy_statement(
+            "public.books",
+            &[col("id")],
+            std::slice::from_ref(&spec),
+            None,
+            &whole(),
+            None,
+            None,
+            None,
+        );
+        assert!(
+            sql.contains(&pg2osync_source::children::agg_subquery(&spec, None)),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("JOIN \"public\".\"book_author\" j") && sql.contains("ON c0.k = p.\"id\""),
+            "the junction keys the array and the parent joins it as any other: {sql}"
         );
     }
 
@@ -1122,7 +1154,7 @@ mod tests {
             sql.contains(&pg2osync_source::children::agg_subquery(&spec, None)),
             "the load embeds the source crate's own aggregation verbatim: {sql}"
         );
-        assert!(sql.contains("ORDER BY \"id\""), "ordered: {sql}");
+        assert!(sql.contains("ORDER BY t.\"id\""), "ordered: {sql}");
         assert!(sql.contains("rn <= 500"), "capped: {sql}");
 
         // and the projection rides along, because it lives in that aggregation

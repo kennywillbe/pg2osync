@@ -1170,5 +1170,159 @@ done
 check "a delete removes the document on the shard that holds it" "$(os_rstatus e2e_mysql_routing 3 acme)" "404"
 stop_sync
 
+say "22. a many-to-many relation embeds through its junction table"
+# `through` (#141) on the binlog path: the aggregation gains one join and both
+# the junction and the child are streamed. binlog_row_image = FULL is already a
+# prerequisite, so a junction DELETE always carries the column that names the
+# parent — the REPLICA IDENTITY caveat of the PostgreSQL suite does not arise.
+stop_sync
+TCONFIG=$(mktemp /tmp/pg2osync-mysql-through.XXXXXX)
+TSID=990010
+cat > "$TCONFIG" <<TOML
+[source]
+flavor = "mysql"
+url_env = "PG2OSYNC_MYSQL_URL"
+server_id = $TSID
+
+[target]
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
+
+[metrics]
+bind = "127.0.0.1:9122"
+
+[sync.books]
+table = "sourcedb.books"
+index = "e2e_mysql_through"
+
+[[sync.books.children]]
+table = "sourcedb.authors"
+field = "authors"
+through = "sourcedb.book_author"
+foreign_key = "book_id"
+through_key = "author_id"
+
+# the same child table as its own index, so an embedded element can be compared
+# against the very row it came from
+[sync.authors]
+table = "sourcedb.authors"
+index = "e2e_mysql_through_author"
+TOML
+through_cleanup() {
+  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  my "DROP TABLE IF EXISTS book_author; DROP TABLE IF EXISTS authors; DROP TABLE IF EXISTS books;" > /dev/null 2>&1 || true
+  curl -s -XDELETE "$OS/e2e_mysql_through,e2e_mysql_through_author,e2e_mysql_through_capped?ignore_unavailable=true" > /dev/null 2>&1 || true
+  rm -f "$TCONFIG" "${TCONFIG}.capped"
+}
+trap 'cleanup; resume_cleanup; types_cleanup; child_cleanup; where_cleanup; events_cleanup; pipe_cleanup; append_cleanup; routing_cleanup; through_cleanup' EXIT
+
+my "DROP TABLE IF EXISTS book_author; DROP TABLE IF EXISTS authors; DROP TABLE IF EXISTS books;"
+my "CREATE TABLE books(id bigint PRIMARY KEY, title varchar(32));"
+my "CREATE TABLE authors(id bigint PRIMARY KEY, name varchar(32));"
+my "CREATE TABLE book_author(book_id bigint, author_id bigint,
+                             PRIMARY KEY (book_id, author_id), INDEX(author_id));"
+my "INSERT INTO books VALUES (1,'first'),(2,'second'),(3,'unwritten');"
+my "INSERT INTO authors VALUES (7,'ada'),(8,'grace'),(9,'edsger');"
+my "INSERT INTO book_author VALUES (1,7),(1,8),(2,7);"
+curl -s -XDELETE "$OS/e2e_mysql_through,e2e_mysql_through_author?ignore_unavailable=true" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/mysql-$TSID" > /dev/null
+
+vout=$($BIN validate -c "$TCONFIG" 2>&1 || true)
+if grep -q "all checks passed" <<< "$vout"; then
+  ok "validate accepts a many-to-many child"
+else
+  bad "validate refused a many-to-many child: $vout"
+fi
+if grep -q "child sourcedb.authors through sourcedb.book_author" <<< "$vout"; then
+  ok "validate names the junction and both of its columns"
+else
+  bad "validate says nothing about the junction: $vout"
+fi
+
+nohup $BIN run -c "$TCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+await_count e2e_mysql_through 3
+check "the load embeds both authors of a book" "$(os_len e2e_mysql_through 1 authors)" "2"
+check "a book nobody wrote gets an empty array" "$(os_len e2e_mysql_through 3 authors)" "0"
+check "and has the field at all" "$(os_has e2e_mysql_through 3 authors)" "True"
+# the point of aggregating in Rust: the element is the row, byte for byte
+await_count e2e_mysql_through_author 3
+in_array=$(curl -s "$OS/e2e_mysql_through/_doc/2" \
+  | jqf "[a for a in ((d.get('_source') or {}).get('authors') or []) if a.get('id')==7]")
+as_doc=$(curl -s "$OS/e2e_mysql_through_author/_doc/7" | jqf "[d.get('_source') or {}]")
+if [ "$in_array" = "$as_doc" ]; then
+  ok "an embedded child is the same JSON as the row itself ($in_array)"
+else
+  bad "an embedded child differs from the row itself (array $in_array, doc $as_doc)"
+fi
+
+my "INSERT INTO book_author VALUES (2,9);"
+sleep 3; refresh
+check "a junction INSERT adds the author to the book" "$(os_len e2e_mysql_through 2 authors)" "2"
+my "DELETE FROM book_author WHERE book_id=2 AND author_id=9;"
+sleep 3; refresh
+check "a junction DELETE takes them away again" "$(os_len e2e_mysql_through 2 authors)" "1"
+
+# a changed CHILD row names no parent at all: the junction is asked which
+# parents it belongs to, and every one of them is rewritten
+my "UPDATE authors SET name='ada lovelace' WHERE id=7;"
+sleep 3; refresh
+check "a renamed author reaches their first book" \
+  "$(curl -s "$OS/e2e_mysql_through/_doc/1" | jqf "sorted(a['name'] for a in d['_source']['authors'])[0]")" \
+  "ada lovelace"
+check "and their second one" \
+  "$(curl -s "$OS/e2e_mysql_through/_doc/2" | jqf "d['_source']['authors'][0]['name']")" "ada lovelace"
+
+# many junction rows in one statement: one document, the whole collection
+my "INSERT INTO authors SELECT 100 + seq, CONCAT('writer ', seq) FROM
+      (SELECT 1 seq UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5
+       UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9
+       UNION SELECT 10) t;"
+my "INSERT INTO book_author SELECT 3, id FROM authors WHERE id > 100;"
+sleep 4; refresh
+check "one statement of 10 junction rows lands whole" "$(os_len e2e_mysql_through 3 authors)" "10"
+stop_sync
+
+# max_rows caps a many-to-many collection the way it caps any other, and the
+# rows kept are the lowest-keyed ones
+cat > "${TCONFIG}.capped" <<TOML
+[source]
+flavor = "mysql"
+url_env = "PG2OSYNC_MYSQL_URL"
+server_id = $TSID
+
+[target]
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
+
+[metrics]
+bind = "127.0.0.1:9122"
+
+[sync.books]
+table = "sourcedb.books"
+index = "e2e_mysql_through_capped"
+
+[[sync.books.children]]
+table = "sourcedb.authors"
+field = "authors"
+through = "sourcedb.book_author"
+foreign_key = "book_id"
+through_key = "author_id"
+max_rows = 2
+TOML
+curl -s -XDELETE "$OS/e2e_mysql_through_capped?ignore_unavailable=true" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/mysql-$TSID" > /dev/null
+nohup $BIN run -c "${TCONFIG}.capped" >> "$LOG" 2>&1 < /dev/null & disown
+await_count e2e_mysql_through_capped 3
+check "a capped collection embeds max_rows of them" "$(os_len e2e_mysql_through_capped 3 authors)" "2"
+check "and says it is not the whole collection" \
+  "$(os_field e2e_mysql_through_capped 3 authors_truncated)" "True"
+check "naming how many there are" "$(os_field e2e_mysql_through_capped 3 authors_total)" "10"
+check "the rows kept are the lowest-keyed ones" \
+  "$(curl -s "$OS/e2e_mysql_through_capped/_doc/3" | jqf "[a['id'] for a in d['_source']['authors']]")" \
+  "[101, 102]"
+check "an uncapped book says nothing extra" \
+  "$(os_has e2e_mysql_through_capped 1 authors_truncated)" "False"
+stop_sync
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

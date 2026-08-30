@@ -1006,6 +1006,68 @@ startup for the same reason.
 - MySQL/MariaDB: the child table is streamed from the binlog automatically;
   `binlog_row_image = FULL` (already required) is what lets a child DELETE
   carry its foreign key, so there is no REPLICA IDENTITY caveat.
+- **A `TRUNCATE` of a child table — or of a junction — is not applied to the
+  parents.** A truncate clears the index of the table it names, and a child has
+  no index of its own; the parents keep the arrays they had until something
+  else changes them. `pg2osync resnapshot --table public.customers` rebuilds
+  them.
+
+#### Many-to-many through a junction table
+
+A books ↔ authors relation lives in a third table, and the rows worth embedding
+are one table further than the one carrying the parent's key. `through` names
+that junction:
+
+```toml
+[sync.books]
+table = "public.books"
+index = "books"
+
+[[sync.books.children]]
+table   = "public.authors"      # the rows that get embedded
+field   = "authors"
+through = "public.book_author"  # the junction
+foreign_key = "book_id"         # junction column referencing the PARENT key
+through_key = "author_id"       # junction column referencing the CHILD key
+```
+
+```json
+{ "id": 1, "title": "…", "authors": [ { "id": 7, "name": "…" } ] }
+```
+
+`foreign_key` keeps its meaning — the column that names the parent — and only
+changes its home: with `through` set it is a column of the junction, not of the
+child. Everything else on a child works unchanged: `fields`, `columns`,
+`exclude_columns`, `max_rows` with its `_truncated`/`_total` fields, and
+`single` for a one-to-one relation that happens to be recorded in a junction.
+The junction contributes no field of its own, and this is still one level deep.
+
+- The aggregation is the same one, with one join added, so the initial load and
+  a streamed re-fetch cannot embed different arrays.
+- **Both tables are watched**: the junction and the child are added to the
+  publication (PostgreSQL) or the streamed set (MySQL/MariaDB) automatically.
+  A junction row is what makes or breaks the relation; a child row changes what
+  is embedded.
+- **Index the junction on both columns.** A primary key of
+  `(book_id, author_id)` covers the aggregation; add an index led by
+  `author_id` as well, because a changed *child* row is looked back up by it.
+  `validate` says so when it is missing.
+- A changed child row costs one extra small query per collection per
+  transaction — a single `SELECT DISTINCT` over the junction for all of that
+  transaction's changed children — and then the parent is read and its
+  collections aggregated exactly once, as for any other change.
+- PostgreSQL: the junction needs `foreign_key` in its replica identity for a
+  junction DELETE to find the parent, which the usual `(book_id, author_id)`
+  primary key already gives it; only a junction keyed some other way needs
+  `REPLICA IDENTITY FULL`, and pg2osync warns at startup when that is the case.
+  The **child** table needs nothing: it is located by its own primary key.
+- The child needs a single-column primary key, refused at startup otherwise:
+  it is what `through_key` points at.
+- A duplicate `(book_id, author_id)` pair embeds the author twice. Give the
+  junction a unique key on the pair.
+- One junction table belongs to one relation: two sections naming the same
+  junction for different parents are refused, because a streamed junction row
+  could not say which parent it meant.
 
 #### A one-to-one relation
 

@@ -54,6 +54,18 @@ pub async fn resolve_order(spec: &mut ChildSpec, conn: &mut MySqlConnection) -> 
              returns and may differ between the initial load and a later re-fetch",
             spec.qualified());
     }
+    let qualified = spec.qualified();
+    if let Some(through) = &mut spec.through {
+        let [child_key] = resolved.pk_columns.as_slice() else {
+            return Err(MySqlError::Config(format!(
+                "[[sync.*.children]] {qualified} is reached through {}, so it needs a \
+                 single-column primary key for the junction to point at; it has {}",
+                through.qualified(),
+                resolved.pk_columns.len()
+            )));
+        };
+        through.child_key = child_key.clone();
+    }
     spec.order_by = resolved.pk_columns;
     Ok(())
 }
@@ -71,7 +83,8 @@ pub async fn fetch_many(
         return Ok(HashMap::new());
     }
     let resolved = catalog::table_schema(conn, &spec.schema, &spec.table, false).await?;
-    let fk_shape = fk_shape(spec, &resolved);
+    let junction = junction_schema(spec, conn).await?;
+    let fk_shape = fk_shape(spec, &resolved, junction.as_ref());
     let projected = project(spec, &resolved);
     let sql = fetch_statement(spec, &projected, keys);
     let mut rows = conn
@@ -148,15 +161,39 @@ pub async fn refetch_parents(
     Ok(out)
 }
 
+/// The junction's own schema, when the collection is reached through one.
+///
+/// Read for one column's type and nothing else, so it is asked for only where a
+/// `through` is configured.
+async fn junction_schema(
+    spec: &ChildSpec,
+    conn: &mut MySqlConnection,
+) -> Result<Option<TableSchema>> {
+    let Some(through) = &spec.through else {
+        return Ok(None);
+    };
+    // keyless_ok: a junction's key is the pair, and this read wants a column
+    // type rather than a way to address a row
+    Ok(Some(
+        catalog::table_schema(conn, &through.schema, &through.table, true).await?,
+    ))
+}
+
 /// How to read the parent key that rides beside each element.
 ///
-/// It is taken from the whole table and never from the projection: the key is
-/// its own column in the result, so projecting the foreign key out of the
-/// element must not turn an integer key into text — the caller matches parents
-/// on the JSON form, where `1` and `"1"` are different parents and every array
-/// would silently come back empty.
-fn fk_shape(spec: &ChildSpec, resolved: &TableSchema) -> crate::typemap::ValueShape {
-    resolved
+/// It is taken from the whole table that holds the key — the junction where
+/// there is one — and never from the projection: the key is its own column in
+/// the result, so projecting the foreign key out of the element, or reading it
+/// off a child that does not have it at all, must not turn an integer key into
+/// text. The caller matches parents on the JSON form, where `1` and `"1"` are
+/// different parents and every array would silently come back empty.
+fn fk_shape(
+    spec: &ChildSpec,
+    resolved: &TableSchema,
+    junction: Option<&TableSchema>,
+) -> crate::typemap::ValueShape {
+    junction
+        .unwrap_or(resolved)
         .columns
         .iter()
         .find(|c| c.name == spec.foreign_key)
@@ -206,20 +243,30 @@ fn fetch_statement(spec: &ChildSpec, resolved: &TableSchema, keys: &[Value]) -> 
             .collect();
         format!(" ORDER BY {}", cols.join(", "))
     };
+    // A many-to-many collection is this same read with one more join: the
+    // junction holds the parent's key, and the ordering, the cap and the count
+    // are the expressions they already were.
+    let join = match &spec.through {
+        Some(through) => format!(
+            " JOIN {}.{} j ON j.{} = t.{}",
+            catalog::quote_ident(&through.schema),
+            catalog::quote_ident(&through.table),
+            catalog::quote_ident(&through.through_key),
+            catalog::quote_ident(&through.child_key),
+        ),
+        None => String::new(),
+    };
+    let fk = fk_ref(spec);
     // The key filter belongs to the innermost read: applied outside the window it
     // would rank the whole child table and only then discard it.
     let ranked = format!(
-        "SELECT {}, t.{} AS pg2osync_fk, \
-         ROW_NUMBER() OVER (PARTITION BY t.{}{ordered}) AS pg2osync_rn, \
-         COUNT(*) OVER (PARTITION BY t.{}) AS pg2osync_total \
-         FROM {}.{} t WHERE t.{} IN ({})",
+        "SELECT {}, {fk} AS pg2osync_fk, \
+         ROW_NUMBER() OVER (PARTITION BY {fk}{ordered}) AS pg2osync_rn, \
+         COUNT(*) OVER (PARTITION BY {fk}) AS pg2osync_total \
+         FROM {}.{} t{join} WHERE {fk} IN ({})",
         columns.join(", "),
-        catalog::quote_ident(&spec.foreign_key),
-        catalog::quote_ident(&spec.foreign_key),
-        catalog::quote_ident(&spec.foreign_key),
         catalog::quote_ident(&spec.schema),
         catalog::quote_ident(&spec.table),
-        catalog::quote_ident(&spec.foreign_key),
         key_list(keys),
     );
     let selected: Vec<String> = resolved
@@ -239,6 +286,51 @@ fn fetch_statement(spec: &ChildSpec, resolved: &TableSchema, keys: &[Value]) -> 
             selected.join(", ")
         ),
     }
+}
+
+/// The parent key as the read refers to it, qualified by the table that holds
+/// it: the junction where there is one, the child otherwise.
+fn fk_ref(spec: &ChildSpec) -> String {
+    let alias = if spec.through.is_some() { "j" } else { "t" };
+    format!("{alias}.{}", catalog::quote_ident(&spec.foreign_key))
+}
+
+/// The parents a group of changed child rows belongs to, in one query.
+///
+/// A row of a through collection's child table names no parent — the junction
+/// is what does — so the transaction's distinct child keys are resolved once, at
+/// commit, and merged into the parents the group already names.
+pub async fn parents_through(
+    spec: &ChildSpec,
+    conn: &mut MySqlConnection,
+    child_keys: &[Value],
+) -> Result<Vec<Value>> {
+    let Some(through) = &spec.through else {
+        return Ok(Vec::new());
+    };
+    if child_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let junction = catalog::table_schema(conn, &through.schema, &through.table, true).await?;
+    let shape = fk_shape(spec, &junction, Some(&junction));
+    let sql = format!(
+        "SELECT DISTINCT j.{} FROM {}.{} j WHERE j.{} IN ({})",
+        catalog::quote_ident(&spec.foreign_key),
+        catalog::quote_ident(&through.schema),
+        catalog::quote_ident(&through.table),
+        catalog::quote_ident(&through.through_key),
+        key_list(child_keys),
+    );
+    let mut rows = conn
+        .text_query(&sql)
+        .await
+        .catalog_ctx(|| format!("junction lookup failed for {}", through.qualified()))?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let raw = row.first().and_then(|v| v.as_deref());
+        out.push(crate::typemap::convert(&shape, raw));
+    }
+    Ok(out)
 }
 
 /// Parent keys as SQL literals.
@@ -358,7 +450,80 @@ mod tests {
                 .any(|c| c.name == "parent_id"),
             "the key is not force-kept in the element"
         );
-        assert!(matches!(fk_shape(&spec, &full), ValueShape::Int));
+        assert!(matches!(fk_shape(&spec, &full, None), ValueShape::Int));
+    }
+
+    const JOINED: &str =
+        "FROM `shop`.`authors` t JOIN `shop`.`book_author` j ON j.`author_id` = t.`id`";
+
+    fn junction() -> TableSchema {
+        TableSchema {
+            columns: vec![
+                Column {
+                    name: "book_id".into(),
+                    shape: ValueShape::Int,
+                },
+                Column {
+                    name: "author_id".into(),
+                    shape: ValueShape::Int,
+                },
+            ],
+            pk_columns: vec!["book_id".into(), "author_id".into()],
+        }
+    }
+
+    fn through_spec() -> ChildSpec {
+        let mut spec =
+            ChildSpec::new("shop.authors", "authors", "book_id", "id").expect("qualified");
+        let mut through =
+            pg2osync_core::children::Through::new("shop.book_author", "author_id").unwrap();
+        through.child_key = "id".into();
+        spec.through = Some(through);
+        spec.order_by = vec!["id".into()];
+        spec
+    }
+
+    #[test]
+    fn a_many_to_many_collection_is_the_same_read_with_one_join() {
+        let mut spec = through_spec();
+        spec.max_rows = Some(3);
+        let sql = fetch_statement(&spec, &schema(), &[json!(1), json!(2)]);
+        assert!(
+            sql.contains(JOINED),
+            "the junction joins the child on the child's own key: {sql}"
+        );
+        assert!(
+            sql.contains("j.`book_id` AS pg2osync_fk")
+                && sql.contains("PARTITION BY j.`book_id` ORDER BY t.`id`")
+                && sql.contains("COUNT(*) OVER (PARTITION BY j.`book_id`)"),
+            "the parent key comes off the junction, everywhere: {sql}"
+        );
+        assert!(
+            sql.contains("pg2osync_rn <= 3"),
+            "the cap is untouched: {sql}"
+        );
+        let inner = sql.find("FROM `shop`.`authors` t").expect("inner read");
+        assert!(
+            sql[inner..].contains("WHERE j.`book_id` IN (1, 2)"),
+            "the filter reaches the innermost read, past the join: {sql}"
+        );
+    }
+
+    #[test]
+    fn the_key_shape_comes_from_the_junction() {
+        // The trap this exists for: with a junction the foreign key is not a
+        // child column at all, so reading its shape off the child falls through
+        // to Text and every parent matches "1" against 1 — every array silently
+        // empty.
+        let spec = through_spec();
+        assert!(
+            matches!(fk_shape(&spec, &schema(), None), ValueShape::Text),
+            "the child has no book_id to take a shape from"
+        );
+        assert!(matches!(
+            fk_shape(&spec, &schema(), Some(&junction())),
+            ValueShape::Int
+        ));
     }
 
     #[test]
