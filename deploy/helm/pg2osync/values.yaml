@@ -53,6 +53,10 @@ env:
   RUST_LOG: pg2osync=info
 extraEnv: []
 
+# "text" or "json". Set it to json where a collector (Loki, Datadog,
+# CloudWatch) parses the log stream instead of a human reading it.
+logFormat: text
+
 serviceAccount:
   create: true
   name: ""

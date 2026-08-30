@@ -1201,6 +1201,7 @@ pg2osync_position_lag                           # difference between the two
 | Variable | Purpose |
 |---|---|
 | `RUST_LOG` | Log filter, e.g. `pg2osync=debug` |
+| `PG2OSYNC_LOG_FORMAT` | `text` (default) or `json` for one JSON object per line |
 | `PG2OSYNC_INSTANCE_ID` | Recorded in the checkpoint document; identifies the writer |
 | whatever `*_env` names | The credentials themselves |
 

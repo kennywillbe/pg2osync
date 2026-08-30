@@ -61,6 +61,9 @@ config:
       index: users
       exclude_columns: ["password_hash"]
 
+# one JSON object per log line, for the cluster's log collector
+logFormat: json
+
 # Production: create this Secret with External Secrets / Vault / SOPS and
 # reference it instead of putting credentials in values.
 existingSecret: pg2osync-credentials
@@ -74,6 +77,7 @@ Key values:
 | `extraConfig` | `""` | Raw TOML appended — use it for `[[sync.x.children]]` |
 | `secrets` | `{}` | Rendered into a Secret; dev convenience only |
 | `existingSecret` | `""` | Name of a Secret you manage; wins over `secrets` |
+| `logFormat` | `text` | `json` sets `PG2OSYNC_LOG_FORMAT` on the pod, for Loki, Datadog or CloudWatch |
 | `persistence.enabled` | `false` | Enable for Meilisearch, whose checkpoint is a file |
 | `metrics.serviceMonitor.enabled` | `false` | Needs the Prometheus Operator CRDs |
 | `grafanaDashboard.enabled` | `false` | Ships `deploy/grafana/pg2osync.json` as a ConfigMap the Grafana sidecar picks up |

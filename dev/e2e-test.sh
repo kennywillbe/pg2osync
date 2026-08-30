@@ -149,6 +149,13 @@ if $BIN validate -c "$CONFIG" 2>&1 | grep -q "all checks passed"; then
 else
   bad "validate failed"
 fi
+# a plain-text url is the one thing validate reliably logs, so it is what shows
+# the log format a collector would see
+sed "s|^url_env = \"PG2OSYNC_SOURCE_URL\"|url = \"$PG2OSYNC_SOURCE_URL\"|" "$CONFIG" > "${CONFIG}.plain"
+json_log=$(PG2OSYNC_LOG_FORMAT=json $BIN validate -c "${CONFIG}.plain" 2>&1 | grep -m1 '^{' || true)
+check "PG2OSYNC_LOG_FORMAT=json writes JSON log lines" \
+  "$(printf '%s' "$json_log" | jqf "d.get('level', '<missing>')" 2> /dev/null || echo '<unparsed>')" "WARN"
+rm -f "${CONFIG}.plain"
 # a rename of a column that projection drops can never take effect; refuse it
 # where it can still be fixed rather than let it pass silently
 sed 's/^metadata = "meta"/password_hash = "pw"/' "$CONFIG" > "${CONFIG}.bad"

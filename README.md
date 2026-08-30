@@ -311,7 +311,8 @@ flushed, sink errors, reconnects, tables that changed shape under the running
 pipeline, commit-to-indexed latency quantiles, and the current/confirmed source
 position with the lag between them. Import
 [deploy/grafana/pg2osync.json](deploy/grafana/pg2osync.json) for the dashboard
-built from those series.
+built from those series. `PG2OSYNC_LOG_FORMAT=json` writes one JSON object per
+log line for the collector alongside it.
 
 **Read-your-writes** — the pipeline is asynchronous, so a page that writes and
 then reads from search can race it. Enable `[api]` and call `GET /synced` after

@@ -46,6 +46,8 @@ spec:
             - name: {{ $k }}
               value: {{ $v | quote }}
             {{- end }}
+            - name: PG2OSYNC_LOG_FORMAT
+              value: {{ .Values.logFormat | quote }}
             # identifies the writer in the checkpoint document
             - name: PG2OSYNC_INSTANCE_ID
               valueFrom:
