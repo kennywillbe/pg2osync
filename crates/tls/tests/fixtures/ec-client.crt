@@ -1,0 +1,13 @@
+# Throwaway key material generated for pg2osync unit tests only.
+# Not a secret: it guards nothing and is never used outside this repository.
+-----BEGIN CERTIFICATE-----
+MIIBjDCCATOgAwIBAgIUQf/9jqYTdXssWwapNRkuTHUzjcAwCgYIKoZIzj0EAwIw
+GzEZMBcGA1UEAwwQcGcyb3N5bmMtdGVzdC1lYzAgFw0yNjA4MjkyMzEzMzRaGA8y
+MTI2MDgwNTIzMTMzNFowGzEZMBcGA1UEAwwQcGcyb3N5bmMtdGVzdC1lYzBZMBMG
+ByqGSM49AgEGCCqGSM49AwEHA0IABC+FUTquSCNukey/lricTQiLCVSrkrFjNOML
+0Hy33uIyrIswtj9+fcQpPrHbShZSBqFD5kAUg6mM9g0EVlhUd1OjUzBRMB0GA1Ud
+DgQWBBSeGGqC+XOn0nYRpSkjEctdnJaMrjAfBgNVHSMEGDAWgBSeGGqC+XOn0nYR
+pSkjEctdnJaMrjAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0cAMEQCIBQZ
+bZ/Kj8fnLBXmH49njroZ+/LZcsGd74Ae0MY0EQTHAiAmFncQGNMiAWje7RSxxSkj
+InsGY+pSm7wRBumBEERFAA==
+-----END CERTIFICATE-----

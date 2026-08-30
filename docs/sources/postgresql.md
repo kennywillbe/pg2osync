@@ -57,6 +57,32 @@ refuses unencrypted connections, so `disable` fails there by design. See the
 mode table in [configuration](../configuration.md) for what each one actually
 verifies.
 
+### Client certificates
+
+A server that authenticates its clients by certificate needs both halves of an
+identity, and refuses the connection outright without them:
+
+```toml
+[source]
+url_env = "PG2OSYNC_SOURCE_URL"
+sslmode = "verify-full"
+sslrootcert = "/etc/ssl/certs/server-ca.pem"
+sslcert = "/etc/ssl/certs/client.crt"
+sslkey = "/etc/ssl/private/client.key"
+```
+
+On the server side that is a `pg_hba.conf` line such as
+
+```
+hostssl all all 0.0.0.0/0 cert clientcert=verify-full
+```
+
+with the issuing CA in `ssl_ca_file`. Under `cert` and under
+`clientcert=verify-full` the certificate's CN must equal the database role the
+URL connects as; a certificate that verifies but names someone else is
+rejected. `pg2osync validate` prints the DN the server saw, which is the
+quickest way to tell the two failures apart.
+
 ## WAL mode (default)
 
 ```toml

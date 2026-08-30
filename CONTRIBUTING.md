@@ -30,6 +30,7 @@ cargo build --release
 ./dev/e2e-test.sh                    # PostgreSQL -> OpenSearch, full pipeline
 ./dev/e2e-mysql-test.sh              # MySQL source (needs a MySQL container)
 ./dev/failover-probe.sh              # MySQL failover; builds its own primary and replica
+./dev/mtls-probe.sh                  # client certificates; builds its own PostgreSQL with a CA
 ./dev/db-load-impact.sh              # what the source database pays while busy
 ./dev/many-tables.sh                 # what a table costs, apart from its rows
 ./dev/resource-limits.sh             # how many cores it needs (needs the container image)

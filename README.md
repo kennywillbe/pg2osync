@@ -138,13 +138,14 @@ Stated up front, because finding these out in production is expensive:
 **PostgreSQL source** — 15 or newer, `wal_level = logical`, a user with
 `REPLICATION`, and a primary key on every synced table — or `append_only` on
 one that has none. TLS is supported on
-every connection via `[source] sslmode` (libpq semantics, `prefer` by default).
+every connection via `[source] sslmode` (libpq semantics, `prefer` by default),
+and client certificates via `sslcert`/`sslkey`.
 
 **MySQL source** — MySQL 8.0+ or MariaDB 10.6+ with `log_bin = ON`,
 `binlog_format = ROW`, `binlog_row_image = FULL`, and a user holding `SELECT`,
 `REPLICATION SLAVE` and `REPLICATION CLIENT`. Both `caching_sha2_password` and
 `mysql_native_password` work, and TLS is supported through the same
-`[source] sslmode` setting.
+`[source] sslmode` setting, with client certificates via `sslcert`/`sslkey`.
 
 **Network** — a direct connection for the stream: a pooler or query-routing
 proxy cannot carry a replication or binlog-dump connection. The SQL connection

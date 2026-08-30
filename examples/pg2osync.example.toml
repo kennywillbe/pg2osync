@@ -11,6 +11,10 @@ url_env = "PG2OSYNC_SOURCE_URL"     # postgres://user:pass@host:5432/db
 # generally need "require" at minimum; "verify-full" is the safe choice.
 # sslmode = "verify-full"
 # sslrootcert = "/etc/ssl/certs/rds-ca.pem"
+# Client-certificate (mTLS) auth; both are required together. MySQL uses the
+# same two options (its own names are ssl-cert / ssl-key).
+# sslcert = "/etc/ssl/certs/client.crt"
+# sslkey  = "/etc/ssl/private/client.key"
 slot_name = "pg2osync"
 publication = "pg2osync_pub"
 # A broken stream is retried in process with backoff; after this many
