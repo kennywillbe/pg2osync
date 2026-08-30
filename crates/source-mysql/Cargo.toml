@@ -16,7 +16,6 @@ thiserror.workspace = true
 tracing.workspace = true
 sha1.workspace = true
 sha2.workspace = true
-anyhow.workspace = true
 futures-util = "0.3.34"
 base64 = "0.23.1"
 crc32fast = "1.5.1"
@@ -29,3 +28,8 @@ rsa = "0.9.10"
 # rsa 0.10, which would resolve the split, is still a release candidate.
 sha1-oaep = { package = "sha1", version = "0.10" }
 rand-oaep = { package = "rand", version = "0.8" }
+
+[dev-dependencies]
+# The examples are small binaries, not library code: they may report with
+# anyhow the way `crates/bin` does.
+anyhow.workspace = true

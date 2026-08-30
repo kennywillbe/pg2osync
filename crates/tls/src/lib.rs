@@ -8,7 +8,9 @@
 //! are libpq's for MySQL too: one spelling per concept beats two aliases for
 //! the same file.
 
-use anyhow::{Context as _, Result, bail};
+mod error;
+use error::Result;
+pub use error::TlsError;
 // through rustls rather than as a dependency of its own: rustls-pemfile, which
 // used to do this, was folded into pki-types and is now unmaintained
 use rustls::pki_types::pem::PemObject as _;
@@ -46,10 +48,9 @@ impl SslMode {
             "require" => Ok(Self::Require),
             "verify-ca" => Ok(Self::VerifyCa),
             "verify-full" => Ok(Self::VerifyFull),
-            other => bail!(
-                "unknown sslmode {other:?}; expected disable, prefer, require, \
-                 verify-ca or verify-full"
-            ),
+            other => Err(TlsError::UnknownMode {
+                value: other.to_string(),
+            }),
         }
     }
 
@@ -124,7 +125,7 @@ impl TlsSettings {
         if let Some(path) = &root_cert
             && !path.exists()
         {
-            bail!("sslrootcert {} does not exist", path.display());
+            return Err(TlsError::missing_file("sslrootcert", path));
         }
         if root_cert.is_some() && !mode.verifies_certificate() {
             tracing::warn!(target: "pg2osync::tls",
@@ -135,15 +136,15 @@ impl TlsSettings {
         // both halves of a client identity, or neither: pgwire checks this too,
         // but only on the replication path and only once the socket is open
         match (&client_cert, &client_key) {
-            (Some(_), None) => bail!("sslcert and sslkey must be set together; got sslcert only"),
-            (None, Some(_)) => bail!("sslcert and sslkey must be set together; got sslkey only"),
+            (Some(_), None) => return Err(TlsError::HalfIdentity { half: "sslcert" }),
+            (None, Some(_)) => return Err(TlsError::HalfIdentity { half: "sslkey" }),
             _ => {}
         }
         for (option, path) in [("sslcert", &client_cert), ("sslkey", &client_key)] {
             if let Some(path) = path
                 && !path.exists()
             {
-                bail!("{option} {} does not exist", path.display());
+                return Err(TlsError::missing_file(option, path));
             }
         }
         if client_cert.is_some() && mode == SslMode::Disable {
@@ -169,7 +170,7 @@ impl TlsSettings {
     pub fn client_config(&self) -> Result<rustls::ClientConfig> {
         let builder = rustls::ClientConfig::builder_with_provider(crypto_provider())
             .with_safe_default_protocol_versions()
-            .context("cannot initialise TLS")?;
+            .map_err(|e| TlsError::rustls("cannot initialise TLS", e))?;
         if !self.mode.verifies_certificate() {
             // `require` promises encryption, not authentication: libpq accepts
             // any certificate here, and a self-signed managed instance is the
@@ -199,7 +200,7 @@ impl TlsSettings {
                 crypto_provider(),
             )
             .build()
-            .context("cannot build certificate verifier")?;
+            .map_err(|e| TlsError::certificate("cannot build certificate verifier", e))?;
             return self.client_auth(builder.dangerous().with_custom_certificate_verifier(
                 Arc::new(danger::SkipHostnameCheck::new(inner)),
             ));
@@ -217,7 +218,12 @@ impl TlsSettings {
         };
         builder
             .with_client_auth_cert(load_client_chain(cert)?, load_client_key(key)?)
-            .with_context(|| format!("cannot use the client certificate {}", cert.display()))
+            .map_err(|e| {
+                TlsError::rustls(
+                    format!("cannot use the client certificate {}", cert.display()),
+                    e,
+                )
+            })
     }
 }
 
@@ -236,30 +242,50 @@ fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
 }
 
 fn load_roots(path: &Path) -> Result<rustls::RootCertStore> {
-    let pem = std::fs::read(path)
-        .with_context(|| format!("cannot read root certificate {}", path.display()))?;
+    let pem = std::fs::read(path).map_err(|e| {
+        TlsError::certificate(
+            format!("cannot read root certificate {}", path.display()),
+            e,
+        )
+    })?;
     let mut store = rustls::RootCertStore::empty();
     let mut added = 0usize;
     for cert in CertificateDer::pem_slice_iter(&pem) {
-        let cert = cert.with_context(|| format!("malformed PEM in {}", path.display()))?;
-        store
-            .add(cert)
-            .with_context(|| format!("cannot trust a certificate from {}", path.display()))?;
+        let cert = cert.map_err(|e| {
+            TlsError::certificate(format!("malformed PEM in {}", path.display()), e)
+        })?;
+        store.add(cert).map_err(|e| {
+            TlsError::certificate(
+                format!("cannot trust a certificate from {}", path.display()),
+                e,
+            )
+        })?;
         added += 1;
     }
     if added == 0 {
-        bail!("no certificates found in {}", path.display());
+        return Err(TlsError::NoMaterial(format!(
+            "no certificates found in {}",
+            path.display()
+        )));
     }
     Ok(store)
 }
 
 fn load_client_chain(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
     let chain = CertificateDer::pem_file_iter(path)
-        .with_context(|| format!("cannot read client certificate {}", path.display()))?
+        .map_err(|e| {
+            TlsError::certificate(
+                format!("cannot read client certificate {}", path.display()),
+                e,
+            )
+        })?
         .collect::<std::result::Result<Vec<_>, _>>()
-        .with_context(|| format!("malformed PEM in {}", path.display()))?;
+        .map_err(|e| TlsError::certificate(format!("malformed PEM in {}", path.display()), e))?;
     if chain.is_empty() {
-        bail!("no certificates found in sslcert {}", path.display());
+        return Err(TlsError::NoMaterial(format!(
+            "no certificates found in sslcert {}",
+            path.display()
+        )));
     }
     Ok(chain)
 }
@@ -269,16 +295,18 @@ fn load_client_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
     // `ENCRYPTED PRIVATE KEY` section this iterator does not recognise, so it
     // simply yields nothing and needs saying out loud.
     PrivateKeyDer::pem_file_iter(path)
-        .with_context(|| format!("cannot read sslkey {}", path.display()))?
+        .map_err(|e| TlsError::certificate(format!("cannot read sslkey {}", path.display()), e))?
         .next()
         .transpose()
-        .with_context(|| format!("malformed PEM in sslkey {}", path.display()))?
-        .with_context(|| {
-            format!(
+        .map_err(|e| {
+            TlsError::certificate(format!("malformed PEM in sslkey {}", path.display()), e)
+        })?
+        .ok_or_else(|| {
+            TlsError::NoMaterial(format!(
                 "no private key found in sslkey {}; it must be an unencrypted \
                  PKCS#8, RSA or EC key",
                 path.display()
-            )
+            ))
         })
 }
 

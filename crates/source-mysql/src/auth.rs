@@ -3,7 +3,7 @@
 //! Pure functions only: the scrambles are easy to get subtly wrong and easy to
 //! test, so they live apart from the connection state machine that uses them.
 
-use anyhow::{Context as _, Result, bail};
+use crate::error::{Context as _, MySqlError, Result};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
@@ -75,13 +75,15 @@ pub fn rsa_encrypted_password(
     use rsa::pkcs8::DecodePublicKey;
 
     if nonce.is_empty() {
-        bail!("server sent an empty nonce for RSA authentication");
+        return Err(MySqlError::auth(
+            "server sent an empty nonce for RSA authentication",
+        ));
     }
     let pem = std::str::from_utf8(public_key_pem)
-        .context("server public key is not valid UTF-8")?
+        .auth_ctx(|| "server public key is not valid UTF-8".into())?
         .trim();
     let key = RsaPublicKey::from_public_key_pem(pem)
-        .context("cannot parse the server's caching_sha2_password public key")?;
+        .auth_ctx(|| "cannot parse the server's caching_sha2_password public key".into())?;
 
     let obfuscated: Vec<u8> = cleartext_password(password)
         .iter()
@@ -92,7 +94,7 @@ pub fn rsa_encrypted_password(
     // MySQL encrypts with OAEP/SHA-1, which is what the server decrypts with
     let padding = rsa::Oaep::new::<Sha1Oaep>();
     key.encrypt(&mut rand_oaep::thread_rng(), padding, &obfuscated)
-        .context("cannot encrypt the password with the server's public key")
+        .auth_ctx(|| "cannot encrypt the password with the server's public key".into())
 }
 
 #[cfg(test)]

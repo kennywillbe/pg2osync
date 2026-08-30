@@ -9,7 +9,7 @@
 use crate::binlog::{self, RowsKind};
 use crate::catalog::{self, SchemaCache, TableSchema};
 use crate::connection::{MySqlConfig, MySqlConnection};
-use anyhow::{Context as _, Result};
+use crate::error::{Context as _, MySqlError, Result};
 use pg2osync_core::event::{ChangeEvent, RowChange, RowKind, TransactionBoundary};
 use pg2osync_core::lsn::Lsn;
 use serde_json::{Map, Value};
@@ -92,7 +92,7 @@ impl MySqlSource {
     pub async fn admin_connection(&self) -> Result<MySqlConnection> {
         MySqlConnection::connect(&self.cfg.connection())
             .await
-            .context("mysql admin connection failed")
+            .connect_ctx(|| "mysql admin connection failed".into())
     }
 
     /// Verify server prerequisites (`log_bin`, `binlog_format`,
@@ -121,7 +121,7 @@ impl MySqlSource {
 
         let mut conn = MySqlConnection::connect(&self.cfg.connection())
             .await
-            .context("mysql connect failed")?;
+            .connect_ctx(|| "mysql connect failed".into())?;
         conn.negotiate_checksum().await?;
         // frequent enough that a caller waiting on a position is not left
         // waiting for unrelated traffic, cheap enough to be invisible
@@ -199,14 +199,14 @@ impl MySqlSource {
                 return Ok(());
             }
             let pkt = tokio::select! {
-                pkt = conn.read_packet() => pkt.context("binlog stream failed")?,
+                pkt = conn.read_packet() => pkt.connect_ctx(|| "binlog stream failed".into())?,
                 _ = wait_shutdown(&shutdown) => return Ok(()),
             };
             if pkt.first() == Some(&0xFF) {
-                anyhow::bail!(
+                return Err(MySqlError::protocol(format!(
                     "server error: {}",
                     String::from_utf8_lossy(pkt.get(9..).unwrap_or(&[]))
-                );
+                )));
             }
             let ev = &pkt[1..];
             let Some(h) = binlog::parse_header(ev) else {
@@ -270,7 +270,7 @@ impl MySqlSource {
                                     version: Some(token_at(&current_file, end_pos)),
                                 })
                                 .await
-                                .context("change channel closed")?;
+                                .map_err(|_| MySqlError::ChannelClosed)?;
                                 continue;
                             }
                             // a truncate we decline to act on is worth naming:
@@ -355,7 +355,7 @@ impl MySqlSource {
                         commit_ts_micros: 0,
                     }))
                     .await
-                    .context("change channel closed")?;
+                    .map_err(|_| MySqlError::ChannelClosed)?;
                 }
                 binlog::T_XID => {
                     // Everything held for this transaction resolves here, before
@@ -376,7 +376,7 @@ impl MySqlSource {
                         commit_ts_micros: i64::from(h.timestamp) * 1_000_000 - 946_684_800_000_000,
                     }))
                     .await
-                    .context("change channel closed")?;
+                    .map_err(|_| MySqlError::ChannelClosed)?;
                 }
                 binlog::T_TABLE_MAP => {
                     let (tid, meta, opt) = binlog::parse_table_map(body)?;
@@ -493,7 +493,9 @@ impl MySqlSource {
                     } else {
                         for row in &set.rows {
                             let change = build_change(rt, &set.kind, row, version)?;
-                            tx.send(change).await.context("change channel closed")?;
+                            tx.send(change)
+                                .await
+                                .map_err(|_| MySqlError::ChannelClosed)?;
                         }
                     }
                     if pending.len() >= PENDING_FLUSH_ROWS {
@@ -504,10 +506,11 @@ impl MySqlSource {
                 binlog::T_PARTIAL_UPDATE_ROWS => {
                     // the setting that produces these is refused at startup, so
                     // reaching one means it was turned on underneath us
-                    anyhow::bail!(
+                    return Err(MySqlError::Config(
                         "the server sent a partial JSON update, which is not decoded here; \
                          set binlog_row_value_options to the empty string"
-                    );
+                            .into(),
+                    ));
                 }
                 _ => {}
             }
@@ -564,7 +567,7 @@ async fn report_drift(
         detail,
     })
     .await
-    .context("change channel closed")
+    .map_err(|_| MySqlError::ChannelClosed)
 }
 
 /// The parent key a child row names.
@@ -578,10 +581,9 @@ fn child_foreign_key(
     table: &(String, String),
     row: &binlog::RowsRow,
 ) -> Result<serde_json::Value> {
-    let parent = cfg
-        .child_parents
-        .get(table)
-        .ok_or_else(|| anyhow::anyhow!("{}.{} is not a configured child", table.0, table.1))?;
+    let parent = cfg.child_parents.get(table).ok_or_else(|| {
+        MySqlError::protocol(format!("{}.{} is not a configured child", table.0, table.1))
+    })?;
     let spec = cfg
         .children
         .get(parent)
@@ -591,36 +593,31 @@ fn child_foreign_key(
                 .find(|s| s.schema == table.0 && s.table == table.1)
         })
         .ok_or_else(|| {
-            anyhow::anyhow!(
+            MySqlError::protocol(format!(
                 "child {}.{} has no matching children entry",
-                table.0,
-                table.1
-            )
+                table.0, table.1
+            ))
         })?;
     let values = row
         .after
         .as_ref()
         .or(row.before.as_ref())
-        .ok_or_else(|| anyhow::anyhow!("child row carries no image"))?;
+        .ok_or_else(|| MySqlError::protocol("child row carries no image"))?;
     let idx = rt
         .columns
         .iter()
         .position(|c| c == &spec.foreign_key)
         .ok_or_else(|| {
-            anyhow::anyhow!(
+            MySqlError::protocol(format!(
                 "fk column {} missing on {}.{}",
-                spec.foreign_key,
-                table.0,
-                table.1
-            )
+                spec.foreign_key, table.0, table.1
+            ))
         })?;
     values.get(idx).and_then(|v| v.clone()).ok_or_else(|| {
-        anyhow::anyhow!(
+        MySqlError::protocol(format!(
             "child row of {}.{} carries no {}; cannot locate its parent",
-            table.0,
-            table.1,
-            spec.foreign_key
-        )
+            table.0, table.1, spec.foreign_key
+        ))
     })
 }
 
@@ -694,7 +691,7 @@ async fn flush_pending(
             change.version = version;
             tx.send(ChangeEvent::Row(change))
                 .await
-                .context("change channel closed")?;
+                .map_err(|_| MySqlError::ChannelClosed)?;
         }
     }
     pending.clear_seen();
@@ -709,11 +706,11 @@ async fn flush_pending(
 fn event_body(ev: &[u8], event_type: u8, checksum_len: usize) -> Result<&[u8]> {
     ev.get(binlog::HEADER_LEN..ev.len().saturating_sub(checksum_len))
         .ok_or_else(|| {
-            anyhow::anyhow!(
+            MySqlError::protocol(format!(
                 "binlog event type {event_type} is {} bytes, too short for its header and \
                  {checksum_len}-byte checksum",
                 ev.len()
-            )
+            ))
         })
 }
 
@@ -742,12 +739,11 @@ fn build_change(
             RowsKind::Update => "an UPDATE",
             _ => "a DELETE",
         };
-        anyhow::bail!(
+        return Err(MySqlError::Config(format!(
             "{}.{}: {what} arrived on an append-only table; nothing can say which \
              document it is",
-            rt.schema,
-            rt.table
-        );
+            rt.schema, rt.table
+        )));
     }
     // Deletes carry only the before-image; inserts and updates carry an after-
     // image whose values are the new row state.
@@ -757,14 +753,14 @@ fn build_change(
                 .before
                 .as_ref()
                 .or(row.after.as_ref())
-                .ok_or_else(|| anyhow::anyhow!("delete event carries no row image"))?;
+                .ok_or_else(|| MySqlError::protocol("delete event carries no row image"))?;
             (before, before)
         }
         _ => {
             let after = row
                 .after
                 .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("row event carries no after image"))?;
+                .ok_or_else(|| MySqlError::protocol("row event carries no after image"))?;
             (after, after)
         }
     };
@@ -836,14 +832,12 @@ fn primary_key(
 ) -> Result<Value> {
     let mut key = Map::new();
     for pk in pk_columns {
-        let idx = columns
-            .iter()
-            .position(|c| c == pk)
-            .ok_or_else(|| anyhow::anyhow!("primary key column {pk} not present in binlog row"))?;
-        let value = values
-            .get(idx)
-            .and_then(|v| v.clone())
-            .ok_or_else(|| anyhow::anyhow!("primary key column {pk} missing from row image"))?;
+        let idx = columns.iter().position(|c| c == pk).ok_or_else(|| {
+            MySqlError::protocol(format!("primary key column {pk} not present in binlog row"))
+        })?;
+        let value = values.get(idx).and_then(|v| v.clone()).ok_or_else(|| {
+            MySqlError::protocol(format!("primary key column {pk} missing from row image"))
+        })?;
         key.insert(pk.clone(), value);
     }
     Ok(if key.len() == 1 {

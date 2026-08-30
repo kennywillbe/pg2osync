@@ -1587,8 +1587,8 @@ dependencies = [
 name = "pg2osync-tls"
 version = "1.0.0"
 dependencies = [
- "anyhow",
  "rustls",
+ "thiserror 2.0.20",
  "tracing",
  "url",
  "webpki-roots 1.0.9",

@@ -962,6 +962,12 @@ where
         if policy.attempt_recovered(streamed_for) {
             failures = 0;
         }
+        // The source's own verdict comes first: counting attempts cannot tell
+        // a dropped connection from a configuration nothing can satisfy, and
+        // the second one fails the same way on every attempt.
+        if !worth_retrying(&error) {
+            return Err(error);
+        }
         if !policy.should_retry(failures) {
             return Err(error.context(format!(
                 "giving up after {} consecutive source failures",
@@ -977,6 +983,21 @@ where
             delay.as_secs_f64());
         tokio::time::sleep(delay).await;
     }
+}
+
+/// Whether the failure leaves anything for another attempt to do.
+///
+/// Only a typed source error can answer. Anything raised by the wiring here is
+/// retried, because nothing has claimed it cannot succeed — and a pipeline
+/// that stops on an unclassified failure is worse than one that tries again.
+fn worth_retrying(error: &anyhow::Error) -> bool {
+    if let Some(e) = error.downcast_ref::<pg2osync_source::SourceError>() {
+        return e.is_retryable();
+    }
+    if let Some(e) = error.downcast_ref::<pg2osync_source_mysql::MySqlError>() {
+        return e.is_retryable();
+    }
+    true
 }
 
 /// A stored checkpoint is only usable when it belongs to this exact stream.
@@ -1295,13 +1316,14 @@ async fn attempt_postgres(
         if polling {
             let mut poll =
                 pg2osync_source::poll::PollSource::new(poll_config(cfg, source_url, tls.clone())?);
-            poll.stream(events_tx, shutdown_rx.clone()).await
+            poll.stream(events_tx, shutdown_rx.clone()).await?;
         } else {
             let mut source = WalSource::new(src_cfg.clone());
             source
                 .stream(events_tx, shutdown_rx.clone(), Some(admin))
-                .await
+                .await?;
         }
+        Ok(())
     };
     // Either failing abandons the other: a stream error is a reconnect, and the
     // load picks up from its recorded progress on the next attempt.
@@ -1882,6 +1904,8 @@ async fn attempt_mysql(
         let copy_tx = copy_tx;
         if resume.is_none() || load_pending {
             let tables = src_cfg.tables.clone();
+            let scope = pg2osync_core::load::LoadScope::initial_load()
+                .with_table_filters(table_filters(cfg)?);
             with_bulk_load_settings(&load_sink, cfg, async {
                 pg2osync_source_mysql::load::run(
                     &mut admin,
@@ -1891,13 +1915,13 @@ async fn attempt_mysql(
                     load_sink.as_ref(),
                     &load_stream_id,
                     load_done_rx,
-                    &pg2osync_core::load::LoadScope::initial_load()
-                        .with_table_filters(table_filters(cfg)?),
+                    &scope,
                     &load_children,
                     base,
                     &src_cfg.append_only,
                 )
-                .await
+                .await?;
+                Ok(())
             })
             .await
         } else {
@@ -1908,7 +1932,8 @@ async fn attempt_mysql(
     let started = std::time::Instant::now();
     let stream = async {
         let mut streaming = MySqlSource::new(src_cfg.clone());
-        streaming.stream(events_tx, shutdown_rx.clone()).await
+        streaming.stream(events_tx, shutdown_rx.clone()).await?;
+        Ok(())
     };
     // Either failing abandons the other: a stream error is a reconnect, and the
     // load picks up from its recorded progress on the next attempt.
@@ -2138,6 +2163,32 @@ mod tests {
         // the gap between the checkpoint and the slot's replay position would
         // be lost, so the load runs again instead
         assert_eq!(resume_position(false, Some(Lsn(10)), Some(Lsn(90))), None);
+    }
+
+    #[test]
+    fn only_a_configuration_the_source_cannot_satisfy_stops_the_reconnect_loop() {
+        use pg2osync_source::SourceError;
+
+        let transient = SourceError::connect(
+            "replication connect failed",
+            std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+        );
+        assert!(worth_retrying(&anyhow::Error::from(transient)));
+
+        let permanent = SourceError::Config("wal_level is 'replica' but must be 'logical'".into());
+        assert!(!worth_retrying(&anyhow::Error::from(permanent)));
+
+        // the context the binary attaches must not hide the verdict
+        let wrapped = anyhow::Error::from(pg2osync_source_mysql::MySqlError::Config(
+            "binlog_format is \"STATEMENT\" but must be ROW".into(),
+        ))
+        .context("mysql source");
+        assert!(!worth_retrying(&wrapped));
+
+        // an error this module raised itself says nothing, so it is retried
+        assert!(worth_retrying(&anyhow::anyhow!(
+            "the source closed the stream"
+        )));
     }
 
     #[test]

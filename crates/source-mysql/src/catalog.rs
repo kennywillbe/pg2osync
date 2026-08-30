@@ -5,8 +5,8 @@
 //! dump connection cannot run queries once streaming has started.
 
 use crate::connection::MySqlConnection;
+use crate::error::{Context as _, MySqlError, Result};
 use crate::typemap::{self, ValueShape};
-use anyhow::{Context as _, Result, bail};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 
@@ -143,9 +143,11 @@ pub async fn table_schema(
             quote_str(table)
         ))
         .await
-        .with_context(|| format!("cannot read columns of {schema}.{table}"))?;
+        .catalog_ctx(|| format!("cannot read columns of {schema}.{table}"))?;
     if rows.is_empty() {
-        bail!("table {schema}.{table} does not exist or is not visible to this user");
+        return Err(MySqlError::Config(format!(
+            "table {schema}.{table} does not exist or is not visible to this user"
+        )));
     }
     let lower = |r: &Vec<Option<String>>, i: usize| -> String {
         r.get(i)
@@ -178,11 +180,11 @@ pub async fn table_schema(
         .filter_map(|r| r.first().cloned().flatten())
         .collect();
     if pk_columns.is_empty() && !keyless_ok {
-        bail!(
+        return Err(MySqlError::Config(format!(
             "table {schema}.{table} has no PRIMARY KEY; pg2osync needs one to \
              derive a stable document id, or `append_only = true` on its [sync] \
              section to index its rows as they arrive"
-        );
+        )));
     }
     Ok(TableSchema {
         columns,
@@ -236,7 +238,9 @@ pub fn setup_script(user: &str, databases: &[String]) -> String {
 pub async fn check_prerequisites(conn: &mut MySqlConnection) -> Result<()> {
     let log_bin = conn.global_var("log_bin").await?.unwrap_or_default();
     if log_bin != "1" && log_bin.to_uppercase() != "ON" {
-        bail!("binary logging is disabled (log_bin={log_bin:?}); enable it and restart MySQL");
+        return Err(MySqlError::Config(format!(
+            "binary logging is disabled (log_bin={log_bin:?}); enable it and restart MySQL"
+        )));
     }
     let format = conn
         .global_var("binlog_format")
@@ -244,27 +248,31 @@ pub async fn check_prerequisites(conn: &mut MySqlConnection) -> Result<()> {
         .unwrap_or_default()
         .to_uppercase();
     if format != "ROW" {
-        bail!(
+        return Err(MySqlError::Config(format!(
             "binlog_format is {format:?} but must be ROW; \
              set `binlog_format = ROW` in my.cnf and restart MySQL"
-        );
+        )));
     }
     // MariaDB has no binlog_row_image before 10.1 and reports FULL by default
     match conn.global_var("binlog_row_image").await {
-        Ok(Some(image)) if image.to_uppercase() != "FULL" => bail!(
-            "binlog_row_image is {image:?} but must be FULL; \
-             MINIMAL/NOBLOB images omit unchanged columns, which loses data"
-        ),
+        Ok(Some(image)) if image.to_uppercase() != "FULL" => {
+            return Err(MySqlError::Config(format!(
+                "binlog_row_image is {image:?} but must be FULL; \
+                 MINIMAL/NOBLOB images omit unchanged columns, which loses data"
+            )));
+        }
         _ => {}
     }
     // PARTIAL_JSON logs a JSON update as a diff in an event type of its own,
     // and changes the shape of every row image that follows it. Refusing is
     // honest; the alternative is dropping those updates without saying so.
     match conn.global_var("binlog_row_value_options").await {
-        Ok(Some(options)) if !options.trim().is_empty() => bail!(
-            "binlog_row_value_options is {options:?} but must be empty; \
-             PARTIAL_JSON writes JSON updates as diffs, which are not decoded here"
-        ),
+        Ok(Some(options)) if !options.trim().is_empty() => {
+            return Err(MySqlError::Config(format!(
+                "binlog_row_value_options is {options:?} but must be empty; \
+                 PARTIAL_JSON writes JSON updates as diffs, which are not decoded here"
+            )));
+        }
         _ => {}
     }
     Ok(())
@@ -286,7 +294,9 @@ pub async fn master_position(conn: &mut MySqlConnection) -> Result<(String, u32)
             return Ok((file.clone(), pos));
         }
     }
-    bail!("cannot read binlog position; the replication user needs REPLICATION CLIENT")
+    Err(MySqlError::Config(
+        "cannot read binlog position; the replication user needs REPLICATION CLIENT".into(),
+    ))
 }
 
 /// Which server this is, and whether its GTIDs can be used to resume.

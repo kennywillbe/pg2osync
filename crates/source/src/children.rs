@@ -17,7 +17,7 @@ pub use pg2osync_core::children::{
     keys_needing_refetch,
 };
 
-use anyhow::{Context as _, Result};
+use crate::error::{Context as _, Result, SourceError};
 use serde_json::Value;
 use std::collections::HashMap;
 use tokio_postgres::Client;
@@ -26,20 +26,20 @@ use tokio_postgres::Client;
 pub async fn resolve_order(spec: &mut ChildSpec, client: &Client) -> Result<()> {
     let info = crate::catalog::table_info(client, &spec.schema, &spec.table).await?;
     if info.pk_columns.is_empty() && spec.single {
-        anyhow::bail!(
+        return Err(SourceError::Config(format!(
             "[[sync.*.children]] single is set on {}, which has no primary key to order \
              by — with no order there is no first row, so two runs could embed different \
              ones. Add a primary key or drop single",
             spec.qualified()
-        );
+        )));
     }
     if info.pk_columns.is_empty() && spec.max_rows.is_some() {
-        anyhow::bail!(
+        return Err(SourceError::Config(format!(
             "[[sync.*.children]] max_rows is set on {}, which has no primary key to \
              order by — the same rows would not be kept twice running. Add a primary \
              key or drop max_rows",
             spec.qualified()
-        );
+        )));
     }
     if info.pk_columns.is_empty() {
         tracing::warn!(target: "pg2osync::source",
@@ -142,7 +142,7 @@ pub async fn fetch_many(
     let rows = client
         .query(&sql, &[param.as_ref()])
         .await
-        .with_context(|| format!("child fetch failed for {}", spec.qualified()))?;
+        .catalog_ctx(|| format!("child fetch failed for {}", spec.qualified()))?;
     let mut out = HashMap::new();
     for row in rows {
         let key: String = row.get(0);
@@ -284,7 +284,7 @@ pub async fn refetch_parents(
     let rows = client
         .query(&sql, &[param.as_ref()])
         .await
-        .with_context(|| format!("parent refetch failed for {schema}.{table}"))?;
+        .catalog_ctx(|| format!("parent refetch failed for {schema}.{table}"))?;
     Ok(rows
         .into_iter()
         .map(|r| {

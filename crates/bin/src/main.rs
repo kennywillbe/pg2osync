@@ -1629,7 +1629,9 @@ async fn drop_slot(path: &Path, publication: bool) -> Result<()> {
     let client = connect_pg(&cfg, &secrets.source_url).await?;
     pg2osync_source::catalog::drop_slot(&client, &cfg.source.slot_name).await?;
     if publication {
-        return pg2osync_source::catalog::drop_publication(&client, &cfg.source.publication).await;
+        return Ok(
+            pg2osync_source::catalog::drop_publication(&client, &cfg.source.publication).await?,
+        );
     }
     // A reindex runs two pipelines on one publication, so dropping the old
     // one's slot used to take the publication out from under the new one —

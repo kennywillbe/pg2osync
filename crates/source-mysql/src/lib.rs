@@ -8,9 +8,12 @@ pub mod binlog;
 pub mod catalog;
 pub mod children;
 pub mod connection;
+pub mod error;
 pub mod gtid;
 pub mod json;
 pub mod load;
 pub mod packet;
 pub mod runner;
 pub mod typemap;
+
+pub use error::MySqlError;

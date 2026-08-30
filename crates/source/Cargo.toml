@@ -9,16 +9,20 @@ description = "PostgreSQL logical-replication source for pg2osync"
 
 [dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-anyhow.workspace = true
 base64 = "0.23.1"
 bytes = "1.12.1"
 pg2osync-core = { path = "../core" }
 pg2osync-tls = { path = "../tls" }
 pgwire-replication.workspace = true
 serde_json.workspace = true
-thiserror = "2"
+thiserror.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 tokio-postgres = { workspace = true, features = ["with-serde_json-1"] }
 tracing.workspace = true
 url = "2.5.8"
 tokio-postgres-rustls = "0.14.0"
+
+[dev-dependencies]
+# The examples are small binaries, not library code: they may report with
+# anyhow the way `crates/bin` does.
+anyhow.workspace = true

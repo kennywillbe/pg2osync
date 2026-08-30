@@ -24,7 +24,7 @@
 
 use crate::catalog::{self, TableSchema};
 use crate::connection::MySqlConnection;
-use anyhow::{Context as _, Result};
+use crate::error::{Context as _, MySqlError, Result};
 use pg2osync_core::children::{ChildSpec, key_lookup};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -33,20 +33,20 @@ use std::collections::HashMap;
 pub async fn resolve_order(spec: &mut ChildSpec, conn: &mut MySqlConnection) -> Result<()> {
     let resolved = catalog::table_schema(conn, &spec.schema, &spec.table, false).await?;
     if resolved.pk_columns.is_empty() && spec.single {
-        anyhow::bail!(
+        return Err(MySqlError::Config(format!(
             "[[sync.*.children]] single is set on {}, which has no primary key to order \
              by — with no order there is no first row, so two runs could embed different \
              ones. Add a primary key or drop single",
             spec.qualified()
-        );
+        )));
     }
     if resolved.pk_columns.is_empty() && spec.max_rows.is_some() {
-        anyhow::bail!(
+        return Err(MySqlError::Config(format!(
             "[[sync.*.children]] max_rows is set on {}, which has no primary key to order \
              by — the same rows would not be kept twice running. Add a primary key or drop \
              max_rows",
             spec.qualified()
-        );
+        )));
     }
     if resolved.pk_columns.is_empty() {
         tracing::warn!(target: "pg2osync::source",
@@ -77,7 +77,7 @@ pub async fn fetch_many(
     let mut rows = conn
         .text_query(&sql)
         .await
-        .with_context(|| format!("child fetch failed for {}", spec.qualified()))?;
+        .catalog_ctx(|| format!("child fetch failed for {}", spec.qualified()))?;
 
     // The foreign key and the total ride after the child's own columns, so the
     // row prefix is exactly what build_document expects.
@@ -117,11 +117,11 @@ pub async fn refetch_parents(
     }
     let resolved = catalog::table_schema(conn, schema, table, false).await?;
     let [pk_column] = resolved.pk_columns.as_slice() else {
-        anyhow::bail!(
+        return Err(MySqlError::Config(format!(
             "{schema}.{table} is a parent of a nested collection, so it needs a single-column \
              primary key to be located by; it has {}",
             resolved.pk_columns.len()
-        );
+        )));
     };
     let sql = format!(
         "SELECT {} FROM {}.{} WHERE {} IN ({})",
@@ -139,7 +139,7 @@ pub async fn refetch_parents(
     let mut rows = conn
         .text_query(&sql)
         .await
-        .with_context(|| format!("parent refetch failed for {schema}.{table}"))?;
+        .catalog_ctx(|| format!("parent refetch failed for {schema}.{table}"))?;
     let mut out = HashMap::new();
     while let Some(row) = rows.next().await? {
         let (doc, pk) = catalog::build_document(&resolved, &row);

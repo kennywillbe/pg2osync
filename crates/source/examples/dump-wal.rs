@@ -133,5 +133,5 @@ async fn main() -> Result<()> {
         eprintln!("source stream ended normally");
     }
     let _ = printer.await;
-    result
+    Ok(result?)
 }

@@ -16,8 +16,8 @@
 
 use crate::catalog::{self, TableSchema};
 use crate::connection::MySqlConnection;
+use crate::error::{Context as _, MySqlError, Result};
 use crate::typemap::ValueShape;
-use anyhow::{Context as _, Result};
 use pg2osync_core::checkpoint::StreamId;
 use pg2osync_core::children::ChildSpec;
 use pg2osync_core::event::{ChangeEvent, RowChange, RowKind, TransactionBoundary};
@@ -58,7 +58,7 @@ pub async fn run(
     // slowdown — it stops.
     conn.query_text_rows("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
         .await
-        .context("cannot set the load session's isolation level")?;
+        .catalog_ctx(|| "cannot set the load session's isolation level".into())?;
 
     let chunk_rows = chunk_rows.max(1);
     // One counter for the whole load: a mark only has to be increasing, and a
@@ -163,7 +163,7 @@ pub async fn run(
             let mut rows = conn
                 .text_query(&sql)
                 .await
-                .with_context(|| format!("initial load of {qualified} failed reading a chunk"))?;
+                .catalog_ctx(|| format!("initial load of {qualified} failed reading a chunk"))?;
             let mut in_chunk: u64 = 0;
             let mut last: Option<Vec<String>> = None;
             // Held only when there are collections to attach: their read needs the
@@ -185,9 +185,9 @@ pub async fn run(
                     version,
                 };
                 if specs.is_empty() {
-                    tx.send(ChangeEvent::Row(change))
-                        .await
-                        .context("engine closed during the initial load")?;
+                    tx.send(ChangeEvent::Row(change)).await.map_err(|_| {
+                        MySqlError::LoadInterrupted("engine closed during the initial load".into())
+                    })?;
                     if count.is_multiple_of(ROWS_PER_BOUNDARY) {
                         send_boundary(tx).await?;
                     }
@@ -200,9 +200,9 @@ pub async fn run(
             if !specs.is_empty() {
                 attach_to_chunk(conn, &specs, &mut held).await?;
                 for (nth, change) in held.into_iter().enumerate() {
-                    tx.send(ChangeEvent::Row(change))
-                        .await
-                        .context("engine closed during the initial load")?;
+                    tx.send(ChangeEvent::Row(change)).await.map_err(|_| {
+                        MySqlError::LoadInterrupted("engine closed during the initial load".into())
+                    })?;
                     if (nth as u64 + 1).is_multiple_of(ROWS_PER_BOUNDARY) {
                         send_boundary(tx).await?;
                     }
@@ -216,13 +216,17 @@ pub async fn run(
             // idempotent write makes free — the reverse order would claim a
             // chunk that was never written.
             mark += 1;
-            tx.send(ChangeEvent::LoadMark(mark))
-                .await
-                .map_err(|_| anyhow::anyhow!("engine closed during the initial load"))?;
+            tx.send(ChangeEvent::LoadMark(mark)).await.map_err(|_| {
+                MySqlError::LoadInterrupted("engine closed during the initial load".into())
+            })?;
             load_done
                 .wait_for(|written| *written >= mark)
                 .await
-                .map_err(|_| anyhow::anyhow!("engine stopped before the chunk was written"))?;
+                .map_err(|_| {
+                    MySqlError::LoadInterrupted(
+                        "engine stopped before the chunk was written".into(),
+                    )
+                })?;
 
             // A short chunk is the last one: there is nothing past its final
             // key that this statement could have left behind. A full chunk that
@@ -230,10 +234,10 @@ pub async fn run(
             // end would silently load part of a table.
             let finished = !chunked || in_chunk < chunk_rows;
             if !finished && last.is_none() {
-                anyhow::bail!(
+                return Err(MySqlError::Config(format!(
                     "{qualified}: a full chunk produced no key to continue from, \
                      so the rest of the table cannot be read"
-                );
+                )));
             }
             cursor = last;
             if scope.resumable {
@@ -317,7 +321,7 @@ async fn send_boundary(tx: &Sender<ChangeEvent>) -> Result<()> {
         commit_ts_micros: 0,
     }))
     .await
-    .map_err(|_| anyhow::anyhow!("engine closed during the initial load"))
+    .map_err(|_| MySqlError::LoadInterrupted("engine closed during the initial load".into()))
 }
 
 /// The statement for one chunk: everything after `cursor`, in key order.
