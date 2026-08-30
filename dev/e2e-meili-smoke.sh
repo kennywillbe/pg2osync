@@ -23,6 +23,9 @@
 #   PG_PORT           source port           (default 15432)
 #   E2E_LOG           pipeline log file     (default /tmp/pg2osync-meili-smoke.log)
 set -euo pipefail
+# shellcheck source=dev/e2e-lock.sh
+source "$(dirname "$0")/e2e-lock.sh"
+e2e_lock
 
 cd "$(dirname "$0")/.."
 BIN=./target/release/pg2osync
@@ -101,6 +104,7 @@ cleanup() {
   pg "DROP PUBLICATION IF EXISTS ${SLOT}_pub;" > /dev/null 2>&1 || true
   mi_drop_indexes > /dev/null 2>&1 || true
   rm -rf "$CONFIG" "$STATE_DIR"
+  e2e_unlock
 }
 trap cleanup EXIT
 

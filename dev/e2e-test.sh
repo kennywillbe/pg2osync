@@ -3,6 +3,7 @@
 #
 # Runs one at a time: stopping the pipeline kills every pg2osync process, so
 # two suites at once take each other's down and report failures that are not.
+# dev/e2e-lock.sh enforces that with a machine-wide lock; a second suite waits.
 #
 # Prerequisites:
 #   docker compose -f dev/docker-compose.yml up -d
@@ -16,6 +17,9 @@
 #   PG_PORT        source port on localhost (default 15432)
 #   E2E_LOG        pipeline log file        (default /tmp/pg2osync-e2e.log)
 set -euo pipefail
+# shellcheck source=dev/e2e-lock.sh
+source "$(dirname "$0")/e2e-lock.sh"
+e2e_lock
 
 cd "$(dirname "$0")/.."
 BIN=./target/release/pg2osync
@@ -70,7 +74,7 @@ drop_own_slot() { pg "SELECT pg_drop_replication_slot('pg2osync_e2e') WHERE EXIS
 # replication slots are in use". Only idle slots go — a running pipeline's is
 # in use and stays.
 drop_idle_probe_slots() { pg "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name LIKE 'pg2osync\\_e2e\\_%' AND NOT active;" > /dev/null 2>&1 || true; }
-cleanup()   { stop_sync; drop_own_slot; rm -f "$CONFIG" "$MAPPING"; }
+cleanup()   { stop_sync; drop_own_slot; rm -f "$CONFIG" "$MAPPING"; e2e_unlock; }
 trap cleanup EXIT
 
 cat > "$CONFIG" <<TOML
