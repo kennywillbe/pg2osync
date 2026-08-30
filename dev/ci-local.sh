@@ -33,6 +33,8 @@
 # shellcheck disable=SC2329
 # every job and probe below is reached by name from run_job, never literally
 set -euo pipefail
+# shellcheck source=dev/e2e-lock.sh
+source "$(dirname "$0")/e2e-lock.sh"
 
 cd "$(dirname "$0")/.."
 
@@ -191,7 +193,15 @@ run_job() {
   log=$RUN_DIR/$slug.log
   start=$SECONDS
   printf '\033[2m.. %s\033[0m\n' "$name"
+  # Seeding the databases and running a suite must not interleave with another
+  # run's suite, so the whole job holds the lock the suites queue on.
+  case $slug in
+    e2e-*|compat-*) e2e_lock ;;
+  esac
   "$fn" > "$log" 2>&1 || rc=$?
+  case $slug in
+    e2e-*|compat-*) e2e_unlock ;;
+  esac
   cleanup_containers
   took=$((SECONDS - start))
   printf '\033[1A\033[2K'
@@ -277,7 +287,9 @@ mysql_enable_gtid() {
 # red that was never about the change.
 no_pipeline_running() {
   local waited=0 wait_max=${E2E_LOCK_WAIT:-5400}
-  while pgrep -f "pg2osync run" > /dev/null 2>&1 || [ -d "${E2E_LOCK:-/tmp/pg2osync-e2e.lock}" ]; do
+  # The lock this run took itself is not someone else's run.
+  while pgrep -f "pg2osync run" > /dev/null 2>&1 \
+    || { [ -d "$E2E_LOCK" ] && [ "${E2E_LOCK_OWNER:-}" != "$$" ]; }; do
     if [ "$waited" -eq 0 ]; then
       echo "another pg2osync pipeline or e2e suite is running on this machine; waiting for it"
     fi

@@ -12,8 +12,13 @@
 E2E_LOCK=${E2E_LOCK:-/tmp/pg2osync-e2e.lock}
 E2E_LOCK_WAIT=${E2E_LOCK_WAIT:-5400}
 
+# A run that already holds the lock — ci-local around a suite — passes it down
+# through E2E_LOCK_OWNER, so the suite it starts does not wait on its parent.
 e2e_lock() {
   local waited=0 holder
+  if [ -n "${E2E_LOCK_OWNER:-}" ] && kill -0 "$E2E_LOCK_OWNER" 2>/dev/null; then
+    return 0
+  fi
   until mkdir "$E2E_LOCK" 2>/dev/null; do
     holder=$(cat "$E2E_LOCK/pid" 2>/dev/null || true)
     if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
@@ -31,6 +36,7 @@ e2e_lock() {
     waited=$((waited + 10))
   done
   echo $$ > "$E2E_LOCK/pid"
+  export E2E_LOCK_OWNER=$$
 }
 
 # Only the holder releases: a suite that timed out waiting must not remove a
