@@ -147,6 +147,20 @@ email = "redact"                     # "redact" -> "***", "hash" -> SHA-256 pref
 # foreign_key = "customer_id"
 # single = true
 
+# Many-to-many: the rows to embed live one table further, behind a junction.
+# foreign_key names the parent from the junction; through_key names the child.
+# Index the junction on both columns; both tables are streamed automatically.
+# [sync.books]
+# table = "public.books"
+# index = "books"
+#
+# [[sync.books.children]]
+# table = "public.authors"
+# field = "authors"
+# through = "public.book_author"
+# foreign_key = "book_id"
+# through_key = "author_id"
+
 # Fan-out: one document per element of an array column (PostgreSQL array or
 # jsonb holding one; needs REPLICA IDENTITY FULL). The element id renders from
 # the parent-minus-array document merged with the element.

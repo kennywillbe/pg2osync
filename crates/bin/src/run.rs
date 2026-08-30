@@ -103,15 +103,20 @@ pub fn embedded_children_with_own_section(cfg: &AppConfig) -> Vec<String> {
     let mut notes = Vec::new();
     for (owner, tbl) in &cfg.sync {
         for child in &tbl.children {
-            if let Some((key, own)) = cfg.sync.iter().find(|(_, t)| t.table == child.table) {
-                notes.push(format!(
-                    "[sync.{key}] {} is also an embedded child of [sync.{owner}]: the \
-                     replication runner reads its rows only as a re-fetch of {}, so \
-                     index {:?} receives the initial load and no streamed change",
-                    child.table,
-                    tbl.table,
-                    own.index_name(key)
-                ));
+            // the junction is read as somebody's child in exactly the same way
+            for watched in [Some(&child.table), child.through.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                if let Some((key, own)) = cfg.sync.iter().find(|(_, t)| &t.table == watched) {
+                    notes.push(format!(
+                        "[sync.{key}] {watched} is also an embedded child of [sync.{owner}]: \
+                         the replication runner reads its rows only as a re-fetch of {}, so \
+                         index {:?} receives the initial load and no streamed change",
+                        tbl.table,
+                        own.index_name(key)
+                    ));
+                }
             }
         }
     }
@@ -1040,11 +1045,18 @@ async fn run_postgres(
     let mut children = child_specs_for(&cfg)?;
     resolve_child_order(&mut children, &admin).await?;
     let mut tables: Vec<String> = cfg.sync.values().map(|t| t.table.clone()).collect();
-    // child tables must join the publication or their changes never reach us
+    // Child tables must join the publication or their changes never reach us,
+    // and so must a junction: each of the two carries half of what a
+    // many-to-many collection is made of.
     for tbl in cfg.sync.values() {
         for child in &tbl.children {
-            if !tables.contains(&child.table) {
-                tables.push(child.table.clone());
+            for table in [Some(&child.table), child.through.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                if !tables.contains(table) {
+                    tables.push(table.clone());
+                }
             }
         }
     }
@@ -1398,11 +1410,18 @@ fn wal_config(
             tbl.primary_key.clone().unwrap_or_else(|| "id".into()),
         );
         for child in &tbl.children {
-            let (cs, ct) = split_qualified(&child.table);
-            child_parents.insert(
-                (cs.to_string(), ct.to_string()),
-                (ps.to_string(), pt.to_string()),
-            );
+            // the junction as well as the child: a row of either one is not a
+            // document, and both resolve to this parent
+            for table in [Some(&child.table), child.through.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                let (cs, ct) = split_qualified(table);
+                child_parents.insert(
+                    (cs.to_string(), ct.to_string()),
+                    (ps.to_string(), pt.to_string()),
+                );
+            }
         }
     }
     Ok(pg2osync_source::runner::WalSourceConfig {
@@ -1507,6 +1526,12 @@ pub fn child_specs_for(
             spec.columns = child.columns.clone();
             spec.exclude_columns = child.exclude_columns.clone();
             spec.single = child.single;
+            if let (Some(through), Some(through_key)) = (&child.through, &child.through_key) {
+                spec.through = Some(pg2osync_source::children::Through::new(
+                    through,
+                    through_key,
+                )?);
+            }
             map.entry((schema.to_string(), table.to_string()))
                 .or_default()
                 .push(spec);
@@ -1515,23 +1540,37 @@ pub fn child_specs_for(
     Ok(map)
 }
 
-/// Deletes on a child table carry no foreign key under the default replica
-/// identity, so the parent cannot be located. Warn before it happens.
+/// Deletes carry only the replica identity, so a table whose delete has to name
+/// something else cannot locate the parent. Warn before it happens.
+///
+/// Which column that is depends on the role. A direct child is located by its
+/// foreign key, which is not part of its key, so it needs FULL. A junction is
+/// located by the same foreign key — but that column is normally half of its
+/// `(parent, child)` primary key, and the default identity carries it, so only a
+/// junction keyed some other way needs the warning. A through child is located
+/// by its own primary key, which every replica identity carries, so it never
+/// does.
 async fn warn_on_child_replica_identity(
     cfg: &AppConfig,
     admin: &tokio_postgres::Client,
 ) -> Result<()> {
     for tbl in cfg.sync.values() {
         for child in &tbl.children {
-            let (schema, table) = split_qualified(&child.table);
+            let located_by = match &child.through {
+                Some(through) => (through.clone(), child.foreign_key.clone()),
+                None => (child.table.clone(), child.foreign_key.clone()),
+            };
+            let (qualified, column) = located_by;
+            let (schema, table) = split_qualified(&qualified);
             let info = pg2osync_source::catalog::table_info(admin, schema, table)
                 .await
-                .with_context(|| format!("cannot inspect child table {}", child.table))?;
-            if info.relreplident != 'f' {
+                .with_context(|| format!("cannot inspect child table {qualified}"))?;
+            if info.relreplident != 'f' && !info.pk_columns.contains(&column) {
                 tracing::warn!(target: "pg2osync::run",
-                    "child table {} has REPLICA IDENTITY '{}': DELETEs on it cannot \
-                     refresh the parent document. Run: ALTER TABLE {} REPLICA IDENTITY FULL",
-                    child.table, info.relreplident, child.table);
+                    "{qualified} has REPLICA IDENTITY '{}' and {column} is not in its \
+                     primary key: DELETEs on it cannot refresh the parent document. \
+                     Run: ALTER TABLE {qualified} REPLICA IDENTITY FULL",
+                    info.relreplident);
             }
         }
     }
@@ -2003,11 +2042,19 @@ pub fn mysql_config_for(
     // resolve to a parent instead of becoming documents.
     for (parent, specs) in &children {
         for spec in specs {
-            let child = (spec.schema.clone(), spec.table.clone());
-            if !tables.contains(&child) {
-                tables.push(child.clone());
+            let junction = spec
+                .through
+                .as_ref()
+                .map(|t| (t.schema.clone(), t.table.clone()));
+            for watched in [Some((spec.schema.clone(), spec.table.clone())), junction]
+                .into_iter()
+                .flatten()
+            {
+                if !tables.contains(&watched) {
+                    tables.push(watched.clone());
+                }
+                child_parents.insert(watched, parent.clone());
             }
-            child_parents.insert(child, parent.clone());
         }
     }
     Ok(pg2osync_source_mysql::runner::MySqlSourceConfig {

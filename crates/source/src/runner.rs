@@ -283,6 +283,11 @@ impl WalSource {
                                 Classified::NamesParent { parent, key } => {
                                     pending.name_parent(parent, key)
                                 }
+                                Classified::NamesThrough {
+                                    parent,
+                                    field,
+                                    child_key,
+                                } => pending.name_through(parent, &field, child_key),
                                 Classified::Skip => {}
                             }
                             // A transaction large enough to matter is resolved in
@@ -402,34 +407,51 @@ impl WalSource {
             let specs = self.cfg.children.get(parent).cloned().unwrap_or_default();
             let cspec = specs
                 .iter()
-                .find(|s| s.schema == rel.schema && s.table == rel.name)
+                .find(|s| s.reads(&rel.schema, &rel.name))
                 .ok_or_else(|| {
                     SourceError::protocol(format!(
                         "child {}.{} has no matching children entry",
                         rel.schema, rel.name
                     ))
                 })?;
-            // the parent is located by the FOREIGN KEY value carried in the
-            // row; deletes only carry it under REPLICA IDENTITY FULL
-            let fk_idx =
-                super::docbuild::column_index(rel, &cspec.foreign_key).ok_or_else(|| {
-                    SourceError::protocol(format!(
-                        "fk column {} missing on {}.{}",
-                        cspec.foreign_key, rel.schema, rel.name
-                    ))
-                })?;
-            let fk_json = super::docbuild::convert_column_at(rel, fk_idx, incoming.tuple())
-                .protocol_ctx(|| "fk decode".into())?;
-            if fk_json.is_null() {
+            // Which half of a many-to-many relation this row is. The junction
+            // carries the parent's key and takes the direct path; the child
+            // carries only its own, and the junction is asked at commit.
+            let through_child = cspec
+                .through
+                .as_ref()
+                .filter(|_| cspec.schema == rel.schema && cspec.table == rel.name);
+            let column = match through_child {
+                Some(through) => &through.child_key,
+                None => &cspec.foreign_key,
+            };
+            // the value is read out of the row itself; deletes only carry it
+            // under REPLICA IDENTITY FULL, unless it is the key
+            let idx = super::docbuild::column_index(rel, column).ok_or_else(|| {
+                SourceError::protocol(format!(
+                    "column {column} missing on {}.{}",
+                    rel.schema, rel.name
+                ))
+            })?;
+            let value = super::docbuild::convert_column_at(rel, idx, incoming.tuple())
+                .protocol_ctx(|| "child key decode".into())?;
+            if value.is_null() {
                 return Err(SourceError::protocol(format!(
-                    "child row carries NULL {}; cannot locate parent. \
+                    "child row carries NULL {column}; cannot locate parent. \
                      Consider ALTER TABLE {}.{} REPLICA IDENTITY FULL",
-                    cspec.foreign_key, rel.schema, rel.name
+                    rel.schema, rel.name
                 )));
             }
-            return Ok(Classified::NamesParent {
-                parent: parent.clone(),
-                key: fk_json,
+            return Ok(match through_child {
+                Some(_) => Classified::NamesThrough {
+                    parent: parent.clone(),
+                    field: cspec.field.clone(),
+                    child_key: value,
+                },
+                None => Classified::NamesParent {
+                    parent: parent.clone(),
+                    key: value,
+                },
             });
         }
 
@@ -476,6 +498,13 @@ enum Classified {
         parent: (String, String),
         key: serde_json::Value,
     },
+    /// Not a document either, and it names no parent: a row of a many-to-many
+    /// child, whose parents the junction knows and the commit asks for.
+    NamesThrough {
+        parent: (String, String),
+        field: String,
+        child_key: serde_json::Value,
+    },
     Skip,
 }
 
@@ -502,6 +531,7 @@ async fn flush_pending(
     if pending.is_empty() {
         return Ok(());
     }
+    resolve_through(cfg, pending, admin).await?;
     for table in pending.tables() {
         let (mut emitted, named) = pending.take(&table);
         let specs = cfg.children.get(&table).cloned().unwrap_or_default();
@@ -545,6 +575,33 @@ async fn flush_pending(
         }
     }
     pending.clear_seen();
+    Ok(())
+}
+
+/// Turn the group's changed many-to-many child rows into the parents they
+/// belong to, before anything else is resolved.
+///
+/// One `SELECT DISTINCT` per through collection, whatever the transaction
+/// touched, and the answer merges into the parents the group already names — so
+/// a parent named by both a junction row and one of its child rows is still
+/// read once and its collections aggregated once.
+async fn resolve_through(
+    cfg: &WalSourceConfig,
+    pending: &mut crate::children::Pending,
+    admin: &tokio_postgres::Client,
+) -> Result<()> {
+    for ((table, field), child_keys) in pending.take_through() {
+        let Some(spec) = cfg
+            .children
+            .get(&table)
+            .and_then(|specs| specs.iter().find(|s| s.field == field))
+        else {
+            continue;
+        };
+        for key in crate::children::parents_through(admin, spec, &child_keys).await? {
+            pending.name_parent(table.clone(), key);
+        }
+    }
     Ok(())
 }
 

@@ -78,6 +78,7 @@ not expressions) — if you need those, you want Kafka.
 | Consistent initial load, then live streaming | ✅ |
 | Crash recovery with no data loss (`kill -9` safe) | ✅ verified by the e2e suite |
 | Nested child collections (one level) | ✅ PostgreSQL and MySQL/MariaDB; the parent document embeds child arrays, resolved once per collection per transaction, with their own `columns` / `exclude_columns` projection, or `single = true` to embed a 1:1 relation as an object |
+| Many-to-many children (`through`) | ✅ PostgreSQL and MySQL/MariaDB; a junction table is joined inside the same aggregation, and both the junction and the child are streamed |
 | Parent-child as a join field (`join`) | ✅ OpenSearch and Elasticsearch; shared index, per-document routing, parent delete cascades to its children |
 | Per-document routing from a column (`routing = "tenant_id"`) | ✅ OpenSearch and Elasticsearch; co-locates a tenant on one shard; a changed value moves the document; non-key columns need `REPLICA IDENTITY FULL` |
 | One index fed by several tables | ✅ each section declares an explicit id; reconcile refuses it, a TRUNCATE is skipped and counted |
@@ -117,6 +118,9 @@ Stated up front, because finding these out in production is expensive:
 - **Poll mode cannot see a hard delete.** It has no access to the replication
   log. A soft delete it can see (`soft_delete`), and `pg2osync reconcile`
   removes index documents whose row is gone.
+- **A many-to-many relation embeds through its junction table**: `through` adds
+  one join inside the same aggregation, so the array is read the way any other
+  child collection is.
 - **Nested children are one level deep**, re-fetched once per collection per
   transaction rather than per changed row, ordered by the child's primary key.
   `max_rows` bounds a collection, and a document whose array was cut says so.

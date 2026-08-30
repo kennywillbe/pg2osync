@@ -13,7 +13,7 @@
 //! answer it differently.
 
 pub use pg2osync_core::children::{
-    ChildSpec, Duplicates, Pending, UNBOUNDED_ARRAY_WARNING, apply_collection, key_lookup,
+    ChildSpec, Duplicates, Pending, Through, UNBOUNDED_ARRAY_WARNING, apply_collection, key_lookup,
     keys_needing_refetch,
 };
 
@@ -47,6 +47,18 @@ pub async fn resolve_order(spec: &mut ChildSpec, client: &Client) -> Result<()> 
              read returns and may differ between the initial load and a later re-fetch",
             spec.qualified());
     }
+    let qualified = spec.qualified();
+    if let Some(through) = &mut spec.through {
+        let [child_key] = info.pk_columns.as_slice() else {
+            return Err(SourceError::Config(format!(
+                "[[sync.*.children]] {qualified} is reached through {}, so it needs a \
+                 single-column primary key for the junction to point at; it has {}",
+                through.qualified(),
+                info.pk_columns.len()
+            )));
+        };
+        through.child_key = child_key.clone();
+    }
     spec.order_by = info.pk_columns;
     Ok(())
 }
@@ -58,12 +70,29 @@ pub async fn resolve_order(spec: &mut ChildSpec, client: &Client) -> Result<()> 
 /// cannot disagree about what a child array contains — a disagreement is
 /// invisible until someone re-snapshots.
 pub fn agg_subquery(spec: &ChildSpec, filter: Option<&str>) -> String {
-    let fk = pg_quote_ident(&spec.foreign_key);
+    let fk = fk_ref(spec);
     let ordered = if spec.order_by.is_empty() {
         String::new()
     } else {
-        let cols: Vec<String> = spec.order_by.iter().map(|c| pg_quote_ident(c)).collect();
+        let cols: Vec<String> = spec
+            .order_by
+            .iter()
+            .map(|c| format!("t.{}", pg_quote_ident(c)))
+            .collect();
         format!(" ORDER BY {}", cols.join(", "))
+    };
+    // A many-to-many collection is this same aggregation with one more join:
+    // the junction holds the parent's key, and nothing else about the read —
+    // cap, count, order, projection — changes.
+    let join = match &spec.through {
+        Some(through) => format!(
+            " JOIN {}.{} j ON j.{} = t.{}",
+            pg_quote_ident(&through.schema),
+            pg_quote_ident(&through.table),
+            pg_quote_ident(&through.through_key),
+            pg_quote_ident(&through.child_key),
+        ),
+        None => String::new(),
     };
     // The total is counted before the cap applies, so a truncated document
     // can say how many there really are rather than only that it was cut.
@@ -78,7 +107,7 @@ pub fn agg_subquery(spec: &ChildSpec, filter: Option<&str>) -> String {
         "SELECT {fk} AS k, {element} AS doc, \
          row_number() OVER (PARTITION BY {fk}{ordered}) AS rn, \
          count(*) OVER (PARTITION BY {fk}) AS total \
-         FROM {}.{} t{where_clause}",
+         FROM {}.{} t{join}{where_clause}",
         pg_quote_ident(&spec.schema),
         pg_quote_ident(&spec.table),
         element = element_expr(spec),
@@ -132,7 +161,7 @@ pub async fn fetch_many(
     if keys.is_empty() {
         return Ok(HashMap::new());
     }
-    let (predicate, param) = any_predicate(&pg_quote_ident(&spec.foreign_key), keys);
+    let (predicate, param) = any_predicate(&fk_ref(spec), keys);
     // to_jsonb of the key rather than its text: the caller matches on the
     // JSON form, so a number and its rendering cannot drift apart
     let sql = format!(
@@ -151,6 +180,17 @@ pub async fn fetch_many(
         out.insert(key, (agg, total));
     }
     Ok(out)
+}
+
+/// The parent key as the aggregation refers to it, qualified by the table that
+/// holds it.
+///
+/// Qualified even without a junction: a child table with a column named like the
+/// parent's key would otherwise make the predicate ambiguous the moment a join
+/// stands beside it.
+fn fk_ref(spec: &ChildSpec) -> String {
+    let alias = if spec.through.is_some() { "j" } else { "t" };
+    format!("{alias}.{}", pg_quote_ident(&spec.foreign_key))
 }
 
 fn any_predicate(
@@ -295,6 +335,40 @@ pub async fn refetch_parents(
         .collect())
 }
 
+/// The parents a group of changed child rows belongs to, in one query.
+///
+/// A row of a through collection's child table names no parent — the junction
+/// is what does — so the transaction's distinct child keys are resolved once, at
+/// commit, and merged into the parents the group already names. One query per
+/// collection, whatever the transaction touched.
+pub async fn parents_through(
+    client: &Client,
+    spec: &ChildSpec,
+    child_keys: &[Value],
+) -> Result<Vec<Value>> {
+    let Some(through) = &spec.through else {
+        return Ok(Vec::new());
+    };
+    if child_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (predicate, param) = any_predicate(
+        &format!("j.{}", pg_quote_ident(&through.through_key)),
+        child_keys,
+    );
+    let sql = format!(
+        "SELECT DISTINCT to_jsonb(j.{}) FROM {}.{} j WHERE {predicate}",
+        pg_quote_ident(&spec.foreign_key),
+        pg_quote_ident(&through.schema),
+        pg_quote_ident(&through.table),
+    );
+    let rows = client
+        .query(&sql, &[param.as_ref()])
+        .await
+        .catalog_ctx(|| format!("junction lookup failed for {}", through.qualified()))?;
+    Ok(rows.into_iter().map(|r| r.get(0)).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,7 +424,7 @@ mod tests {
         let mut spec = ChildSpec::new("public.orders", "orders", "customer_id", "id").unwrap();
         let plain = agg_subquery(&spec, None);
         assert!(
-            !plain.contains("PARTITION BY \"customer_id\" ORDER BY") && !plain.contains("rn <="),
+            !plain.contains("PARTITION BY t.\"customer_id\" ORDER BY") && !plain.contains("rn <="),
             "nothing to order by and no cap set: {plain}"
         );
 
@@ -358,12 +432,12 @@ mod tests {
         spec.max_rows = Some(10);
         let capped = agg_subquery(&spec, None);
         assert!(
-            capped.contains("PARTITION BY \"customer_id\" ORDER BY \"id\""),
+            capped.contains("PARTITION BY t.\"customer_id\" ORDER BY t.\"id\""),
             "the kept rows must be the same ones twice running: {capped}"
         );
         assert!(capped.contains("r.rn <= 10"), "{capped}");
         assert!(
-            capped.contains("count(*) OVER (PARTITION BY \"customer_id\")"),
+            capped.contains("count(*) OVER (PARTITION BY t.\"customer_id\")"),
             "the total is counted before the cap, so a cut document can say how \
              many there really are: {capped}"
         );
@@ -392,7 +466,7 @@ mod tests {
             "names are literals, columns are identifiers: {listed}"
         );
         assert!(
-            listed.contains("PARTITION BY \"customer_id\" ORDER BY \"id\""),
+            listed.contains("PARTITION BY t.\"customer_id\" ORDER BY t.\"id\""),
             "the key is read beside the element, so it need not be in it: {listed}"
         );
 
@@ -403,7 +477,72 @@ mod tests {
             excluded.contains("to_jsonb(t) - ARRAY['internal_notes']::text[] AS doc"),
             "{excluded}"
         );
-        assert!(excluded.contains("count(*) OVER (PARTITION BY \"customer_id\")"));
+        assert!(excluded.contains("count(*) OVER (PARTITION BY t.\"customer_id\")"));
+    }
+
+    fn through_spec() -> ChildSpec {
+        let mut spec = ChildSpec::new("public.authors", "authors", "book_id", "id").unwrap();
+        let mut through = Through::new("public.book_author", "author_id").unwrap();
+        through.child_key = "id".into();
+        spec.through = Some(through);
+        spec.order_by = vec!["id".into()];
+        spec
+    }
+
+    #[test]
+    fn a_many_to_many_collection_is_the_same_aggregation_with_one_join() {
+        let sql = agg_subquery(&through_spec(), None);
+        assert!(
+            sql.contains(
+                "FROM \"public\".\"authors\" t JOIN \"public\".\"book_author\" j \
+                 ON j.\"author_id\" = t.\"id\""
+            ),
+            "the junction joins the child on the child's own key: {sql}"
+        );
+        assert!(
+            sql.contains("SELECT j.\"book_id\" AS k")
+                && sql.contains("PARTITION BY j.\"book_id\" ORDER BY t.\"id\"")
+                && sql.contains("count(*) OVER (PARTITION BY j.\"book_id\")"),
+            "the parent key comes off the junction, everywhere: {sql}"
+        );
+        assert!(
+            sql.contains("to_jsonb(t) AS doc")
+                && sql.contains("jsonb_agg(doc ORDER BY rn)")
+                && sql.contains("GROUP BY k"),
+            "the element and the aggregation are what they already were: {sql}"
+        );
+    }
+
+    #[test]
+    fn a_junction_keeps_the_cap_the_count_and_the_key_filter_inside() {
+        let mut spec = through_spec();
+        spec.max_rows = Some(3);
+        let sql = agg_subquery(&spec, Some("j.\"book_id\" = ANY($1::bigint[])"));
+        assert!(sql.contains("r.rn <= 3"), "{sql}");
+        let inner = sql
+            .find("FROM \"public\".\"authors\" t")
+            .expect("inner read");
+        assert!(
+            sql[inner..].contains("WHERE j.\"book_id\" = ANY"),
+            "the key filter reaches the innermost read, past the join: {sql}"
+        );
+        assert!(
+            sql.find("JOIN").expect("join") < sql.find("WHERE").expect("where"),
+            "the join comes before the predicate that uses it: {sql}"
+        );
+    }
+
+    #[test]
+    fn the_parent_key_is_qualified_by_the_table_that_holds_it() {
+        // Unqualified, a child column named like the parent's key makes the
+        // predicate ambiguous the moment a junction joins beside it — and the
+        // error is a failed query on every batch.
+        let mut spec = ChildSpec::new("public.orders", "orders", "customer_id", "id").unwrap();
+        assert_eq!(fk_ref(&spec), "t.\"customer_id\"");
+        let mut through = Through::new("public.book_author", "author_id").unwrap();
+        through.child_key = "id".into();
+        spec.through = Some(through);
+        assert_eq!(fk_ref(&spec), "j.\"customer_id\"");
     }
 
     #[test]

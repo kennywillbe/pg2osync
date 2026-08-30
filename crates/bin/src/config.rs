@@ -522,8 +522,18 @@ pub struct ChildJoin {
     pub table: String,
     /// Field name on the parent document holding the nested array.
     pub field: String,
-    /// FK column on the CHILD table referencing the parent PK.
+    /// Column holding the parent's key: on the CHILD table, or — where
+    /// `through` is set — on the junction, which is what carries it there.
     pub foreign_key: String,
+    /// Schema-qualified junction table of a many-to-many relation.
+    ///
+    /// The child rows are still what gets embedded; the junction only says
+    /// which parent each of them belongs to, and contributes no field.
+    #[serde(default)]
+    pub through: Option<String>,
+    /// Junction column referencing the CHILD's primary key.
+    #[serde(default)]
+    pub through_key: Option<String>,
     /// How many children to embed. Unset embeds all of them.
     ///
     /// Unset by default because a cap loses data and the target already has the
@@ -1039,6 +1049,38 @@ impl AppConfig {
                 if child.columns.as_ref().is_some_and(|c| c.is_empty()) {
                     anyhow::bail!("[{child_key}] columns must not be empty");
                 }
+                match (&child.through, &child.through_key) {
+                    (Some(through), Some(_)) => {
+                        if !is_qualified_table(through) {
+                            anyhow::bail!(
+                                "[{child_key}] through table {through:?} must be \
+                                 schema-qualified"
+                            );
+                        }
+                        // the junction is a third table by definition: pointed
+                        // at either end of the relation it joins nothing
+                        if through == &child.table || through == &tbl.table {
+                            anyhow::bail!(
+                                "[{child_key}] through {through:?} is the same table as the \
+                                 {} it would join; a junction is a table of its own",
+                                if through == &child.table {
+                                    "child"
+                                } else {
+                                    "parent"
+                                }
+                            );
+                        }
+                    }
+                    (Some(_), None) => anyhow::bail!(
+                        "[{child_key}] through needs through_key: the junction column \
+                         referencing the child's primary key"
+                    ),
+                    (None, Some(_)) => anyhow::bail!(
+                        "[{child_key}] through_key needs through: without a junction there \
+                         is nothing for it to name"
+                    ),
+                    (None, None) => {}
+                }
                 if child.single && child.max_rows.is_some() {
                     anyhow::bail!(
                         "[{child_key}] single and max_rows contradict each other: a relation \
@@ -1135,6 +1177,7 @@ impl AppConfig {
             }
             targets.push((key.as_str(), target));
         }
+        check_junctions(self)?;
         check_template_claims(self, &targets)?;
         for (index, members) in &by_index {
             check_index_group(index, members)?;
@@ -1230,6 +1273,40 @@ impl SourceConfig {
 fn is_qualified_table(name: &str) -> bool {
     let parts: Vec<&str> = name.split('.').collect();
     parts.len() == 2 && parts.iter().all(|p| !p.is_empty())
+}
+
+/// One junction table belongs to one relation.
+///
+/// The streamed row of a junction is resolved through a single mapping from its
+/// table to the parent it feeds, so two sections naming the same junction with
+/// different parents — or the same parent through a different `foreign_key` —
+/// describe something the stream cannot represent: one of the two would win and
+/// the other would go stale without a word.
+fn check_junctions(cfg: &AppConfig) -> Result<()> {
+    let mut seen: std::collections::HashMap<&str, (&str, &str, &str)> =
+        std::collections::HashMap::new();
+    for (key, tbl) in &cfg.sync {
+        for child in &tbl.children {
+            let Some(through) = &child.through else {
+                continue;
+            };
+            let entry = (tbl.table.as_str(), child.foreign_key.as_str(), key.as_str());
+            match seen.get(through.as_str()) {
+                Some((table, foreign_key, first))
+                    if (*table, *foreign_key) != (entry.0, entry.1) =>
+                {
+                    anyhow::bail!(
+                        "[sync.{key}] junction {through} is already used by [sync.{first}]                          for {table} through {foreign_key}; one junction table names one                          parent, or a streamed junction row cannot say which"
+                    );
+                }
+                Some(_) => {}
+                None => {
+                    seen.insert(through.as_str(), entry);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A template is a claim on a whole namespace, so it cannot also be a shared
@@ -1937,6 +2014,67 @@ id = "user-{id}"
             cfg.sync["users"].children[0].fields["total"], "amount",
             "the child's fields attach to that child"
         );
+    }
+
+    #[test]
+    fn a_many_to_many_child_names_its_junction_and_both_of_its_columns() {
+        const M2M: &str = "[[sync.users.children]]\ntable = \"public.tags\"\n\
+                           field = \"tags\"\nforeign_key = \"user_id\"\n";
+        let refused = [
+            (
+                format!("{M2M}through = \"public.user_tag\"\n"),
+                "a junction with no column pointing at the child",
+            ),
+            (
+                format!("{M2M}through_key = \"tag_id\"\n"),
+                "a junction column with no junction",
+            ),
+            (
+                format!("{M2M}through = \"user_tag\"\nthrough_key = \"tag_id\"\n"),
+                "an unqualified junction",
+            ),
+            (
+                format!("{M2M}through = \"public.tags\"\nthrough_key = \"tag_id\"\n"),
+                "the child as its own junction",
+            ),
+            (
+                format!("{M2M}through = \"public.users\"\nthrough_key = \"tag_id\"\n"),
+                "the parent as the junction",
+            ),
+            (
+                format!(
+                    "{M2M}through = \"public.user_tag\"\nthrough_key = \"tag_id\"\n\
+                     [sync.other]\ntable = \"public.posts\"\n\
+                     [[sync.other.children]]\ntable = \"public.tags\"\nfield = \"tags\"\n\
+                     foreign_key = \"post_id\"\nthrough = \"public.user_tag\"\n\
+                     through_key = \"tag_id\"\n"
+                ),
+                "one junction naming two parents: a streamed junction row could \
+                 not say which",
+            ),
+        ];
+        for (extra, why) in refused {
+            assert!(parse(&format!("{MINIMAL}{extra}")).is_err(), "{why}");
+        }
+
+        let cfg = parse(&format!(
+            "{MINIMAL}{M2M}through = \"public.user_tag\"\nthrough_key = \"tag_id\"\n\
+             max_rows = 5\nsingle = false\n"
+        ))
+        .expect("a many-to-many child parses, cap and all");
+        let child = &cfg.sync["users"].children[0];
+        assert_eq!(child.through.as_deref(), Some("public.user_tag"));
+        assert_eq!(child.through_key.as_deref(), Some("tag_id"));
+        assert_eq!(
+            child.foreign_key, "user_id",
+            "the foreign key keeps its name and changes its home"
+        );
+        parse(&format!(
+            "{MINIMAL}[[sync.users.children]]\ntable = \"public.tags\"\nfield = \"tag\"\n\
+             foreign_key = \"user_id\"\nthrough = \"public.user_tag\"\n\
+             through_key = \"tag_id\"\nsingle = true\n"
+        ))
+        .expect("a one-to-one relation may still be recorded in a junction");
     }
 
     #[test]

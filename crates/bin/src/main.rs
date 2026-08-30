@@ -571,11 +571,17 @@ fn setup_sql(path: &Path) -> Result<()> {
     }
 
     let mut tables: Vec<String> = cfg.sync.values().map(|t| t.table.clone()).collect();
-    // child tables are read by the initial load too, so they need the grant
+    // child tables are read by the initial load too, and a junction is read by
+    // every aggregation over the collection it joins, so both need the grant
     for table in cfg.sync.values() {
         for child in &table.children {
-            if !tables.contains(&child.table) {
-                tables.push(child.table.clone());
+            for name in [Some(&child.table), child.through.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                if !tables.contains(name) {
+                    tables.push(name.clone());
+                }
             }
         }
     }
@@ -1178,12 +1184,127 @@ async fn report_client_certificate(
     }
 }
 
+/// One column as a join has to compare it: its name, its type, and the family
+/// that type belongs to.
+#[derive(Clone)]
+struct JoinColumn {
+    name: String,
+    type_name: String,
+    category: char,
+}
+
+/// What a junction adds to the child check.
+///
+/// Gathered by whichever source `validate` is talking to, so the check itself
+/// stays one function that both of them run.
+#[derive(Default)]
+struct Junction {
+    qualified: String,
+    columns: Vec<JoinColumn>,
+    /// The parent column the junction's `foreign_key` has to compare against.
+    parent_key: Option<JoinColumn>,
+    /// The child's primary key, which is what `through_key` points at.
+    child_key: Vec<JoinColumn>,
+    /// Whether an index leads with `through_key`, which is what a changed child
+    /// row is looked back up by.
+    leading_index_on_through_key: bool,
+}
+
+/// Whether two columns can be joined on at all.
+///
+/// Compared by family rather than by type, because `int4` against `int8` is
+/// fine and `text` against `int` is not: the mismatch does not fail the query
+/// on every server, it silently matches nothing, and the only symptom is an
+/// array that is always empty.
+fn joinable(left: &JoinColumn, right: &JoinColumn) -> bool {
+    left.category == right.category
+}
+
+/// The junction half of the child check: that the join can be made, and that
+/// the lookups it costs are indexed.
+fn check_through(child: &config::ChildJoin, junction: &Junction) -> Result<()> {
+    let Some(through_key) = &child.through_key else {
+        return Ok(());
+    };
+    let named = |name: &str| junction.columns.iter().find(|c| c.name == name);
+    let (Some(foreign_key), Some(through)) = (named(&child.foreign_key), named(through_key)) else {
+        bail!(
+            "junction {} has no column(s) {}; with `through` set, foreign_key and \
+             through_key are columns of the junction, not of {}",
+            junction.qualified,
+            [child.foreign_key.as_str(), through_key.as_str()]
+                .into_iter()
+                .filter(|n| named(n).is_none())
+                .collect::<Vec<_>>()
+                .join(", "),
+            child.table
+        );
+    };
+    let [child_key] = junction.child_key.as_slice() else {
+        bail!(
+            "child {} is reached through {}, so it needs a single-column primary key \
+             for {through_key} to point at; it has {}",
+            child.table,
+            junction.qualified,
+            junction.child_key.len()
+        );
+    };
+    if let Some(parent_key) = &junction.parent_key
+        && !joinable(foreign_key, parent_key)
+    {
+        bail!(
+            "junction column {}.{} is {} and the parent key it references is {}; \
+             the two do not compare, so every embedded array would be empty",
+            junction.qualified,
+            foreign_key.name,
+            foreign_key.type_name,
+            parent_key.type_name
+        );
+    }
+    if !joinable(through, child_key) {
+        bail!(
+            "junction column {}.{} is {} and {}.{} is {}; the two do not compare, \
+             so every embedded array would be empty",
+            junction.qualified,
+            through.name,
+            through.type_name,
+            child.table,
+            child_key.name,
+            child_key.type_name
+        );
+    }
+    if !junction.leading_index_on_through_key {
+        println!(
+            "! no index on {}({}): a changed row of {} is looked back up by it, \
+             which without one scans the junction",
+            junction.qualified, through.name, child.table
+        );
+    }
+    println!(
+        "✓ child {} through {} ({} → parent, {} → {}.{})",
+        child.table,
+        junction.qualified,
+        foreign_key.name,
+        through.name,
+        child.table,
+        child_key.name
+    );
+    Ok(())
+}
+
 /// The same check for one child collection, against the child table's columns.
 ///
 /// A child's projection and renames name columns of the *child* table, which the
 /// parent's check never sees; without this a `columns` list that outlived a
 /// dropped column would quietly shrink every embedded element.
-fn check_child_columns(child: &config::ChildJoin, live: &[String]) -> Result<()> {
+fn check_child_columns(
+    child: &config::ChildJoin,
+    live: &[String],
+    junction: Option<&Junction>,
+) -> Result<()> {
+    if let Some(junction) = junction {
+        check_through(child, junction)?;
+    }
     let missing = |names: &[String]| -> Vec<String> {
         names
             .iter()
@@ -1234,6 +1355,81 @@ fn check_child_columns(child: &config::ChildJoin, live: &[String]) -> Result<()>
         }
     }
     Ok(())
+}
+
+/// One table's columns as `check_through` compares them.
+async fn pg_columns(client: &tokio_postgres::Client, qualified: &str) -> Result<Vec<JoinColumn>> {
+    Ok(client
+        .query(
+            "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod), \
+                    t.typcategory::text \
+             FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid \
+             WHERE a.attrelid = to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped \
+             ORDER BY a.attnum",
+            &[&qualified],
+        )
+        .await?
+        .iter()
+        .map(|r| {
+            let category: String = r.get(2);
+            JoinColumn {
+                name: r.get(0),
+                type_name: r.get(1),
+                category: category.chars().next().unwrap_or('?'),
+            }
+        })
+        .collect())
+}
+
+/// What PostgreSQL knows about a many-to-many child's junction.
+async fn pg_junction(
+    client: &tokio_postgres::Client,
+    table: &config::TableSync,
+    child: &config::ChildJoin,
+) -> Result<Option<Junction>> {
+    let (Some(qualified), Some(through_key)) = (&child.through, &child.through_key) else {
+        return Ok(None);
+    };
+    let columns = pg_columns(client, qualified).await?;
+    if columns.is_empty() {
+        bail!("through table {qualified} does not exist");
+    }
+    let parent_key_name = table.primary_key.clone().unwrap_or_else(|| "id".into());
+    let parent_key = pg_columns(client, &table.table)
+        .await?
+        .into_iter()
+        .find(|c| c.name == parent_key_name);
+    let (schema, name) = child
+        .table
+        .split_once('.')
+        .context("child table must be schema-qualified")?;
+    let pk_columns = pg2osync_source::catalog::table_info(client, schema, name)
+        .await?
+        .pk_columns;
+    let child_columns = pg_columns(client, &child.table).await?;
+    let child_key = child_columns
+        .into_iter()
+        .filter(|c| pk_columns.contains(&c.name))
+        .collect();
+    // indkey[0] is the leading column: an index the lookup can descend, rather
+    // than any index the column happens to appear in
+    let leading_index_on_through_key = client
+        .query_opt(
+            "SELECT 1 FROM pg_index i \
+             WHERE i.indrelid = to_regclass($1) \
+               AND i.indkey[0] = (SELECT a.attnum FROM pg_attribute a \
+                                  WHERE a.attrelid = to_regclass($1) AND a.attname = $2)",
+            &[qualified, through_key],
+        )
+        .await?
+        .is_some();
+    Ok(Some(Junction {
+        qualified: qualified.clone(),
+        columns,
+        parent_key,
+        child_key,
+        leading_index_on_through_key,
+    }))
 }
 
 async fn validate_postgres(cfg: &config::AppConfig, source_url: &str) -> Result<()> {
@@ -1338,8 +1534,12 @@ async fn validate_postgres(cfg: &config::AppConfig, source_url: &str) -> Result<
             if child_live.is_empty() {
                 bail!("child table {} does not exist", child.table);
             }
-            check_child_columns(child, &child_live)?;
+            let junction = pg_junction(&client, table, child).await?;
+            check_child_columns(child, &child_live, junction.as_ref())?;
             tables.push(child.table.clone());
+            if let Some(through) = &child.through {
+                tables.push(through.clone());
+            }
         }
     }
 
@@ -1409,6 +1609,80 @@ async fn report_privileges(
     bail!("insufficient privileges to bootstrap; see the statements above")
 }
 
+/// A MySQL column as `check_through` compares it.
+///
+/// The family comes from the shape the rest of the pipeline already decided,
+/// rather than from a second reading of `information_schema`: a column joins
+/// against another one exactly when the two mean the same kind of value.
+fn mysql_join_column(column: &pg2osync_source_mysql::catalog::Column) -> JoinColumn {
+    use pg2osync_source_mysql::typemap::ValueShape;
+    let (type_name, category) = match &column.shape {
+        ValueShape::Int => ("integer", 'N'),
+        ValueShape::Float => ("floating point", 'N'),
+        ValueShape::Decimal => ("decimal", 'N'),
+        ValueShape::Bits => ("bit", 'N'),
+        ValueShape::Bytes => ("binary", 'B'),
+        ValueShape::Text => ("text", 'S'),
+        ValueShape::Json => ("json", 'S'),
+        ValueShape::Enum(_) => ("enum", 'S'),
+        ValueShape::Set(_) => ("set", 'S'),
+    };
+    JoinColumn {
+        name: column.name.clone(),
+        type_name: type_name.into(),
+        category,
+    }
+}
+
+/// What MySQL knows about a many-to-many child's junction.
+async fn mysql_junction(
+    admin: &mut pg2osync_source_mysql::connection::MySqlConnection,
+    table: &config::TableSync,
+    child: &config::ChildJoin,
+    child_live: &pg2osync_source_mysql::catalog::TableSchema,
+) -> Result<Option<Junction>> {
+    let (Some(qualified), Some(through_key)) = (&child.through, &child.through_key) else {
+        return Ok(None);
+    };
+    let (schema, name) = qualified
+        .split_once('.')
+        .context("through table must be written as database.table for MySQL")?;
+    // keyless_ok: a junction is keyed by the pair, and nothing here addresses
+    // one of its rows
+    let junction = pg2osync_source_mysql::catalog::table_schema(admin, schema, name, true).await?;
+    let (pschema, pname) = table
+        .table
+        .split_once('.')
+        .context("table must be written as database.table for MySQL")?;
+    let parent = pg2osync_source_mysql::catalog::table_schema(admin, pschema, pname, true).await?;
+    let parent_key_name = table.primary_key.clone().unwrap_or_else(|| "id".into());
+    let leading = admin
+        .query_text_rows(&format!(
+            "SELECT 1 FROM information_schema.statistics WHERE table_schema = {} \
+             AND table_name = {} AND seq_in_index = 1 AND column_name = {}",
+            pg2osync_source_mysql::catalog::quote_str(schema),
+            pg2osync_source_mysql::catalog::quote_str(name),
+            pg2osync_source_mysql::catalog::quote_str(through_key),
+        ))
+        .await?;
+    Ok(Some(Junction {
+        qualified: qualified.clone(),
+        columns: junction.columns.iter().map(mysql_join_column).collect(),
+        parent_key: parent
+            .columns
+            .iter()
+            .find(|c| c.name == parent_key_name)
+            .map(mysql_join_column),
+        child_key: child_live
+            .columns
+            .iter()
+            .filter(|c| child_live.pk_columns.contains(&c.name))
+            .map(mysql_join_column)
+            .collect(),
+        leading_index_on_through_key: !leading.is_empty(),
+    }))
+}
+
 async fn validate_mysql(cfg: &config::AppConfig, source_url: &str) -> Result<()> {
     let source = mysql_source(cfg, source_url)?;
     let mut admin = source.admin_connection().await?;
@@ -1443,7 +1717,8 @@ async fn validate_mysql(cfg: &config::AppConfig, source_url: &str) -> Result<()>
             let child_live =
                 pg2osync_source_mysql::catalog::table_schema(&mut admin, cschema, cname, false)
                     .await?;
-            check_child_columns(child, &child_live.column_names())?;
+            let junction = mysql_junction(&mut admin, table, child, &child_live).await?;
+            check_child_columns(child, &child_live.column_names(), junction.as_ref())?;
         }
         if table.append_only {
             println!(

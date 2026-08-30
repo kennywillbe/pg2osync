@@ -708,6 +708,28 @@ promise, so a re-snapshot embeds the same row rather than rewriting the document
 No metric counts it: neither source crate holds a `Metrics` handle, and a warning
 already names what to fix.
 
+**A many-to-many child is one more join inside the same builder.** `through`
+names a junction table and changes nothing else: the aggregation gains
+`JOIN junction j ON j.<through_key> = t.<child primary key>` and keys on
+`j.<foreign_key>` instead of on a column of the child. The cap, the count taken
+before the cap, the order by the child's primary key, `_truncated`/`_total`, the
+projection and `single` are the same expressions they already were, in the one
+builder each source has — a second builder for the many-to-many case is what
+would let the initial load and a streamed re-fetch embed different arrays. It is
+not a second level of nesting either: the document shape is unchanged and the
+junction contributes no field of its own.
+
+Both the junction and the child are streamed, because each carries half the
+answer. A junction row *is* the relation, so it names the parent through its
+`foreign_key` and takes the path a child row already takes today. A child row
+does not name a parent at all — the row that would is one table away — so the
+transaction's distinct child keys are turned into parent keys at commit by one
+`SELECT DISTINCT j.<foreign_key> … WHERE j.<through_key> = ANY(…)` per
+collection, and merged into the same named set. Everything downstream is
+unchanged, so one parent read and one aggregation per collection per transaction
+still hold; folding that lookup into the parent re-fetch instead would read a
+parent twice whenever a junction row and one of its child rows changed together.
+
 ## Checkpoints
 
 **State lives in the target.** A hidden `.pg2osync_meta` index holds one
