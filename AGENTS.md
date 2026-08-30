@@ -60,6 +60,8 @@ cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ./dev/e2e-test.sh          # when the pipeline changed
+./dev/e2e-mysql-test.sh    # when the MySQL source, the engine or a sink changed
+./dev/failover-probe.sh    # when the MySQL checkpoint or version logic changed
 ```
 
 Every bug fix ships with a regression test that fails without the fix. For
