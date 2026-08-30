@@ -84,6 +84,8 @@ Key values:
 | `metrics.serviceMonitor.enabled` | `false` | Needs the Prometheus Operator CRDs |
 | `grafanaDashboard.enabled` | `false` | Ships `deploy/grafana/pg2osync.json` as a ConfigMap the Grafana sidecar picks up |
 | `probes.startup.failureThreshold` | `60` | 10 minutes of initial load headroom |
+| `probes.readiness.enabled` | `true` | Readiness on `/healthz`, same port as liveness |
+| `podDisruptionBudget.enabled` | `false` | With `maxUnavailable: 0`, blocks voluntary evictions |
 
 `config.sync` is intentionally empty in the chart defaults: Helm merges maps, so
 a default table would survive your override and sync a table you never asked
@@ -129,6 +131,7 @@ What they set up:
 | `deployment.yaml` | one replica, `Recreate` strategy, non-root, read-only rootfs |
 | `service.yaml` | headless service exposing the metrics port |
 | `servicemonitor.yaml` | Prometheus Operator scrape config (optional) |
+| `poddisruptionbudget.yaml` | Blocks voluntary evictions (optional) |
 
 Before applying either variant:
 
@@ -151,6 +154,28 @@ The startup probe allows up to ten minutes because the initial load of a large
 table happens before the pipeline reaches its steady state. Raise
 `failureThreshold` if your initial load takes longer — a liveness probe alone
 would restart the pod mid-load, forever.
+
+The readiness probe hits the same endpoint. Be honest about what it proves:
+`/healthz` answers `200` as soon as the metrics listener binds, and that happens
+before the initial load runs, so readiness means "the process is up and its port
+answers", not "the checkpoint is loaded". It is still worth having. The pod
+stays out of the Service endpoints while it is starting, failing or shutting
+down, so a Prometheus scrape or a `port-forward` never resolves to a socket
+nobody is listening on, and a rollout does not report itself complete until the
+new pod answers. Set `probes.readiness.enabled: false` if you would rather the
+endpoint exist unconditionally.
+
+### PodDisruptionBudget
+
+`podDisruptionBudget.enabled` (default `false`) renders a `policy/v1`
+PodDisruptionBudget selecting the same pod as the Deployment, with
+`maxUnavailable: 0` — or `minAvailable`, if you set that instead. With a single
+replica, `maxUnavailable: 0` refuses every voluntary eviction: a node drain
+stops and waits rather than moving a pipeline mid-transaction. That is the
+point, and it is also the cost — the drain hangs until somebody deletes the pod
+or disables the budget, so enable it only where an operator is watching. The
+plain manifests ship the same object in `poddisruptionbudget.yaml`, left out of
+the Kustomization until you uncomment it.
 
 ### Verifying a rollout
 

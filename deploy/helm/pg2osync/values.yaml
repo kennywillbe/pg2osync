@@ -113,6 +113,18 @@ probes:
     enabled: true
     periodSeconds: 30
     failureThreshold: 3
+  # What "ready" means here: /healthz answers 200 as soon as the metrics
+  # listener binds, which happens before the initial load runs, so readiness
+  # reports "the process is up and its port answers", not "the checkpoint is
+  # loaded". It is still worth having on the headless metrics Service: the pod
+  # is out of the endpoint list while it is starting, failing or shutting down,
+  # so nothing resolving the Service — a Prometheus scrape, a port-forward —
+  # lands on a socket nobody is listening on, and a rollout does not count the
+  # new pod as up until it answers.
+  readiness:
+    enabled: true
+    periodSeconds: 10
+    failureThreshold: 3
 
 resources:
   requests:
@@ -148,6 +160,17 @@ persistence:
 # pod actually mounts the volume.
 extraVolumes: []
 extraVolumeMounts: []
+
+# With one replica, maxUnavailable: 0 refuses every voluntary eviction: a node
+# drain hangs until someone deletes the pod or disables this. That is the point
+# for a pipeline you would rather move deliberately than have a cluster upgrade
+# move for you — and it is also the cost, so it is off by default rather than a
+# surprise the first drain teaches you. Set minAvailable or maxUnavailable, not
+# both.
+podDisruptionBudget:
+  enabled: false
+  maxUnavailable: 0
+  # minAvailable: 1
 
 nodeSelector: {}
 tolerations: []

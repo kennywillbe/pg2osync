@@ -9,6 +9,7 @@ resources:
   - deployment.yaml
   - service.yaml
   # - servicemonitor.yaml   # needs the Prometheus Operator CRDs
+  # - poddisruptionbudget.yaml   # blocks node drains until you move the pod
 
 images:
   - name: ghcr.io/kennywillbe/pg2osync
