@@ -2100,5 +2100,155 @@ for _ in $(seq 1 30); do refresh; [ "$(os_count e2e_routing)" = "0" ] && break; 
 check "a TRUNCATE clears the index whatever the documents were routed by" "$(os_count e2e_routing)" "0"
 stop_sync
 
+echo -e "\n\033[1m== 30. a rebuild into a fresh index, then the alias onto it ==\033[0m"
+# A mapping cannot change on a live index, so a rebuild is a new index and an
+# alias flip (#107). What has to hold: the fresh index is created with the
+# mapping the section names *now*, the count is checked against the source,
+# the checkpoint does not move — so the restart replays what changed while the
+# pipeline was stopped — and the command refuses everything it cannot do
+# safely, a live stream first among them.
+XCONFIG=$(mktemp /tmp/pg2osync-e2e-reindex.XXXXXX)
+XMAPPING=$(dirname "$XCONFIG")/pg2osync-e2e-reindex-mapping.json
+XSLOT=pg2osync_e2e_reindex
+XALIAS=e2e_reindex_live
+drop_idle_probe_slots
+cat > "$XCONFIG" <<TOML
+[source]
+url_env = "PG2OSYNC_SOURCE_URL"
+slot_name = "$XSLOT"
+publication = "${XSLOT}_pub"
+
+[target]
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
+
+[metrics]
+bind = "127.0.0.1:9132"
+
+[sync.reindex]
+table = "public.reindex_probe"
+index = "e2e_reindex"
+mapping_file = "pg2osync-e2e-reindex-mapping.json"
+TOML
+cat > "$XMAPPING" <<'JSON'
+{ "mappings": { "properties": { "v": { "type": "text" } } } }
+JSON
+# a wildcard DELETE is refused by both targets by default, so the rebuilt
+# indices are named one at a time
+drop_reindex_indices() {
+  for name in $(curl -s "$OS/_cat/indices/e2e_reindex*?h=index" 2> /dev/null); do
+    curl -s -XDELETE "$OS/$name" > /dev/null 2>&1 || true
+  done
+}
+reindex_cleanup() {
+  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  pg "SELECT pg_drop_replication_slot('$XSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$XSLOT');" > /dev/null 2>&1 || true
+  pg "DROP PUBLICATION IF EXISTS ${XSLOT}_pub; DROP TABLE IF EXISTS reindex_probe;" > /dev/null 2>&1 || true
+  drop_reindex_indices
+  rm -f "$XCONFIG" "$XMAPPING" "${XCONFIG}.new"
+}
+trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup; init_cleanup; fan_cleanup; bid_cleanup; shape_cleanup; where_cleanup; join_cleanup; union_cleanup; events_cleanup; pipe_cleanup; append_cleanup; routing_cleanup; reindex_cleanup' EXIT
+
+pg "DROP TABLE IF EXISTS reindex_probe; CREATE TABLE reindex_probe(id bigint primary key, v text);" > /dev/null 2>&1
+pg "INSERT INTO reindex_probe VALUES (1,'one'),(2,'two'),(3,'three');" > /dev/null
+pg "DROP PUBLICATION IF EXISTS ${XSLOT}_pub; CREATE PUBLICATION ${XSLOT}_pub FOR TABLE reindex_probe;" > /dev/null 2>&1
+drop_reindex_indices
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/postgres-$XSLOT" > /dev/null
+
+nohup $BIN run -c "$XCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_count e2e_reindex)" = "3" ] && break
+  sleep 1
+done
+check "the original index is loaded" "$(os_count e2e_reindex)" "3"
+
+# a rebuild beside a running pipeline would fill an index the stream is not
+# writing to, so a row changing under it would be wrong there for good
+refusal=$($BIN reindex -c "$XCONFIG" --table public.reindex_probe --alias "$XALIAS" 2>&1 || true)
+case "$refusal" in
+  *"$XSLOT"*"reader attached"*) ok "a rebuild refuses while the pipeline is running, naming the slot" ;;
+  *) bad "a rebuild ran beside a live stream: $refusal" ;;
+esac
+stop_sync
+
+# the mapping the rebuild has to pick up: v is a keyword from here on, which
+# is the change no live index would accept
+cat > "$XMAPPING" <<'JSON'
+{ "mappings": { "properties": { "v": { "type": "keyword" } } } }
+JSON
+ckpt_before=$(curl -s "$OS/.pg2osync_meta/_doc/postgres-$XSLOT" | jqf "d['_source']['position']")
+
+out=$($BIN reindex -c "$XCONFIG" --table public.reindex_probe --alias "$XALIAS" 2>&1)
+echo "$out" >> "$LOG"
+new_index=$(curl -s "$OS/_alias/$XALIAS" | jqf "sorted(d.keys())[0] if d else 'none'")
+case "$new_index" in
+  e2e_reindex-*) ok "the rebuild created $new_index and the alias resolves to it" ;;
+  *) bad "the alias does not resolve to a rebuilt index (got '$new_index'): $out" ;;
+esac
+refresh
+check "the rebuilt index holds every row" "$(os_count "$new_index")" "$(pg 'SELECT count(*) FROM reindex_probe;')"
+check "the alias reads the rebuilt index" "$(os_count "$XALIAS")" "3"
+check "the rebuilt index took the new mapping" \
+  "$(curl -s "$OS/$new_index/_mapping" | jqf "d['$new_index']['mappings']['properties']['v']['type']")" "keyword"
+check "the checkpoint did not move" \
+  "$(curl -s "$OS/.pg2osync_meta/_doc/postgres-$XSLOT" | jqf "d['_source']['position']")" "$ckpt_before"
+check "the old index is kept as the rollback" "$(curl -s -o /dev/null -w '%{http_code}' "$OS/e2e_reindex")" "200"
+if grep -q "DELETE /e2e_reindex" <<< "$out"; then
+  ok "the output says how to remove the old index"
+else
+  bad "the output does not name the delete: $out"
+fi
+
+# The crux. A rebuild fills an index the stream is not writing to, so it can
+# only be as fresh as the moment the load read. What closes the gap is the
+# checkpoint standing still: the restart replays everything committed since.
+pg "UPDATE reindex_probe SET v='changed-while-stopped' WHERE id=1;" > /dev/null
+pg "INSERT INTO reindex_probe VALUES (4,'added-while-stopped');" > /dev/null
+refresh
+check "the rebuilt index cannot know about them yet" "$(os_field "$new_index" 1 v)" "one"
+sed "s#^index = \"e2e_reindex\"\$#index = \"$new_index\"#" "$XCONFIG" > "${XCONFIG}.new"
+nohup $BIN run -c "${XCONFIG}.new" >> "$LOG" 2>&1 < /dev/null & disown
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_status "$new_index" 4)" = "200" ] && break
+  sleep 1
+done
+check "the restart replays what changed while the pipeline was stopped" \
+  "$(os_field "$new_index" 1 v)" "changed-while-stopped"
+check "and what was inserted while it was stopped" "$(os_field "$new_index" 4 v)" "added-while-stopped"
+stop_sync
+
+# an alias points at one index, and a rebuild reads one table
+sed "s#^index = \"e2e_reindex\"\$#index = \"e2e_reindex_{id}\"#" "$XCONFIG" > "${XCONFIG}.new"
+refusal=$($BIN reindex -c "${XCONFIG}.new" --table public.reindex_probe --alias "$XALIAS" 2>&1 || true)
+case "$refusal" in
+  *"per row"*) ok "a rebuild refuses a templated index" ;;
+  *) bad "a templated index was accepted: $refusal" ;;
+esac
+cat "$XCONFIG" > "${XCONFIG}.new"
+cat >> "${XCONFIG}.new" <<'TOML'
+id = "p-{id}"
+
+[sync.reindex_two]
+table = "public.users"
+index = "e2e_reindex"
+id = "u-{id}"
+TOML
+refusal=$($BIN reindex -c "${XCONFIG}.new" --table public.reindex_probe --alias "$XALIAS" 2>&1 || true)
+case "$refusal" in
+  *"more than one table"*) ok "a rebuild refuses an index two tables feed" ;;
+  *) bad "a shared index was accepted: $refusal" ;;
+esac
+
+# --drop-old removes the index the alias came off; the default kept it above
+sed "s#^index = \"e2e_reindex\"\$#index = \"$new_index\"#" "$XCONFIG" > "${XCONFIG}.new"
+$BIN reindex -c "${XCONFIG}.new" --table public.reindex_probe --alias "$XALIAS" --drop-old >> "$LOG" 2>&1
+check "--drop-old removed the index the alias came off" \
+  "$(curl -s -o /dev/null -w '%{http_code}' "$OS/$new_index")" "404"
+newer_index=$(curl -s "$OS/_alias/$XALIAS" | jqf "sorted(d.keys())[0] if d else 'none'")
+refresh
+check "and the alias points at the newest rebuild" "$(os_count "$newer_index")" "4"
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

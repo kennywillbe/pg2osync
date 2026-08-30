@@ -130,9 +130,9 @@ Stated up front, because finding these out in production is expensive:
   `TRUNCATE` on one of its tables is skipped and logged rather than applied
   (a join pair clears its own relation).
 - **A per-row index (`index = "events-{tenant}"`) cannot be reconciled or
-  aliased.** `reconcile` and `switch-alias` refuse a templated table, and
-  Meilisearch refuses the template at startup: it has no mappings to create
-  an index with.
+  aliased.** `reconcile`, `switch-alias` and `reindex` refuse a templated
+  table, and Meilisearch refuses the template at startup: it has no mappings
+  to create an index with.
 - **MySQL needs `binlog_row_image = FULL`**, and refuses
   `binlog_row_value_options = PARTIAL_JSON`.
 - Ordering is guaranteed per row, not across tables.
@@ -304,6 +304,7 @@ needs no flag at all.
 | `resnapshot --table T` | Read one table again into its index, without reloading the rest |
 | `reconcile` | Name index documents whose row is gone; `--delete` removes them |
 | `rejects` | What the target refused, and `--replay` to submit it again |
+| `reindex --table T --alias A` | Rebuild the table's index under a fresh name and flip the alias onto it |
 | `switch-alias --alias A` | Point an alias at this config's index, atomically |
 | `drop-slot` | Drop the slot and publication when decommissioning |
 

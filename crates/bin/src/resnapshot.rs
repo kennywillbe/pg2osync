@@ -78,6 +78,51 @@ pub async fn run_for(
         .collect();
     sink.ensure_ready(&specs).await?;
 
+    let scope =
+        LoadScope::resnapshot(qualified_table, filter).with_table_filters(run::table_filters(cfg)?);
+    println!(
+        "re-reading {qualified_table} into {index}{}",
+        scope
+            .filter
+            .as_deref()
+            .map(|f| format!(" where {f}"))
+            .unwrap_or_default()
+    );
+    let started = std::time::Instant::now();
+    load_one(cfg, source_url, admin_url, sink.clone(), &scope).await?;
+
+    // `refresh_interval` is left alone throughout, unlike an initial load's:
+    // this repairs an index that is in use, and hiding its ordinary writes for
+    // the duration would be the wrong trade. One refresh at the end so whoever
+    // ran the command can see the result immediately. A templated table's rows
+    // landed wherever they rendered, so the glob is what gets refreshed.
+    if let Err(e) = sink.refresh(&[pattern]).await {
+        tracing::warn!(target: "pg2osync::resnapshot",
+            "the re-snapshot is written, but the index could not be refreshed, so it \
+             may not be searchable yet: {e}");
+    }
+    println!(
+        "re-snapshot of {qualified_table} finished in {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+/// Read one table through the ordinary write path, into whatever indices the
+/// config in hand maps it to.
+///
+/// Shared with `reindex`, which passes a config whose section names a fresh
+/// index: everything that decides where a document lands is derived from the
+/// config here, so redirecting a load is a config change rather than a second
+/// code path. Nothing in it can move the checkpoint — the rows carry position
+/// `0` and no source stream is attached — which is what both callers rest on.
+pub(crate) async fn load_one(
+    cfg: &AppConfig,
+    source_url: &str,
+    admin_url: &str,
+    sink: Arc<dyn pg2osync_core::sink::Sink>,
+    scope: &LoadScope,
+) -> Result<()> {
     let stream_id = run::stream_id_for(cfg);
     let (events_tx, events_rx) = mpsc::channel::<ChangeEvent>(1);
     // no source stream in this process: closing it leaves the engine reading only
@@ -101,17 +146,6 @@ pub async fn run_for(
         shutdown_rx,
     );
 
-    let scope =
-        LoadScope::resnapshot(qualified_table, filter).with_table_filters(run::table_filters(cfg)?);
-    println!(
-        "re-reading {qualified_table} into {index}{}",
-        scope
-            .filter
-            .as_deref()
-            .map(|f| format!(" where {f}"))
-            .unwrap_or_default()
-    );
-    let started = std::time::Instant::now();
     let read = async {
         // moved in, so the channel closes when the read is done and the engine
         // can finish
@@ -125,7 +159,7 @@ pub async fn run_for(
                     sink.as_ref(),
                     &stream_id,
                     load_done_rx,
-                    &scope,
+                    scope,
                 )
                 .await
             }
@@ -138,7 +172,7 @@ pub async fn run_for(
                     sink.as_ref(),
                     &stream_id,
                     load_done_rx,
-                    &scope,
+                    scope,
                 )
                 .await
             }
@@ -148,23 +182,7 @@ pub async fn run_for(
     engine
         .await
         .context("engine task failed")?
-        .context("engine stopped before the re-snapshot finished")?;
-
-    // `refresh_interval` is left alone throughout, unlike an initial load's:
-    // this repairs an index that is in use, and hiding its ordinary writes for
-    // the duration would be the wrong trade. One refresh at the end so whoever
-    // ran the command can see the result immediately. A templated table's rows
-    // landed wherever they rendered, so the glob is what gets refreshed.
-    if let Err(e) = sink.refresh(&[pattern]).await {
-        tracing::warn!(target: "pg2osync::resnapshot",
-            "the re-snapshot is written, but the index could not be refreshed, so it \
-             may not be searchable yet: {e}");
-    }
-    println!(
-        "re-snapshot of {qualified_table} finished in {:.1}s",
-        started.elapsed().as_secs_f64()
-    );
-    Ok(())
+        .context("engine stopped before the read finished")
 }
 
 #[allow(clippy::too_many_arguments)]

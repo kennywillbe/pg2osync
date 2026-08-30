@@ -233,7 +233,9 @@ append-only table. If the table carries a unique column such as an
   address a document by.
 - `reconcile` refuses an append-only table — it pages the index by a key
   column the table does not have. `resnapshot` works and writes the same
-  hashes.
+  hashes, and so does [`reindex`](#rebuilding-an-index), which checks its
+  count as `documents <= rows`: rows the source cannot tell apart are one
+  document.
 - `init` writes `append_only = true` for a table it finds without a primary
   key, so the generated config runs unedited.
 
@@ -278,6 +280,10 @@ id = "order-{id}"
   apart by the join field, so a truncate there clears one relation exactly.
 - **`resnapshot` works** on any one of the tables for the same reason: it
   writes by id and touches nothing else in the index.
+- **[`reindex`](#rebuilding-an-index) refuses a shared index,** including a
+  join pair's. It reads one table, so the fresh index it built would hold
+  that table's documents and nothing else — and the alias would then hide the
+  others. Rebuild a shared index with a second instance of the whole config.
 
 A [join pair](#join-fields) is the other way two sections share an index:
 there the join field scopes every document to its relation, which is why
@@ -337,14 +343,57 @@ and the document is then in the old index.
 - **A row that changes its index-choosing column moves.** It is written in
   the new index and deleted from the old — the same move `id` makes for a row
   whose id changed.
-- **`reconcile` and `switch-alias` refuse a templated table.** Reconcile
-  pages one index by its key column, and the table's documents are spread
-  over every index the template renders; an alias points at one index.
-  `resnapshot` works.
+- **`reconcile`, `switch-alias` and `reindex` refuse a templated table.**
+  Reconcile pages one index by its key column, and the table's documents are
+  spread over every index the template renders; an alias points at one index,
+  and so does a rebuild. `resnapshot` works.
 - **Meilisearch refuses a template** at startup: it has no mappings to
   create an index with.
 - **Bulk-load settings are not relaxed** for a templated index. An index
   created during the initial load takes the target's defaults.
+
+### Rebuilding an index
+
+A mapping cannot be changed on an index that already exists, so changing one
+means building a new index and moving the traffic to it. `reindex` is that in
+one command:
+
+```sh
+pg2osync reindex -c pg2osync.toml --table public.users --alias users
+```
+
+It creates `users-<unix seconds>` with the section's `mapping_file`, loads the
+table into it, compares what it wrote against the source's row count, and
+points the alias at the new index in one atomic request. `--drop-old` deletes
+the index the alias came off; by default it is kept, because it is the
+rollback — one alias flip away.
+
+- **Stop the pipeline first; the command refuses to run beside it.** A
+  re-snapshot is safe beside the stream because a copied row and a streamed
+  change meet in the same index and the higher position wins. A fresh index the
+  stream is not writing to has no second document to compare against, so a row
+  that changed during the rebuild would be wrong there for good — and the count
+  would still add up. The refusal is evidence, not a flag: an active
+  replication slot on PostgreSQL, and on either source a checkpoint seen
+  moving. There is no `--force`.
+- **The checkpoint does not move,** by construction: the rows carry position
+  `0`, exactly as a re-snapshot's do. So everything committed while the
+  pipeline was stopped is still in the log, and the restart replays it into the
+  new index. That is also what proves the *contents*: the count only proves how
+  many.
+- **Two follow-ups are yours,** and the command prints both: set `index` to the
+  new name in the section, and start the pipeline again.
+- **A count the source does not explain leaves the alias where it is.** The
+  source is counted before and after the load; anything outside that range is
+  reported with all three numbers and a non-zero exit, and the rebuilt index is
+  left for you to look at.
+- **Refused for** a [templated](#per-row-indices) index, a
+  [shared](#sharing-an-index) index or a join pair, a [fanned](#fan-out)
+  table, an `--alias` equal to the index the section already writes to, and
+  Meilisearch, which has no aliases to move (#108).
+- **A live cutover with no freshness gap at all is still two instances,** as
+  [operations.md](operations.md) describes. A rebuild trades the gap for one
+  command.
 
 ### Retention
 
@@ -500,6 +549,8 @@ and element fields alike.
   column in `columns`/`exclude_columns`, which would cut the array before
   identity and fan-out ever see it. `reconcile` and `resnapshot` do not
   support fanned tables yet: both page by key, and one row now has many
+  documents. [`reindex`](#rebuilding-an-index) refuses one too — it checks
+  what it wrote against the source's row count, and here one row is many
   documents.
 
 Two tables may map to the same index once each declares its `id`; see

@@ -4,6 +4,7 @@
 mod backfill;
 mod config;
 mod reconcile;
+mod reindex;
 mod resnapshot;
 mod run;
 
@@ -120,6 +121,26 @@ enum Command {
         #[arg(long = "where", value_name = "PREDICATE")]
         filter: Option<String>,
     },
+    /// Rebuild one table's index under a fresh name and point an alias at it.
+    ///
+    /// Stop the pipeline first: the fresh index is one the stream is not
+    /// writing to, so a row that changes during the rebuild has nothing there
+    /// to lose to. The checkpoint does not move, so the restart replays
+    /// everything committed since.
+    Reindex {
+        #[arg(short, long, value_name = "FILE", default_value = "pg2osync.toml")]
+        config: PathBuf,
+        /// Qualified table name, as it appears in the config.
+        #[arg(long, value_name = "SCHEMA.TABLE")]
+        table: String,
+        /// The alias to point at the rebuilt index.
+        #[arg(long)]
+        alias: String,
+        /// Delete the index the alias came off. Kept by default: it is the
+        /// rollback, one alias flip away.
+        #[arg(long)]
+        drop_old: bool,
+    },
     /// List the documents the target refused and, with --replay, submit them
     /// again once the mapping that refused them is fixed.
     Rejects {
@@ -218,6 +239,12 @@ async fn main() -> Result<()> {
             table,
             filter,
         } => resnapshot_cmd(&config, &table, filter).await,
+        Command::Reindex {
+            config,
+            table,
+            alias,
+            drop_old,
+        } => reindex_cmd(&config, &table, &alias, drop_old).await,
         Command::Rejects {
             config,
             replay,
@@ -777,6 +804,25 @@ async fn resnapshot_cmd(path: &Path, table: &str, filter: Option<String>) -> Res
         secrets.target_password,
         table,
         filter,
+    )
+    .await
+}
+
+/// Rebuild one table's index and hand the alias to the copy.
+async fn reindex_cmd(path: &Path, table: &str, alias: &str, drop_old: bool) -> Result<()> {
+    let cfg = config::AppConfig::load(path)?;
+    let secrets = cfg.resolve_secrets()?;
+    for warning in &secrets.warnings {
+        tracing::warn!(target: "pg2osync::config", "{warning}");
+    }
+    reindex::run_for(
+        &cfg,
+        &secrets.source_url,
+        &secrets.admin_url,
+        secrets.target_password,
+        table,
+        alias,
+        drop_old,
     )
     .await
 }

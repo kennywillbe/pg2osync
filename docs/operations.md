@@ -374,7 +374,25 @@ pg2osync switch-alias -c users-v2.toml --alias users
 ```
 
 That leaves the new index static from the moment the re-snapshot finished, so it
-suits a one-off rebuild rather than a live cutover. For a live cutover:
+suits a one-off rebuild rather than a live cutover.
+
+Or, when the pipeline can be stopped for the length of a load, the same rebuild
+as one command:
+
+```sh
+pg2osync reindex -c pg2osync.toml --table public.users --alias users
+```
+
+It builds `users-<unix seconds>` from the section's `mapping_file`, checks what
+it wrote against the source's row count, and moves the alias in one atomic
+request. It refuses to run while the stream is live, and that refusal is the
+point: the fresh index is one the stream is not writing to, so a row that
+changed during the load would have nothing there to lose to. The checkpoint
+never moves, so setting `index` to the new name and starting the pipeline again
+replays everything committed since. The old index is kept unless `--drop-old`
+says otherwise — it is the rollback, one alias flip away.
+
+For a live cutover with no freshness gap at all:
 
 ```sh
 # 1. Copy the config. Change `index` to users_v2 and `slot_name` to a new

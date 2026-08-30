@@ -337,6 +337,24 @@ impl Sink for MeilisearchSink {
         Ok(())
     }
 
+    async fn count_documents(&self, index: &str) -> Result<Option<u64>, CoreError> {
+        let (status, body) = self
+            .send(
+                reqwest::Method::GET,
+                &format!("/indexes/{index}/stats"),
+                None,
+            )
+            .await?;
+        match status {
+            404 => Ok(None),
+            200 => body["numberOfDocuments"]
+                .as_u64()
+                .map(Some)
+                .ok_or_else(|| CoreError::Sink(format!("count {index}: {body}"))),
+            other => Err(CoreError::Sink(format!("count {index}: {other} {body}"))),
+        }
+    }
+
     async fn read_state(&self, key: &str) -> Result<Option<Value>, CoreError> {
         match std::fs::read(self.state_path(key)) {
             Ok(bytes) => serde_json::from_slice::<Value>(&bytes)

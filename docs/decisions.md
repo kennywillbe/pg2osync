@@ -548,6 +548,40 @@ duration would be the wrong trade.
 It adds and updates but never deletes. `reconcile` is the other half, and keeping
 them apart is what keeps each one explainable.
 
+**A rebuild is a fresh index and an alias flip, not an in-place rewrite.** (#107.)
+A mapping cannot be changed on a live index for anything that matters, so
+rebuilding one means writing a new one; rewriting in place would leave an index
+that is half old and half new searchable throughout, which is the outage the
+exercise exists to avoid. `pg2osync reindex --table T --alias A` therefore
+creates `<index>-<unix seconds>` with the section's mapping, loads the table
+into it, checks the count against the source, and moves the alias onto it in
+one atomic request.
+
+It refuses to run while the stream is live, which is the one place it differs
+from a re-snapshot. A re-snapshot is safe beside the stream because a copied
+row and a streamed change meet at the target and the higher position wins — a
+comparison between two documents in *one* index. A fresh index the stream is
+not writing to has no second operand: a row updated during the load would be
+permanently wrong there and the count would still match. So a rebuild closes
+the window the way the initial load does — its rows carry position `0`, the
+checkpoint does not move, and restarting the pipeline against the new index
+replays everything committed since. The refusal is positive evidence rather
+than a flag: an active replication slot on PostgreSQL, and on either source a
+checkpoint that moves while it is watched. There is no `--force`.
+
+The alias is flipped before the restart because it costs nothing to: the old
+index is exactly as stale as the new one at that moment, and both catch up
+from the same replay. A live cutover with no freshness gap at all is still two
+instances, as [operations.md](https://github.com/kennywillbe/pg2osync/blob/main/docs/operations.md)
+describes — dual-writing from one process is not on the table.
+
+`refresh_interval` *is* suspended for the duration here, unlike a re-snapshot's:
+nothing searches an index no alias points at yet, so there is no visibility to
+trade away. The old index is kept unless `--drop-old` says otherwise, because
+it is the rollback — one alias flip back — and a `--keep-old` that defaults to
+on would be an option that does nothing. The count proves the number of rows,
+not their contents; what proves the contents is the replay the restart runs.
+
 **Children resolve in the source, once per transaction.** The engine is
 source-agnostic and runs no SQL against the source, so the only place that can
 group child lookups is the source's own decode loop — which already knows where a
