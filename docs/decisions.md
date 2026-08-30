@@ -880,6 +880,44 @@ gone and the url is refused instead. Nothing in the competitive set advertises
 Serverless either — the tools that do are log shippers and AWS's own ingestion
 pipeline, not database-to-index replication — so this closes no gap.
 
+**Sources share a process, never a slot or a checkpoint.** (#146.) One process
+was one source database, so thirty tenant databases were thirty processes, with
+thirty sets of limits, scrape targets and probes for pipelines that are
+individually almost idle. What they can share is the process. What they must
+never share is anything the stream is identified by.
+
+The form is a directory of configs — `--config-dir /etc/pg2osync` — rather than
+a `[[sources]]` array inside one file. A file is what an operator already
+templates, mounts and moves: one ConfigMap, one file per tenant, one `*_env`
+per file. It also needs no schema migration and invalidates no example, because
+every config that exists today stays a whole file. The accepted cost is that
+`[metrics]` and `[api]` describe the process while sitting in a per-source
+file, which is a validation rule rather than a redesign: the files that declare
+one of those sections must declare the same one, and a file that leaves it out
+takes what the others say.
+
+A source is named by `[source] name`, or by its file's stem when the key is
+left out. The grammar is `A-Z a-z 0-9 _ -`, because the name has to survive a
+metrics label and a command line unescaped.
+
+What the loader refuses is the point of it, and the slot is the one that
+matters. A checkpoint is bound to its stream, and a stream is identified by its
+slot name or its server id and by neither the host nor the file — which is
+exactly why configs copied from one template are one stream, sharing one
+`.pg2osync_meta` document and resuming from each other's position, however many
+different databases they name. So two files sharing a slot, a server id or a
+source name are refused before anything connects, and the message names the
+checkpoint document they would have collided in. The
+[shared-index](#correctness) and templated-index rules are the same rules as
+within one file; they simply run over the whole directory as well, because an
+index does not know which file a document came from.
+
+The runtime half of this — one metrics exposition with a `source` label on
+every series, health per source, and a supervisor in which one halted source
+does not stop the others — follows in the next change. Until it lands, `run`
+takes exactly one config file, and `--config-dir` is read by `validate` and
+`status`.
+
 ## Scope
 
 **One-way replication only.** No bidirectional sync, no conflict resolution.

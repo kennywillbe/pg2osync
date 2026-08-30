@@ -4,7 +4,7 @@
 //! wiring below is identical for every source.
 
 use anyhow::{Context as _, Result, bail};
-use pg2osync_core::checkpoint::{Checkpoint, SOURCE_MYSQL, SOURCE_POSTGRES, StreamId};
+use pg2osync_core::checkpoint::{Checkpoint, StreamId};
 use pg2osync_core::event::ChangeEvent;
 use pg2osync_core::lsn::Lsn;
 use pg2osync_core::sink::{IndexSpec, Sink};
@@ -657,24 +657,6 @@ fn read_token(var: Option<&str>, endpoint: &str) -> Result<Option<String>> {
 }
 
 /// Build the engine context for one attempt.
-/// Which stream this configuration is, as the checkpoint and the load's progress
-/// documents key themselves.
-pub fn stream_id_for(cfg: &AppConfig) -> StreamId {
-    if cfg.source.flavor == "mysql" {
-        StreamId {
-            source: SOURCE_MYSQL.into(),
-            stream: cfg.source.server_id.to_string(),
-            publication: String::new(),
-        }
-    } else {
-        StreamId {
-            source: SOURCE_POSTGRES.into(),
-            stream: cfg.source.slot_name.clone(),
-            publication: cfg.source.publication.clone(),
-        }
-    }
-}
-
 pub fn pipeline_ctx(
     cfg: &AppConfig,
     sink: Arc<dyn Sink>,
@@ -1099,7 +1081,7 @@ async fn run_postgres(
         return Ok(());
     }
 
-    let stream_id = stream_id_for(&cfg);
+    let stream_id = cfg.stream_id();
     let render: PositionRenderer = Arc::new(|token| Lsn(token).to_string());
     let parse: pg2osync_engine::PositionParser =
         Arc::new(|text| text.trim().parse::<Lsn>().ok().map(|lsn| lsn.0));
@@ -1607,7 +1589,7 @@ async fn run_mysql(
         return Ok(());
     }
 
-    let stream_id = stream_id_for(&cfg);
+    let stream_id = cfg.stream_id();
     let metrics = start_metrics(&cfg)?;
     let (ack_tx, ack_rx) = watch::channel(None);
     // The generation the pipeline is versioning in, shared with the endpoints
@@ -2122,6 +2104,7 @@ pub fn spawn_engine(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pg2osync_core::checkpoint::SOURCE_POSTGRES;
 
     /// `(file index << 32) | offset`, the coordinate the version is built on.
     fn coordinate(file_index: u64, offset: u64) -> u64 {

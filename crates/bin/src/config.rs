@@ -28,6 +28,10 @@ pub struct AppConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceConfig {
+    /// What this source is called in a directory of configs: the name every
+    /// message about it uses, defaulting to the file's stem.
+    #[serde(default)]
+    pub name: Option<String>,
     /// "wal" (default) | "poll" — ignored for MySQL (always binlog)
     #[serde(default = "default_mode")]
     pub mode: String,
@@ -180,7 +184,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MetricsConfig {
     #[serde(default = "default_true")]
@@ -198,7 +202,7 @@ fn default_bind() -> String {
 
 /// The read-your-writes endpoint. Off by default: it is a surface applications
 /// call, not an operational one, so opening a port is the operator's decision.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ApiConfig {
     pub enabled: bool,
@@ -779,6 +783,26 @@ impl AppConfig {
         Ok(cfg)
     }
 
+    /// The stream this config identifies, which is also where its checkpoint
+    /// lives. It names neither the host nor the target, so two configs copied
+    /// from the same template are one stream however far apart they run.
+    pub fn stream_id(&self) -> pg2osync_core::checkpoint::StreamId {
+        use pg2osync_core::checkpoint::{SOURCE_MYSQL, SOURCE_POSTGRES, StreamId};
+        if self.source.flavor == "mysql" {
+            StreamId {
+                source: SOURCE_MYSQL.into(),
+                stream: self.source.server_id.to_string(),
+                publication: String::new(),
+            }
+        } else {
+            StreamId {
+                source: SOURCE_POSTGRES.into(),
+                stream: self.source.slot_name.clone(),
+                publication: self.source.publication.clone(),
+            }
+        }
+    }
+
     /// Structural validation. Connection checks happen in `validate` command;
     /// this function never touches the network.
     pub fn validate(&self) -> Result<()> {
@@ -786,6 +810,9 @@ impl AppConfig {
         const TARGET_FLAVORS: [&str; 3] = ["opensearch", "elasticsearch", "meilisearch"];
         const SOURCE_MODES: [&str; 2] = ["wal", "poll"];
 
+        if let Some(name) = &self.source.name {
+            check_source_name(name).map_err(|e| anyhow::anyhow!("[source] {e}"))?;
+        }
         if !SOURCE_FLAVORS.contains(&self.source.flavor.as_str()) {
             anyhow::bail!(
                 "[source] flavor {:?} is not one of {SOURCE_FLAVORS:?}",
@@ -849,11 +876,7 @@ impl AppConfig {
         // Whether the sections sharing an index may do so is a question about
         // the group, not about either section, so the groups are checked after
         // every section has been.
-        let mut by_index: BTreeMap<String, Vec<(&str, &TableSync)>> = BTreeMap::new();
-        // A template is a claim on a whole namespace, which is a question
-        // about every other section's index, so the targets are kept for a
-        // pass over the pairs.
-        let mut targets: Vec<(&str, IndexTarget)> = Vec::with_capacity(self.sync.len());
+        let mut sections: Vec<(Label, &TableSync)> = Vec::with_capacity(self.sync.len());
         if self.sync.is_empty() {
             anyhow::bail!("no [sync.*] sections: nothing to synchronize");
         }
@@ -883,10 +906,6 @@ impl AppConfig {
                      index cannot be combined"
                 );
             }
-            by_index
-                .entry(index.clone())
-                .or_default()
-                .push((key.as_str(), tbl));
             if let Some(join) = &tbl.join {
                 if join.field.is_empty() {
                     anyhow::bail!("[sync.{key}.join] field must not be empty");
@@ -1275,13 +1294,10 @@ impl AppConfig {
                     );
                 }
             }
-            targets.push((key.as_str(), target));
+            sections.push((Label::section(key), tbl));
         }
         check_junctions(self)?;
-        check_template_claims(self, &targets)?;
-        for (index, members) in &by_index {
-            check_index_group(index, members)?;
-        }
+        check_index_overlap(&sections)?;
         for (key, table) in &self.sync {
             // the predicate is evaluated by the database inside the poll query;
             // WAL mode has no query to put it in, and sees a soft delete as the
@@ -1449,33 +1465,125 @@ fn check_junctions(cfg: &AppConfig) -> Result<()> {
     Ok(())
 }
 
+/// A source's name is a metrics label and a command-line argument, so it is
+/// what both of those take unescaped and nothing more.
+pub fn check_source_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        anyhow::bail!(
+            "name {name:?} must be one or more of A-Z a-z 0-9 _ -; it identifies this source \
+             wherever it is reported, and neither a metrics label nor a command line takes \
+             anything else unescaped"
+        );
+    }
+    Ok(())
+}
+
+/// Which `[sync.*]` section a message is about. Inside one file the section
+/// name says it; across a directory two files hold sections of the same name
+/// as a matter of course, so there the file is what tells them apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Label {
+    file: Option<String>,
+    key: String,
+}
+
+impl Label {
+    pub fn section(key: &str) -> Self {
+        Self {
+            file: None,
+            key: key.to_string(),
+        }
+    }
+
+    pub fn in_file(file: &str, key: &str) -> Self {
+        Self {
+            file: Some(file.to_string()),
+            key: key.to_string(),
+        }
+    }
+
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// The section's `join` sub-table, labelled the same way.
+    fn join(&self) -> String {
+        match &self.file {
+            Some(file) => format!("{file} [sync.{}.join]", self.key),
+            None => format!("[sync.{}.join]", self.key),
+        }
+    }
+}
+
+impl std::fmt::Display for Label {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.file {
+            Some(file) => write!(f, "{file} [sync.{}]", self.key),
+            None => write!(f, "[sync.{}]", self.key),
+        }
+    }
+}
+
+/// The questions that are about a group of sections rather than any one of
+/// them: what a template claims, and who else writes the index a section
+/// writes.
+///
+/// A directory of configs asks them of the whole set, because two files
+/// collide on one index exactly as two sections of one file do, so the pass
+/// takes labelled sections rather than an `AppConfig`.
+pub fn check_index_overlap(sections: &[(Label, &TableSync)]) -> Result<()> {
+    let mut targets: Vec<(&Label, &TableSync, IndexTarget)> = Vec::with_capacity(sections.len());
+    let mut by_index: BTreeMap<String, Vec<(Label, &TableSync)>> = BTreeMap::new();
+    for (label, tbl) in sections {
+        // the key columns do not matter to the grammar; whether a bare key
+        // can render the template is the startup check's question
+        let target = tbl
+            .index_target(label.key(), &[])
+            .map_err(|e| anyhow::anyhow!("{label} {e}"))?;
+        by_index
+            .entry(tbl.index_name(label.key()))
+            .or_default()
+            .push((label.clone(), tbl));
+        targets.push((label, tbl, target));
+    }
+    check_template_claims(&targets)?;
+    for (index, members) in &by_index {
+        check_index_group(index, members)?;
+    }
+    Ok(())
+}
+
 /// A template is a claim on a whole namespace, so it cannot also be a shared
 /// index, and nothing else may sit inside what its TRUNCATE would clear.
-fn check_template_claims(cfg: &AppConfig, targets: &[(&str, IndexTarget)]) -> Result<()> {
-    for (key, target) in targets {
+fn check_template_claims(targets: &[(&Label, &TableSync, IndexTarget)]) -> Result<()> {
+    for (label, tbl, target) in targets {
         let IndexTarget::Template { spec, .. } = target else {
             continue;
         };
-        if let Some((other, _)) = targets
+        if let Some((other, _, _)) = targets
             .iter()
-            .find(|(k, _)| k != key && cfg.sync[*k].index_name(k) == *spec)
+            .find(|(k, t, _)| k != label && t.index_name(k.key()) == *spec)
         {
             anyhow::bail!(
-                "[sync.{key}] index {spec:?} is a template and is also fed by [sync.{other}]; a \
+                "{label} index {spec:?} is a template and is also fed by {other}; a \
                  template claims every index it can render, which is not something two tables \
                  can share"
             );
         }
         let pattern = target.pattern();
-        if let Some((other, _)) = targets
+        if let Some((other, other_table, _)) = targets
             .iter()
-            .find(|(k, t)| k != key && index_matches_pattern(&pattern, &t.pattern()))
+            .find(|(k, _, t)| k != label && index_matches_pattern(&pattern, &t.pattern()))
         {
             anyhow::bail!(
-                "[sync.{key}] index {spec:?} claims {pattern:?}, which also matches {:?} of \
-                 [sync.{other}]; a TRUNCATE of {} would clear that index too",
-                cfg.sync[*other].index_name(other),
-                cfg.sync[*key].table
+                "{label} index {spec:?} claims {pattern:?}, which also matches {:?} of \
+                 {other}; a TRUNCATE of {} would clear that index too",
+                other_table.index_name(other.key()),
+                tbl.table
             );
         }
     }
@@ -1485,13 +1593,13 @@ fn check_template_claims(cfg: &AppConfig, targets: &[(&str, IndexTarget)]) -> Re
 /// Whether the sections writing one index may share it: either as a join
 /// pair, or with an explicit id on each. A section alone in its index is only
 /// refused when it is a child, whose parent then exists nowhere.
-fn check_index_group(index: &str, members: &[(&str, &TableSync)]) -> Result<()> {
-    let [(key, single)] = members else {
+fn check_index_group(index: &str, members: &[(Label, &TableSync)]) -> Result<()> {
+    let [(label, single)] = members else {
         return check_shared_index(index, members);
     };
     if let Some(column) = single.join.as_ref().and_then(|join| join.parent.as_deref()) {
         anyhow::bail!(
-            "[sync.{key}] join names a parent through {column}, but no other [sync.*] section \
+            "{label} join names a parent through {column}, but no other [sync.*] section \
              writes index {index:?} as its parent"
         );
     }
@@ -1503,21 +1611,21 @@ fn check_index_group(index: &str, members: &[(&str, &TableSync)]) -> Result<()> 
 /// with a row 1 are one document. An explicit `id` on every section sharing
 /// the index is the declaration that makes a collision the operator's choice,
 /// so the only ones left are the ones written down.
-fn check_plain_shared_index(index: &str, members: &[(&str, &TableSync)]) -> Result<()> {
-    if let Some((key, _)) = members.iter().find(|(_, tbl)| tbl.id.is_none()) {
+fn check_plain_shared_index(index: &str, members: &[(Label, &TableSync)]) -> Result<()> {
+    if let Some((label, _)) = members.iter().find(|(_, tbl)| tbl.id.is_none()) {
         anyhow::bail!(
-            "[sync.{key}] two tables map to the same index {index:?}; give each an explicit \
+            "{label} two tables map to the same index {index:?}; give each an explicit \
              id template so their documents cannot collide, or declare a join pair"
         );
     }
-    let described: Vec<&str> = members
+    let described: Vec<&Label> = members
         .iter()
         .filter(|(_, tbl)| tbl.mapping_file.is_some())
-        .map(|(key, _)| *key)
+        .map(|(label, _)| label)
         .collect();
     if let [first, second, ..] = described.as_slice() {
         anyhow::bail!(
-            "[sync.{second}] index {index:?} is also described by [sync.{first}]; an index is \
+            "{second} index {index:?} is also described by {first}; an index is \
              created once, so at most one of the sections feeding it may set mapping_file"
         );
     }
@@ -1526,50 +1634,52 @@ fn check_plain_shared_index(index: &str, members: &[(&str, &TableSync)]) -> Resu
 
 /// A join pair: every section declares the same join field, exactly one is
 /// the parent, and each has a relation name of its own.
-fn check_shared_index(index: &str, members: &[(&str, &TableSync)]) -> Result<()> {
-    let Some((joined_key, _)) = members.iter().find(|(_, tbl)| tbl.join.is_some()) else {
+fn check_shared_index(index: &str, members: &[(Label, &TableSync)]) -> Result<()> {
+    let Some((joined_label, _)) = members.iter().find(|(_, tbl)| tbl.join.is_some()) else {
         return check_plain_shared_index(index, members);
     };
     let mut joined = Vec::with_capacity(members.len());
-    for (key, tbl) in members {
+    for (label, tbl) in members {
         let Some(join) = &tbl.join else {
             // A join field is read on every document of the index, so a table
             // writing there without one leaves documents no relation names.
             anyhow::bail!(
-                "[sync.{key}] writes index {index:?} without join, but [sync.{joined_key}] \
+                "{label} writes index {index:?} without join, but {joined_label} \
                  declares one; every section sharing a join field's index must be part of \
                  the pair"
             );
         };
-        joined.push((*key, *tbl, join));
+        joined.push((label, *tbl, join));
     }
     // the slice is non-empty: a group exists because a section put itself in it
-    let Some((first_key, _, first)) = joined.first() else {
+    let Some((first_label, _, first)) = joined.first() else {
         return Ok(());
     };
-    for (key, _, join) in &joined {
+    for (label, _, join) in &joined {
         if join.field != first.field {
             anyhow::bail!(
-                "[sync.{key}.join] field {:?} disagrees with [sync.{first_key}.join] field {:?}; \
+                "{} field {:?} disagrees with {} field {:?}; \
                  every section writing to index {index:?} must name the same join field",
+                label.join(),
                 join.field,
+                first_label.join(),
                 first.field
             );
         }
     }
-    let parents: Vec<(&str, &TableSync)> = joined
+    let parents: Vec<(&Label, &TableSync)> = joined
         .iter()
         .filter(|(_, _, join)| join.parent.is_none())
-        .map(|(key, tbl, _)| (*key, *tbl))
+        .map(|(label, tbl, _)| (*label, *tbl))
         .collect();
-    let (parent_key, parent) = match parents.as_slice() {
+    let (parent_label, parent) = match parents.as_slice() {
         [] => anyhow::bail!(
             "index {index:?} has no join parent: every section writing to it names a parent \
              column, so nothing writes the parent documents. Remove parent from the section \
              that holds them"
         ),
         [(a, _), (b, _), ..] => anyhow::bail!(
-            "[sync.{a}] and [sync.{b}] are both the join parent of index {index:?}; exactly one \
+            "{a} and {b} are both the join parent of index {index:?}; exactly one \
              section may omit parent"
         ),
         [one] => *one,
@@ -1577,7 +1687,7 @@ fn check_shared_index(index: &str, members: &[(&str, &TableSync)]) -> Result<()>
     for (i, (a, _, join)) in joined.iter().enumerate() {
         if let Some((b, _, _)) = joined[i + 1..].iter().find(|(_, _, o)| o.name == join.name) {
             anyhow::bail!(
-                "[sync.{a}] and [sync.{b}] both use the join name {:?}; each section of index \
+                "{a} and {b} both use the join name {:?}; each section of index \
                  {index:?} needs its own relation name",
                 join.name
             );
@@ -1587,16 +1697,15 @@ fn check_shared_index(index: &str, members: &[(&str, &TableSync)]) -> Result<()>
     // so the parent's id may name nothing but the key
     if let Some(spec) = &parent.id {
         let pk = vec![parent.primary_key.clone().unwrap_or_else(|| "id".into())];
-        let template = pg2osync_engine::mapping::IdTemplate::parse(spec, &pk).map_err(|e| {
-            anyhow::anyhow!("[sync.{parent_key}] id {spec:?} is not a usable id: {e}")
-        })?;
+        let template = pg2osync_engine::mapping::IdTemplate::parse(spec, &pk)
+            .map_err(|e| anyhow::anyhow!("{parent_label} id {spec:?} is not a usable id: {e}"))?;
         if !template.is_pk_only()
             && let Some(column) = joined
                 .iter()
                 .find_map(|(_, _, join)| join.parent.as_deref())
         {
             anyhow::bail!(
-                "[sync.{parent_key}] id {spec:?} names a column outside the primary key, so a \
+                "{parent_label} id {spec:?} names a column outside the primary key, so a \
                  join child cannot compute the parent's document id from its own {column} \
                  column. Give the parent an id that names only its key"
             );

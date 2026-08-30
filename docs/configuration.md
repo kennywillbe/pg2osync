@@ -35,6 +35,7 @@ startup. Secrets never appear in logs or error messages.
 |---|---|---|
 | `flavor` | `"postgres"` | `"postgres"` or `"mysql"` (also covers MariaDB) |
 | `mode` | `"wal"` | `"wal"` (replication log) or `"poll"`. PostgreSQL only |
+| `name` | the file's stem, fitted to the grammar | What this source is called; `A-Z a-z 0-9 _ -` only. See [A directory of configs](#a-directory-of-configs) |
 | `url_env` | — | Environment variable holding the connection URL |
 | `url` | — | Inline URL; warns as deprecated |
 | `sslmode` | from the URL, else `prefer` | `disable`, `prefer`, `require`, `verify-ca`, `verify-full` |
@@ -1540,6 +1541,79 @@ pg2osync_position_current                       # highest position received
 pg2osync_position_confirmed                     # highest position checkpointed
 pg2osync_position_lag                           # difference between the two
 ```
+
+## A directory of configs
+
+One file is one source: its own slot, its own checkpoint, its own target.
+`--config-dir` gives a whole directory of them to one command:
+
+```sh
+pg2osync validate --config-dir /etc/pg2osync
+pg2osync status   --config-dir /etc/pg2osync
+```
+
+`--config` and `--config-dir` are alternatives — passing both is an error — and
+`run` still takes exactly one file. What the directory adds is everything two
+files can disagree about, none of which is visible from inside either one.
+
+Which files are read:
+
+- every `*.toml` **directly** in the directory, in name order; subdirectories
+  are not descended into
+- entries whose name begins with `.` are skipped, and so is anything that is
+  not a file. A Kubernetes ConfigMap mounts as a directory of symlinks beside a
+  `..data` symlink to a timestamped directory holding the files themselves, so
+  a loader that recursed would read every config twice
+- anything that is not `.toml` is skipped, so a `mapping_file` JSON can sit
+  beside the config that names it
+- a directory with no `*.toml` in it is an error, and so is a directory in
+  which any file fails to load — the message lists **every** failing file, not
+  the first
+
+Each file is loaded and validated exactly as `--config` loads it. Nothing about
+a config changes because it has neighbours.
+
+### Names
+
+A source is called what `[source] name` says, or, with the key left out, the
+file's stem — `orders.toml` is `orders`. The grammar is `A-Z a-z 0-9 _ -` and
+nothing else, because the name has to survive both a metrics label and a
+command line unescaped. A name you write is held to that grammar and refused
+otherwise; a stem is fitted to it instead — every other character becomes `-`,
+runs collapse, the ends are trimmed — so `orders v2.beta.toml` is
+`orders-v2-beta` and no config fails to load over the path it was handed under.
+Two sources of the same name are refused, naming both files.
+
+### What two files may not share
+
+**A stream.** A checkpoint is bound to its stream, and a stream is identified
+by its `slot_name` (PostgreSQL) or `server_id` (MySQL) — not by the host it
+reads. Thirty configs copied from one template therefore name one stream, share
+the one `.pg2osync_meta` document, and each resume from the others' position.
+The refusal names the document:
+
+```
+duplicate stream identity: tenant-a.toml and tenant-b.toml both name replication
+slot "pg2osync", so both would keep their position in the one checkpoint document
+.pg2osync_meta/postgres-pg2osync and each would resume from the other's. Give
+every source a [source] slot_name of its own
+```
+
+**An index, unless every section says who its documents are.** The
+[shared-index rule](#sharing-an-index) runs over the whole directory as well as
+inside each file: sections feeding one index each declare an `id`, or form a
+join pair. An index does not know which file a document came from, so two files
+with a row `1` are otherwise one document.
+
+**An index a template claims.** A [per-row index](#per-row-indices) claims
+every name it can render, in any file: a fixed `events-2024` inside another
+file's `events-{tenant}` is refused, because a re-snapshot of the templated
+section would clear it.
+
+**A listener.** `[metrics]` and `[api]` describe the process, not a source. A
+file that leaves the section out takes whatever the files that declare it say;
+two files declaring it differently are refused, naming both — one process opens
+one listener.
 
 ## Environment variables
 
