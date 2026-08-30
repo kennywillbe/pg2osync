@@ -1087,6 +1087,36 @@ trigger — or a CDC platform built to fan out.
 Prometheus client plus an HTTP framework in a binary that advertises having no
 dependencies.
 
+**Traces are opt-in and live in the binary.** (#152.) Metrics answer "how much
+and how far behind"; nothing answered "what happened to *this* change" — read
+from the log, transformed, written in which request, visible when — or tied it
+to the request an application was already tracing. `PG2OSYNC_OTLP_ENDPOINT`
+turns on an OTLP exporter over the spans the pipeline emits, and `/synced`
+continues an incoming `traceparent` into the wait, so a caller's trace and the
+batch it is waiting for are one timeline.
+
+Behind an environment variable, and unset by default, for the reason the log
+format is one: where telemetry goes belongs to whoever runs the deployment, not
+to the config file that describes a pipeline. With no endpoint nothing is
+constructed — no exporter, no batch thread, no connection — so an operator with
+no tracing backend pays for none of it, and one whose collector is down loses
+spans and one log line rather than throughput: an export failure is reported
+once and never reaches the write path.
+
+This does not change the metrics decision above. The two answer different
+questions, and a Prometheus endpoint is still six counters that need no client
+library.
+
+**The engine emits `tracing` spans and nothing else.** The whole OpenTelemetry
+dependency — exporter, sampler, propagator — is confined to `crates/bin`, which
+is also the only place that knows the log format. The engine and the sources
+name a span and its fields; what collects them, and whether anything does, is
+the binary's business. Anything else would make the source-agnostic engine
+depend on a telemetry vendor's types, and put a second consumer of them behind
+every `Sink`. Where the engine needs something only the binary can do — linking
+a caller's `traceparent` to a span — it takes a closure, the way it already
+takes the position parser and the stream nudge.
+
 **Batch reads with `COPY … (FORMAT text)`.** Text parsing measured fast enough
 (~21k docs/s end to end) that binary format's complexity is not yet justified.
 

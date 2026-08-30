@@ -1692,6 +1692,9 @@ nothing changed) or `failed`. Nothing a reload does moves the checkpoint.
 | `RUST_LOG` | Log filter, e.g. `pg2osync=debug`. Wins over `[log] filter`, and cannot be changed without a restart |
 | `PG2OSYNC_LOG_FORMAT` | `text` (default) or `json` for one JSON object per line |
 | `PG2OSYNC_INSTANCE_ID` | Recorded in the checkpoint document; identifies the writer |
+| `PG2OSYNC_OTLP_ENDPOINT` | OTLP/gRPC collector for traces. Unset means none are built or sent — [Traces](operations.md#traces) |
+| `PG2OSYNC_OTLP_SAMPLE_RATIO` | Fraction of traces kept, `0.0` to `1.0` (default `1.0`) |
+| `PG2OSYNC_OTLP_SERVICE_NAME` | `service.name` on every span (default `pg2osync`) |
 | whatever `*_env` names | The credentials themselves |
 
 Filling those credentials from Vault, AWS Secrets Manager or the External

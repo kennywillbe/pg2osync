@@ -21,6 +21,17 @@ pub fn split_target(target: &str) -> (&str, &str) {
     target.split_once('?').unwrap_or((target, ""))
 }
 
+/// The value of one request header, matched case-insensitively by name.
+///
+/// Not used for the token: that comparison must not exit at the first wrong
+/// byte, which is what `authorized` below is for.
+pub fn header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+    request.lines().find_map(|line| {
+        let (header, value) = line.split_once(':')?;
+        header.eq_ignore_ascii_case(name).then(|| value.trim())
+    })
+}
+
 /// Whether the request carries `Authorization: Bearer <expected>`.
 pub fn authorized(request: &str, expected: &str) -> bool {
     request.lines().any(|line| {
@@ -78,6 +89,14 @@ mod tests {
     fn the_query_string_is_not_part_of_the_path() {
         assert_eq!(split_target("/synced?timeout=5"), ("/synced", "timeout=5"));
         assert_eq!(split_target("/metrics"), ("/metrics", ""));
+    }
+
+    #[test]
+    fn a_header_is_read_by_name_whatever_its_case() {
+        let request = with("TraceParent: 00-4bf9-00f0-01");
+        assert_eq!(header(&request, "traceparent"), Some("00-4bf9-00f0-01"));
+        assert_eq!(header(&request, "Host"), Some("h"));
+        assert_eq!(header(&request, "x-request-id"), None);
     }
 
     #[test]

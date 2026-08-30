@@ -214,46 +214,245 @@ impl LogFormat {
     }
 }
 
-/// Install the subscriber, keeping a handle on its filter.
+/// Install the subscriber: the filter, then the traces, then the format, on one
+/// registry.
 ///
-/// The handle is what lets `[log] filter` change on a running process. The two
-/// formats are wired separately rather than through one builder because the
-/// reload handle's type carries the formatter's, so the format has to be
-/// chosen before the filter becomes reloadable.
-fn init_logging(format: LogFormat) {
+/// The filter goes in behind a reload layer, which is what lets `[log] filter`
+/// change on a running process. It is the outermost layer, so turning a level
+/// up or down decides what is exported as well as what is printed.
+fn init_logging(
+    format: LogFormat,
+    traces: Option<impl tracing_subscriber::Layer<LogRegistry> + Send + Sync + 'static>,
+) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let (filter, handle) = tracing_subscriber::reload::Layer::new(reload::default_filter());
+    reload::set_filter_reload(std::sync::Arc::new(move |filter| {
+        handle.reload(filter).map_err(|e| e.to_string())
+    }));
+    let base = tracing_subscriber::registry().with(filter).with(traces);
+    let fmt = tracing_subscriber::fmt::layer();
     match format {
-        LogFormat::Text => {
-            let builder = tracing_subscriber::fmt()
-                .with_env_filter(reload::default_filter())
-                .with_filter_reloading();
-            let handle = builder.reload_handle();
-            reload::set_filter_reload(std::sync::Arc::new(move |filter| {
-                handle.reload(filter).map_err(|e| e.to_string())
-            }));
-            builder.init();
-        }
+        LogFormat::Text => base.with(fmt).init(),
         // Flattened, so a collector reads the event's own fields as top-level
         // keys beside level and target rather than under a nested object.
-        LogFormat::Json => {
-            let builder = tracing_subscriber::fmt()
-                .with_env_filter(reload::default_filter())
-                .json()
-                .flatten_event(true)
-                .with_filter_reloading();
-            let handle = builder.reload_handle();
-            reload::set_filter_reload(std::sync::Arc::new(move |filter| {
-                handle.reload(filter).map_err(|e| e.to_string())
-            }));
-            builder.init();
-        }
+        LogFormat::Json => base.with(fmt.json().flatten_event(true)).init(),
     }
+}
+
+/// What the trace layer is layered onto: the registry plus the reloadable
+/// filter, which is what is built before any format layer is added.
+type LogRegistry = tracing_subscriber::layer::Layered<
+    tracing_subscriber::reload::Layer<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>,
+    tracing_subscriber::Registry,
+>;
+
+/// Where traces go, and how many of them.
+///
+/// Environment variables rather than config keys, for the reason the log format
+/// is one: the tracing backend belongs to whoever runs the deployment, not to
+/// the pipeline the config file describes. No endpoint means nothing is built —
+/// no exporter, no batch thread, no connection attempt.
+#[derive(Debug, PartialEq)]
+struct TraceExport {
+    endpoint: String,
+    /// Fraction of traces to keep, honoured only where nothing upstream has
+    /// already decided: a caller's sampled `traceparent` outranks it.
+    ratio: f64,
+    service_name: String,
+}
+
+impl TraceExport {
+    fn from_env() -> Result<Option<Self>> {
+        Self::parse(
+            std::env::var("PG2OSYNC_OTLP_ENDPOINT").ok().as_deref(),
+            std::env::var("PG2OSYNC_OTLP_SAMPLE_RATIO").ok().as_deref(),
+            std::env::var("PG2OSYNC_OTLP_SERVICE_NAME").ok().as_deref(),
+        )
+    }
+
+    /// Kept separate from `from_env` so the rules can be tested without a
+    /// process environment every other test in the binary shares.
+    fn parse(
+        endpoint: Option<&str>,
+        ratio: Option<&str>,
+        service_name: Option<&str>,
+    ) -> Result<Option<Self>> {
+        let Some(endpoint) = endpoint.map(str::trim).filter(|e| !e.is_empty()) else {
+            return Ok(None);
+        };
+        let ratio = match ratio.map(str::trim).filter(|r| !r.is_empty()) {
+            Some(raw) => raw
+                .parse::<f64>()
+                .ok()
+                .filter(|r| (0.0..=1.0).contains(r))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "PG2OSYNC_OTLP_SAMPLE_RATIO is {raw:?}: expected a number \
+                         from 0.0 to 1.0"
+                    )
+                })?,
+            None => 1.0,
+        };
+        Ok(Some(Self {
+            endpoint: endpoint.to_string(),
+            ratio,
+            service_name: service_name
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("pg2osync")
+                .to_string(),
+        }))
+    }
+}
+
+/// An exporter that says the collector is unreachable once, then stops saying
+/// it.
+///
+/// A tracing backend that is down must cost the pipeline nothing: the batch
+/// processor drops the spans it could not send and replication carries on, and
+/// the operator gets one line rather than one per batch for as long as the
+/// outage lasts.
+#[derive(Debug)]
+struct QuietExporter<E> {
+    inner: E,
+    complained: std::sync::atomic::AtomicBool,
+}
+
+impl<E: opentelemetry_sdk::trace::SpanExporter> opentelemetry_sdk::trace::SpanExporter
+    for QuietExporter<E>
+{
+    async fn export(
+        &self,
+        batch: Vec<opentelemetry_sdk::trace::SpanData>,
+    ) -> opentelemetry_sdk::error::OTelSdkResult {
+        let result = self.inner.export(batch).await;
+        if let Err(e) = &result
+            && !self
+                .complained
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::warn!(target: "pg2osync::traces",
+                "spans are not reaching the OTLP endpoint and are being dropped; \
+                 replication is unaffected: {e}");
+        }
+        result
+    }
+
+    fn shutdown_with_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> opentelemetry_sdk::error::OTelSdkResult {
+        self.inner.shutdown_with_timeout(timeout)
+    }
+
+    fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+        self.inner.force_flush()
+    }
+
+    fn set_resource(&mut self, resource: &opentelemetry_sdk::Resource) {
+        self.inner.set_resource(resource);
+    }
+}
+
+/// Build the OTLP exporter and the provider that owns it.
+///
+/// Called from inside the tokio runtime, which the tonic client needs.
+fn build_tracer_provider(cfg: &TraceExport) -> Result<opentelemetry_sdk::trace::SdkTracerProvider> {
+    use opentelemetry_otlp::WithExportConfig;
+
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint(&cfg.endpoint)
+        .build()
+        .with_context(|| format!("cannot build an OTLP exporter for {}", cfg.endpoint))?;
+    Ok(opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_batch_exporter(QuietExporter {
+            inner: exporter,
+            complained: std::sync::atomic::AtomicBool::new(false),
+        })
+        // Parent-based, so a caller who decided to sample their own request has
+        // decided for the writes that request waits on as well.
+        .with_sampler(opentelemetry_sdk::trace::Sampler::ParentBased(Box::new(
+            opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(cfg.ratio),
+        )))
+        .with_resource(
+            opentelemetry_sdk::Resource::builder()
+                .with_service_name(cfg.service_name.clone())
+                .build(),
+        )
+        .build())
+}
+
+/// Continues a caller's trace into the wait `/synced` performs.
+///
+/// It lives here because this is the only crate that may name an OpenTelemetry
+/// type: the engine hands over a `tracing` span and the header it was given,
+/// and knows nothing about what happens to either. Process-wide, like the
+/// subscriber it belongs to, and set only when traces are on — so the endpoint
+/// links nothing while nothing is exporting.
+static TRACE_LINK: std::sync::OnceLock<pg2osync_engine::api::TraceLink> =
+    std::sync::OnceLock::new();
+
+pub(crate) fn trace_link() -> Option<pg2osync_engine::api::TraceLink> {
+    TRACE_LINK.get().cloned()
+}
+
+fn install_trace_link() {
+    let _ = TRACE_LINK.set(std::sync::Arc::new(|span, traceparent| {
+        use opentelemetry::propagation::TextMapPropagator;
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+        let carrier =
+            std::collections::HashMap::from([("traceparent".to_string(), traceparent.to_string())]);
+        let parent =
+            opentelemetry_sdk::propagation::TraceContextPropagator::new().extract(&carrier);
+        // A header that is not a W3C context extracts to an empty context,
+        // which `set_parent` treats as no parent at all: a malformed header
+        // costs the caller the link, never the request.
+        let _ = span.set_parent(parent);
+    }));
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_logging(LogFormat::from_env()?);
+    // Arguments first: `--help` and a mistyped subcommand exit here, and
+    // neither should have built an exporter on the way.
+    let command = Cli::parse().command;
+    let format = LogFormat::from_env()?;
+    // Read before anything is built, so a typo in either variable is a refusal
+    // at startup rather than a pipeline that runs half-configured.
+    let (provider, layer) = match TraceExport::from_env()? {
+        Some(cfg) => {
+            let provider = build_tracer_provider(&cfg)?;
+            let layer = tracing_opentelemetry::layer().with_tracer(
+                opentelemetry::trace::TracerProvider::tracer(&provider, "pg2osync"),
+            );
+            (Some(provider), Some(layer))
+        }
+        None => (None, None),
+    };
+    init_logging(format, layer);
+    if provider.is_some() {
+        install_trace_link();
+    }
 
-    match Cli::parse().command {
+    let result = run_command(command).await;
+
+    // The spans of the last batch are still in the batch processor's queue when
+    // the pipeline returns from its drain; without this they are lost exactly
+    // when a trace is most wanted, on the shutdown that ended the run.
+    if let Some(provider) = provider
+        && let Err(e) = provider.shutdown()
+    {
+        tracing::warn!(target: "pg2osync::traces", "the last spans were not flushed: {e}");
+    }
+    result
+}
+
+async fn run_command(command: Command) -> Result<()> {
+    match command {
         Command::Run { config } => pipeline(&config, run::Mode::Run).await,
         Command::Bootstrap { config } => pipeline(&config, run::Mode::Bootstrap).await,
         Command::Validate { config, config_dir } => {
@@ -2104,6 +2303,49 @@ mod tests {
             every_source(&["billing".to_string()], 3, "failed").expect_err("one failed")
         );
         assert_eq!(why, "1 of 3 source(s) failed: billing");
+    }
+
+    #[test]
+    fn without_an_endpoint_no_trace_export_is_configured_at_all() {
+        assert_eq!(
+            TraceExport::parse(None, Some("0.1"), Some("shop"))
+                .expect("no endpoint is not an error"),
+            None,
+            "a ratio and a name alone must not build an exporter"
+        );
+        assert_eq!(
+            TraceExport::parse(Some("  "), None, None).expect("blank is unset"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_sample_ratio_is_a_fraction_and_nothing_else_is_accepted() {
+        let with = |ratio| TraceExport::parse(Some("http://otel:4317"), Some(ratio), None);
+        assert_eq!(
+            with("0.05").expect("a fraction").expect("built").ratio,
+            0.05
+        );
+        assert_eq!(with(" 1 ").expect("padded").expect("built").ratio, 1.0);
+        for refused in ["1.5", "-0.1", "half", "100%", "0.1.2"] {
+            assert!(
+                with(refused).is_err(),
+                "{refused:?} is not a sampling ratio and must be refused at startup"
+            );
+        }
+    }
+
+    #[test]
+    fn the_service_name_defaults_to_the_binarys_own() {
+        let built = TraceExport::parse(Some("http://otel:4317"), None, None)
+            .expect("valid")
+            .expect("built");
+        assert_eq!(built.service_name, "pg2osync");
+        assert_eq!(built.ratio, 1.0, "every trace, until an operator says less");
+        let named = TraceExport::parse(Some("http://otel:4317"), None, Some("shop-sync"))
+            .expect("valid")
+            .expect("built");
+        assert_eq!(named.service_name, "shop-sync");
     }
 
     fn found() -> Vec<String> {
