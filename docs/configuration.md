@@ -135,6 +135,7 @@ It re-reads rows whose timestamp column advanced since the last cycle.
 | `api_key_env` | — | Elasticsearch API key, or Meilisearch master key |
 | `tls_verify` | `true` | Only disable for self-signed development certificates |
 | `state_dir` | `./.pg2osync-state` | Meilisearch only: directory for the checkpoint file |
+| `require_alias` | `false` | Refuse any write whose target is an index rather than an alias — see [Rebuilding an index](#rebuilding-an-index) |
 
 Meilisearch has no place to store an arbitrary document, so its checkpoint is a
 local file. Give that directory persistent storage, or a restart re-runs the
@@ -400,6 +401,60 @@ rollback — one alias flip away.
 - **A live cutover with no freshness gap at all is still two instances,** as
   [operations.md](operations.md) describes. A rebuild trades the gap for one
   command.
+
+#### Keeping every write behind the alias
+
+The follow-up that is yours — set `index` to the new name — is also the one
+that goes wrong quietly. A section left pointing at the raw index keeps
+writing, keeps its checkpoint moving and never says anything; the alias simply
+stops seeing new rows, and the first sign of it is a search result that is
+weeks stale.
+
+`[target] require_alias = true` makes that impossible. Every bulk action then
+tells OpenSearch or Elasticsearch that its target has to be an alias, and a
+write to a plain index comes back refused. The refusal is a **permanent**
+rejection — nothing about a name that is an index and not an alias changes on
+a retry — so the pipeline halts, or quarantines, exactly as it does for a
+document the mapping refuses:
+
+```
+orders is not an alias; with require_alias every write must go through one
+```
+
+```toml
+[target]
+url = "http://localhost:9200"
+require_alias = true
+
+[sync.orders]
+table = "public.orders"
+index = "orders_live"   # the alias, never the index it resolves to
+```
+
+`pg2osync validate` checks the same thing before the first batch, so the
+misconfiguration is caught by the command you already run after editing the
+config rather than by a halted pipeline an hour later:
+
+```
+✓ require_alias: every configured index is an alias
+```
+
+Two configurations are refused outright rather than left to fail per write:
+Meilisearch, which has no alias namespace at all — the live name there *is* an
+index uid — and a [templated](#per-row-indices) index, whose per-row index is
+created on demand and is therefore always a raw one.
+
+The target enforces the flag on writes that create or replace a document.
+A delete against a plain index is not refused by either engine, so the option
+is a guard on the writes that make an index diverge, not an access control.
+
+**A rebuild needs the flag off for the duration.** With `require_alias` the
+section names the alias, and `reindex` needs two names: a fresh index to fill
+and a separate one to point at it. So unset the option for the rebuild — the
+pipeline is stopped for it anyway — and afterwards leave `index` naming the
+alias rather than the new index the command prints, then set the option again.
+The alias now resolves to the rebuilt index and nothing in the section changed,
+which is the drift the option existed to prevent, gone at the source.
 
 ### Retention
 

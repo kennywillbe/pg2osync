@@ -261,6 +261,19 @@ fn refuse_unsupported(
             );
         }
     } else if alias == index {
+        // With require_alias the section names the alias by construction —
+        // validate proves it is one — so this is the *only* invocation an
+        // operator could reach for, and it is still not one a rebuild can do:
+        // it needs a fresh index to fill and a separate name to point at it.
+        if cfg.target.require_alias {
+            bail!(
+                "[target] require_alias is set, so [sync.{key}] names the alias {index} and not \
+                 an index, and a rebuild needs both a fresh index to fill and a name to point at \
+                 it. Unset require_alias for the rebuild — the pipeline is stopped for it anyway \
+                 — then leave index = \"{index}\" in place instead of the new name it prints, and \
+                 set require_alias again"
+            );
+        }
         bail!(
             "--alias {alias} is the index [sync.{key}] already writes to: an alias and an index \
              cannot share a name, and the rebuild would have nowhere to point it"
@@ -487,6 +500,22 @@ mod tests {
         assert!(err.to_string().contains("cannot share a name"), "{err}");
         refuse_unsupported(&cfg, "users", &cfg.sync["users"], "live")
             .expect("an ordinary section is fine");
+    }
+
+    #[test]
+    fn a_section_that_has_to_name_an_alias_is_told_what_a_rebuild_needs() {
+        // require_alias leaves the section naming the alias, so this is the
+        // only invocation left — and the refusal has to say why rather than
+        // claim a name collision that is not the problem here
+        let requiring = toml::from_str::<AppConfig>(
+            "[source]\nurl = \"postgres://u@h/db\"\n\
+             [target]\nurl = \"http://t\"\nrequire_alias = true\n\
+             [sync.users]\ntable = \"public.users\"\nindex = \"users_live\"\n",
+        )
+        .expect("parses");
+        let err = refuse_unsupported(&requiring, "users", &requiring.sync["users"], "users_live")
+            .expect_err("refused");
+        assert!(err.to_string().contains("require_alias is set"), "{err}");
     }
 
     #[test]

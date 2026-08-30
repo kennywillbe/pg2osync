@@ -118,6 +118,8 @@ pub struct OpenSearchSink {
     templates: Mutex<Vec<(String, Option<Value>)>>,
     /// Index names known to exist, so the ordinary batch costs no request.
     known_indexes: Mutex<HashSet<String>>,
+    /// Whether every bulk action has to land on an alias.
+    require_alias: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +130,9 @@ pub struct OpenSearchSinkConfig {
     pub password: Option<String>,
     pub tls_verify: bool,
     pub retry: RetryPolicy,
+    /// `[target] require_alias`: refuse a write whose target is an index
+    /// rather than an alias.
+    pub require_alias: bool,
 }
 
 /// Retry policy for transient failures; tunable via `[engine]` config.
@@ -185,6 +190,7 @@ impl OpenSearchSink {
             retry: cfg.retry,
             templates: Mutex::new(Vec::new()),
             known_indexes: Mutex::new(HashSet::new()),
+            require_alias: cfg.require_alias,
         })
     }
 
@@ -597,9 +603,15 @@ impl OpenSearchSink {
             .map(|op| bulk_action(&op.op))
             .collect::<Result<Vec<_>, _>>()?;
 
-        let resp = self
-            .client
-            .bulk(BulkParts::None)
+        // On the request rather than on each action because the generated
+        // client offers it there and its `BulkOperation` has no field for it.
+        // The two are the same rule: the target applies the flag to every
+        // action of the request either way.
+        let mut request = self.client.bulk(BulkParts::None);
+        if self.require_alias {
+            request = request.require_alias(true);
+        }
+        let resp = request
             .body(ops)
             .send()
             .await
@@ -638,6 +650,8 @@ impl OpenSearchSink {
             let error_type = entry["error"]["type"].as_str().unwrap_or("unknown");
             if item_status == 429 || item_status >= 500 {
                 retryable_http = true;
+            } else if let Some(reason) = require_alias_refusal(&entry) {
+                permanent.push((nth, reason));
             } else if error_type == "version_conflict_engine_exception" {
                 // Not a failure: a later position already holds this document,
                 // so declining this write is the ordering rule working. Treating
@@ -805,6 +819,32 @@ pub(crate) fn claiming_template<'a>(
 pub(crate) fn is_absent(item: &Value) -> bool {
     let entry = &item["delete"];
     entry["result"] == "not_found" || entry["error"]["type"] == "index_not_found_exception"
+}
+
+/// The refusal `require_alias` produced, if that is what this bulk item is.
+///
+/// Both targets report it as an `index_not_found_exception` naming the flag,
+/// which reads as "the index vanished" to anyone who did not set the option —
+/// so it is translated into the one sentence that says what to do about it.
+///
+/// Permanent rather than transient wherever it is used: nothing about a name
+/// that is an index and not an alias changes on a retry, and the whole point of
+/// the option is that the pipeline stops instead of writing past the alias.
+pub(crate) fn require_alias_refusal(entry: &Value) -> Option<String> {
+    if entry["error"]["type"] != "index_not_found_exception" {
+        return None;
+    }
+    let reason = entry["error"]["reason"].as_str()?;
+    if !reason.contains("[require_alias]") {
+        return None;
+    }
+    let index = entry["error"]["index"]
+        .as_str()
+        .or(entry["_index"].as_str())
+        .unwrap_or("the target index");
+    Some(format!(
+        "{index} is not an alias; with require_alias every write must go through one"
+    ))
 }
 
 fn chrono_now() -> u64 {
@@ -1642,6 +1682,26 @@ impl Sink for OpenSearchSink {
             ))),
         }
     }
+
+    async fn is_alias(&self, name: &str) -> Result<bool, CoreError> {
+        // `/_alias/<name>` looks the name up in the alias namespace alone, so
+        // an index of that name answers 404 exactly as a name nothing holds
+        // does — which is the distinction `require_alias` turns on.
+        let resp = self
+            .client
+            .indices()
+            .get_alias(opensearch::indices::IndicesGetAliasParts::Name(&[name]))
+            .send()
+            .await
+            .map_err(|e| CoreError::Sink(format!("alias {name:?} lookup failed: {e}")))?;
+        match resp.status_code().as_u16() {
+            200 => Ok(true),
+            404 => Ok(false),
+            status => Err(CoreError::Sink(format!(
+                "alias {name:?} lookup failed: status {status}"
+            ))),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2034,5 +2094,119 @@ mod tests {
         assert!(!super::is_serverless_endpoint(
             "https://search-mine-xyz.eu-west-1.es.amazonaws.com"
         ));
+    }
+
+    #[test]
+    fn a_refusal_that_names_the_flag_becomes_the_sentence_that_says_what_to_do() {
+        let entry = json!({"_index": "orders", "status": 404, "error": {
+            "type": "index_not_found_exception", "index": "orders",
+            "reason": "no such index [orders] and [require_alias] request flag is [true] \
+                       and [orders] is not an alias"}});
+        assert_eq!(
+            require_alias_refusal(&entry).as_deref(),
+            Some("orders is not an alias; with require_alias every write must go through one")
+        );
+
+        // an index that really is missing is a different failure and keeps its
+        // own reason, which is what tells an operator to create it
+        let missing = json!({"error": {"type": "index_not_found_exception", "index": "orders",
+                                       "reason": "no such index [orders]"}});
+        assert_eq!(require_alias_refusal(&missing), None);
+        assert_eq!(require_alias_refusal(&json!({"status": 201})), None);
+    }
+
+    /// The request lines an `OpenSearchSink` sends to a loopback listener that
+    /// answers every one of them with an empty, error-free bulk response.
+    ///
+    /// The flag goes on the request rather than on each action here, so a
+    /// serialised action cannot show it and only the URL can.
+    async fn request_lines_of_a_write(require_alias: bool, batch: Vec<LsnOp>) -> Vec<String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let url = format!("http://{}", listener.local_addr().expect("local address"));
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let record = std::sync::Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let record = std::sync::Arc::clone(&record);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let Ok(n) = stream.read(&mut buf).await else {
+                        return;
+                    };
+                    let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let mut words = head.lines().next().unwrap_or_default().split_whitespace();
+                    lock(&record).push(format!(
+                        "{} {}",
+                        words.next().unwrap_or_default(),
+                        words.next().unwrap_or_default()
+                    ));
+                    let body = r#"{"errors":false,"items":[]}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 Fake\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        let sink = OpenSearchSink::new(OpenSearchSinkConfig {
+            url,
+            username: None,
+            password: None,
+            tls_verify: true,
+            retry: RetryPolicy::default(),
+            require_alias,
+        })
+        .expect("a sink over plain http");
+        sink.write(batch).await.expect("the fake accepts the batch");
+        lock(&seen).clone()
+    }
+
+    fn an_upsert_and_a_delete() -> Vec<LsnOp> {
+        vec![
+            LsnOp {
+                lsn: Lsn(0x2A),
+                op: DocumentOp::Upsert {
+                    index: "users".into(),
+                    id: "1".into(),
+                    routing: None,
+                    doc: json!({"id": 1}),
+                    version: Some(0x2A),
+                    pipeline: None,
+                },
+            },
+            LsnOp {
+                lsn: Lsn(0x2A),
+                op: DocumentOp::Delete {
+                    index: "users".into(),
+                    id: "2".into(),
+                    routing: None,
+                    version: Some(0x2A),
+                },
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn every_bulk_action_of_a_write_is_told_to_require_an_alias() {
+        let lines = request_lines_of_a_write(true, an_upsert_and_a_delete()).await;
+        assert_eq!(
+            lines,
+            vec!["POST /_bulk?require_alias=true".to_string()],
+            "one request carries the flag for the upsert and the delete alike"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_target_nobody_asked_to_require_an_alias_sends_what_it_always_sent() {
+        let lines = request_lines_of_a_write(false, an_upsert_and_a_delete()).await;
+        assert_eq!(lines, vec!["POST /_bulk".to_string()]);
     }
 }

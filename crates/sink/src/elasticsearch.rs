@@ -26,6 +26,8 @@ pub struct ElasticsearchSink {
     templates: Mutex<Vec<(String, Option<Value>)>>,
     /// Index names known to exist, so the ordinary batch costs no request.
     known_indexes: Mutex<HashSet<String>>,
+    /// Whether every bulk action has to land on an alias.
+    require_alias: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +39,9 @@ pub struct ElasticsearchSinkConfig {
     pub api_key: Option<String>,
     pub tls_verify: bool,
     pub retry: crate::RetryPolicy,
+    /// `[target] require_alias`: refuse a write whose target is an index
+    /// rather than an alias.
+    pub require_alias: bool,
 }
 
 /// The version fields of a bulk action header, or nothing when the source has
@@ -75,16 +80,24 @@ fn pipeline_field(pipeline: Option<&str>) -> String {
     }
 }
 
-/// `/_ingest/pipeline/<name>` with the name percent-encoded as a path
-/// segment, so a `/` or `?` in it cannot turn the lookup into another request.
-fn pipeline_path(name: &str) -> String {
-    let Ok(mut url) = reqwest::Url::parse("http://query.invalid/_ingest/pipeline") else {
+/// `<base>/<name>` with the name percent-encoded as a path segment, so a `/`
+/// or `?` in it cannot turn the lookup into another request.
+fn path_under(base: &str, name: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(&format!("http://query.invalid{base}")) else {
         return String::new();
     };
     if let Ok(mut segments) = url.path_segments_mut() {
         segments.push(name);
     }
     url.path().to_string()
+}
+
+fn pipeline_path(name: &str) -> String {
+    path_under("/_ingest/pipeline", name)
+}
+
+fn alias_path(name: &str) -> String {
+    path_under("/_alias", name)
 }
 
 /// `key=value&…` with every value percent-encoded, so a parent id holding
@@ -100,6 +113,17 @@ fn query_string(pairs: &[(&str, &str)]) -> String {
     url.query().unwrap_or_default().to_string()
 }
 
+/// The `require_alias` field of a bulk action header, or nothing when the
+/// operator has not asked for it — so the wire shape of every configuration
+/// that does not set it stays byte-identical.
+fn require_alias_field(require_alias: bool) -> &'static str {
+    if require_alias {
+        ",\"require_alias\":true"
+    } else {
+        ""
+    }
+}
+
 /// One bulk action header line: `{"<action>":{"_index":…,"_id":…,…}}`.
 fn action_header(
     action: &str,
@@ -108,14 +132,16 @@ fn action_header(
     routing: Option<&str>,
     version: Option<u64>,
     pipeline: Option<&str>,
+    require_alias: bool,
 ) -> String {
     format!(
-        "{{\"{action}\":{{\"_index\":{},\"_id\":{}{}{}{}}}}}\n",
+        "{{\"{action}\":{{\"_index\":{},\"_id\":{}{}{}{}{}}}}}\n",
         serde_json::to_string(index).unwrap_or_default(),
         serde_json::to_string(id).unwrap_or_default(),
         routing_field(routing),
         version_fields(version),
-        pipeline_field(pipeline)
+        pipeline_field(pipeline),
+        require_alias_field(require_alias)
     )
 }
 
@@ -250,6 +276,9 @@ impl ElasticsearchSink {
             }
             let mut ndjson = String::new();
             for id in &ids {
+                // never `require_alias`: the index here is the concrete one a
+                // search found the child in, which is what has to be deleted
+                // from, and the flag exists to catch a *configured* name
                 ndjson.push_str(&action_header(
                     "delete",
                     index,
@@ -257,6 +286,7 @@ impl ElasticsearchSink {
                     Some(parent_id),
                     version,
                     None,
+                    false,
                 ));
             }
             let (status, body) = self
@@ -334,6 +364,7 @@ impl ElasticsearchSink {
             retry: cfg.retry,
             templates: Mutex::new(Vec::new()),
             known_indexes: Mutex::new(HashSet::new()),
+            require_alias: cfg.require_alias,
         })
     }
 
@@ -456,7 +487,7 @@ impl ElasticsearchSink {
     /// one action per operation, in order, so it identifies the operation even
     /// when a batch holds two writes for the same document.
     async fn bulk_once(&self, batch: &[LsnOp]) -> Result<(Lsn, Vec<(usize, String)>), CoreError> {
-        let ndjson = ndjson_body(batch)?;
+        let ndjson = ndjson_body(batch, self.require_alias)?;
 
         let resp = self
             .http
@@ -496,6 +527,8 @@ impl ElasticsearchSink {
             let error_type = entry["error"]["type"].as_str().unwrap_or("unknown");
             if s == 429 || s >= 500 {
                 retryable = true;
+            } else if let Some(reason) = crate::require_alias_refusal(&entry) {
+                permanent.push((nth, reason));
             } else if error_type == "version_conflict_engine_exception" {
                 // a later position already holds this document, so declining
                 // the write is the ordering rule working rather than a failure
@@ -551,7 +584,11 @@ impl ElasticsearchSink {
 /// A cascade is not a bulk action — `write` runs it between bulk requests —
 /// so one reaching here is a bug in the caller and is reported rather than
 /// skipped, which would silently lose it.
-fn ndjson_body(batch: &[LsnOp]) -> Result<String, CoreError> {
+///
+/// `require_alias` rides on each action rather than on the request so the
+/// header is self-describing: a body captured from a log says on its own line
+/// what the target was asked to enforce.
+fn ndjson_body(batch: &[LsnOp], require_alias: bool) -> Result<String, CoreError> {
     let mut ndjson = String::new();
     for op in batch {
         match &op.op {
@@ -570,6 +607,7 @@ fn ndjson_body(batch: &[LsnOp]) -> Result<String, CoreError> {
                     routing.as_deref(),
                     *version,
                     pipeline.as_deref(),
+                    require_alias,
                 ));
                 ndjson.push_str(&serde_json::to_string(doc).unwrap_or_default());
                 ndjson.push('\n');
@@ -587,6 +625,7 @@ fn ndjson_body(batch: &[LsnOp]) -> Result<String, CoreError> {
                     routing.as_deref(),
                     *version,
                     None,
+                    require_alias,
                 ));
             }
             DocumentOp::DeleteChildren {
@@ -1168,6 +1207,22 @@ impl Sink for ElasticsearchSink {
             ))),
         }
     }
+
+    async fn is_alias(&self, name: &str) -> Result<bool, CoreError> {
+        // `/_alias/<name>` looks the name up in the alias namespace alone, so
+        // an index of that name answers 404 exactly as a name nothing holds
+        // does — which is the distinction `require_alias` turns on.
+        let (status, _) = self
+            .send(reqwest::Method::GET, &alias_path(name), None)
+            .await?;
+        match status {
+            200 => Ok(true),
+            404 => Ok(false),
+            status => Err(CoreError::Sink(format!(
+                "alias {name:?} lookup failed: status {status}"
+            ))),
+        }
+    }
 }
 
 fn is_retryable(e: &CoreError) -> bool {
@@ -1181,7 +1236,11 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn lines(batch: &[LsnOp]) -> Vec<Value> {
-        ndjson_body(batch)
+        lines_with(batch, false)
+    }
+
+    fn lines_with(batch: &[LsnOp], require_alias: bool) -> Vec<Value> {
+        ndjson_body(batch, require_alias)
             .expect("bulk actions")
             .lines()
             // the body ends with the blank line the bulk API requires
@@ -1297,6 +1356,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn require_alias_rides_on_the_upsert_and_the_delete_alike() {
+        let batch = vec![
+            LsnOp {
+                lsn: Lsn(0x2A),
+                op: DocumentOp::Upsert {
+                    index: "users".into(),
+                    id: "1".into(),
+                    routing: None,
+                    doc: json!({"id": 1}),
+                    version: None,
+                    pipeline: None,
+                },
+            },
+            LsnOp {
+                lsn: Lsn(0x2A),
+                op: DocumentOp::Delete {
+                    index: "users".into(),
+                    id: "2".into(),
+                    routing: None,
+                    version: None,
+                },
+            },
+        ];
+        assert_eq!(
+            lines_with(&batch, true),
+            vec![
+                json!({"index": {"_index": "users", "_id": "1", "require_alias": true}}),
+                json!({"id": 1}),
+                json!({"delete": {"_index": "users", "_id": "2", "require_alias": true}}),
+            ]
+        );
+        // and the wire shape of a deployment that never asked for it is
+        // byte-identical to what it always sent
+        assert_eq!(
+            lines(&batch),
+            vec![
+                json!({"index": {"_index": "users", "_id": "1"}}),
+                json!({"id": 1}),
+                json!({"delete": {"_index": "users", "_id": "2"}}),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_name_that_is_an_index_is_not_an_alias_path_away() {
+        assert_eq!(alias_path("orders"), "/_alias/orders");
+        assert_eq!(alias_path("a/b?c"), "/_alias/a%2Fb%3Fc");
+    }
+
     /// A stand-in for Elasticsearch: `answer` maps each request — its line
     /// (`"POST /orders/_refresh"`) and its body — to the status and body it
     /// replies with, and `seen` records every request in the order it arrived.
@@ -1340,6 +1449,10 @@ mod tests {
         }
 
         fn sink(&self) -> ElasticsearchSink {
+            self.sink_with(false)
+        }
+
+        fn sink_with(&self, require_alias: bool) -> ElasticsearchSink {
             ElasticsearchSink::new(ElasticsearchSinkConfig {
                 url: self.url.clone(),
                 username: None,
@@ -1347,6 +1460,7 @@ mod tests {
                 api_key: None,
                 tls_verify: true,
                 retry: crate::RetryPolicy::default(),
+                require_alias,
             })
             .expect("a sink over plain http")
         }
@@ -1607,5 +1721,58 @@ mod tests {
         assert_eq!(sent[0]["sort"], json!([{"id": "asc"}]));
         assert_eq!(sent[0].get("search_after"), None);
         assert_eq!(sent[1]["search_after"], json!([2]));
+    }
+
+    #[tokio::test]
+    async fn a_name_the_alias_namespace_does_not_hold_is_not_an_alias() {
+        let target = FakeTarget::start(|line, _sent| match line {
+            "GET /_alias/orders_live" => (200, r#"{"orders-1":{"aliases":{"orders_live":{}}}}"#),
+            _ => (404, r#"{"error":{"type":"alias_not_found_exception"}}"#),
+        })
+        .await;
+        let sink = target.sink();
+        assert!(sink.is_alias("orders_live").await.expect("a lookup"));
+        // an index of that name answers the same 404 a name nothing holds
+        // does, which is exactly the distinction validate needs
+        assert!(!sink.is_alias("orders").await.expect("a lookup"));
+    }
+
+    #[tokio::test]
+    async fn a_write_past_the_alias_is_refused_permanently_and_says_so() {
+        let target = FakeTarget::start(|line, _sent| match line {
+            "POST /_bulk" => (
+                200,
+                r#"{"errors":true,"items":[{"index":{"_index":"orders","status":404,
+                   "error":{"type":"index_not_found_exception","index":"orders",
+                   "reason":"no such index [orders] and [require_alias] request flag is [true] and [orders] is not an alias"}}}]}"#,
+            ),
+            _ => (200, "{}"),
+        })
+        .await;
+        let ack = target
+            .sink_with(true)
+            .write(vec![LsnOp {
+                lsn: Lsn(0x2A),
+                op: DocumentOp::Upsert {
+                    index: "orders".into(),
+                    id: "1".into(),
+                    routing: None,
+                    doc: json!({"id": 1}),
+                    version: Some(0x2A),
+                    pipeline: None,
+                },
+            }])
+            .await
+            .expect("a refused item is reported, not raised");
+        assert_eq!(ack.rejected.len(), 1, "and it is a rejection, not a retry");
+        assert_eq!(
+            ack.rejected[0].reason,
+            "orders is not an alias; with require_alias every write must go through one"
+        );
+        assert_eq!(ack.rejected[0].doc_id, "1");
+        assert!(
+            target.seen().contains(&"POST /_bulk".to_string()),
+            "the refusal came out of a real bulk request"
+        );
     }
 }

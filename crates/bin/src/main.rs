@@ -933,6 +933,23 @@ async fn validate(path: &Path) -> Result<()> {
         }
         println!("✓ ingest pipeline {name} exists for [sync.{key}]");
     }
+    // Before the first write rather than at it: the target reports a name that
+    // is an index and not an alias as a refused document, one batch at a time,
+    // and the pipeline halts having already been configured wrong for as long
+    // as it took to notice.
+    if cfg.target.require_alias {
+        for spec in run::index_specs(&cfg)?.iter().filter(|s| !s.pattern) {
+            if !sink.is_alias(&spec.name).await? {
+                bail!(
+                    "[target] require_alias is set, but {} is an index, not an alias; \
+                     point the section at the alias that resolves to it, or unset \
+                     require_alias",
+                    spec.name
+                );
+            }
+        }
+        println!("✓ require_alias: every configured index is an alias");
+    }
     run::check_rejection_policy(&cfg, sink.as_ref())?;
     for note in run::embedded_children_with_own_section(&cfg) {
         println!("! {note}");
