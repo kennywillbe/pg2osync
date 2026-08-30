@@ -16,4 +16,7 @@ first. The rules below are the ones that must never be violated.
    decision record first, then the code.
 6. Before calling a change done: `cargo fmt --all`,
    `cargo clippy --workspace --all-targets -- -D warnings`,
-   `cargo test --workspace`, and `./dev/e2e-test.sh` when the pipeline changed.
+   `cargo test --workspace`, plus `./dev/e2e-test.sh` when the pipeline changed,
+   `./dev/e2e-mysql-test.sh` when the MySQL source, the engine or a sink
+   changed, and `./dev/failover-probe.sh` when the MySQL checkpoint or version
+   logic changed.

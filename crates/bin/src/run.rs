@@ -1134,6 +1134,29 @@ async fn run_postgres(
     .await
 }
 
+/// Which position a reconnect may resume streaming from.
+///
+/// Poll mode has no source position to resume from, so a leftover WAL
+/// checkpoint would skip rows changed while the process was down: it always
+/// reloads. A checkpoint behind the slot's replay position is unusable for the
+/// same reason — streaming resumes at the slot position, so the gap between
+/// them would be lost.
+fn resume_position(polling: bool, checkpoint: Option<Lsn>, slot: Option<Lsn>) -> Option<Lsn> {
+    if polling {
+        return None;
+    }
+    let checkpoint = checkpoint?;
+    if let Some(slot) = slot
+        && checkpoint < slot
+    {
+        tracing::warn!(target: "pg2osync::run",
+            "checkpoint {checkpoint} predates slot position {slot}; running a full \
+             initial load to avoid a gap");
+        return None;
+    }
+    Some(checkpoint)
+}
+
 /// Run an initial load with the target's per-load settings relaxed.
 ///
 /// Restoring is not optional and not conditional on success: an index left with
@@ -1188,28 +1211,17 @@ async fn attempt_postgres(
         .context("cannot connect to source PostgreSQL")?;
     let admin = &admin;
 
-    // Poll mode has no source position to resume from, so a leftover WAL
-    // checkpoint would skip rows changed while the process was down.
     let stored = if polling {
         None
     } else {
         usable_checkpoint(sink.read_checkpoint(&stream_id).await?, &stream_id)
     };
-    let mut resume_from = stored.map(|c| Lsn(c.token));
-    if !polling {
-        let slot_lsn =
-            pg2osync_source::catalog::confirmed_flush_lsn(admin, &cfg.source.slot_name).await?;
-        // A checkpoint behind the slot's replay position is unusable: streaming
-        // resumes at the slot position, so the gap between them would be lost.
-        if let (Some(cp), Some(slot)) = (resume_from, slot_lsn)
-            && cp < slot
-        {
-            tracing::warn!(target: "pg2osync::run",
-                "checkpoint {cp} predates slot position {slot}; running a full \
-                 initial load to avoid a gap");
-            resume_from = None;
-        }
-    }
+    let slot_lsn = if polling {
+        None
+    } else {
+        pg2osync_source::catalog::confirmed_flush_lsn(admin, &cfg.source.slot_name).await?
+    };
+    let resume_from = resume_position(polling, stored.map(|c| Lsn(c.token)), slot_lsn);
     // A checkpoint is not proof that the load finished: it says where streaming
     // got to, and with a load recording its own progress the two are separate
     // facts. Trusting the checkpoint alone is what silently skips a load.
@@ -1619,6 +1631,35 @@ struct AttemptWiring {
     version_base: Arc<std::sync::atomic::AtomicU64>,
 }
 
+/// Where MySQL document versions are numbered from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VersionBase {
+    /// The coordinate space the checkpoint was written in still holds.
+    Kept(u64),
+    /// The source is behind the checkpoint, so this is a different binlog
+    /// history and versions restart above everything already written.
+    NewGeneration(u64),
+}
+
+/// Decide the version base from the checkpoint and the source's coordinate.
+///
+/// The version is `base + coordinate`, and a version at the target only ever
+/// goes up. A failover onto a server whose numbering is lower would therefore
+/// have every write refused, leaving the index quietly stale — so when the
+/// coordinate the source is at now versions below the checkpoint's own token, a
+/// new generation opens above that token instead.
+fn version_base_for(base: u64, stored_token: u64, current_coordinate: u64) -> VersionBase {
+    if base.saturating_add(current_coordinate) >= stored_token {
+        return VersionBase::Kept(base);
+    }
+    // The margin has to clear the highest version already written but not yet
+    // acknowledged, which one unacknowledged transaction bounds to a few file
+    // rotations. A thousand rotations of headroom is far past that, and still
+    // leaves millions of generations in a u64.
+    const GENERATION_MARGIN: u64 = 1 << 40;
+    VersionBase::NewGeneration(stored_token.saturating_add(GENERATION_MARGIN))
+}
+
 async fn attempt_mysql(
     cfg: &AppConfig,
     source_url: &str,
@@ -1674,14 +1715,11 @@ async fn attempt_mysql(
             .as_ref()
             .map(mysql_catalog::StoredPosition::token)
             .unwrap_or(0);
-        if base.saturating_add(mysql_catalog::position_token(&current_file, current_pos))
-            < stored_token
-        {
-            // The margin has to clear the highest version already written but
-            // not yet acknowledged, which one unacknowledged transaction bounds
-            // to a few file rotations. A thousand rotations of headroom is far
-            // past that, and still leaves millions of generations in a u64.
-            const GENERATION_MARGIN: u64 = 1 << 40;
+        if let VersionBase::NewGeneration(opened) = version_base_for(
+            base,
+            stored_token,
+            mysql_catalog::position_token(&current_file, current_pos),
+        ) {
             let Some(position) = gtid_resume.clone() else {
                 bail!(
                     "the source is at {current_file}@{current_pos}, behind the checkpointed \
@@ -1701,7 +1739,7 @@ async fn attempt_mysql(
                      fresh index name to load again from here"
                 );
             }
-            base = stored_token.saturating_add(GENERATION_MARGIN);
+            base = opened;
             tracing::warn!(target: "pg2osync::run",
                 "the source is behind the checkpoint, so this is a different binlog history: \
                  resuming from gtid {} and versioning documents from a new generation at {base}",
@@ -2005,6 +2043,101 @@ pub fn spawn_engine(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `(file index << 32) | offset`, the coordinate the version is built on.
+    fn coordinate(file_index: u64, offset: u64) -> u64 {
+        (file_index << 32) | offset
+    }
+
+    const MARGIN: u64 = 1 << 40;
+
+    #[test]
+    fn a_first_run_versions_from_zero_so_the_version_is_the_bare_coordinate() {
+        assert_eq!(
+            version_base_for(0, 0, coordinate(1, 4)),
+            VersionBase::Kept(0)
+        );
+    }
+
+    #[test]
+    fn a_source_ahead_of_its_checkpoint_keeps_the_generation_it_is_in() {
+        let stored = coordinate(7, 120);
+        assert_eq!(
+            version_base_for(0, stored, coordinate(9, 4)),
+            VersionBase::Kept(0),
+            "the same server, further along: nothing to renumber"
+        );
+        // exactly at the checkpoint is a restart, not a different history
+        assert_eq!(version_base_for(0, stored, stored), VersionBase::Kept(0));
+        // a pipeline already in a later generation compares within it
+        assert_eq!(
+            version_base_for(MARGIN, MARGIN + stored, coordinate(8, 0)),
+            VersionBase::Kept(MARGIN)
+        );
+    }
+
+    #[test]
+    fn a_failover_onto_a_lower_coordinate_opens_a_generation_above_every_stored_version() {
+        // the promoted replica rotated fewer times than the old primary, so its
+        // own coordinate versions below what the target already holds
+        let stored = coordinate(9, 800);
+        let promoted = coordinate(2, 40);
+        let VersionBase::NewGeneration(base) = version_base_for(0, stored, promoted) else {
+            panic!("a lower coordinate has to open a generation");
+        };
+        assert_eq!(base, stored + MARGIN);
+        assert!(
+            base + promoted > stored,
+            "the first version written after the failover outranks the last one before it"
+        );
+    }
+
+    #[test]
+    fn each_failover_stacks_another_margin_so_versions_never_go_backwards() {
+        let first = coordinate(9, 800);
+        let VersionBase::NewGeneration(second_base) = version_base_for(0, first, coordinate(2, 40))
+        else {
+            panic!("the first failover opens a generation");
+        };
+        // the second failover compares against the version the first generation
+        // reached, not against a bare coordinate
+        let reached = second_base + coordinate(5, 10);
+        let VersionBase::NewGeneration(third_base) =
+            version_base_for(second_base, reached, coordinate(1, 0))
+        else {
+            panic!("the second failover opens another generation");
+        };
+        assert!(third_base > second_base);
+        assert_eq!(third_base, reached + MARGIN);
+    }
+
+    #[test]
+    fn the_margin_leaves_room_for_the_coordinate_space_and_for_millions_of_generations() {
+        // 2^40 is 2^8 whole file indexes of coordinate space, and a file caps
+        // at MySQL's 1 GiB, so a thousand rotations of headroom
+        assert_eq!(MARGIN / coordinate(1, 0), 1 << 8);
+        assert_eq!(MARGIN / (1 << 30), 1024, "1 GiB rotations");
+        assert_eq!(u64::MAX / MARGIN, (1 << 24) - 1, "millions of generations");
+    }
+
+    #[test]
+    fn poll_mode_always_reloads_and_a_checkpoint_behind_the_slot_is_unusable() {
+        // no source position to resume from, so a leftover WAL checkpoint would
+        // skip whatever changed while the process was down
+        assert_eq!(resume_position(true, Some(Lsn(90)), None), None);
+        assert_eq!(resume_position(false, None, Some(Lsn(10))), None);
+        assert_eq!(
+            resume_position(false, Some(Lsn(90)), Some(Lsn(10))),
+            Some(Lsn(90))
+        );
+        assert_eq!(
+            resume_position(false, Some(Lsn(90)), Some(Lsn(90))),
+            Some(Lsn(90))
+        );
+        // the gap between the checkpoint and the slot's replay position would
+        // be lost, so the load runs again instead
+        assert_eq!(resume_position(false, Some(Lsn(10)), Some(Lsn(90))), None);
+    }
 
     #[test]
     fn credentials_are_percent_decoded() {

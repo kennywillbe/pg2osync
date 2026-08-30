@@ -28,7 +28,7 @@ cargo test --workspace
 
 cargo build --release
 ./dev/e2e-test.sh                    # PostgreSQL -> OpenSearch, full pipeline
-./dev/e2e-mysql-test.sh              # MySQL source (needs a MySQL container)
+./dev/e2e-mysql-test.sh              # MySQL source, engine or sink (needs a MySQL container)
 ./dev/failover-probe.sh              # MySQL failover; builds its own primary and replica
 ./dev/mtls-probe.sh                  # client certificates; builds its own PostgreSQL with a CA
 ./dev/db-load-impact.sh              # what the source database pays while busy
@@ -38,8 +38,8 @@ cargo build --release
 
 `failover-probe.sh` is separate because it is the only check that needs two
 servers: it promotes a replica and asserts that the stream resumes *and* that
-documents written afterwards still land. Run it when touching checkpoints,
-versions or the MySQL protocol.
+documents written afterwards still land. Run it when the MySQL checkpoint or
+version logic changed.
 
 Commit subjects follow [Conventional Commits](https://www.conventionalcommits.org/)
 — `feat:`, `fix:`, `docs:`, `chore:`, and `feat!:` for anything that breaks a
