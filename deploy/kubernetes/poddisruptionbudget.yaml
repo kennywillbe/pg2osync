@@ -1,0 +1,16 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pg2osync
+  namespace: pg2osync
+  labels:
+    app.kubernetes.io/name: pg2osync
+spec:
+  # With one replica this refuses every voluntary eviction: a node drain hangs
+  # until someone deletes the pod. That is deliberate for a pipeline you would
+  # rather move yourself than have a cluster upgrade move for you, and it is
+  # why the Kustomization leaves this file out until you opt in.
+  maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pg2osync

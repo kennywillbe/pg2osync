@@ -61,6 +61,17 @@ spec:
               port: metrics
             periodSeconds: 30
             failureThreshold: 3
+          readinessProbe:
+            # /healthz answers 200 from the moment the metrics listener binds,
+            # which is before the initial load runs, so this reports "the port
+            # answers", not "the load is done" — enough to keep the Service
+            # from resolving to a pod that is starting, failing or shutting
+            # down
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: 10
+            failureThreshold: 3
           resources:
             requests:
               cpu: 100m
