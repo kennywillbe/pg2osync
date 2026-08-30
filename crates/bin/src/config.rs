@@ -158,6 +158,13 @@ pub struct TargetConfig {
     /// meilisearch only: checkpoint fallback directory
     #[serde(default = "default_state_dir")]
     pub state_dir: String,
+    /// Refuse a write whose target is an index rather than an alias.
+    ///
+    /// Off by default because it is a claim about the deployment — that every
+    /// index a section names is reached through an alias — and a deployment
+    /// that writes to indices directly is not wrong, only un-flippable.
+    #[serde(default)]
+    pub require_alias: bool,
 }
 
 fn default_target_flavor() -> String {
@@ -727,6 +734,13 @@ impl AppConfig {
                 self.target.flavor
             );
         }
+        if self.target.require_alias && self.target.flavor == "meilisearch" {
+            anyhow::bail!(
+                "[target] require_alias is an OpenSearch and Elasticsearch flag; Meilisearch \
+                 has no alias namespace — the name a section writes to is an index uid — so \
+                 there is nothing for it to require"
+            );
+        }
         if !SOURCE_MODES.contains(&self.source.mode.as_str()) {
             anyhow::bail!(
                 "[source] mode {:?} is not one of {SOURCE_MODES:?}",
@@ -783,6 +797,19 @@ impl AppConfig {
             let target = tbl
                 .index_target(key, &[])
                 .map_err(|e| anyhow::anyhow!("[sync.{key}] {e}"))?;
+            // A templated section creates the index a row names on demand, and
+            // an index created on demand is a raw one — no alias points at a
+            // name that did not exist a moment ago. Every write would be
+            // refused, so the combination is refused here instead.
+            if self.target.require_alias
+                && let IndexTarget::Template { spec, .. } = &target
+            {
+                anyhow::bail!(
+                    "[sync.{key}] index {spec:?} is rendered per row and the index it names is \
+                     created on demand, which never has an alias; require_alias and a templated \
+                     index cannot be combined"
+                );
+            }
             by_index
                 .entry(index.clone())
                 .or_default()
@@ -1538,6 +1565,43 @@ table = "public.users"
             message.contains("unset") && message.contains("unlimited"),
             "the refusal says what to write instead: {message}"
         );
+    }
+
+    #[test]
+    fn require_alias_is_off_until_the_operator_asks_for_it() {
+        let cfg = parse(MINIMAL).expect("valid");
+        assert!(!cfg.target.require_alias);
+        let asked = parse(&MINIMAL.replace("[target]", "[target]\nrequire_alias = true"))
+            .expect("a fixed index and an alias namespace");
+        assert!(asked.target.require_alias);
+    }
+
+    #[test]
+    fn require_alias_is_refused_where_there_are_no_aliases_to_require() {
+        // Meilisearch's live name is an index uid; there is no namespace the
+        // flag could ask a write to go through
+        let err = parse(&MINIMAL.replace(
+            "[target]",
+            "[target]\nflavor = \"meilisearch\"\nrequire_alias = true",
+        ))
+        .expect_err("refused");
+        assert!(err.to_string().contains("no alias namespace"), "{err}");
+    }
+
+    #[test]
+    fn require_alias_is_refused_for_an_index_a_row_chooses() {
+        // the index a row names is created on demand, and nothing has put an
+        // alias in front of a name that did not exist a moment ago
+        let err = parse(
+            &MINIMAL
+                .replace("[target]", "[target]\nrequire_alias = true")
+                .replace(
+                    "table = \"public.users\"",
+                    "table = \"public.users\"\nindex = \"events-{tenant}\"",
+                ),
+        )
+        .expect_err("refused");
+        assert!(err.to_string().contains("created on demand"), "{err}");
     }
 
     #[test]

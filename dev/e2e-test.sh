@@ -2464,6 +2464,93 @@ check "the rows kept are the lowest-keyed ones" \
 check "an uncapped book says nothing extra" \
   "$(os_has e2e_through_capped 1 authors_truncated)" "False"
 stop_sync
+echo -e "\n\033[1m== 33. require_alias refuses a write that bypasses the alias ==\033[0m"
+# A rebuild leaves one step to the operator: point the section at the new name.
+# A section left on the raw index keeps writing, keeps its checkpoint moving and
+# says nothing while the alias goes stale (#150). require_alias makes that a
+# refusal instead of a silence, and validate catches it before the first write.
+RACONFIG=$(mktemp /tmp/pg2osync-e2e-require-alias.XXXXXX)
+ra_cleanup() {
+  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  rm -f "$RACONFIG" "${RACONFIG}.raw"
+}
+trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup; init_cleanup; fan_cleanup; bid_cleanup; shape_cleanup; where_cleanup; join_cleanup; union_cleanup; events_cleanup; pipe_cleanup; append_cleanup; routing_cleanup; reindex_cleanup; rate_cleanup; through_cleanup; ra_cleanup' EXIT
+
+cat > "$RACONFIG" <<TOML
+[source]
+url_env = "PG2OSYNC_SOURCE_URL"
+slot_name = "$XSLOT"
+publication = "${XSLOT}_pub"
+
+[target]
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
+require_alias = true
+
+[metrics]
+bind = "127.0.0.1:9134"
+
+[sync.reindex]
+table = "public.reindex_probe"
+index = "$XALIAS"
+TOML
+
+out=$($BIN validate -c "$RACONFIG" 2>&1 || true)
+case "$out" in
+  *"require_alias: every configured index is an alias"*)
+    ok "validate confirms every configured index is an alias" ;;
+  *) bad "validate did not confirm the alias: $out" ;;
+esac
+
+nohup $BIN run -c "$RACONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sleep 3
+pg "INSERT INTO reindex_probe VALUES (5,'through-the-alias');" > /dev/null
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_status "$XALIAS" 5)" = "200" ] && break
+  sleep 1
+done
+check "a write through the alias is accepted with require_alias set" \
+  "$(os_field "$XALIAS" 5 v)" "through-the-alias"
+stop_sync
+
+# the same configuration one edit away from correct: the raw index the alias
+# resolves to, which is exactly what a rebuild leaves an operator holding
+sed "s#^index = \"$XALIAS\"\$#index = \"$newer_index\"#" "$RACONFIG" > "${RACONFIG}.raw"
+refusal=$($BIN validate -c "${RACONFIG}.raw" 2>&1 || true)
+case "$refusal" in
+  *"$newer_index"*"not an alias"*)
+    ok "validate refuses the raw index a rebuild left behind, naming it" ;;
+  *) bad "validate accepted a raw index under require_alias: $refusal" ;;
+esac
+
+# started anyway, the target refuses the first write itself, and a name that is
+# an index and not an alias never becomes one — so it halts rather than retries
+halts_before=$(grep -c "must go through one" "$LOG" || true)
+nohup $BIN run -c "${RACONFIG}.raw" >> "$LOG" 2>&1 < /dev/null & disown
+sleep 3
+pg "INSERT INTO reindex_probe VALUES (6,'past-the-alias');" > /dev/null
+for _ in $(seq 1 30); do
+  [ "$(grep -c 'must go through one' "$LOG" || true)" -gt "$halts_before" ] && break
+  sleep 1
+done
+if [ "$(grep -c 'must go through one' "$LOG" || true)" -gt "$halts_before" ]; then
+  ok "a run started anyway halts on the first write, naming the index and the flag"
+else
+  bad "a write past the alias was neither refused nor logged"
+fi
+refresh
+check "and the row never reached the index behind the alias" \
+  "$(os_status "$newer_index" 6)" "404"
+stop_sync
+
+# the section now names the alias, so the one rebuild invocation left needs the
+# flag off: a rebuild fills a fresh index and points a second name at it
+refusal=$($BIN reindex -c "$RACONFIG" --table public.reindex_probe --alias "$XALIAS" 2>&1 || true)
+case "$refusal" in
+  *"require_alias is set"*) ok "a rebuild says why require_alias has to come off first" ;;
+  *) bad "a rebuild under require_alias did not explain itself: $refusal" ;;
+esac
 
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

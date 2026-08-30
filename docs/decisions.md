@@ -609,6 +609,26 @@ it is the rollback — one alias flip back — and a `--keep-old` that defaults 
 on would be an option that does nothing. The count proves the number of rows,
 not their contents; what proves the contents is the replay the restart runs.
 
+The config edit the rebuild leaves to the operator is the step that fails
+silently, so `[target] require_alias` (#150) lets a deployment refuse a write
+whose target is an index rather than an alias — the flag both engines carry on
+a bulk action. Opt-in, because writing to an index directly is a perfectly good
+deployment and not one to break; a claim about how a deployment is run is the
+operator's to make. It is a *permanent* rejection when it fires: a name that is
+an index and not an alias is not going to become one on a retry, and quietly
+retrying would be the drift the option exists to stop. `validate` checks every
+fixed index against `/_alias/<name>` for the same reason the ingest-pipeline
+check is there — the flag would otherwise only report the mistake one refused
+batch at a time, after the pipeline had already been configured wrong for as
+long as it took to notice. A templated index is refused with it rather than
+enforced against: the index a row names is created on demand and no alias
+stands in front of a name that did not exist a moment ago. A rebuild is refused
+with it for the same shape of reason — the section names the alias, and
+`reindex` needs a fresh index *and* a separate name to point at it — so the
+option comes off for the rebuild and goes back on afterwards, with the section
+left naming the alias rather than the new index. That is the config edit the
+option exists to make unnecessary, so there is nothing to forget.
+
 **An alias is a contract, not an API call.** (#108.) `Sink::switch_alias` names
 an outcome — after it returns, the name readers use resolves to the documents
 the rebuild wrote, and it never resolved to nothing in between — and leaves the

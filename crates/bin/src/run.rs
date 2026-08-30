@@ -184,6 +184,7 @@ pub fn build_sink(cfg: &AppConfig, target_password: Option<String>) -> Result<Ar
                 api_key,
                 tls_verify: cfg.target.tls_verify,
                 retry,
+                require_alias: cfg.target.require_alias,
             },
         )?),
         "meilisearch" => Arc::new(pg2osync_sink::meilisearch::MeilisearchSink::new(
@@ -200,6 +201,7 @@ pub fn build_sink(cfg: &AppConfig, target_password: Option<String>) -> Result<Ar
                 password: target_password,
                 tls_verify: cfg.target.tls_verify,
                 retry,
+                require_alias: cfg.target.require_alias,
             },
         )?),
         other => bail!(

@@ -404,6 +404,19 @@ pub trait Sink: Send + Sync {
     async fn has_pipeline(&self, _name: &str) -> Result<bool, CoreError> {
         Ok(true)
     }
+
+    /// Whether `name` is an alias rather than an index of that name.
+    ///
+    /// Asked by `validate` when `require_alias` is set, so a section still
+    /// pointing at the raw index a rebuild replaced is named before the first
+    /// batch is refused for it rather than after.
+    ///
+    /// The default says yes for the reason `has_pipeline`'s does: a target
+    /// with no alias namespace never gets `require_alias` past config load, so
+    /// it is never asked.
+    async fn is_alias(&self, _name: &str) -> Result<bool, CoreError> {
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
