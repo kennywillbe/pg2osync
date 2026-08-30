@@ -135,7 +135,18 @@ pub(crate) async fn load_one(
     // A bare counter rather than `start_metrics`: binding the metrics port would
     // collide with the pipeline this is most likely running beside.
     let metrics = Arc::new(pg2osync_engine::metrics::Metrics::default());
-    let ctx = run::pipeline_ctx(cfg, sink.clone(), metrics, ack_tx, load_done_tx)?;
+    // A one-shot read has no signal to reload from, so the settings are the
+    // file's for its whole duration. Dropping the sender is what says so: a
+    // receiver keeps answering with the last value sent.
+    let settings_rx = cfg.engine.settings_channel().1;
+    let ctx = run::pipeline_ctx(
+        cfg,
+        sink.clone(),
+        metrics,
+        ack_tx,
+        load_done_tx,
+        settings_rx,
+    )?;
     let engine = run::spawn_engine(
         events_rx,
         copy_rx,

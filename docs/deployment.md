@@ -177,6 +177,49 @@ or disables the budget, so enable it only where an operator is watching. The
 plain manifests ship the same object in `poddisruptionbudget.yaml`, left out of
 the Kustomization until you uncomment it.
 
+### Reloading the configuration
+
+A change to `config` in values re-renders the ConfigMap. What that does to the
+running pod is `reloadOnChange`:
+
+| Value | What happens |
+|---|---|
+| `restart` (default) | The pod carries a checksum of the rendered config, so `helm upgrade` replaces it. Every option takes effect, at the cost of a drain, a reconnect and a replay from the checkpoint |
+| `signal` | No checksum, so the pod stays. The kubelet updates the ConfigMap volume in place and a sidecar sends SIGHUP when the file changes |
+
+```sh
+helm upgrade pg2osync deploy/helm/pg2osync -n pg2osync --set reloadOnChange=signal
+```
+
+Under `signal` the pipeline applies the settings a batch reads — batch sizes,
+the checkpoint interval, the load's rate ceiling, the retry budget, `[log]
+filter` — and refuses everything else *in place*, with one `ERROR` line naming
+the field and what it would take. [Reloading](configuration.md#reloading) has
+the full table. So `signal` does not mean "every change is picked up"; it means
+the changes that can be applied without a restart are, and the rest are named
+rather than silently dropped. Watch
+`pg2osync_config_reloads_total{result="refused"}` for the difference.
+
+Three things it needs, and one it cannot do:
+
+- `shareProcessNamespace: true`, which the chart sets. Without it the sidecar
+  cannot see the pipeline process to signal it.
+- Time. The kubelet refreshes a mounted ConfigMap on its own sync period, so
+  the change reaches the file up to about a minute after `helm upgrade`
+  returns, and the sidecar notices it within `reloadSidecar.intervalSeconds`.
+- A whole-volume mount. A `subPath` mount of the config is **never** updated in
+  place by the kubelet, so the sidecar would watch a file that never changes;
+  the chart refuses that combination at template time rather than shipping a
+  reload that silently does nothing.
+- It cannot be a `postStart` hook or an init container: both run once, and the
+  file changes long after.
+
+To reload by hand at any time, under either value:
+
+```sh
+kubectl -n pg2osync exec deploy/pg2osync -c pg2osync -- kill -HUP 1
+```
+
 ### Verifying a rollout
 
 ```sh
@@ -512,6 +555,10 @@ User=pg2osync
 # credentials live in a root-owned 0600 file, not in the unit
 EnvironmentFile=/etc/pg2osync/env
 ExecStart=/usr/local/bin/pg2osync run -c /etc/pg2osync/pg2osync.toml
+# `systemctl reload pg2osync` after editing the file; the process validates it
+# whole and refuses in place anything that needs a restart
+ExecReload=/usr/local/bin/pg2osync validate -c /etc/pg2osync/pg2osync.toml
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=5
 NoNewPrivileges=true

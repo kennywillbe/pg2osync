@@ -5,6 +5,7 @@ mod backfill;
 mod config;
 mod reconcile;
 mod reindex;
+mod reload;
 mod resnapshot;
 mod run;
 mod workspace;
@@ -213,16 +214,38 @@ impl LogFormat {
     }
 }
 
+/// Install the subscriber, keeping a handle on its filter.
+///
+/// The handle is what lets `[log] filter` change on a running process. The two
+/// formats are wired separately rather than through one builder because the
+/// reload handle's type carries the formatter's, so the format has to be
+/// chosen before the filter becomes reloadable.
 fn init_logging(format: LogFormat) {
-    let builder = tracing_subscriber::fmt().with_env_filter(
-        tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| "pg2osync=info".into()),
-    );
     match format {
-        LogFormat::Text => builder.init(),
+        LogFormat::Text => {
+            let builder = tracing_subscriber::fmt()
+                .with_env_filter(reload::default_filter())
+                .with_filter_reloading();
+            let handle = builder.reload_handle();
+            reload::set_filter_reload(std::sync::Arc::new(move |filter| {
+                handle.reload(filter).map_err(|e| e.to_string())
+            }));
+            builder.init();
+        }
         // Flattened, so a collector reads the event's own fields as top-level
         // keys beside level and target rather than under a nested object.
-        LogFormat::Json => builder.json().flatten_event(true).init(),
+        LogFormat::Json => {
+            let builder = tracing_subscriber::fmt()
+                .with_env_filter(reload::default_filter())
+                .json()
+                .flatten_event(true)
+                .with_filter_reloading();
+            let handle = builder.reload_handle();
+            reload::set_filter_reload(std::sync::Arc::new(move |filter| {
+                handle.reload(filter).map_err(|e| e.to_string())
+            }));
+            builder.init();
+        }
     }
 }
 
@@ -282,10 +305,18 @@ async fn main() -> Result<()> {
 
 async fn pipeline(path: &Path, mode: run::Mode) -> Result<()> {
     let cfg = config::AppConfig::load(path)?;
+    reload::apply_log_filter(cfg.log.filter.as_deref())?;
     let secrets = cfg.resolve_secrets()?;
     for warning in &secrets.warnings {
         tracing::warn!(target: "pg2osync::config", "{warning}");
     }
+    // Installed before the pipeline starts, so a SIGHUP that arrives during
+    // the initial load is a reload rather than the default disposition, which
+    // is to kill the process.
+    let reload = reload::ReloadSource {
+        path: path.to_path_buf(),
+        generations: reload::on_sighup(),
+    };
     run::run_pipeline(
         cfg,
         secrets.source_url,
@@ -294,6 +325,7 @@ async fn pipeline(path: &Path, mode: run::Mode) -> Result<()> {
         shutdown_signal(),
         pg2osync_engine::mapping::DurableLsn::default(),
         mode,
+        reload,
     )
     .await
 }

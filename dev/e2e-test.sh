@@ -2678,5 +2678,169 @@ check "a streamed update produces the token the load did" \
 stop_sync
 unset PG2OSYNC_E2E_PSEUDONYM_KEY
 
+echo -e "\n\033[1m== 35. SIGHUP re-reads the configuration without a restart ==\033[0m"
+# #145: a reload applies the settings a batch consults each time round, and
+# refuses everything else in place. What has to hold: the process is the same
+# process afterwards (same pid, no reconnect), a changed batch_size actually
+# moves the batch boundary, an identity change is refused by name while the
+# stream keeps running, and a file that does not parse leaves everything as it
+# was rather than taking the pipeline down with it.
+RLCONFIG=$(mktemp /tmp/pg2osync-e2e-reload.XXXXXX)
+RLSLOT=pg2osync_e2e_reload
+RLLOG=/tmp/pg2osync-e2e-reload.log
+: > "$RLLOG"
+drop_idle_probe_slots
+rl_metric() { curl -s 127.0.0.1:9136/metrics | grep -v '^#' | grep -F "$1" | awk '{print $2}' | head -1; }
+rl_write_config() {
+  cat > "$RLCONFIG" <<TOML
+[source]
+url_env = "PG2OSYNC_SOURCE_URL"
+slot_name = "$RLSLOT"
+publication = "${RLSLOT}_pub"
+
+[target]
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
+
+[metrics]
+bind = "127.0.0.1:9136"
+
+[engine]
+batch_size = $1
+checkpoint_interval_ms = 200
+
+[sync.reload]
+table = "public.reload_probe"
+index = "e2e_reload"
+$2
+TOML
+}
+rl_cleanup() {
+  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  pg "SELECT pg_drop_replication_slot('$RLSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$RLSLOT');" > /dev/null 2>&1 || true
+  pg "DROP PUBLICATION IF EXISTS ${RLSLOT}_pub; DROP TABLE IF EXISTS reload_probe;" > /dev/null 2>&1 || true
+  curl -s -XDELETE "$OS/e2e_reload" > /dev/null 2>&1 || true
+  rm -f "$RLCONFIG"
+}
+trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup; init_cleanup; fan_cleanup; bid_cleanup; shape_cleanup; where_cleanup; join_cleanup; union_cleanup; events_cleanup; pipe_cleanup; append_cleanup; routing_cleanup; reindex_cleanup; rate_cleanup; through_cleanup; ra_cleanup; pseudo_cleanup; rl_cleanup' EXIT
+
+pg "DROP TABLE IF EXISTS reload_probe; CREATE TABLE reload_probe(id bigint primary key, v text);" > /dev/null 2>&1
+pg "INSERT INTO reload_probe VALUES (1,'seed');" > /dev/null
+curl -s -XDELETE "$OS/e2e_reload" > /dev/null 2>&1
+rl_write_config 500 ""
+
+nohup $BIN run -c "$RLCONFIG" >> "$RLLOG" 2>&1 < /dev/null &
+RLPID=$!
+disown
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_count e2e_reload)" = "1" ] && break
+  sleep 1
+done
+check "the pipeline is up on the batch_size it started with" "$(os_count e2e_reload)" "1"
+batches_before=$(rl_metric "pg2osync_batches_flushed ")
+reconnects_before=$(rl_metric "pg2osync_reconnects_total ")
+
+# batch_size 500 -> 5. One transaction of 200 rows is the proof: no commit
+# boundary cuts it, so the only thing that can split it into batches is the
+# size the engine is reading now.
+rl_write_config 5 ""
+kill -HUP "$RLPID"
+for _ in $(seq 1 30); do
+  grep -q "applied: batch_size=5" "$RLLOG" && break
+  sleep 1
+done
+if grep -q "applied: batch_size=5" "$RLLOG"; then
+  ok "SIGHUP applied the new batch_size and said so"
+else
+  bad "the reload did not apply: $(grep -i reload "$RLLOG" | tail -3)"
+fi
+check "the process is the same process" "$(kill -0 "$RLPID" 2> /dev/null && echo alive)" "alive"
+
+# The engine copies the settings at the top of a batch turn, so a turn that was
+# already waiting when the HUP landed still runs on the old size — one turn of
+# lag, the documented cost. A sentinel row spends that turn, so the big
+# transaction below is guaranteed to meet the reloaded size.
+pg "INSERT INTO reload_probe VALUES (999, 'sentinel');" > /dev/null
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_count e2e_reload)" = "2" ] && break
+  sleep 1
+done
+check "the sentinel row went through on the old turn" "$(os_count e2e_reload)" "2"
+batches_before=$(rl_metric "pg2osync_batches_flushed ")
+
+pg "BEGIN; INSERT INTO reload_probe SELECT g, 'v' || g FROM generate_series(1000, 1199) g; COMMIT;" > /dev/null
+for _ in $(seq 1 90); do
+  refresh
+  [ "$(os_count e2e_reload)" = "202" ] && break
+  sleep 1
+done
+check "every row of the transaction is indexed" "$(os_count e2e_reload)" "202"
+batches_after=$(rl_metric "pg2osync_batches_flushed ")
+grew=$((batches_after - batches_before))
+# 200 rows at 5 a batch is around forty requests; at 500 it would have been one
+if [ "$grew" -ge 20 ]; then
+  ok "the reloaded batch_size cut the transaction into $grew batches, not one"
+else
+  bad "the batch boundary did not move: $grew batches for 200 rows"
+fi
+check "and nothing reconnected to do it" "$(rl_metric 'pg2osync_reconnects_total ')" "$reconnects_before"
+check "the reload is counted as applied" "$(rl_metric 'pg2osync_config_reloads_total{result="applied"}')" "1"
+
+# An identity change is refused in place: the section keeps running as it was,
+# because every document already written is filed the old way.
+rl_write_config 5 'id = "reload-{id}"'
+kill -HUP "$RLPID"
+for _ in $(seq 1 30); do
+  grep -q "id changed from None" "$RLLOG" && break
+  sleep 1
+done
+if grep -qF '[sync.reload] id changed from None to Some("reload-{id}")' "$RLLOG" \
+  && grep -qF "pg2osync reindex --table public.reload_probe" "$RLLOG"; then
+  ok "an identity change is refused by name, pointing at the rebuild"
+else
+  bad "the identity change was not refused clearly: $(grep -i 'id changed' "$RLLOG" | tail -1)"
+fi
+check "and it is counted as refused" "$(rl_metric 'pg2osync_config_reloads_total{result="refused"}')" "1"
+
+pg "INSERT INTO reload_probe VALUES (2001,'after-the-refusal');" > /dev/null
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_status e2e_reload 2001)" = "200" ] && break
+  sleep 1
+done
+check "the section is still filing rows under the id it was running with" \
+  "$(os_field e2e_reload 2001 v)" "after-the-refusal"
+check "so the refused template was never used" "$(os_status e2e_reload 'reload-2001')" "404"
+
+# A file that does not parse changes nothing, and above all does not stop the
+# process: a config pushed by a deployment tool must not be able to take a
+# pipeline down.
+printf '[source]\nthis is not toml' > "$RLCONFIG"
+kill -HUP "$RLPID"
+for _ in $(seq 1 30); do
+  grep -q "was not reloaded and nothing changed" "$RLLOG" && break
+  sleep 1
+done
+if grep -q "was not reloaded and nothing changed" "$RLLOG"; then
+  ok "a file that does not parse is reported and applied to nothing"
+else
+  bad "a broken file was not reported: $(grep -i reload "$RLLOG" | tail -3)"
+fi
+check "the process is still alive" "$(kill -0 "$RLPID" 2> /dev/null && echo alive)" "alive"
+check "and the broken read is counted as invalid" \
+  "$(rl_metric 'pg2osync_config_reloads_total{result="invalid"}')" "1"
+
+pg "INSERT INTO reload_probe VALUES (2002,'still-streaming');" > /dev/null
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_status e2e_reload 2002)" = "200" ] && break
+  sleep 1
+done
+check "the stream is still advancing after the bad file" \
+  "$(os_field e2e_reload 2002 v)" "still-streaming"
+stop_sync
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

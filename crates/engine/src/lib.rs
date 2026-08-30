@@ -28,7 +28,7 @@ use std::sync::atomic::Ordering;
 use tokio::sync::{mpsc, watch};
 
 /// `[engine]` config section.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EngineConfig {
     /// Rows per sink request.
@@ -89,6 +89,46 @@ pub enum RejectionPolicy {
 
 fn default_max_rejects() -> u64 {
     100
+}
+
+/// The `[engine]` settings a running pipeline re-reads rather than captures.
+///
+/// Separated from the rest of `EngineConfig` because these are the ones a
+/// batch consults each time round, so a new value reaches the next batch
+/// without anything being rebuilt. Everything left in `EngineConfig` is baked
+/// into a task, a connection or a channel when the attempt starts, and a
+/// reload refuses to change it rather than pretending it took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineSettings {
+    pub batch_size: usize,
+    pub batch_max_bytes: usize,
+    pub txn_buffer_cap_mb: usize,
+    pub checkpoint_interval_ms: u64,
+    pub load_max_rows_per_sec: Option<u32>,
+}
+
+impl EngineConfig {
+    pub fn settings(&self) -> EngineSettings {
+        EngineSettings {
+            batch_size: self.batch_size,
+            batch_max_bytes: self.batch_max_bytes,
+            txn_buffer_cap_mb: self.txn_buffer_cap_mb,
+            checkpoint_interval_ms: self.checkpoint_interval_ms,
+            load_max_rows_per_sec: self.load_max_rows_per_sec,
+        }
+    }
+
+    /// A channel carrying these settings, for a caller with nothing to reload
+    /// them from. The sender is returned so it can be kept alive; dropping it
+    /// leaves the receiver reading the value it was created with.
+    pub fn settings_channel(
+        &self,
+    ) -> (
+        watch::Sender<EngineSettings>,
+        watch::Receiver<EngineSettings>,
+    ) {
+        watch::channel(self.settings())
+    }
 }
 
 impl Default for EngineConfig {
@@ -183,6 +223,9 @@ pub struct PipelineCtx {
     /// the section configures an id.
     pub append_only: crate::mapping::AppendOnly,
     pub cfg: EngineConfig,
+    /// The settings the engine re-reads, so a configuration reload reaches the
+    /// next batch without the pipeline being rebuilt.
+    pub settings: watch::Receiver<EngineSettings>,
     /// Updated by the sink task after every successful flush.
     pub ack_tx: watch::Sender<Option<Lsn>>,
     /// Highest initial-load mark whose rows are durably written. The load
@@ -204,11 +247,15 @@ pub async fn run(
     durable: crate::mapping::DurableLsn,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), CoreError> {
-    if let Some(rows_per_sec) = ctx.cfg.load_max_rows_per_sec {
+    // The whole struct is copied out of the watch at the top of every turn:
+    // holding the guard would keep a lock across the awaits below, and a batch
+    // has to decide its size from one consistent set of values.
+    let mut settings = *ctx.settings.borrow();
+    if let Some(rows_per_sec) = settings.load_max_rows_per_sec {
         tracing::info!(target: "pg2osync::engine",
             "the load is capped at {rows_per_sec} rows/s; the stream is not capped");
     }
-    let mut copy = LoadIntake::new(copy, ctx.cfg.load_max_rows_per_sec);
+    let mut copy = LoadIntake::new(copy, settings.load_max_rows_per_sec);
     let (batch_tx, batch_rx) = mpsc::channel::<SinkCommand>(64);
     let (ckpt_done_tx, ckpt_done_rx) = watch::channel::<Option<Lsn>>(None);
 
@@ -230,11 +277,15 @@ pub async fn run(
     let ckpt_stream = stream;
     let ckpt_render = render_position;
     let ckpt_metrics = ctx.metrics.clone();
-    let ckpt_interval = ctx.cfg.checkpoint_interval_ms.max(100);
+    // Read per iteration rather than captured, so a reloaded interval takes
+    // effect — one interval late, since the sleep already under way is the old
+    // one and cutting it short would persist a checkpoint nobody asked for.
+    let ckpt_settings = ctx.settings.clone();
     let ckpt_task = tokio::spawn(async move {
         let mut last_persisted: Option<Lsn> = None;
         let mut ckpt_done_rx = ckpt_done_rx;
         loop {
+            let ckpt_interval = ckpt_settings.borrow().checkpoint_interval_ms.max(100);
             // The channel closes when the writer is done, and its last
             // acknowledgement is then the final position: persisting it before
             // leaving is what lets a stop resume where it left off instead of
@@ -290,7 +341,7 @@ pub async fn run(
     // A load mark that arrived mid-transaction, released once the transaction
     // it interrupted has been handed over.
     let mut pending_mark: Option<u64> = None;
-    let txn_cap_bytes = ctx.cfg.txn_buffer_cap_mb.saturating_mul(1024 * 1024);
+    let mut txn_cap_bytes = settings.txn_buffer_cap_mb.saturating_mul(1024 * 1024);
     let mut cap_warned = false;
     // A closed channel yields None immediately, which would spin the select; a
     // flag disables its branch instead. The loop ends when both are closed.
@@ -310,6 +361,15 @@ pub async fn run(
     let mut transform_warned: HashSet<(String, String)> = HashSet::new();
 
     let result = loop {
+        // The batch boundary is decided from here down, so a reload that
+        // landed since the last turn moves it from this batch onwards.
+        let latest = *ctx.settings.borrow();
+        if latest != settings {
+            settings = latest;
+            txn_cap_bytes = settings.txn_buffer_cap_mb.saturating_mul(1024 * 1024);
+            cap_warned = false;
+            copy.set_rate(settings.load_max_rows_per_sec);
+        }
         let ev = match deferred.take().or_else(|| try_next(&mut events, &mut copy)) {
             Some(ev) => ev,
             None => {
@@ -467,7 +527,7 @@ pub async fn run(
                 // one request instead of one round-trip each. Nothing is waited
                 // for, so this costs no latency when rows arrive alone.
                 let mut rows = vec![row];
-                while rows.len() < ctx.cfg.batch_size {
+                while rows.len() < settings.batch_size {
                     match try_next(&mut events, &mut copy) {
                         Some(ChangeEvent::Row(next)) => rows.push(next),
                         Some(other) => {
@@ -643,10 +703,10 @@ pub async fn run(
                         tracing::warn!(target: "pg2osync::engine",
                             "open transaction exceeds txn_buffer_cap_mb ({} MB); it will be \
                              split across sink requests",
-                            ctx.cfg.txn_buffer_cap_mb);
+                            settings.txn_buffer_cap_mb);
                     }
-                    if txn_buffer.len() >= ctx.cfg.batch_size
-                        || txn_bytes >= ctx.cfg.batch_max_bytes
+                    if txn_buffer.len() >= settings.batch_size
+                        || txn_bytes >= settings.batch_max_bytes
                     {
                         // oversized transaction split: safe because every op is
                         // idempotent and the commit LSN lands on the final piece
@@ -780,6 +840,9 @@ fn try_next(
 struct LoadIntake {
     rx: mpsc::Receiver<ChangeEvent>,
     limit: Option<RateLimit>,
+    /// The ceiling this bucket was built for, so a reload that leaves it alone
+    /// does not restart the bucket and hand the load a fresh empty allowance.
+    configured: Option<u32>,
     /// When the limit will let another row through; `None` means now.
     open_at: Option<std::time::Instant>,
 }
@@ -789,7 +852,25 @@ impl LoadIntake {
         Self {
             rx,
             limit: max_rows_per_sec.map(RateLimit::new),
+            configured: max_rows_per_sec,
             open_at: None,
+        }
+    }
+
+    /// Take a reloaded ceiling. A new rate starts its bucket empty, which is
+    /// what keeps the first second after the change at the new rate rather
+    /// than letting the old allowance be spent at it.
+    fn set_rate(&mut self, max_rows_per_sec: Option<u32>) {
+        if self.configured == max_rows_per_sec {
+            return;
+        }
+        self.configured = max_rows_per_sec;
+        self.limit = max_rows_per_sec.map(RateLimit::new);
+        self.open_at = None;
+        match max_rows_per_sec {
+            Some(rows) => tracing::info!(target: "pg2osync::engine",
+                "the load is now capped at {rows} rows/s"),
+            None => tracing::info!(target: "pg2osync::engine", "the load is no longer capped"),
         }
     }
 
@@ -1885,6 +1966,13 @@ mod pipeline_tests {
     use serde_json::json;
     use std::sync::Mutex;
 
+    /// Settings that never change, for the runs that are not about reloading.
+    /// The sender is dropped: a receiver keeps answering with the last value
+    /// sent, so nothing has to be kept alive to hold these still.
+    fn fixed_settings(cfg: &EngineConfig) -> watch::Receiver<EngineSettings> {
+        watch::channel(cfg.settings()).1
+    }
+
     /// Records what the pipeline asks of a sink, so ordering and checkpoint
     /// behaviour can be asserted without a live cluster.
     #[derive(Default)]
@@ -2246,6 +2334,7 @@ mod pipeline_tests {
             pipelines: crate::mapping::Pipelines::default(),
             routings: Default::default(),
             append_only: Default::default(),
+            settings: fixed_settings(&cfg),
             cfg,
             ack_tx,
             load_done_tx,
@@ -3294,6 +3383,11 @@ mod pipeline_tests {
         let (ack_tx, _ack_rx) = watch::channel(None);
         let (load_done_tx, _load_done_rx) = watch::channel(0u64);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let engine_cfg = EngineConfig {
+            batch_size,
+            checkpoint_interval_ms: 100,
+            ..EngineConfig::default()
+        };
         let ctx = Arc::new(PipelineCtx {
             sink: sink.clone(),
             mapping: TableMapping::from_pairs([(
@@ -3311,11 +3405,8 @@ mod pipeline_tests {
             pipelines,
             routings: Default::default(),
             append_only: Default::default(),
-            cfg: EngineConfig {
-                batch_size,
-                checkpoint_interval_ms: 100,
-                ..EngineConfig::default()
-            },
+            settings: fixed_settings(&engine_cfg),
+            cfg: engine_cfg,
             ack_tx,
             load_done_tx,
             metrics: Arc::new(crate::metrics::Metrics::default()),
@@ -3460,6 +3551,7 @@ mod pipeline_tests {
             pipelines: Default::default(),
             routings: Default::default(),
             append_only: Default::default(),
+            settings: fixed_settings(&EngineConfig::default()),
             cfg: EngineConfig::default(),
             ack_tx,
             load_done_tx,
@@ -3522,6 +3614,7 @@ mod pipeline_tests {
             pipelines: Default::default(),
             routings: Default::default(),
             append_only: Default::default(),
+            settings: fixed_settings(&EngineConfig::default()),
             cfg: EngineConfig::default(),
             ack_tx,
             load_done_tx,
@@ -3588,6 +3681,7 @@ mod pipeline_tests {
             pipelines: Default::default(),
             routings: Default::default(),
             append_only: Default::default(),
+            settings: fixed_settings(&EngineConfig::default()),
             cfg: EngineConfig::default(),
             ack_tx,
             load_done_tx,
@@ -3906,6 +4000,7 @@ mod pipeline_tests {
             pipelines: Default::default(),
             routings: Default::default(),
             append_only: Default::default(),
+            settings: fixed_settings(&EngineConfig::default()),
             cfg: EngineConfig::default(),
             ack_tx,
             load_done_tx,
@@ -3974,6 +4069,7 @@ mod pipeline_tests {
             pipelines: Default::default(),
             routings: Default::default(),
             append_only: Default::default(),
+            settings: fixed_settings(&EngineConfig::default()),
             cfg: EngineConfig::default(),
             ack_tx: ack_tx.clone(),
             load_done_tx: load_done_tx.clone(),
@@ -4265,6 +4361,11 @@ mod pipeline_tests {
             template: crate::mapping::IdTemplate::parse(spec, &["id".to_string()])
                 .expect("valid template"),
         };
+        let engine_cfg = EngineConfig {
+            batch_size: 500,
+            checkpoint_interval_ms: 100,
+            ..EngineConfig::default()
+        };
         let ctx = Arc::new(PipelineCtx {
             sink,
             mapping: TableMapping::from_pairs([(
@@ -4282,11 +4383,8 @@ mod pipeline_tests {
             pipelines: crate::mapping::Pipelines::default(),
             routings: Default::default(),
             append_only: Default::default(),
-            cfg: EngineConfig {
-                batch_size: 500,
-                checkpoint_interval_ms: 100,
-                ..EngineConfig::default()
-            },
+            settings: fixed_settings(&engine_cfg),
+            cfg: engine_cfg,
             ack_tx,
             load_done_tx,
             metrics: Arc::new(crate::metrics::Metrics::default()),
@@ -4598,6 +4696,11 @@ mod pipeline_tests {
         let ids = |spec: &str| {
             crate::mapping::IdTemplate::parse(spec, &["id".to_string()]).expect("valid template")
         };
+        let engine_cfg = EngineConfig {
+            batch_size: 500,
+            checkpoint_interval_ms: 100,
+            ..EngineConfig::default()
+        };
         let ctx = Arc::new(PipelineCtx {
             sink,
             mapping: TableMapping::from_pairs([
@@ -4630,11 +4733,8 @@ mod pipeline_tests {
             pipelines: crate::mapping::Pipelines::default(),
             routings: Default::default(),
             append_only: Default::default(),
-            cfg: EngineConfig {
-                batch_size: 500,
-                checkpoint_interval_ms: 100,
-                ..EngineConfig::default()
-            },
+            settings: fixed_settings(&engine_cfg),
+            cfg: engine_cfg,
             ack_tx,
             load_done_tx,
             metrics: metrics.clone(),
@@ -4872,6 +4972,11 @@ mod pipeline_tests {
         let (ack_tx, _ack_rx) = watch::channel(None);
         let (load_done_tx, _load_done_rx) = watch::channel(0u64);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let engine_cfg = EngineConfig {
+            batch_size: 500,
+            checkpoint_interval_ms: 100,
+            ..EngineConfig::default()
+        };
         let ctx = Arc::new(PipelineCtx {
             sink,
             mapping: TableMapping::from_pairs([(
@@ -4899,11 +5004,8 @@ mod pipeline_tests {
                 },
             )]),
             append_only: Default::default(),
-            cfg: EngineConfig {
-                batch_size: 500,
-                checkpoint_interval_ms: 100,
-                ..EngineConfig::default()
-            },
+            settings: fixed_settings(&engine_cfg),
+            cfg: engine_cfg,
             ack_tx,
             load_done_tx,
             metrics: Arc::new(crate::metrics::Metrics::default()),
@@ -5123,6 +5225,11 @@ mod pipeline_tests {
         let (load_done_tx, _load_done_rx) = watch::channel(0u64);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let sink = Arc::new(RecordingSink::default());
+        let engine_cfg = EngineConfig {
+            batch_size: 500,
+            checkpoint_interval_ms: 100,
+            ..EngineConfig::default()
+        };
         let ctx = Arc::new(PipelineCtx {
             sink: sink.clone(),
             mapping: TableMapping::from_pairs([(
@@ -5143,11 +5250,8 @@ mod pipeline_tests {
                 "public".to_string(),
                 "users".to_string(),
             )]),
-            cfg: EngineConfig {
-                batch_size: 500,
-                checkpoint_interval_ms: 100,
-                ..EngineConfig::default()
-            },
+            settings: fixed_settings(&engine_cfg),
+            cfg: engine_cfg,
             ack_tx,
             load_done_tx,
             metrics: Arc::new(crate::metrics::Metrics::default()),
@@ -5309,5 +5413,136 @@ mod pipeline_tests {
         .await;
         outcome.expect("engine ran");
         assert_eq!(sink.events(), vec!["write[upsert:event-e-1]"]);
+    }
+
+    /// A reload moves the batch boundary of the batches that come after it.
+    ///
+    /// Driven by hand rather than through `drive`, because the point is what
+    /// the engine does to work that is already in flight: rows go in under one
+    /// `batch_size`, the setting changes, and the rows that follow have to be
+    /// flushed by the new one without any transaction boundary forcing it.
+    #[tokio::test]
+    async fn a_reloaded_batch_size_moves_the_boundary_of_the_batches_after_it() {
+        let sink = Arc::new(RecordingSink::default());
+        let (events_tx, events_rx) = mpsc::channel(1);
+        let (copy_tx, copy_rx) = mpsc::channel(1);
+        let (ack_tx, _ack_rx) = watch::channel(None);
+        let (load_done_tx, _load_done_rx) = watch::channel(0u64);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let engine_cfg = EngineConfig {
+            batch_size: 100,
+            ..EngineConfig::default()
+        };
+        let (settings_tx, settings_rx) = engine_cfg.settings_channel();
+        let ctx = Arc::new(PipelineCtx {
+            sink: sink.clone(),
+            mapping: TableMapping::from_pairs([(
+                ("public".to_string(), "users".to_string()),
+                "users".to_string(),
+            )]),
+            projections: crate::mapping::Projections::default(),
+            transforms: crate::mapping::Transforms::default(),
+            renames: crate::mapping::Renames::default(),
+            constants: crate::mapping::Constants::default(),
+            id_templates: crate::mapping::IdTemplates::default(),
+            fan_outs: crate::mapping::FanOuts::default(),
+            joins: crate::mapping::Joins::default(),
+            filters: crate::mapping::Filters::default(),
+            pipelines: crate::mapping::Pipelines::default(),
+            routings: Default::default(),
+            append_only: Default::default(),
+            settings: settings_rx,
+            cfg: engine_cfg,
+            ack_tx,
+            load_done_tx,
+            metrics: Arc::new(crate::metrics::Metrics::default()),
+        });
+        let stream = StreamId {
+            source: SOURCE_POSTGRES.into(),
+            stream: "slot".into(),
+            publication: "pub".into(),
+        };
+        let render: PositionRenderer = Arc::new(|token| Lsn(token).to_string());
+        let engine = tokio::spawn(run(
+            events_rx,
+            copy_rx,
+            ctx,
+            stream,
+            render,
+            crate::mapping::DurableLsn::default(),
+            shutdown_rx,
+        ));
+        // no load in this run, and the engine only leaves once both its
+        // producers are gone
+        drop(copy_tx);
+
+        events_tx.send(begin(10)).await.expect("engine is running");
+        for id in 1..=3 {
+            events_tx.send(row(id)).await.expect("engine is running");
+        }
+        assert!(
+            sink.events().is_empty(),
+            "three rows are nowhere near a batch of 100, and no commit has been sent"
+        );
+
+        settings_tx.send_replace(EngineSettings {
+            batch_size: 2,
+            ..EngineConfig::default().settings()
+        });
+        // The engine reads the settings at the top of a turn and then waits, so
+        // the turn already waiting when the change landed is still using the
+        // old ones; a few more rows give it the turns to notice.
+        for id in 4..=12 {
+            events_tx.send(row(id)).await.expect("engine is running");
+            if !sink.events().is_empty() {
+                break;
+            }
+        }
+        let flushed = sink.events();
+        assert!(
+            !flushed.is_empty(),
+            "the reloaded batch_size should have flushed without a commit"
+        );
+        assert!(
+            flushed[0].matches("upsert:").count() < 100,
+            "the batch was cut by the reloaded size, not by the one the run started with: {}",
+            flushed[0]
+        );
+
+        events_tx.send(commit(20)).await.expect("engine is running");
+        drop(events_tx);
+        engine.await.expect("engine task").expect("engine ran");
+    }
+
+    #[test]
+    fn a_rate_limit_is_rebuilt_only_when_the_ceiling_actually_changed() {
+        let (_tx, rx) = mpsc::channel(1);
+        let mut intake = LoadIntake::new(rx, Some(10));
+        // spend more than a second's worth, so the bucket is in debt
+        intake
+            .limit
+            .as_mut()
+            .expect("capped")
+            .charge(100, std::time::Instant::now());
+        let owed = intake.limit.as_ref().expect("capped").tokens;
+        assert!(
+            owed < 0.0,
+            "the bucket has to be in debt for this to prove anything"
+        );
+
+        intake.set_rate(Some(10));
+        assert_eq!(
+            intake.limit.as_ref().expect("still capped").tokens,
+            owed,
+            "an unchanged ceiling must not hand the load a fresh allowance"
+        );
+
+        intake.set_rate(Some(20));
+        let limit = intake.limit.as_ref().expect("still capped");
+        assert_eq!(limit.per_sec, 20.0);
+        assert_eq!(limit.tokens, 0.0, "a new rate starts its bucket empty");
+
+        intake.set_rate(None);
+        assert!(intake.limit.is_none(), "the cap was removed");
     }
 }

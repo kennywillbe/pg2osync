@@ -29,6 +29,12 @@ pub struct Metrics {
     /// that the index and the table now disagree; before it, the only report
     /// was a log line nothing can alert on.
     pub schema_drift_total: Mutex<HashMap<String, AtomicU64>>,
+    /// Configuration reloads by outcome: `applied`, `invalid` (the file did
+    /// not load, so nothing changed), `refused` (something in it needs a
+    /// restart or a rebuild, and the running definition was kept) or `failed`.
+    /// A pipeline whose file is edited by a deployment tool is one an alert
+    /// should be able to ask this of.
+    pub config_reloads_total: Mutex<HashMap<String, AtomicU64>>,
     pub reconnects_total: AtomicU64,
     /// 1 while the source is streaming, 0 while it is being retried. The
     /// counter says how often it broke; this says whether it is broken now.
@@ -86,6 +92,16 @@ impl Metrics {
             .lock()
             .unwrap()
             .entry(table.to_string())
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `result` is one reload's outcome, one of the four documented above.
+    pub fn incr_config_reload(&self, result: &str) {
+        self.config_reloads_total
+            .lock()
+            .unwrap()
+            .entry(result.to_string())
             .or_insert_with(|| AtomicU64::new(0))
             .fetch_add(1, Ordering::Relaxed);
     }
@@ -203,6 +219,27 @@ impl Metrics {
             );
             out.push_str("# TYPE pg2osync_schema_drift_total counter\n");
             out.push_str(&drift.join("\n"));
+            out.push('\n');
+        }
+        let reloads: Vec<String> = self
+            .config_reloads_total
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(result, count)| {
+                format!(
+                    "pg2osync_config_reloads_total{{result=\"{result}\"}} {}",
+                    count.load(Ordering::Relaxed)
+                )
+            })
+            .collect();
+        if !reloads.is_empty() {
+            out.push_str(
+                "# HELP pg2osync_config_reloads_total Configuration reloads by outcome: \
+                 applied, invalid, refused or failed\n",
+            );
+            out.push_str("# TYPE pg2osync_config_reloads_total counter\n");
+            out.push_str(&reloads.join("\n"));
             out.push('\n');
         }
         push(

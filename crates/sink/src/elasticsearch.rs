@@ -631,6 +631,16 @@ fn ndjson_body(batch: &[LsnOp], require_alias: bool) -> Result<String, CoreError
 
 #[async_trait]
 impl Sink for ElasticsearchSink {
+    fn set_retry_policy(
+        &self,
+        max_attempts: u32,
+        base_backoff_ms: u64,
+        max_elapsed_ms: Option<u64>,
+    ) {
+        self.retry
+            .set(max_attempts, base_backoff_ms, max_elapsed_ms);
+    }
+
     async fn ensure_ready(&self, tables: &[IndexSpec]) -> Result<(), CoreError> {
         let (status, _) = self
             .send(

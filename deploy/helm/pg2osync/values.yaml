@@ -64,6 +64,30 @@ args: []
 # CloudWatch) parses the log stream instead of a human reading it.
 logFormat: text
 
+# What a change to the rendered config does to a running pod.
+#
+#   restart  the pod carries a checksum of the config, so `helm upgrade`
+#            replaces it. Simple, and every option takes effect — at the cost
+#            of a drain, a reconnect and a replay from the checkpoint.
+#   signal   no checksum, so the pod stays. The kubelet updates the ConfigMap
+#            volume in place (within about a minute) and a small sidecar sends
+#            SIGHUP when the file changes. pg2osync then applies the settings a
+#            batch reads and refuses the rest in place, naming the field — see
+#            docs/configuration.md#reloading for which is which. Needs
+#            shareProcessNamespace, and cannot work with a subPath mount of the
+#            config, which the kubelet never updates in place.
+reloadOnChange: restart
+
+reloadSidecar:
+  image: busybox:1.37
+  intervalSeconds: 10
+  resources:
+    requests:
+      cpu: 5m
+      memory: 8Mi
+    limits:
+      memory: 32Mi
+
 serviceAccount:
   create: true
   name: ""

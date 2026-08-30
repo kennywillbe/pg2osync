@@ -213,6 +213,20 @@ pub trait Sink: Send + Sync {
         only: Option<(&str, &str)>,
     ) -> Result<(), CoreError>;
 
+    /// Take a retry budget the operator changed while the pipeline was
+    /// running.
+    ///
+    /// Default is to ignore it: a target whose client does not retry — or
+    /// retries on its own terms — has nothing here to change, and saying so by
+    /// doing nothing is better than a second knob that means nothing.
+    fn set_retry_policy(
+        &self,
+        _max_attempts: u32,
+        _base_backoff_ms: u64,
+        _max_elapsed_ms: Option<u64>,
+    ) {
+    }
+
     /// Make everything written so far visible to search.
     ///
     /// A write that the sink has accepted is not necessarily searchable yet;

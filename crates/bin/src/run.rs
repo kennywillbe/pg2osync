@@ -53,6 +53,7 @@ pub async fn run_pipeline(
     shutdown_rx: watch::Receiver<bool>,
     durable: DurableLsn,
     mode: Mode,
+    reload: crate::reload::ReloadSource,
 ) -> Result<()> {
     let sink = build_sink(&cfg, target_password)?;
     check_rejection_policy(&cfg, sink.as_ref())?;
@@ -71,6 +72,7 @@ pub async fn run_pipeline(
                 shutdown_rx,
                 durable,
                 mode,
+                reload,
             )
             .await
         }
@@ -84,6 +86,7 @@ pub async fn run_pipeline(
                 shutdown_rx,
                 durable,
                 mode,
+                reload,
             )
             .await
         }
@@ -171,11 +174,11 @@ pub fn build_sink(cfg: &AppConfig, target_password: Option<String>) -> Result<Ar
         .api_key_env
         .as_ref()
         .and_then(|k| std::env::var(k).ok());
-    let retry = pg2osync_sink::RetryPolicy {
-        max_attempts: cfg.engine.retry_max.max(1),
-        base_backoff_ms: cfg.engine.retry_backoff_ms.max(1),
-        max_elapsed_ms: cfg.engine.retry_max_elapsed_ms,
-    };
+    let retry = pg2osync_sink::RetryPolicy::new(
+        cfg.engine.retry_max.max(1),
+        cfg.engine.retry_backoff_ms.max(1),
+        cfg.engine.retry_max_elapsed_ms,
+    );
     let sink: Arc<dyn Sink> = match cfg.target.flavor.as_str() {
         "elasticsearch" => Arc::new(pg2osync_sink::elasticsearch::ElasticsearchSink::new(
             pg2osync_sink::elasticsearch::ElasticsearchSinkConfig {
@@ -663,6 +666,7 @@ pub fn pipeline_ctx(
     metrics: SharedMetrics,
     ack_tx: watch::Sender<Option<Lsn>>,
     load_done_tx: watch::Sender<u64>,
+    settings: watch::Receiver<pg2osync_engine::EngineSettings>,
 ) -> Result<Arc<PipelineCtx>> {
     Ok(Arc::new(PipelineCtx {
         sink,
@@ -679,6 +683,7 @@ pub fn pipeline_ctx(
         routings: routings(cfg),
         append_only: append_only(cfg),
         cfg: cfg.engine.clone(),
+        settings,
         ack_tx,
         load_done_tx,
         metrics,
@@ -1017,6 +1022,7 @@ async fn run_postgres(
     shutdown_rx: watch::Receiver<bool>,
     durable: DurableLsn,
     mode: Mode,
+    reload: crate::reload::ReloadSource,
 ) -> Result<()> {
     use pg2osync_source::runner::{WalSource, WalSourceConfig};
 
@@ -1087,6 +1093,19 @@ async fn run_postgres(
         Arc::new(|text| text.trim().parse::<Lsn>().ok().map(|lsn| lsn.0));
     let metrics = start_metrics(&cfg)?;
     start_slot_watch(&cfg, admin_url.clone(), metrics.clone())?;
+    // Reloads are watched from here rather than from `main`, because this is
+    // where the settings channel and the sink they reach into exist, and only
+    // a pipeline that is actually running has anything to reload.
+    let (settings_tx, settings_rx) = cfg.engine.settings_channel();
+    crate::reload::spawn(
+        reload,
+        cfg.clone(),
+        crate::reload::Handles {
+            settings: settings_tx,
+            sink: sink.clone(),
+            metrics: metrics.clone(),
+        },
+    );
     let (ack_tx, ack_rx) = watch::channel(None);
     let nudge: Option<pg2osync_engine::api::StreamNudge> = if cfg.api.enabled {
         let url = admin_url.clone();
@@ -1148,6 +1167,7 @@ async fn run_postgres(
                 durable.clone(),
                 shutdown_rx.clone(),
                 polling,
+                settings_rx.clone(),
             )
         },
     )
@@ -1219,6 +1239,7 @@ async fn attempt_postgres(
     durable: DurableLsn,
     shutdown_rx: watch::Receiver<bool>,
     polling: bool,
+    settings: watch::Receiver<pg2osync_engine::EngineSettings>,
 ) -> Result<AttemptEnd> {
     use pg2osync_source::runner::WalSource;
 
@@ -1265,7 +1286,7 @@ async fn attempt_postgres(
     let (load_done_tx, load_done_rx) = watch::channel(0u64);
     let load_sink = sink.clone();
     let load_stream_id = stream_id.clone();
-    let ctx = pipeline_ctx(cfg, sink, metrics, ack_tx, load_done_tx)?;
+    let ctx = pipeline_ctx(cfg, sink, metrics, ack_tx, load_done_tx, settings)?;
     let engine = spawn_engine(
         events_rx,
         copy_rx,
@@ -1575,6 +1596,7 @@ async fn run_mysql(
     shutdown_rx: watch::Receiver<bool>,
     durable: DurableLsn,
     mode: Mode,
+    reload: crate::reload::ReloadSource,
 ) -> Result<()> {
     use pg2osync_source_mysql::runner::MySqlSource;
 
@@ -1591,6 +1613,19 @@ async fn run_mysql(
 
     let stream_id = cfg.stream_id();
     let metrics = start_metrics(&cfg)?;
+    // Reloads are watched from here rather than from `main`, because this is
+    // where the settings channel and the sink they reach into exist, and only
+    // a pipeline that is actually running has anything to reload.
+    let (settings_tx, settings_rx) = cfg.engine.settings_channel();
+    crate::reload::spawn(
+        reload,
+        cfg.clone(),
+        crate::reload::Handles {
+            settings: settings_tx,
+            sink: sink.clone(),
+            metrics: metrics.clone(),
+        },
+    );
     let (ack_tx, ack_rx) = watch::channel(None);
     // The generation the pipeline is versioning in, shared with the endpoints
     // outside the retry loop. They speak binlog coordinates, the pipeline
@@ -1656,6 +1691,7 @@ async fn run_mysql(
                     durable: durable.clone(),
                     shutdown_rx: shutdown_rx.clone(),
                     version_base: version_base.clone(),
+                    settings: settings_rx.clone(),
                 },
             )
         },
@@ -1678,6 +1714,9 @@ struct AttemptWiring {
     shutdown_rx: watch::Receiver<bool>,
     /// Where the endpoints learn which generation the pipeline is in.
     version_base: Arc<std::sync::atomic::AtomicU64>,
+    /// The `[engine]` settings each batch re-reads, so a reload reaches one
+    /// without the attempt being rebuilt.
+    settings: watch::Receiver<pg2osync_engine::EngineSettings>,
 }
 
 /// Where MySQL document versions are numbered from.
@@ -1725,6 +1764,7 @@ async fn attempt_mysql(
         durable,
         shutdown_rx,
         version_base,
+        settings,
     } = wiring;
     let source = MySqlSource::new(mysql_config_for(cfg, source_url)?);
     let mut admin = source.admin_connection().await?;
@@ -1902,7 +1942,7 @@ async fn attempt_mysql(
     let (load_done_tx, load_done_rx) = watch::channel(0u64);
     let load_sink = sink.clone();
     let load_stream_id = stream_id.clone();
-    let ctx = pipeline_ctx(cfg, sink, metrics, ack_tx, load_done_tx)?;
+    let ctx = pipeline_ctx(cfg, sink, metrics, ack_tx, load_done_tx, settings)?;
     let engine = spawn_engine(
         events_rx,
         copy_rx,

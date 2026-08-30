@@ -20,6 +20,7 @@ use pg2osync_core::sink::{
 };
 use serde_json::{Value, json};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 pub const META_INDEX: &str = ".pg2osync_meta";
@@ -140,22 +141,72 @@ pub struct OpenSearchSinkConfig {
 const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Retry policy for transient failures; tunable via `[engine]` config.
-#[derive(Debug, Clone)]
+///
+/// Atomics rather than plain fields because the sink is behind an `Arc<dyn
+/// Sink>` shared by every task by the time an operator changes their mind:
+/// there is no `&mut` to reach it through, and rebuilding the sink to widen a
+/// backoff would drop the connection pool and the index cache with it. Each
+/// value is read at the top of an attempt, so a change reaches the next one.
+#[derive(Debug)]
 pub struct RetryPolicy {
-    pub max_attempts: u32,
-    pub base_backoff_ms: u64,
+    max_attempts: std::sync::atomic::AtomicU32,
+    base_backoff_ms: AtomicU64,
     /// Ceiling on the time spent retrying one request, measured from its first
-    /// failure. `None` leaves the attempt count as the only limit.
-    pub max_elapsed_ms: Option<u64>,
+    /// failure. Zero is `None`: no ceiling, leaving the attempt count as the
+    /// only limit. A ceiling of zero would mean "never retry", which is what
+    /// `retry_max = 1` says, so the sentinel costs nothing expressible.
+    max_elapsed_ms: AtomicU64,
+}
+
+impl RetryPolicy {
+    pub fn new(max_attempts: u32, base_backoff_ms: u64, max_elapsed_ms: Option<u64>) -> Self {
+        Self {
+            max_attempts: std::sync::atomic::AtomicU32::new(max_attempts),
+            base_backoff_ms: AtomicU64::new(base_backoff_ms),
+            max_elapsed_ms: AtomicU64::new(max_elapsed_ms.unwrap_or(0)),
+        }
+    }
+
+    pub fn max_attempts(&self) -> u32 {
+        self.max_attempts.load(Ordering::Relaxed)
+    }
+
+    pub fn base_backoff_ms(&self) -> u64 {
+        self.base_backoff_ms.load(Ordering::Relaxed)
+    }
+
+    pub fn max_elapsed_ms(&self) -> Option<u64> {
+        match self.max_elapsed_ms.load(Ordering::Relaxed) {
+            0 => None,
+            ms => Some(ms),
+        }
+    }
+
+    /// Every value at once, so a retry loop in flight cannot pair the old
+    /// ceiling with the new backoff.
+    pub fn set(&self, max_attempts: u32, base_backoff_ms: u64, max_elapsed_ms: Option<u64>) {
+        self.max_attempts
+            .store(max_attempts.max(1), Ordering::Relaxed);
+        self.base_backoff_ms
+            .store(base_backoff_ms.max(1), Ordering::Relaxed);
+        self.max_elapsed_ms
+            .store(max_elapsed_ms.unwrap_or(0), Ordering::Relaxed);
+    }
+}
+
+impl Clone for RetryPolicy {
+    fn clone(&self) -> Self {
+        Self::new(
+            self.max_attempts(),
+            self.base_backoff_ms(),
+            self.max_elapsed_ms(),
+        )
+    }
 }
 
 impl Default for RetryPolicy {
     fn default() -> Self {
-        Self {
-            max_attempts: 10,
-            base_backoff_ms: 500,
-            max_elapsed_ms: None,
-        }
+        Self::new(10, 500, None)
     }
 }
 
@@ -178,14 +229,14 @@ impl RetryPolicy {
         failures: u32,
         elapsed: std::time::Duration,
     ) -> Result<std::time::Duration, RetryLimit> {
-        if failures >= self.max_attempts {
+        if failures >= self.max_attempts() {
             return Err(RetryLimit::Attempts);
         }
         let doubled = self
-            .base_backoff_ms
+            .base_backoff_ms()
             .saturating_mul(2u64.saturating_pow(failures.saturating_sub(1).min(16)));
         let backoff = std::time::Duration::from_millis(doubled).min(MAX_BACKOFF);
-        let Some(ceiling) = self.max_elapsed_ms else {
+        let Some(ceiling) = self.max_elapsed_ms() else {
             return Ok(backoff);
         };
         let remaining = std::time::Duration::from_millis(ceiling)
@@ -1160,6 +1211,16 @@ fn report_mapping(index: &str, configured: &Value, live: &Value) -> Result<(), C
 
 #[async_trait]
 impl Sink for OpenSearchSink {
+    fn set_retry_policy(
+        &self,
+        max_attempts: u32,
+        base_backoff_ms: u64,
+        max_elapsed_ms: Option<u64>,
+    ) {
+        self.retry
+            .set(max_attempts, base_backoff_ms, max_elapsed_ms);
+    }
+
     async fn ensure_ready(&self, tables: &[IndexSpec]) -> Result<(), CoreError> {
         self.ensure_meta_index().await?;
         let mut fixed: Vec<&str> = Vec::new();
@@ -2310,11 +2371,7 @@ mod retry_tests {
     use std::time::Duration;
 
     fn policy(max_attempts: u32, max_elapsed_ms: Option<u64>) -> RetryPolicy {
-        RetryPolicy {
-            max_attempts,
-            base_backoff_ms: 500,
-            max_elapsed_ms,
-        }
+        RetryPolicy::new(max_attempts, 500, max_elapsed_ms)
     }
 
     #[test]
@@ -2353,12 +2410,33 @@ mod retry_tests {
     }
 
     #[test]
+    fn a_reloaded_policy_is_read_by_the_next_wait() {
+        // The sink is behind an Arc by the time an operator changes their
+        // mind, so the budget has to be readable through `&self` and change
+        // under a loop that is already running.
+        let policy = policy(3, None);
+        assert_eq!(
+            policy.backoff_after(3, Duration::ZERO),
+            Err(RetryLimit::Attempts)
+        );
+        policy.set(10, 100, Some(5_000));
+        assert_eq!(
+            policy.backoff_after(3, Duration::ZERO),
+            Ok(Duration::from_millis(400)),
+            "the attempt that was out of budget now has one, at the new backoff"
+        );
+        assert_eq!(policy.max_elapsed_ms(), Some(5_000));
+        policy.set(10, 100, None);
+        assert_eq!(policy.max_elapsed_ms(), None, "the ceiling can be removed");
+        // a floor of one, so a reload cannot turn retrying off by accident
+        policy.set(0, 0, None);
+        assert_eq!(policy.max_attempts(), 1);
+        assert_eq!(policy.base_backoff_ms(), 1);
+    }
+
+    #[test]
     fn a_huge_backoff_cannot_overflow_into_a_short_wait() {
-        let policy = RetryPolicy {
-            max_attempts: 100,
-            base_backoff_ms: u64::MAX,
-            max_elapsed_ms: None,
-        };
+        let policy = RetryPolicy::new(100, u64::MAX, None);
         assert_eq!(policy.backoff_after(5, Duration::ZERO), Ok(MAX_BACKOFF));
     }
 

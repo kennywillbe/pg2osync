@@ -1615,11 +1615,81 @@ file that leaves the section out takes whatever the files that declare it say;
 two files declaring it differently are refused, naming both — one process opens
 one listener.
 
+## `[log]`
+
+| Option | Default | Description |
+|---|---|---|
+| `filter` | unset | `tracing` filter, e.g. `pg2osync=debug`. Ignored while `RUST_LOG` is set |
+
+`RUST_LOG` wins wherever both are set — the environment is what a container
+runtime, a systemd unit and a shell all reach for, and a file that quietly
+overrode it would make the variable a lie. This key exists for the case the
+variable cannot serve: the environment is fixed when the process is executed,
+so this is the only way to turn a level up on a pipeline that is already
+running, and it is one of the things a [reload](#reloading) applies. An
+unparsable filter fails validation, which means it fails the whole reload.
+Removing the key puts the default back.
+
+## Reloading
+
+`SIGHUP` re-reads this file. The whole file is validated first, so a file with a
+mistake anywhere in it changes nothing at all:
+
+```sh
+pg2osync validate -c pg2osync.toml && kill -HUP "$(pidof pg2osync)"
+```
+
+`validate` checks exactly what a reload checks, which is what makes that one
+line the workflow. There is no `pg2osync reload` subcommand: a second process
+would have to find the first one, and the only portable way is a pidfile —
+state outside the target, which is the one place pg2osync keeps state. Under
+Kubernetes the step is `kubectl exec … -- kill -HUP 1`; see
+[Deployment](deployment.md#reloading-the-configuration) for doing it on a
+config change automatically. Note that installing a handler changes what the
+signal does: SIGHUP's default disposition is to terminate, so a deployment
+using `kill -HUP` as a blunt restart now gets a reload instead.
+
+What a reload does with each option:
+
+| Option | On reload |
+|---|---|
+| `[engine] batch_size`, `batch_max_bytes`, `txn_buffer_cap_mb`, `load_max_rows_per_sec` | **Applied** — the next batch reads it |
+| `[engine] checkpoint_interval_ms` | **Applied**, one interval late: the sleep already under way is the old one |
+| `[engine] retry_max`, `retry_backoff_ms`, `retry_max_elapsed_ms` | **Applied** — the next attempt reads it |
+| `[log] filter` | **Applied**, unless `RUST_LOG` is set |
+| `[engine] write_concurrency`, `on_permanent_rejection`, `max_rejects` | **Restart** — the sink task is built with them |
+| `[source] *`, `[target] *` | **Restart** — they name the stream, and the checkpoint is bound to it. `[source] name` is the exception: only a [directory of configs](#a-directory-of-configs) reads it, so a running pipeline is indifferent to it |
+| `[metrics] *`, `[api] *`, any `*_env` | **Restart** — a listener is bound once, and the environment is fixed at exec |
+| `[sync.<key>] table`, `index`, `id`, `primary_key`, `append_only`, `routing`, `fan_out`, `join`, `children` | **Rebuild** — see below |
+| `[sync.<key>] columns`, `exclude_columns`, `transform`, `fields`, `constants`, `where`, `pipeline`, `soft_delete`, `mapping_file` | **Re-snapshot** — see below |
+| `[sync.<key>] poll_column` | **Restart** — the poll query is built when an attempt starts |
+| a `[sync.<key>]` added or removed | **Restart** |
+
+Anything not applied is refused *in place*: the section keeps running exactly as
+it was, and one `ERROR` line names the field, both values and what it would
+take. Nothing is half-applied, and a refusal elsewhere does not hold back the
+settings that can change.
+
+The two `[sync]` classes differ in what it costs to put right. The first changes
+what a row is **filed as**, so every document the section already wrote is filed
+the old way — the fix is a re-index into a new name with the alias moved onto
+it ([Zero-downtime re-index](operations.md#zero-downtime-re-index)). The second
+only changes the **shape** of the document, so the index would end up holding a
+mixture with nothing recording which is which — the fix is `pg2osync resnapshot
+--table …` after the restart. Adding or removing a section is a restart: a table
+joins a running pipeline only once its rows have been loaded beside the stream
+and, on PostgreSQL, its name is in the publication. Removing one leaves its
+index exactly as it is; nothing here deletes documents.
+
+Every reload is counted as `pg2osync_config_reloads_total{result}`, with
+`result` one of `applied`, `refused`, `invalid` (the file did not load, so
+nothing changed) or `failed`. Nothing a reload does moves the checkpoint.
+
 ## Environment variables
 
 | Variable | Purpose |
 |---|---|
-| `RUST_LOG` | Log filter, e.g. `pg2osync=debug` |
+| `RUST_LOG` | Log filter, e.g. `pg2osync=debug`. Wins over `[log] filter`, and cannot be changed without a restart |
 | `PG2OSYNC_LOG_FORMAT` | `text` (default) or `json` for one JSON object per line |
 | `PG2OSYNC_INSTANCE_ID` | Recorded in the checkpoint document; identifies the writer |
 | whatever `*_env` names | The credentials themselves |
