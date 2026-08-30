@@ -549,6 +549,7 @@ primary_key = "id"
 table = "sourcedb.kid_item"
 field = "items"
 foreign_key = "parent_id"
+exclude_columns = ["internal_notes"]
 
 # the same child table as its own index, so an embedded object can be compared
 # against the very row it came from
@@ -570,10 +571,11 @@ my "CREATE TABLE kid_parent(id bigint PRIMARY KEY, name varchar(32));"
 # silently if the array were built by JSON_ARRAYAGG(JSON_OBJECT(...)).
 my "CREATE TABLE kid_item(id bigint PRIMARY KEY, parent_id bigint,
                           b varbinary(8), d decimal(10,2), bt bit(16),
-                          s set('a','b','c'), label varchar(32), INDEX(parent_id));"
+                          s set('a','b','c'), label varchar(32),
+                          internal_notes varchar(64), INDEX(parent_id));"
 my "INSERT INTO kid_parent VALUES (1,'one'),(2,'two');"
-my "INSERT INTO kid_item VALUES (10,1,0x00FF10,12.34,b'0000000011111111','a,c','i10'),
-                                (11,1,0x01,0.10,b'1','','i11');"
+my "INSERT INTO kid_item VALUES (10,1,0x00FF10,12.34,b'0000000011111111','a,c','i10','do not index'),
+                                (11,1,0x01,0.10,b'1','','i11','nor this');"
 curl -s -XDELETE "$OS/e2e_mysql_kid,e2e_mysql_kid_item?ignore_unavailable=true" > /dev/null
 curl -s -XDELETE "$OS/.pg2osync_meta/_doc/mysql-$CSID" > /dev/null
 
@@ -586,8 +588,11 @@ done
 check "children attached during the load" "$(os_len e2e_mysql_kid 1 items)" "2"
 check "a childless parent gets an empty array" "$(os_len e2e_mysql_kid 2 items)" "0"
 check "and has the field at all" "$(os_has e2e_mysql_kid 2 items)" "True"
+check "an excluded child column is not in the array" \
+  "$(curl -s "$OS/e2e_mysql_kid/_doc/1" | jqf "'internal_notes' in ((d.get('_source') or {}).get('items') or [{}])[0]")" \
+  "False"
 
-my "INSERT INTO kid_item VALUES (12,1,0x02,1.00,b'10','b','i12');"
+my "INSERT INTO kid_item VALUES (12,1,0x02,1.00,b'10','b','i12','nor that');"
 sleep 3; refresh
 check "child INSERT refreshes the parent" "$(os_len e2e_mysql_kid 1 items)" "3"
 my "DELETE FROM kid_item WHERE id = 12;"
@@ -596,8 +601,16 @@ sleep 3; refresh
 # parent is always locatable — no REPLICA IDENTITY caveat as on PostgreSQL
 check "child DELETE refreshes the parent" "$(os_len e2e_mysql_kid 1 items)" "2"
 
+# the same projected schema builds the load's and the re-fetch's select list, so
+# a change to the excluded column may not leak it into the array
+my "UPDATE kid_item SET internal_notes = 'still secret' WHERE id = 10;"
+sleep 3; refresh
+check "the excluded child column stays out on the stream" \
+  "$(curl -s "$OS/e2e_mysql_kid/_doc/1" | jqf "'internal_notes' in ((d.get('_source') or {}).get('items') or [{}])[0]")" \
+  "False"
+
 # many children of one parent in one statement: deduplicated to one document
-my "INSERT INTO kid_item SELECT 1000+seq, 2, 0x03, 2.00, b'11', 'c', CONCAT('m',seq)
+my "INSERT INTO kid_item SELECT 1000+seq, 2, 0x03, 2.00, b'11', 'c', CONCAT('m',seq), 'nope'
       FROM (SELECT 1 seq UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5
             UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9
             UNION SELECT 10) t;"

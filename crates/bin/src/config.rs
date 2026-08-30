@@ -537,6 +537,16 @@ pub struct ChildJoin {
     /// Target field names inside the embedded array, child column → field.
     #[serde(default)]
     pub fields: std::collections::HashMap<String, String>,
+    /// The only child columns to embed. Unset embeds all of them.
+    ///
+    /// Projected in the read, so the initial load and a streamed re-fetch
+    /// cannot embed different shapes. Mutually exclusive with
+    /// `exclude_columns`, as on the parent section.
+    #[serde(default)]
+    pub columns: Option<Vec<String>>,
+    /// Child columns to leave out of the embedded element.
+    #[serde(default)]
+    pub exclude_columns: Vec<String>,
 }
 
 impl ChildJoin {
@@ -1002,6 +1012,42 @@ impl AppConfig {
                     &format!("sync.{key}.children({}).fields", child.table),
                     &child.fields,
                 )?;
+                let child_key = format!("sync.{key}.children({})", child.table);
+                if child.columns.is_some() && !child.exclude_columns.is_empty() {
+                    anyhow::bail!(
+                        "[{child_key}] columns and exclude_columns are mutually exclusive"
+                    );
+                }
+                if child.columns.as_ref().is_some_and(|c| c.is_empty()) {
+                    anyhow::bail!("[{child_key}] columns must not be empty");
+                }
+                for (col, target) in &child.fields {
+                    // a rename is a promise that the column reaches the target;
+                    // projection dropping it would break that promise silently
+                    if child.exclude_columns.contains(col) {
+                        anyhow::bail!(
+                            "[{child_key}.fields] {col} is renamed but also excluded; \
+                             an excluded column never reaches the target"
+                        );
+                    }
+                    if let Some(cols) = &child.columns
+                        && !cols.contains(col)
+                    {
+                        anyhow::bail!(
+                            "[{child_key}.fields] {col} is renamed but not in columns; \
+                             it would never reach the target"
+                        );
+                    }
+                    if let Some(cols) = &child.columns
+                        && cols.contains(target)
+                        && !child.fields.contains_key(target)
+                    {
+                        anyhow::bail!(
+                            "[{child_key}.fields] {col} = {target:?} would overwrite column \
+                             {target}"
+                        );
+                    }
+                }
             }
             // qualification was checked at the top of this loop
             let (schema, table) = tbl.table.split_once('.').unwrap_or((&tbl.table, ""));
@@ -1846,6 +1892,45 @@ id = "user-{id}"
             cfg.sync["users"].children[0].fields["total"], "amount",
             "the child's fields attach to that child"
         );
+    }
+
+    #[test]
+    fn a_child_collection_projects_its_own_columns() {
+        const CHILD: &str = "[[sync.users.children]]\ntable = \"public.orders\"\n\
+                             field = \"orders\"\nforeign_key = \"user_id\"\n";
+        let refused = [
+            (
+                "columns = [\"id\"]\nexclude_columns = [\"note\"]\n",
+                "a projection is one list or the other",
+            ),
+            ("columns = []\n", "an empty projection embeds nothing"),
+            (
+                "exclude_columns = [\"note\"]\n[sync.users.children.fields]\nnote = \"n\"\n",
+                "an excluded child column cannot be renamed",
+            ),
+            (
+                "columns = [\"id\"]\n[sync.users.children.fields]\nnote = \"n\"\n",
+                "a child column outside the projection cannot be renamed",
+            ),
+            (
+                "columns = [\"id\", \"note\"]\n[sync.users.children.fields]\nid = \"note\"\n",
+                "a target that is a surviving child column would overwrite it",
+            ),
+        ];
+        for (extra, why) in refused {
+            assert!(parse(&format!("{MINIMAL}{CHILD}{extra}")).is_err(), "{why}");
+        }
+
+        let cfg = parse(&format!(
+            "{MINIMAL}{CHILD}exclude_columns = [\"internal_notes\"]\n"
+        ))
+        .expect("a child exclusion parses");
+        assert_eq!(
+            cfg.sync["users"].children[0].exclude_columns,
+            vec!["internal_notes".to_string()],
+            "the exclusion attaches to that child, not to the parent"
+        );
+        assert!(cfg.sync["users"].exclude_columns.is_empty());
     }
 
     #[test]

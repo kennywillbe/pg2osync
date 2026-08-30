@@ -1470,6 +1470,8 @@ pub fn child_specs_for(
                 &tbl.primary_key.clone().unwrap_or_else(|| "id".into()),
             )?;
             spec.max_rows = child.max_rows;
+            spec.columns = child.columns.clone();
+            spec.exclude_columns = child.exclude_columns.clone();
             map.entry((schema.to_string(), table.to_string()))
                 .or_default()
                 .push(spec);

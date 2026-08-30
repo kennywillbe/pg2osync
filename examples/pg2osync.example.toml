@@ -130,6 +130,7 @@ email = "redact"                     # "redact" -> "***", "hash" -> SHA-256 pref
 # table = "public.orders"
 # field = "orders"
 # foreign_key = "customer_id"
+# exclude_columns = ["internal_notes"]    # or columns = [...], not both
 #
 # [sync.customers.children.fields]
 # order_dt = "ordered_at"

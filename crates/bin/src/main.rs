@@ -1130,6 +1130,64 @@ async fn report_client_certificate(
     }
 }
 
+/// The same check for one child collection, against the child table's columns.
+///
+/// A child's projection and renames name columns of the *child* table, which the
+/// parent's check never sees; without this a `columns` list that outlived a
+/// dropped column would quietly shrink every embedded element.
+fn check_child_columns(child: &config::ChildJoin, live: &[String]) -> Result<()> {
+    let missing = |names: &[String]| -> Vec<String> {
+        names
+            .iter()
+            .filter(|n| !live.iter().any(|c| c.eq_ignore_ascii_case(n)))
+            .cloned()
+            .collect()
+    };
+    if let Some(columns) = &child.columns {
+        let gone = missing(columns);
+        if !gone.is_empty() {
+            bail!(
+                "child {} has no column(s) {}; the `columns` list would silently drop them",
+                child.table,
+                gone.join(", ")
+            );
+        }
+    }
+    // a rename onto a column the element still carries would bury that column
+    let survives = |c: &String| {
+        !child.fields.contains_key(c)
+            && !child.exclude_columns.contains(c)
+            && child.columns.as_ref().is_none_or(|cols| cols.contains(c))
+    };
+    for (col, target) in &child.fields {
+        if let Some(c) = live
+            .iter()
+            .find(|c| c.eq_ignore_ascii_case(target) && survives(c))
+        {
+            bail!(
+                "child {} has a column {c}; renaming {col} to it would overwrite that column",
+                child.table
+            );
+        }
+    }
+    // as on a parent, naming a column that is gone changes nothing: stale
+    // configuration rather than a fault
+    for (label, names) in [
+        ("exclude_columns", child.exclude_columns.clone()),
+        ("fields", child.fields.keys().cloned().collect::<Vec<_>>()),
+    ] {
+        let gone = missing(&names);
+        if !gone.is_empty() {
+            println!(
+                "! {label} on child {} names column(s) that do not exist: {}",
+                child.table,
+                gone.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn validate_postgres(cfg: &config::AppConfig, source_url: &str) -> Result<()> {
     let client = connect_pg(cfg, source_url).await?;
     let tls = cfg.tls_settings(source_url)?;
@@ -1218,6 +1276,21 @@ async fn validate_postgres(cfg: &config::AppConfig, source_url: &str) -> Result<
         }
         tables.push(table.table.clone());
         for child in &table.children {
+            let child_live: Vec<String> = client
+                .query(
+                    "SELECT attname::text FROM pg_attribute \
+                     WHERE attrelid = to_regclass($1) AND attnum > 0 AND NOT attisdropped \
+                     ORDER BY attnum",
+                    &[&child.table],
+                )
+                .await?
+                .iter()
+                .map(|r| r.get(0))
+                .collect();
+            if child_live.is_empty() {
+                bail!("child table {} does not exist", child.table);
+            }
+            check_child_columns(child, &child_live)?;
             tables.push(child.table.clone());
         }
     }
@@ -1314,6 +1387,16 @@ async fn validate_mysql(cfg: &config::AppConfig, source_url: &str) -> Result<()>
         .await?;
         let names: Vec<String> = live.columns.iter().map(|c| c.name.clone()).collect();
         check_configured_columns(table, &names, &live.pk_columns, &[])?;
+        for child in &table.children {
+            let (cschema, cname) = child
+                .table
+                .split_once('.')
+                .context("child table must be written as database.table for MySQL")?;
+            let child_live =
+                pg2osync_source_mysql::catalog::table_schema(&mut admin, cschema, cname, false)
+                    .await?;
+            check_child_columns(child, &child_live.column_names())?;
+        }
         if table.append_only {
             println!(
                 "✓ table {} exists, append-only ({} columns)",
