@@ -102,6 +102,12 @@ Every bug fix needs a regression test that fails without the fix. Protocol
 decoders (`pgoutput.rs`, `binlog.rs`) are tested with byte-level vectors — add
 one for the case you fix rather than only testing through the pipeline.
 
+
+Merges go through the branch's merge queue: `gh pr merge --squash --auto`
+adds a pull request to it once its checks are green, the queue rebuilds the
+candidate `main` with everything ahead of it, runs CI once on that, and lands
+the batch. Nobody has to rebase behind a merge that just happened.
+
 ## Architecture rules
 
 These boundaries are what keep new sources and sinks cheap to add. A pull

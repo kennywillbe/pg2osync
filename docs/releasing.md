@@ -45,7 +45,7 @@ accumulated since the last release goes out as one version.
 Merge the open pull request titled `chore: release …`. That is the whole
 procedure.
 
-Every other pull request is **squash-merged**, and its title becomes the commit
+Every other pull request goes through the merge queue and is **squash-merged**, and its title becomes the commit
 subject on `main`. That is what release-please reads, so the title has to be a
 conventional commit — a required check enforces it. Merge commits are switched
 off: the one that did land (`Merge pull request #52 …`) made release-please
