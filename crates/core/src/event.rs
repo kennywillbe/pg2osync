@@ -100,6 +100,17 @@ pub enum ChangeEvent {
     /// only recorded behind one, so a crash loses forward progress and never
     /// claims a range that was not written.
     LoadMark(u64),
+    /// A source table whose columns changed under the running pipeline, with
+    /// `detail` naming what was added, removed or retyped.
+    ///
+    /// It carries no position and no data on purpose: applying the change is
+    /// refused, so the engine counts it, says so and drops it. Nothing about
+    /// the stream may advance on one.
+    SchemaDrift {
+        schema: String,
+        table: String,
+        detail: String,
+    },
     /// TRUNCATE on a source table; target index content must be cleared.
     /// `version` is the position it happened at, as for a row.
     TableTruncated {

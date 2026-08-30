@@ -123,6 +123,9 @@ stop_sync
 pg "DROP PUBLICATION IF EXISTS pg2osync_e2e_pub;" > /dev/null
 pg "SELECT pg_drop_replication_slot('pg2osync_e2e') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='pg2osync_e2e');" > /dev/null
 pg "TRUNCATE users; TRUNCATE tickets, orders, customers;" > /dev/null
+# a run killed part way through leaves the drift probe's column behind, and the
+# shape change it exists to cause would then not happen
+pg "ALTER TABLE users DROP COLUMN IF EXISTS drift_probe;" > /dev/null
 pg "INSERT INTO users (id,name,email,password_hash,metadata) VALUES
       (1,'alice','alice@test.io','secret-1','{\"role\":\"admin\"}'),
       (2,'bob','bob@test.io','secret-2','{\"role\":\"user\"}'),
@@ -326,6 +329,21 @@ fi
 check "health answers for probes" "$(curl -s http://127.0.0.1:9111/healthz)" "ok"
 check "an unknown path is not the exposition" \
   "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9111/)" "404"
+
+say "9a. a column added under the pipeline is counted as drift"
+# PostgreSQL re-sends a RELATION message before the first row event that
+# depends on the new shape. The change is never applied, so the counter is the
+# only alertable report that the index and the table stopped agreeing.
+pg "ALTER TABLE users ADD COLUMN drift_probe text;" > /dev/null
+pg "INSERT INTO users (id,name,email,drift_probe) VALUES (91,'drift','drift@test.io','later');" > /dev/null
+synced
+metrics=$(curl -s http://127.0.0.1:9111/metrics)
+check "the shape change is counted" \
+  "$(awk '/^pg2osync_schema_drift_total\{table="public.users"\} /{print $2}' <<< "$metrics")" "1"
+check "and the row after it still lands" "$(os_field e2e_users 91 drift_probe)" "later"
+pg "DELETE FROM users WHERE id=91;" > /dev/null
+synced
+pg "ALTER TABLE users DROP COLUMN drift_probe;" > /dev/null
 
 say "9b. reconcile finds a document whose row is gone"
 # the count here depends on what earlier steps left behind, so it is measured

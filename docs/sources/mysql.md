@@ -270,10 +270,19 @@ holds its documents is worth saying out loud.
 ## DDL
 
 An `ALTER` or `RENAME` in the binlog invalidates the cached schema, so the next
-row event resolves column names from the catalog again. If the binlog reports a
-different column count than the catalog — a DDL in flight — the process stops
-with a clear error rather than writing shifted values. Restart it to
-resynchronize.
+row event resolves column names from the catalog again. What that re-resolution
+changed is compared against the shape the pipeline had been decoding rows with,
+logged as `changed shape: added/removed/retyped …` and counted as
+`pg2osync_schema_drift_total{table}` — the same report PostgreSQL makes. The
+change itself is never applied: documents written before it keep the old shape
+until the index is rebuilt.
+
+If the binlog still reports a different column count than the catalog, the
+schema is resolved once more from `information_schema` — MySQL DDL is not
+transactional, so a row event under a new shape means the statement has already
+committed and a fresh read sees that shape. Only if the two still disagree does
+the process stop with a clear error rather than write shifted values. Restart it
+to resynchronize.
 
 Column renames and drops need a re-index: existing documents keep the old
 field names. A `fields` entry in the config can absorb a source-side rename

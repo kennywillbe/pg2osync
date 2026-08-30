@@ -97,6 +97,9 @@ TOML
 say "0. Reset state"
 stop_sync
 my "TRUNCATE shop_users;"
+# a run killed part way through leaves the drift probe's column behind, and the
+# shape change it exists to cause would then not happen
+my "ALTER TABLE shop_users DROP COLUMN drift_probe;" || true
 my "INSERT INTO shop_users (id,name,email,password_hash,balance,metadata) VALUES
       (1,'alice','alice@test.io','secret-1',10.25,'{\"role\":\"admin\"}'),
       (2,'bob','bob@test.io','secret-2',0.00,'{\"role\":\"user\"}'),
@@ -209,6 +212,21 @@ found=$(curl -s "$OS/e2e_mysql_users/_search" -H 'Content-Type: application/json
   -d '{"query":{"term":{"id":11}}}' | jqf "d['hits']['total']['value']")
 check "the row is searchable the moment /synced returns" "$found" "1"
 ok "waited $(jqf "d['waited_ms']" <<< "$synced")ms"
+
+say "8b. a column added under the pipeline is counted as drift"
+# The binlog says a DDL ran but not what it did, so the drift is the difference
+# between what the catalogue answered before the statement and after it. The
+# change is never applied: the counter is what makes that alertable.
+my "ALTER TABLE shop_users ADD COLUMN drift_probe varchar(32);"
+my "INSERT INTO shop_users (id,name,email,drift_probe) VALUES (91,'drift','d@test.io','later');"
+synced
+metrics=$(curl -s http://127.0.0.1:9112/metrics)
+check "the shape change is counted" \
+  "$(awk '/^pg2osync_schema_drift_total\{table="sourcedb.shop_users"\} /{print $2}' <<< "$metrics")" "1"
+check "and the row after it still lands" "$(os_field e2e_mysql_users 91 drift_probe)" "later"
+my "DELETE FROM shop_users WHERE id=91;"
+synced
+my "ALTER TABLE shop_users DROP COLUMN drift_probe;"
 
 say "9. crash recovery resumes from the binlog position"
 loads_before=$(grep -c 'rows from sourcedb' "$LOG")

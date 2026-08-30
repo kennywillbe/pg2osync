@@ -24,6 +24,11 @@ pub struct Metrics {
     /// not ask for — usually a wrong `date` format, or a column that is not
     /// what it looks like.
     pub transform_unconverted_total: AtomicU64,
+    /// Tables whose shape changed under the running pipeline, by qualified
+    /// name. Applying the change is refused, so this is how an operator learns
+    /// that the index and the table now disagree; before it, the only report
+    /// was a log line nothing can alert on.
+    pub schema_drift_total: Mutex<HashMap<String, AtomicU64>>,
     pub reconnects_total: AtomicU64,
     /// 1 while the source is streaming, 0 while it is being retried. The
     /// counter says how often it broke; this says whether it is broken now.
@@ -73,6 +78,16 @@ impl Metrics {
             .entry(kind.to_string())
             .or_insert_with(|| AtomicU64::new(0))
             .fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// `table` is the qualified `schema.table` the drift was observed on.
+    pub fn incr_schema_drift(&self, table: &str) {
+        self.schema_drift_total
+            .lock()
+            .unwrap()
+            .entry(table.to_string())
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn set_source_connected(&self, connected: bool) {
@@ -168,6 +183,28 @@ impl Metrics {
                 .load(Ordering::Relaxed)
                 .to_string(),
         );
+        let drift: Vec<String> = self
+            .schema_drift_total
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(table, count)| {
+                format!(
+                    "pg2osync_schema_drift_total{{table=\"{table}\"}} {}",
+                    count.load(Ordering::Relaxed)
+                )
+            })
+            .collect();
+        if !drift.is_empty() {
+            out.push_str(
+                "# HELP pg2osync_schema_drift_total Times a table's columns changed under the \
+                 running pipeline; the change is never applied, so the index and the table \
+                 disagree until the index is rebuilt\n",
+            );
+            out.push_str("# TYPE pg2osync_schema_drift_total counter\n");
+            out.push_str(&drift.join("\n"));
+            out.push('\n');
+        }
         push(
             &mut out,
             "pg2osync_reconnects_total",

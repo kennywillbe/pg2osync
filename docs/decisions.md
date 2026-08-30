@@ -676,6 +676,19 @@ running pipeline is logged, naming what was added, removed or retyped — the
 index and the database now disagree about what a row looks like, and only a
 rebuild closes that. Which is why the index name is configuration.
 
+It is also counted, as `pg2osync_schema_drift_total{table}`. A log line is not
+alertable: an operator who does not read logs never learns the index and the
+table stopped agreeing, and "reported" that nobody can be paged on is barely
+reported at all. The report reaches the counter through the change-event
+channel, as a positionless `SchemaDrift` event the engine counts and drops —
+the same path rows and truncates already take, so both sources report drift the
+same way, neither of them holds a `Metrics` handle, and nothing PostgreSQL- or
+MySQL-specific reaches the engine. Carrying no position is what keeps it inert:
+a drift event can never flush a batch, acknowledge a position or move a
+checkpoint. On MySQL the comparison is between the catalog's answer before a
+DDL and its answer after, since the binlog says a statement ran but not what it
+did to a column layout.
+
 **No event trigger in the user's database.** The attractive version of DDL
 detection puts a `CREATE EVENT TRIGGER` in the source, which writes each schema
 change into the WAL as a logical message so it arrives inline and correctly

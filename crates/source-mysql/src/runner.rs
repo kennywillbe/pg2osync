@@ -389,15 +389,37 @@ impl MySqlSource {
                     // server runs binlog_row_metadata=FULL; information_schema
                     // is the portable source of truth
                     let append_only = self.cfg.is_append_only(&meta.schema, &meta.name);
-                    let resolved: TableSchema = schemas
+                    let mut resolved: TableSchema = schemas
                         .get(&mut admin, &meta.schema, &meta.name, append_only)
                         .await?
                         .clone();
-                    let columns = if opt.column_names.len() == meta.columns.len() {
-                        opt.column_names.clone()
-                    } else {
-                        resolved.column_names()
-                    };
+                    let mut columns = column_names(&opt, &meta, &resolved);
+                    if let Some(drift) = schemas.take_drift(&meta.schema, &meta.name) {
+                        report_drift(&tx, &meta.schema, &meta.name, drift).await?;
+                    }
+                    if columns.len() != meta.columns.len() {
+                        // The cached answer predates the statement this
+                        // TABLE_MAP already describes. MySQL DDL is not
+                        // transactional, so by the time a row event under the
+                        // new shape reaches us the statement has committed and
+                        // information_schema answers with that shape — reading
+                        // it again is what turns a restart into a hiccup.
+                        schemas.invalidate(&meta.schema, &meta.name);
+                        resolved = schemas
+                            .get(&mut admin, &meta.schema, &meta.name, append_only)
+                            .await?
+                            .clone();
+                        let before = columns.len();
+                        columns = column_names(&opt, &meta, &resolved);
+                        let drift =
+                            schemas
+                                .take_drift(&meta.schema, &meta.name)
+                                .unwrap_or(format!(
+                                    "binlog reports {} columns, the catalog had {before}",
+                                    meta.columns.len()
+                                ));
+                        report_drift(&tx, &meta.schema, &meta.name, drift).await?;
+                    }
                     if columns.len() != meta.columns.len() {
                         anyhow::bail!(
                             "{}.{}: binlog reports {} columns but the catalog has {}; \
@@ -495,6 +517,44 @@ impl MySqlSource {
 /// tables with no children never reach this: they are their own document and go
 /// straight out.
 const PENDING_FLUSH_ROWS: usize = 5_000;
+
+/// The column names a row image is to be read with: the binlog's own where the
+/// server runs `binlog_row_metadata = FULL`, and `information_schema`'s
+/// otherwise, which is the portable answer.
+fn column_names(
+    opt: &binlog::OptionalMeta,
+    meta: &binlog::TableMeta,
+    resolved: &TableSchema,
+) -> Vec<String> {
+    if opt.column_names.len() == meta.columns.len() {
+        opt.column_names.clone()
+    } else {
+        resolved.column_names()
+    }
+}
+
+/// Say a table changed shape, in the log and as an event the engine counts.
+///
+/// The log line names what changed for whoever is reading it; the event is
+/// what makes the drift alertable, since the change is never applied and the
+/// index keeps the shape it had.
+async fn report_drift(
+    tx: &tokio::sync::mpsc::Sender<ChangeEvent>,
+    schema: &str,
+    table: &str,
+    detail: String,
+) -> Result<()> {
+    tracing::warn!(target: "pg2osync::source",
+        "{schema}.{table} changed shape: {detail}. Documents already in the index \
+         keep the old shape until it is rebuilt");
+    tx.send(ChangeEvent::SchemaDrift {
+        schema: schema.to_string(),
+        table: table.to_string(),
+        detail,
+    })
+    .await
+    .context("change channel closed")
+}
 
 /// The parent key a child row names.
 ///

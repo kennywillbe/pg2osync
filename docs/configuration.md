@@ -1128,6 +1128,7 @@ pg2osync_toast_readbacks_total                  # reads to complete TOASTed colu
 pg2osync_sink_errors_total
 pg2osync_rejected_total                         # documents the target refused, quarantined instead of written
 pg2osync_transform_unconverted_total            # values a transform could not convert, indexed as they were
+pg2osync_schema_drift_total{table="schema.table"}  # a table changed shape; the index keeps the old one until rebuilt
 pg2osync_reconnects_total
 pg2osync_source_connected                       # 1 while the source is streaming, 0 while reconnecting
 pg2osync_latency_ms{quantile="0.5|0.9|0.99"}   # source commit to indexed

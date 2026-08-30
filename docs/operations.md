@@ -25,6 +25,7 @@ Probes use `/healthz`, which is never authenticated.
 | `pg2osync_batches_flushed` | counter | Requests the target accepted |
 | `pg2osync_toast_readbacks_total` | counter | Reads of the target to complete unchanged TOASTed columns |
 | `pg2osync_sink_errors_total` | counter | Requests that failed permanently |
+| `pg2osync_schema_drift_total{table}` | counter | Times a table changed shape under the running pipeline. The change is never applied, so the index and the table disagree until the index is rebuilt |
 | `pg2osync_reconnects_total` | counter | Source reconnect attempts |
 | `pg2osync_source_connected` | gauge | 1 while streaming, 0 while reconnecting |
 | `pg2osync_latency_ms{quantile}` | summary | Source commit to indexed |
@@ -66,6 +67,10 @@ deriv(pg2osync_position_lag[10m]) > 0
 
 # a permanent rejection stops the pipeline
 increase(pg2osync_sink_errors_total[5m]) > 0
+
+# a table changed shape: nothing broke, but the index now holds documents in
+# the old shape and only a rebuild closes that
+increase(pg2osync_schema_drift_total[1h]) > 0
 
 # a slot is pinning WAL and growing: this is what fills the source's disk
 deriv(pg2osync_slot_retained_bytes[30m]) > 0 and pg2osync_slot_retained_bytes > 5e9
@@ -202,7 +207,7 @@ Targets: `pg2osync::source`, `::engine`, `::sink`, `::checkpoint`, `::backfill`,
 |---|---|---|
 | `wal_level is 'replica' but must be 'logical'` | Server not configured | Set it in `postgresql.conf` and restart |
 | `publication … covers X but config wants Y` | You changed the table list | Drop and recreate the publication, or align the config. Drift is never auto-applied |
-| `… changed shape: added/removed/retyped …` | A column changed under the running pipeline | Nothing breaks, but documents written earlier keep the old shape. Re-index when you want them to agree |
+| `… changed shape: added/removed/retyped …` | A column changed under the running pipeline | Nothing breaks, but documents written earlier keep the old shape. Re-index when you want them to agree. Also counted as `pg2osync_schema_drift_total{table}`, on both sources |
 | `table … has REPLICA IDENTITY NOTHING` | Updates/deletes cannot be replicated | Run the `ALTER TABLE … REPLICA IDENTITY FULL` from the message |
 | `child row carries NULL <fk>` | Child table lacks `REPLICA IDENTITY FULL` | Set it; a delete without the key cannot find its parent |
 | `halting pipeline: permanent rejection …` | The target refuses the document (usually a mapping conflict) | Fix the mapping or exclude the column; the retry then gets through. Or quarantine it — see below |

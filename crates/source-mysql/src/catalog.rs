@@ -30,20 +30,77 @@ impl TableSchema {
     }
 }
 
+/// What one table's shape changed into, as `added`/`removed`/`retyped`.
+///
+/// The binlog says a DDL ran but not what it did to a column layout, so the
+/// only honest report is the one this comparison produces: what the catalog
+/// answered before the statement against what it answers after.
+pub fn column_drift(before: &TableSchema, after: &TableSchema) -> Option<String> {
+    let (old, new) = (before.column_names(), after.column_names());
+    let added: Vec<&str> = new
+        .iter()
+        .filter(|c| !old.contains(c))
+        .map(String::as_str)
+        .collect();
+    let removed: Vec<&str> = old
+        .iter()
+        .filter(|c| !new.contains(c))
+        .map(String::as_str)
+        .collect();
+    let retyped: Vec<String> = before
+        .columns
+        .iter()
+        .filter_map(|b| {
+            let a = after.columns.iter().find(|a| a.name == b.name)?;
+            (a.shape != b.shape).then(|| format!("{} ({:?} -> {:?})", b.name, b.shape, a.shape))
+        })
+        .collect();
+
+    let mut parts = Vec::new();
+    if !added.is_empty() {
+        parts.push(format!("added {}", added.join(", ")));
+    }
+    if !removed.is_empty() {
+        parts.push(format!("removed {}", removed.join(", ")));
+    }
+    if !retyped.is_empty() {
+        parts.push(format!("retyped {}", retyped.join(", ")));
+    }
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
+
 /// Cache of resolved schemas; DDL invalidates an entry by dropping it.
 #[derive(Default)]
 pub struct SchemaCache {
     entries: HashMap<(String, String), TableSchema>,
+    /// Shapes an invalidation dropped, kept until that table is resolved again
+    /// so the fresh answer can be compared against the one the pipeline had
+    /// been decoding rows with. Bounded by the configured tables.
+    dropped: HashMap<(String, String), TableSchema>,
+    /// Drift found while resolving, waiting for its caller to report it. The
+    /// resolve happens behind a `&TableSchema` borrow, so the finding cannot be
+    /// handed back with the schema itself.
+    drift: HashMap<(String, String), String>,
 }
 
 impl SchemaCache {
     pub fn invalidate(&mut self, schema: &str, table: &str) {
-        self.entries
-            .remove(&(schema.to_string(), table.to_string()));
+        let key = (schema.to_string(), table.to_string());
+        if let Some(previous) = self.entries.remove(&key) {
+            self.dropped.insert(key, previous);
+        }
     }
 
     pub fn invalidate_all(&mut self) {
-        self.entries.clear();
+        for (key, previous) in self.entries.drain() {
+            self.dropped.insert(key, previous);
+        }
+    }
+
+    /// Take the drift found the last time this table was resolved, if any.
+    /// Reported once: a second TABLE_MAP for the same shape is not new drift.
+    pub fn take_drift(&mut self, schema: &str, table: &str) -> Option<String> {
+        self.drift.remove(&(schema.to_string(), table.to_string()))
     }
 
     pub async fn get(
@@ -56,6 +113,11 @@ impl SchemaCache {
         let key = (schema.to_string(), table.to_string());
         if !self.entries.contains_key(&key) {
             let resolved = table_schema(conn, schema, table, keyless_ok).await?;
+            if let Some(previous) = self.dropped.remove(&key)
+                && let Some(drift) = column_drift(&previous, &resolved)
+            {
+                self.drift.insert(key.clone(), drift);
+            }
             self.entries.insert(key.clone(), resolved);
         }
         Ok(self.entries.get(&key).expect("inserted above"))
@@ -566,6 +628,35 @@ mod tests {
         let (doc, pk) = build_document(&schema, &[Some(b"click".to_vec())]);
         assert_eq!(pk, Value::Null);
         assert_eq!(doc["kind"], Value::from("click"));
+    }
+
+    #[test]
+    fn every_shape_change_is_named() {
+        let column = |name: &str, shape: ValueShape| Column {
+            name: name.into(),
+            shape,
+        };
+        let before = TableSchema {
+            columns: vec![
+                column("id", ValueShape::Int),
+                column("name", ValueShape::Text),
+                column("old", ValueShape::Text),
+            ],
+            pk_columns: vec!["id".into()],
+        };
+        let after = TableSchema {
+            columns: vec![
+                column("id", ValueShape::Text),
+                column("name", ValueShape::Text),
+                column("new", ValueShape::Text),
+            ],
+            pk_columns: vec!["id".into()],
+        };
+        assert_eq!(column_drift(&before, &before), None);
+        let drift = column_drift(&before, &after).expect("changed");
+        assert!(drift.contains("added new"), "{drift}");
+        assert!(drift.contains("removed old"), "{drift}");
+        assert!(drift.contains("retyped id"), "{drift}");
     }
 
     #[test]
