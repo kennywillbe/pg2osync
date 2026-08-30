@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The merge queue builds the candidate main and needs every required check
+  # to report on it, or a queued pull request never merges.
+  merge_group:
 
 permissions:
   contents: read
