@@ -51,12 +51,34 @@ and [#122](https://github.com/kennywillbe/pg2osync/issues/122) are open — so a
 failure there prints `!` and does not make your run red.
 
 The script starts the dev stack and the `mysql-test` container if they are
-down, seeds both, and refuses to run an e2e suite while another `pg2osync run`
-is alive — the suites stop a pipeline by killing every one of them, so two at
-once report failures that are not real. Logs go to a directory of this run's
-own, `/tmp/pg2osync-ci-local/<timestamp>`: one file per job, and the pipeline
-log of each suite beside it (the suites take that path in `E2E_LOG`, so two
-runs never read each other's log lines).
+down and seeds both. Those are shared, and so are the table and index names the
+suites use, so the e2e jobs queue on one machine-wide lock: a second run waits
+rather than overwriting the first one's state. Logs go to a directory of this
+run's own, `/tmp/pg2osync-ci-local/<run id>`: one file per job, and the
+pipeline log of each suite beside it (the suites take that path in `E2E_LOG`,
+so two runs never read each other's log lines).
+
+To run two at once, give one of them a stack of its own:
+
+```sh
+./dev/ci-local.sh --isolated
+```
+
+Every e2e and compatibility job of an isolated run gets throwaway containers
+named `pg2osync-ci-<run id>-*` on ports Docker assigns, seeded exactly the way
+CI seeds its service containers and removed when the job ends; the pipelines
+the suites start get a block of localhost ports of their own too, because they
+run on your machine rather than in a container. Such a run takes no lock and
+leaves the dev stack alone, so it can go beside a shared run or another
+isolated one. It also runs the six compatibility cells two at a time
+rather than one after the other, because each of them now has containers and
+ports of its own; `--jobs <n>` sets how many, and more than two is what a
+larger Docker VM buys you. A cell measures about 1 GB — 0.9 of it OpenSearch
+on its 512 MB heap, half a gigabyte more for a MySQL one — against a dev stack
+of 2.6 GB, so an 8 GB Docker VM carries about two isolated runs beside it; past
+that Docker's OOM killer takes a container down and the job waiting on it fails
+naming it, within seconds rather than hanging. The default stays the shared
+stack: it is already running and pulls nothing.
 
 While you are still working, `./dev/ci-local.sh --fast` skips the e2e suites,
 the image build and the matrix, which is about a minute instead of the better

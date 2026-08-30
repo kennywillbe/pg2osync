@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # End-to-end test suite for the PostgreSQL -> OpenSearch/Elasticsearch pipeline.
 #
-# Runs one at a time: stopping the pipeline kills every pg2osync process, so
-# two suites at once take each other's down and report failures that are not.
-# dev/e2e-lock.sh enforces that with a machine-wide lock; a second suite waits.
+# One suite at a time per stack: the section names, the tables and the indices
+# are fixed, so two suites against the same PostgreSQL and OpenSearch overwrite
+# each other's state. dev/e2e-lock.sh enforces that on the shared dev stack
+# with a machine-wide lock; a second suite waits. A run with a stack of its own
+# — ci-local --isolated — passes E2E_LOCK=none and takes no lock, because a
+# stop only ever signals the pipelines this run started (dev/e2e-pipeline.sh).
 #
 # Prerequisites:
 #   docker compose -f dev/docker-compose.yml up -d
@@ -16,9 +19,13 @@
 #   PG_CONTAINER   psql container name      (default dev-postgres-1)
 #   PG_PORT        source port on localhost (default 15432)
 #   E2E_LOG        pipeline log file        (default /tmp/pg2osync-e2e.log)
+#   E2E_LOCK       lock directory, or none  (default /tmp/pg2osync-e2e.lock)
+#   E2E_PORT_BASE  first metrics/API port   (default 9100, a 40-port block)
 set -euo pipefail
 # shellcheck source=dev/e2e-lock.sh
 source "$(dirname "$0")/e2e-lock.sh"
+# shellcheck source=dev/e2e-pipeline.sh
+source "$(dirname "$0")/e2e-pipeline.sh"
 e2e_lock
 
 cd "$(dirname "$0")/.."
@@ -31,12 +38,21 @@ PG_PORT=${PG_PORT:-15432}
 # suffix after them it creates the literal name instead, and one killed run
 # then breaks every later one with "File exists".
 CONFIG=$(mktemp /tmp/pg2osync-e2e.XXXXXX)
-MAPPING=$(dirname "$CONFIG")/pg2osync-e2e-mapping.json
+# mktemp's suffix, reused for every other file this run writes: two suites at
+# once — each against a stack of its own — must not read or delete each other's
+# mapping files and probe logs.
+TAG=${CONFIG##*.}
+MAPPING=$(dirname "$CONFIG")/pg2osync-e2e-mapping-$TAG.json
 # The suite counts lines it wrote to this log, so a second run appending to
 # the same file makes those assertions read another run's output. E2E_LOG
 # gives a caller running suites back to back a file of its own.
 LOG=${E2E_LOG:-/tmp/pg2osync-e2e.log}
 export PG2OSYNC_SOURCE_URL="postgres://postgres:postgres@localhost:$PG_PORT/sourcedb"
+# Every pipeline the suite starts binds its metrics and API ports on this
+# machine rather than inside a container, so two suites at once need two
+# blocks: E2E_PORT_BASE moves every port this one uses.
+PORT_BASE=${E2E_PORT_BASE:-9100}
+
 PASS=0; FAIL=0
 
 say()   { printf "\n\033[1m== %s ==\033[0m\n" "$1"; }
@@ -55,19 +71,10 @@ os_rstatus() { curl -s -o /dev/null -w "%{http_code}" "$OS/$1/_doc/$2?routing=$3
 os_len()     { curl -s "$OS/$1/_doc/$2" | jqf "len(d.get('_source',{}).get('$3',[]))"; }
 pg()         { docker exec "$PG_CONTAINER" psql -U postgres -d sourcedb -qtAc "$1"; }
 refresh()    { curl -s -XPOST "$OS/_refresh" > /dev/null; }
-synced()     { curl -s "http://127.0.0.1:9131/synced?refresh=true&timeout=10000" > /dev/null; refresh; }
+synced()     { curl -s "http://127.0.0.1:$((PORT_BASE + 31))/synced?refresh=true&timeout=10000" > /dev/null; refresh; }
 
-start_sync() {
-  nohup $BIN run -c "$CONFIG" >> "$LOG" 2>&1 < /dev/null &
-  # stays a child of this shell so a section can wait for its exit code
-  SYNC_PID=$!
-}
-# pkill's default signal is SIGTERM, which drains rather than kills: whatever
-# follows a stop — a restart on the same slot, dropping it — needs the exit
-stop_sync() {
-  pkill -f "pg2osync run" 2> /dev/null || true
-  for _ in $(seq 1 100); do pgrep -f "pg2osync run" > /dev/null || break; sleep 0.1; done
-}
+start_sync() { sync_spawn "$CONFIG"; }
+stop_sync()  { sync_stop; }
 drop_own_slot() { pg "SELECT pg_drop_replication_slot('pg2osync_e2e') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='pg2osync_e2e');" > /dev/null 2>&1 || true; }
 # Every probe section keeps its slot until the trap at exit, and the dev
 # database allows ten; a late section would otherwise start with "all
@@ -88,17 +95,17 @@ url = "$OS"
 flavor = "$TARGET_FLAVOR"
 
 [metrics]
-bind = "127.0.0.1:9111"
+bind = "127.0.0.1:$((PORT_BASE + 11))"
 
 [api]
 enabled = true
-bind = "127.0.0.1:9131"
+bind = "127.0.0.1:$((PORT_BASE + 31))"
 
 [sync.users]
 table = "public.users"
 index = "e2e_users"
 exclude_columns = ["password_hash"]
-mapping_file = "pg2osync-e2e-mapping.json"
+mapping_file = "pg2osync-e2e-mapping-$TAG.json"
 
 [sync.users.transform]
 email = "redact"
@@ -357,7 +364,7 @@ behind=$(pg "SELECT pg_wal_lsn_diff('$ckpt_lsn'::pg_lsn, confirmed_flush_lsn) >=
 check "slot never acked past the checkpoint" "$behind" "t"
 
 say "9. metrics endpoint"
-metrics=$(curl -s http://127.0.0.1:9111/metrics)
+metrics=$(curl -s http://127.0.0.1:$((PORT_BASE + 11))/metrics)
 if grep -q "pg2osync_position_confirmed" <<< "$metrics" && grep -q "pg2osync_events_total" <<< "$metrics"; then
   ok "metrics expose position and event counters"
 else
@@ -367,7 +374,7 @@ fi
 # reports it: position_lag stays kilobytes while a slot can pin gigabytes. The
 # poller runs on its own interval, so this waits for the first sample.
 for _ in $(seq 1 40); do
-  metrics=$(curl -s http://127.0.0.1:9111/metrics)
+  metrics=$(curl -s http://127.0.0.1:$((PORT_BASE + 11))/metrics)
   grep -qE "^pg2osync_slot_retained_bytes\{source=\"[^\"]*\",slot=\"pg2osync_e2e\"\}" <<< "$metrics" && break
   sleep 1
 done
@@ -393,9 +400,9 @@ if $BIN status -c "$CONFIG" --max-retained-mb 1048576 > /dev/null 2>&1; then
 else
   bad "status failed under the retention limit"
 fi
-check "health answers for probes" "$(curl -s http://127.0.0.1:9111/healthz)" "ok"
+check "health answers for probes" "$(curl -s http://127.0.0.1:$((PORT_BASE + 11))/healthz)" "ok"
 check "an unknown path is not the exposition" \
-  "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9111/)" "404"
+  "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$((PORT_BASE + 11))/)" "404"
 
 say "9a. a column added under the pipeline is counted as drift"
 # PostgreSQL re-sends a RELATION message before the first row event that
@@ -404,7 +411,7 @@ say "9a. a column added under the pipeline is counted as drift"
 pg "ALTER TABLE users ADD COLUMN drift_probe text;" > /dev/null
 pg "INSERT INTO users (id,name,email,drift_probe) VALUES (91,'drift','drift@test.io','later');" > /dev/null
 synced
-metrics=$(curl -s http://127.0.0.1:9111/metrics)
+metrics=$(curl -s http://127.0.0.1:$((PORT_BASE + 11))/metrics)
 check "the shape change is counted" \
   "$(awk '/^pg2osync_schema_drift_total\{source="[^"]*",table="public.users"\} /{print $2}' <<< "$metrics")" "1"
 check "and the row after it still lands" "$(os_field e2e_users 91 drift_probe)" "later"
@@ -430,15 +437,15 @@ check "reconcile --delete removed it" "$(os_status e2e_users 9999)" "404"
 check "reconcile left the real documents alone" "$(os_count e2e_users)" "$before_reconcile"
 
 say "10. reconnects after the server drops the stream"
-before_pid=$(pgrep -f "pg2osync run" | head -1)
+before_pid=$SYNC_PID
 pg "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE backend_type='walsender';" > /dev/null
 pg "INSERT INTO users (id,name,email) VALUES (9,'written-while-disconnected','w@test.io');" > /dev/null
 synced
 # the same process must still be running: recovery happens in process, not by
 # a supervisor restarting us
-check "same process recovered" "$(pgrep -f "pg2osync run" | head -1)" "$before_pid"
+check "same process recovered" "$(sync_pid)" "$before_pid"
 check "row written while disconnected arrived" "$(os_field e2e_users 9 name)" "written-while-disconnected"
-metrics=$(curl -s http://127.0.0.1:9111/metrics)
+metrics=$(curl -s http://127.0.0.1:$((PORT_BASE + 11))/metrics)
 reconnects=$(awk '/^pg2osync_reconnects_total\{/ {print $2}' <<< "$metrics")
 if [ "${reconnects:-0}" -ge 1 ]; then ok "reconnects_total counted it ($reconnects)"; else bad "reconnects_total still zero"; fi
 check "source reports connected again" "$(awk '/^pg2osync_source_connected\{/ {print $2}' <<< "$metrics")" "1"
@@ -447,7 +454,7 @@ say "11. read-your-writes"
 pg "INSERT INTO users (id,name,email) VALUES (11,'ryw','r@test.io');" > /dev/null
 # no position, no sleep, no retry: the endpoint returns only once the write is
 # searchable, so a single query afterwards must find it
-synced=$(curl -s "http://127.0.0.1:9131/synced?refresh=true&timeout=8000")
+synced=$(curl -s "http://127.0.0.1:$((PORT_BASE + 31))/synced?refresh=true&timeout=8000")
 found=$(curl -s "$OS/e2e_users/_search" -H 'Content-Type: application/json' \
   -d '{"query":{"term":{"id":11}}}' | jqf "d['hits']['total']['value']")
 check "the row is searchable the moment /synced returns" "$found" "1"
@@ -455,11 +462,11 @@ check "and it says so" "$(jqf "d['synced']" <<< "$synced")" "True"
 waited=$(jqf "d['waited_ms']" <<< "$synced")
 ok "waited ${waited}ms"
 # a position nothing will ever reach must time out rather than hang
-code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:9131/synced?position=FFFF%2FFFFFFFFF&timeout=300")
+code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$((PORT_BASE + 31))/synced?position=FFFF%2FFFFFFFFF&timeout=300")
 check "an unreachable position times out" "$code" "408"
 
 say "12. crash recovery"
-pkill -9 -f "pg2osync run"; sleep 1
+sync_kill; sleep 1
 pg "INSERT INTO users (id,name,email) VALUES (8,'eve-during-downtime','eve@test.io');" > /dev/null
 start_sync
 sleep 6; refresh
@@ -473,7 +480,7 @@ say "14. SIGTERM drains, then status and teardown"
 # does: with the last acknowledged position checkpointed, not with the default
 # handler's immediate exit and a replay on the next start
 pg "INSERT INTO users (id,name,email) VALUES (12,'term','t@test.io');" > /dev/null
-confirmed=$(curl -s "http://127.0.0.1:9131/synced?refresh=true&timeout=8000" | jqf "d['confirmed']")
+confirmed=$(curl -s "http://127.0.0.1:$((PORT_BASE + 31))/synced?refresh=true&timeout=8000" | jqf "d['confirmed']")
 log_lines=$(wc -l < "$LOG")
 kill -TERM "$SYNC_PID"
 wait "$SYNC_PID" && code=0 || code=$?
@@ -510,14 +517,14 @@ url = "$OS"
 flavor = "$TARGET_FLAVOR"
 
 [metrics]
-bind = "127.0.0.1:9112"
+bind = "127.0.0.1:$((PORT_BASE + 12))"
 
 [sync.big]
 table = "public.resume_probe"
 index = "e2e_resume"
 TOML
 resume_cleanup() {
-  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  sync_kill
   pg "SELECT pg_drop_replication_slot('$RSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$RSLOT');" > /dev/null 2>&1 || true
   pg "DROP PUBLICATION IF EXISTS ${RSLOT}_pub; DROP TABLE IF EXISTS resume_probe;" > /dev/null 2>&1 || true
   rm -f "$RCONFIG"
@@ -534,13 +541,13 @@ PROG=load-postgres-$RSLOT-public_resume_probe
 curl -s -XDELETE "$OS/.pg2osync_meta/_doc/$PROG" > /dev/null
 
 progress_done() { curl -s "$OS/.pg2osync_meta/_doc/$PROG" | jqf "(d.get('_source') or {}).get('done', -1)"; }
-nohup $BIN run -c "$RCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$RCONFIG"
 for _ in $(seq 1 120); do
   [ "$(progress_done)" -ge 2 ] 2> /dev/null && break
   sleep 0.5
 done
 done_at_kill=$(progress_done)
-pkill -9 -f "pg2osync run"; sleep 1
+sync_kill; sleep 1
 if [ "$done_at_kill" -ge 2 ]; then ok "progress recorded per range ($done_at_kill done)"; else bad "no per-range progress recorded (got '$done_at_kill')"; fi
 
 # the interesting part: the source moves while nothing is watching it, so the
@@ -550,7 +557,7 @@ pg "INSERT INTO resume_probe VALUES (400001,'added-while-down');" > /dev/null
 pg "UPDATE resume_probe SET v='updated-while-down' WHERE id = 77;" > /dev/null
 src_rows=$(pg "SELECT count(*) FROM resume_probe;")
 
-nohup $BIN run -c "$RCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$RCONFIG"
 # The copy now runs beside the stream, so a row can be changed while the range
 # holding it is still being read. The streamed change carries a higher position
 # than the copy did, so it has to win — the version is the only thing stopping
@@ -606,7 +613,7 @@ url = "$OS"
 flavor = "$TARGET_FLAVOR"
 
 [metrics]
-bind = "127.0.0.1:9115"
+bind = "127.0.0.1:$((PORT_BASE + 15))"
 
 $1
 
@@ -620,7 +627,7 @@ on_permanent_rejection = "quarantine"
 max_rejects = 100' > "$QCONFIG"
 q_body '' > "$HCONFIG"
 reject_cleanup() {
-  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  sync_kill
   pg "SELECT pg_drop_replication_slot('$QSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$QSLOT');" > /dev/null 2>&1 || true
   pg "DROP PUBLICATION IF EXISTS ${QSLOT}_pub; DROP TABLE IF EXISTS reject_probe;" > /dev/null 2>&1 || true
   rm -f "$QCONFIG" "$HCONFIG"
@@ -639,7 +646,7 @@ pg "INSERT INTO reject_probe VALUES (1, '100');" > /dev/null
 # halt is the default: no progress past the bad row, and nothing recorded. The
 # attempt dies and is retried, so the process stays up and the document is tried
 # again — which is what lets a mapping fix unblock it without a restart.
-nohup $BIN run -c "$HCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$HCONFIG"
 sleep 5
 halts_before=$(grep -c "halting pipeline: permanent rejection" "$LOG" || true)
 pg "INSERT INTO reject_probe VALUES (2, 'not-a-number');" > /dev/null
@@ -659,7 +666,7 @@ check "nothing was quarantined under halt" \
 stop_sync
 
 # now quarantine: the same row is recorded and the pipeline carries on
-nohup $BIN run -c "$QCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$QCONFIG"
 sleep 5
 pg "INSERT INTO reject_probe VALUES (3, '300');" > /dev/null
 for _ in $(seq 1 30); do
@@ -675,7 +682,7 @@ check "it is in the quarantine store instead" \
 # at least one, not exactly one: the store is keyed by document id, while the
 # counter counts arrivals — and a restart replays the row, so the same refusal
 # is legitimately filed again under at-least-once
-if curl -s http://127.0.0.1:9115/metrics | grep -qE "^pg2osync_rejected_total\{source=\"[^\"]*\"\} [1-9]"; then
+if curl -s http://127.0.0.1:$((PORT_BASE + 15))/metrics | grep -qE "^pg2osync_rejected_total\{source=\"[^\"]*\"\} [1-9]"; then
   ok "pg2osync_rejected_total reports it"
 else
   bad "pg2osync_rejected_total did not move"
@@ -710,7 +717,7 @@ check "and the quarantine store is empty" \
 say "15. re-snapshot one table on demand"
 # resume_probe is still here from section 12, streaming under $RCONFIG, with a
 # composite-key table beside it — so this exercises one table out of two.
-nohup $BIN run -c "$RCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$RCONFIG"
 sleep 4
 # A document that went missing: no version at all, so a re-snapshot restores it.
 curl -s -XDELETE "$OS/e2e_resume/_doc/500" > /dev/null
@@ -788,11 +795,11 @@ WSLOT=pg2osync_e2e_conc
 sed -e "s/^slot_name = .*/slot_name = \"$WSLOT\"/" \
     -e "s/^publication = .*/publication = \"${WSLOT}_pub\"/" \
     -e "s/^index = .*/index = \"e2e_conc\"/" \
-    -e "s#^bind = .*#bind = \"127.0.0.1:9118\"#" \
+    -e "s#^bind = .*#bind = \"127.0.0.1:$((PORT_BASE + 18))\"#" \
     -e "s/^\[target\]/[engine]\nwrite_concurrency = 4\n\n[target]/" \
     "$RCONFIG" > "$WCONFIG"
 conc_cleanup() {
-  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  sync_kill
   pg "SELECT pg_drop_replication_slot('$WSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$WSLOT');" > /dev/null 2>&1 || true
   pg "DROP PUBLICATION IF EXISTS ${WSLOT}_pub;" > /dev/null 2>&1 || true
   rm -f "$WCONFIG"
@@ -801,7 +808,7 @@ trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup' EXIT
 pg "DROP PUBLICATION IF EXISTS ${WSLOT}_pub; CREATE PUBLICATION ${WSLOT}_pub FOR TABLE resume_probe;" > /dev/null 2>&1
 curl -s -XDELETE "$OS/e2e_conc" > /dev/null
 src_rows=$(pg "SELECT count(*) FROM resume_probe;")
-nohup $BIN run -c "$WCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$WCONFIG"
 sleep 1
 pg "UPDATE resume_probe SET v='changed-under-concurrency' WHERE id = 150000;" > /dev/null
 pg "DELETE FROM resume_probe WHERE id = 150001;" > /dev/null
@@ -822,7 +829,7 @@ check "a deleted row is not resurrected by a concurrent write" \
 stop_sync
 sleep 1
 pg "INSERT INTO resume_probe VALUES (900001,'after-the-restart');" > /dev/null
-nohup $BIN run -c "$WCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$WCONFIG"
 for _ in $(seq 1 60); do
   refresh
   [ "$(os_status e2e_conc 900001)" = "200" ] && break
@@ -841,10 +848,10 @@ RNSLOT=pg2osync_e2e_rename
 sed -e "s/^slot_name = .*/slot_name = \"$RNSLOT\"/" \
     -e "s/^publication = .*/publication = \"${RNSLOT}_pub\"/" \
     -e "s/^index = .*/index = \"e2e_rename\"/" \
-    -e "s#^bind = .*#bind = \"127.0.0.1:9119\"#" \
+    -e "s#^bind = .*#bind = \"127.0.0.1:$((PORT_BASE + 19))\"#" \
     "$RCONFIG" > "$RNCONFIG"
 rename_cleanup() {
-  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  sync_kill
   pg "SELECT pg_drop_replication_slot('$RNSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$RNSLOT');" > /dev/null 2>&1 || true
   pg "DROP PUBLICATION IF EXISTS ${RNSLOT}_pub;" > /dev/null 2>&1 || true
   pg "ALTER TABLE IF EXISTS renamed_probe RENAME TO rename_probe;" > /dev/null 2>&1 || true
@@ -865,7 +872,7 @@ text = re.sub(r"table = .*", 'table = "public.rename_probe"', text)
 open(path, "w").write(text)
 PYEOF
 curl -s -XDELETE "$OS/e2e_rename?ignore_unavailable=true" > /dev/null
-nohup $BIN run -c "$RNCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$RNCONFIG"
 for _ in $(seq 1 30); do
   refresh
   [ "$(os_count e2e_rename)" = "1" ] && break
@@ -877,7 +884,7 @@ pg "INSERT INTO renamed_probe VALUES (2,'after-rename');" > /dev/null
 sleep 4
 # The process has to still be there. A panic in a worker thread takes it down
 # and the replay repeats it, so "is it alive" is the whole assertion.
-if pgrep -f "pg2osync run" > /dev/null; then
+if sync_pid > /dev/null; then
   ok "the pipeline survived the rename"
 else
   bad "the pipeline died on the rename"
@@ -916,19 +923,19 @@ PWCONFIG=$(mktemp /tmp/pg2osync-e2e-workers.XXXXXX)
 PWSLOT=pg2osync_e2e_workers
 # Its own log: the shared one already holds two dozen "resuming the load" lines
 # from earlier sections, so grepping it would prove nothing about this run.
-LOG18=/tmp/pg2osync-e2e-workers.log
+LOG18=/tmp/pg2osync-e2e-workers-$TAG.log
 : > "$LOG18"
 sed -e "s/^slot_name = .*/slot_name = \"$PWSLOT\"/" \
     -e "s/^publication = .*/publication = \"${PWSLOT}_pub\"/" \
     -e "s/^index = .*/index = \"e2e_workers\"/" \
-    -e "s#^bind = .*#bind = \"127.0.0.1:9120\"#" \
+    -e "s#^bind = .*#bind = \"127.0.0.1:$((PORT_BASE + 20))\"#" \
     -e "s/^\[source\]/[source]\nload_workers = 4\nload_chunk_rows = 2000/" \
     "$RCONFIG" > "$PWCONFIG"
 workers_cleanup() {
-  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  sync_kill
   pg "SELECT pg_drop_replication_slot('$PWSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$PWSLOT');" > /dev/null 2>&1 || true
   pg "DROP PUBLICATION IF EXISTS ${PWSLOT}_pub;" > /dev/null 2>&1 || true
-  rm -f "$PWCONFIG"
+  rm -f "$PWCONFIG" "$LOG18"
 }
 trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup' EXIT
 pg "DROP PUBLICATION IF EXISTS ${PWSLOT}_pub; CREATE PUBLICATION ${PWSLOT}_pub FOR TABLE resume_probe;" > /dev/null 2>&1
@@ -937,7 +944,7 @@ PWPROG=load-postgres-$PWSLOT-public_resume_probe
 curl -s -XDELETE "$OS/.pg2osync_meta/_doc/$PWPROG" > /dev/null
 src_rows=$(pg "SELECT count(*) FROM resume_probe;")
 pw_done() { curl -s "$OS/.pg2osync_meta/_doc/$PWPROG" | jqf "(d.get('_source') or {}).get('done', -1)"; }
-nohup $BIN run -c "$PWCONFIG" > "$LOG18" 2>&1 < /dev/null & disown
+sync_spawn "$PWCONFIG" "$LOG18"
 # Caught while it runs: the document is removed once the load finishes, so a
 # slow poll sees nothing rather than something wrong.
 done_at_kill=-1
@@ -949,7 +956,7 @@ for _ in $(seq 1 400); do
   fi
   sleep 0.05
 done
-pkill -9 -f "pg2osync run"; sleep 1
+sync_kill; sleep 1
 if [ "$done_at_kill" -gt 0 ]; then
   if [ $((done_at_kill % 4)) = 0 ]; then
     ok "progress advances a wave at a time ($done_at_kill ranges, a multiple of 4)"
@@ -964,7 +971,7 @@ if grep -q "reading the load with 4 connections" "$LOG18"; then
 else
   bad "it did not report reading with four connections"
 fi
-nohup $BIN run -c "$PWCONFIG" >> "$LOG18" 2>&1 < /dev/null & disown
+sync_spawn "$PWCONFIG" "$LOG18"
 for _ in $(seq 1 180); do
   refresh
   [ "$(os_count e2e_workers)" = "$src_rows" ] && break
@@ -1049,7 +1056,7 @@ url = "$OS"
 flavor = "$TARGET_FLAVOR"
 
 [metrics]
-bind = "127.0.0.1:9121"
+bind = "127.0.0.1:$((PORT_BASE + 21))"
 
 [sync.fan]
 table = "public.fan_probe"
@@ -1064,7 +1071,7 @@ id = "fan-{id}-{tags}"
 kind = "tag"
 TOML
 fan_cleanup() {
-  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  sync_kill
   pg "SELECT pg_drop_replication_slot('$FSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$FSLOT');" > /dev/null 2>&1 || true
   pg "DROP PUBLICATION IF EXISTS ${FSLOT}_pub; DROP TABLE IF EXISTS fan_probe;" > /dev/null 2>&1 || true
   rm -f "$FCONFIG"
@@ -1085,7 +1092,7 @@ else
   ok "validate refuses an id naming a column the table does not have"
 fi
 rm -f "${FCONFIG}.bad"
-nohup $BIN run -c "$FCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$FCONFIG"
 for _ in $(seq 1 60); do
   refresh
   [ "$(os_count e2e_fan)" = "3" ] && break
@@ -1131,7 +1138,7 @@ url = "$OS"
 flavor = "$TARGET_FLAVOR"
 
 [metrics]
-bind = "127.0.0.1:9122"
+bind = "127.0.0.1:$((PORT_BASE + 22))"
 
 [sync.bid]
 table = "public.bid_probe"
@@ -1139,10 +1146,10 @@ index = "e2e_bid"
 id = "{tenant}-u{id}"
 TOML
 bid_cleanup() {
-  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  sync_kill
   pg "SELECT pg_drop_replication_slot('$BSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$BSLOT');" > /dev/null 2>&1 || true
   pg "DROP PUBLICATION IF EXISTS ${BSLOT}_pub; DROP TABLE IF EXISTS bid_probe;" > /dev/null 2>&1 || true
-  rm -f "$BCONFIG"
+  rm -f "$BCONFIG" /tmp/pg2osync-e2e-bid-$TAG.log
 }
 trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup; init_cleanup; fan_cleanup; bid_cleanup' EXIT
 
@@ -1152,18 +1159,17 @@ pg "DROP TABLE IF EXISTS bid_probe; CREATE TABLE bid_probe(id bigint primary key
 pg "INSERT INTO bid_probe VALUES (1,'acme');" > /dev/null
 pg "DROP PUBLICATION IF EXISTS ${BSLOT}_pub; CREATE PUBLICATION ${BSLOT}_pub FOR TABLE bid_probe;" > /dev/null 2>&1
 curl -s -XDELETE "$OS/e2e_bid" > /dev/null
-if $BIN run -c "$BCONFIG" > /tmp/pg2osync-e2e-bid.log 2>&1 & then
-  sleep 3
-  pkill -f "pg2osync run" 2>/dev/null || true
-  wait 2> /dev/null || true
-fi
-if grep -q "REPLICA IDENTITY FULL" /tmp/pg2osync-e2e-bid.log; then
+: > /tmp/pg2osync-e2e-bid-$TAG.log
+sync_spawn "$BCONFIG" /tmp/pg2osync-e2e-bid-$TAG.log
+sleep 3
+sync_stop
+if grep -q "REPLICA IDENTITY FULL" /tmp/pg2osync-e2e-bid-$TAG.log; then
   ok "a non-key id on a non-FULL table is refused with the ALTER to run"
 else
   bad "the pipeline started despite an id it cannot delete against"
 fi
 pg "ALTER TABLE bid_probe REPLICA IDENTITY FULL;" > /dev/null 2>&1
-nohup $BIN run -c "$BCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$BCONFIG"
 for _ in $(seq 1 60); do
   refresh
   [ "$(os_status e2e_bid acme-u1)" = "200" ] && break
@@ -1194,7 +1200,7 @@ echo -e "\n\033[1m== 22. named transforms reshape a column, and leave alone what
 # row 2 converts on none of them and has to land exactly as it arrived, counted,
 # rather than halt the pipeline or be nulled.
 SCONFIG=$(mktemp /tmp/pg2osync-e2e-shape.XXXXXX)
-SMAPPING=$(dirname "$SCONFIG")/pg2osync-e2e-shape-mapping.json
+SMAPPING=$(dirname "$SCONFIG")/pg2osync-e2e-shape-mapping-$TAG.json
 SSLOT=pg2osync_e2e_shape
 cat > "$SCONFIG" <<TOML
 [source]
@@ -1207,12 +1213,12 @@ url = "$OS"
 flavor = "$TARGET_FLAVOR"
 
 [metrics]
-bind = "127.0.0.1:9123"
+bind = "127.0.0.1:$((PORT_BASE + 23))"
 
 [sync.shape]
 table = "public.shape_probe"
 index = "e2e_shape"
-mapping_file = "pg2osync-e2e-shape-mapping.json"
+mapping_file = "pg2osync-e2e-shape-mapping-$TAG.json"
 
 [sync.shape.transform]
 payload = "json"
@@ -1228,7 +1234,7 @@ cat > "$SMAPPING" <<'JSON'
 { "mappings": { "properties": { "price": { "type": "text" }, "born": { "type": "text" }, "tags": { "type": "keyword" } } } }
 JSON
 shape_cleanup() {
-  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  sync_kill
   pg "SELECT pg_drop_replication_slot('$SSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$SSLOT');" > /dev/null 2>&1 || true
   pg "DROP PUBLICATION IF EXISTS ${SSLOT}_pub; DROP TABLE IF EXISTS shape_probe;" > /dev/null 2>&1 || true
   rm -f "$SCONFIG" "$SMAPPING"
@@ -1248,7 +1254,7 @@ else
   ok "validate refuses a split with nothing to split by"
 fi
 rm -f "${SCONFIG}.bad"
-nohup $BIN run -c "$SCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$SCONFIG"
 for _ in $(seq 1 60); do
   refresh
   [ "$(os_count e2e_shape)" = "2" ] && break
@@ -1263,7 +1269,7 @@ check "an unconvertible value is indexed as it was" "$(os_field e2e_shape 2 pric
 check "and so is an unparseable date" "$(os_field e2e_shape 2 born)" "not-a-date"
 # -ge rather than =: at-least-once delivery may hand row 2 over more than once,
 # and every pass counts what it left alone again
-left=$(curl -s 127.0.0.1:9123/metrics | awk '/^pg2osync_transform_unconverted_total\{/{print $2}')
+left=$(curl -s 127.0.0.1:$((PORT_BASE + 23))/metrics | awk '/^pg2osync_transform_unconverted_total\{/{print $2}')
 if [ "${left:-0}" -ge 3 ]; then
   ok "the counter reports the values left as they were ($left)"
 else
@@ -1289,7 +1295,7 @@ url = "$OS"
 flavor = "$TARGET_FLAVOR"
 
 [metrics]
-bind = "127.0.0.1:9124"
+bind = "127.0.0.1:$((PORT_BASE + 24))"
 
 [sync.where_probe]
 table = "public.where_probe"
@@ -1297,7 +1303,7 @@ index = "e2e_where"
 where = "status = 'active' AND price > 10 AND deleted_at IS NULL"
 TOML
 where_cleanup() {
-  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  sync_kill
   pg "SELECT pg_drop_replication_slot('$RFSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$RFSLOT');" > /dev/null 2>&1 || true
   pg "DROP PUBLICATION IF EXISTS ${RFSLOT}_pub; DROP TABLE IF EXISTS where_probe;" > /dev/null 2>&1 || true
   rm -f "$RFCONFIG"
@@ -1326,7 +1332,7 @@ else
   ok "validate refuses a predicate naming a column the table does not have"
 fi
 rm -f "${RFCONFIG}.bad"
-nohup $BIN run -c "$RFCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$RFCONFIG"
 for _ in $(seq 1 60); do
   refresh
   [ "$(os_count e2e_where)" = "2" ] && break
@@ -1376,7 +1382,7 @@ echo -e "\n\033[1m== 24. a parent and its children as a join field in one index 
 # parent delete has to take its children with it — through a search, because
 # the engine does not know which children the target holds.
 JCONFIG=$(mktemp /tmp/pg2osync-e2e-join.XXXXXX)
-JMAPPING=$(dirname "$JCONFIG")/pg2osync-e2e-join-mapping.json
+JMAPPING=$(dirname "$JCONFIG")/pg2osync-e2e-join-mapping-$TAG.json
 JSLOT=pg2osync_e2e_join
 drop_idle_probe_slots
 cat > "$JCONFIG" <<TOML
@@ -1390,13 +1396,13 @@ url = "$OS"
 flavor = "$TARGET_FLAVOR"
 
 [metrics]
-bind = "127.0.0.1:9125"
+bind = "127.0.0.1:$((PORT_BASE + 25))"
 
 [sync.jcust]
 table = "public.jcust"
 index = "e2e_shop"
 id = "customer-{id}"
-mapping_file = "pg2osync-e2e-join-mapping.json"
+mapping_file = "pg2osync-e2e-join-mapping-$TAG.json"
 
 [sync.jcust.join]
 field = "relation"
@@ -1420,7 +1426,7 @@ cat > "$JMAPPING" <<'JSON'
 {"settings":{"number_of_shards":3},"mappings":{"properties":{"relation":{"type":"join","relations":{"customer":["order"]}}}}}
 JSON
 join_cleanup() {
-  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  sync_kill
   pg "SELECT pg_drop_replication_slot('$JSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$JSLOT');" > /dev/null 2>&1 || true
   pg "DROP PUBLICATION IF EXISTS ${JSLOT}_pub; DROP TABLE IF EXISTS jord, jcust;" > /dev/null 2>&1 || true
   rm -f "$JCONFIG" "$JMAPPING"
@@ -1452,7 +1458,7 @@ if $BIN validate -c "$JCONFIG" 2>&1 | grep -q "all checks passed"; then
 else
   bad "validate refused the join pair"
 fi
-nohup $BIN run -c "$JCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$JCONFIG"
 for _ in $(seq 1 60); do
   refresh
   [ "$(os_count e2e_shop)" = "5" ] && break
@@ -1502,7 +1508,7 @@ check "a deleted parent is gone" "$(os_status e2e_shop customer-1)" "404"
 check "and so is the child it still had" "$(os_rstatus e2e_shop order-11 customer-1)" "404"
 check "the child that had moved to another parent is untouched" "$(os_rstatus e2e_shop order-10 customer-2)" "200"
 check "and so is the other parent" "$(os_status e2e_shop customer-2)" "200"
-if curl -s 127.0.0.1:9125/metrics | grep -qE '^pg2osync_events_total\{source="[^"]*",type="join_cascade"\} [1-9]'; then
+if curl -s 127.0.0.1:$((PORT_BASE + 25))/metrics | grep -qE '^pg2osync_events_total\{source="[^"]*",type="join_cascade"\} [1-9]'; then
   ok "the cascade is counted"
 else
   bad "pg2osync_events_total{type=\"join_cascade\"} did not move"
@@ -1535,7 +1541,7 @@ check "leaving its sibling alone" "$(os_rstatus e2e_shop order-13 customer-2)" "
 
 # a TRUNCATE of one half of the pair clears that relation only: the join
 # field is what tells the halves apart, so the customers stay
-nohup $BIN run -c "$JCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$JCONFIG"
 sleep 3
 pg "TRUNCATE jord;" > /dev/null
 for _ in $(seq 1 30); do refresh; [ "$(os_rstatus e2e_shop order-13 customer-2)" = "404" ] && break; sleep 1; done
@@ -1563,7 +1569,7 @@ url = "$OS"
 flavor = "$TARGET_FLAVOR"
 
 [metrics]
-bind = "127.0.0.1:9126"
+bind = "127.0.0.1:$((PORT_BASE + 26))"
 
 [sync.user_probe]
 table = "public.user_probe"
@@ -1576,7 +1582,7 @@ index = "e2e_union"
 id = "order-{id}"
 TOML
 union_cleanup() {
-  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  sync_kill
   pg "SELECT pg_drop_replication_slot('$USLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$USLOT');" > /dev/null 2>&1 || true
   pg "DROP PUBLICATION IF EXISTS ${USLOT}_pub; DROP TABLE IF EXISTS user_probe, order_probe;" > /dev/null 2>&1 || true
   rm -f "$UCONFIG"
@@ -1604,7 +1610,7 @@ else
   bad "validate accepted a shared index with a section that has no id"
 fi
 rm -f "${UCONFIG}.bad"
-nohup $BIN run -c "$UCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$UCONFIG"
 for _ in $(seq 1 60); do
   refresh
   [ "$(os_count e2e_union)" = "2" ] && break
@@ -1650,7 +1656,7 @@ check "the other table's document survived the TRUNCATE" "$(os_status e2e_union 
 pg "INSERT INTO user_probe VALUES (2,'still-streaming');" > /dev/null
 for _ in $(seq 1 30); do refresh; [ "$(os_status e2e_union user-2)" = "200" ] && break; sleep 1; done
 check "and the pipeline is still streaming after it" "$(os_status e2e_union user-2)" "200"
-check "the skip is counted" "$(curl -s 127.0.0.1:9126/metrics | awk '/^pg2osync_events_total\{source="[^"]*",type="truncate_skipped"\} /{print $2}')" "1"
+check "the skip is counted" "$(curl -s 127.0.0.1:$((PORT_BASE + 26))/metrics | awk '/^pg2osync_events_total\{source="[^"]*",type="truncate_skipped"\} /{print $2}')" "1"
 stop_sync
 
 echo -e "\n\033[1m== 26. a row chooses the index it lands in ==\033[0m"
@@ -1661,7 +1667,7 @@ echo -e "\n\033[1m== 26. a row chooses the index it lands in ==\033[0m"
 # the index is created the first time a row needs it, with the configured
 # mapping, and nothing that pages one index can run against the table.
 ECONFIG=$(mktemp /tmp/pg2osync-e2e-events.XXXXXX)
-EMAPPING=$(dirname "$ECONFIG")/pg2osync-e2e-events-mapping.json
+EMAPPING=$(dirname "$ECONFIG")/pg2osync-e2e-events-mapping-$TAG.json
 ESLOT=pg2osync_e2e_events
 drop_idle_probe_slots
 cat > "$ECONFIG" <<TOML
@@ -1675,18 +1681,18 @@ url = "$OS"
 flavor = "$TARGET_FLAVOR"
 
 [metrics]
-bind = "127.0.0.1:9127"
+bind = "127.0.0.1:$((PORT_BASE + 27))"
 
 [sync.events]
 table = "public.events_probe"
 index = "e2e-events-{tenant}"
-mapping_file = "pg2osync-e2e-events-mapping.json"
+mapping_file = "pg2osync-e2e-events-mapping-$TAG.json"
 TOML
 cat > "$EMAPPING" <<'JSON'
 {"mappings":{"properties":{"tenant":{"type":"keyword"}}}}
 JSON
 events_cleanup() {
-  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  sync_kill
   pg "SELECT pg_drop_replication_slot('$ESLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$ESLOT');" > /dev/null 2>&1 || true
   pg "DROP PUBLICATION IF EXISTS ${ESLOT}_pub; DROP TABLE IF EXISTS events_probe;" > /dev/null 2>&1 || true
   curl -s -XDELETE "$OS/e2e-events-*?ignore_unavailable=true" > /dev/null 2>&1 || true
@@ -1715,7 +1721,7 @@ rm -f "${ECONFIG}.bad"
 # was in, so the tool refuses to start rather than strand the document. The
 # log is cumulative across sections, so only a new line counts.
 full_before=$(grep -c "REPLICA IDENTITY FULL" "$LOG" || true)
-nohup $BIN run -c "$ECONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$ECONFIG"
 for _ in $(seq 1 30); do
   [ "$(grep -c 'REPLICA IDENTITY FULL' "$LOG" || true)" -gt "$full_before" ] && break
   sleep 1
@@ -1727,7 +1733,7 @@ else
 fi
 stop_sync
 pg "ALTER TABLE events_probe REPLICA IDENTITY FULL;" > /dev/null 2>&1
-nohup $BIN run -c "$ECONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$ECONFIG"
 for _ in $(seq 1 60); do
   refresh
   [ "$(os_status e2e-events-acme 1)" = "200" ] && break
@@ -1809,7 +1815,7 @@ url = "$OS"
 flavor = "$TARGET_FLAVOR"
 
 [metrics]
-bind = "127.0.0.1:9128"
+bind = "127.0.0.1:$((PORT_BASE + 28))"
 
 [sync.pipe]
 table = "public.pipe_probe"
@@ -1817,7 +1823,7 @@ index = "e2e_pipe"
 pipeline = "e2e-tag"
 TOML
 pipe_cleanup() {
-  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  sync_kill
   pg "SELECT pg_drop_replication_slot('$PSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$PSLOT');" > /dev/null 2>&1 || true
   pg "DROP PUBLICATION IF EXISTS ${PSLOT}_pub; DROP TABLE IF EXISTS pipe_probe;" > /dev/null 2>&1 || true
   curl -s -XDELETE "$OS/_ingest/pipeline/e2e-tag" > /dev/null 2>&1 || true
@@ -1849,7 +1855,7 @@ if grep -q "ingest pipeline e2e-tag exists" <<< "$out"; then
 else
   bad "validate did not report the pipeline the target has"
 fi
-nohup $BIN run -c "$PCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$PCONFIG"
 for _ in $(seq 1 60); do
   refresh
   [ "$(os_status e2e_pipe 1)" = "200" ] && break
@@ -1888,7 +1894,7 @@ url = "$OS"
 flavor = "$TARGET_FLAVOR"
 
 [metrics]
-bind = "127.0.0.1:9129"
+bind = "127.0.0.1:$((PORT_BASE + 29))"
 
 [sync.events_log]
 table = "public.events_log"
@@ -1896,7 +1902,7 @@ index = "e2e_append"
 append_only = true
 TOML
 append_cleanup() {
-  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  sync_kill
   pg "SELECT pg_drop_replication_slot('$ASLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$ASLOT');" > /dev/null 2>&1 || true
   pg "DROP PUBLICATION IF EXISTS ${ASLOT}_pub; DROP TABLE IF EXISTS events_log;" > /dev/null 2>&1 || true
   curl -s -XDELETE "$OS/e2e_append?ignore_unavailable=true" > /dev/null 2>&1 || true
@@ -1926,7 +1932,7 @@ else
   bad "validate accepted primary_key on an append_only table"
 fi
 rm -f "${ACONFIG}.bad"
-nohup $BIN run -c "$ACONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$ACONFIG"
 for _ in $(seq 1 60); do
   refresh
   [ "$(os_count e2e_append)" = "2" ] && break
@@ -1958,7 +1964,7 @@ check "a streamed duplicate is the document it already is" "$(os_count e2e_appen
 stop_sync
 pg "ALTER TABLE events_log REPLICA IDENTITY FULL;" > /dev/null 2>&1
 halts_before=$(grep -c "an UPDATE arrived on an append-only table" "$LOG" || true)
-nohup $BIN run -c "$ACONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$ACONFIG"
 pg "UPDATE events_log SET kind='x';" > /dev/null
 for _ in $(seq 1 30); do
   [ "$(grep -c 'an UPDATE arrived on an append-only table' "$LOG" || true)" -gt "$halts_before" ] && break
@@ -1990,7 +1996,7 @@ publication = "${RTSLOT}_pub"
 url = "$OS"
 
 [metrics]
-bind = "127.0.0.1:9130"
+bind = "127.0.0.1:$((PORT_BASE + 30))"
 
 [sync.tenanted]
 table = "public.tenanted"
@@ -1998,11 +2004,11 @@ index = "e2e_routing"
 routing = "tenant"
 TOML
 routing_cleanup() {
-  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  sync_kill
   pg "SELECT pg_drop_replication_slot('$RTSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$RTSLOT');" > /dev/null 2>&1 || true
   pg "DROP PUBLICATION IF EXISTS ${RTSLOT}_pub; DROP TABLE IF EXISTS tenanted;" > /dev/null 2>&1 || true
   curl -s -XDELETE "$OS/e2e_routing?ignore_unavailable=true" > /dev/null 2>&1 || true
-  rm -f "$RTCONFIG" /tmp/pg2osync-e2e-routing.log
+  rm -f "$RTCONFIG" /tmp/pg2osync-e2e-routing-$TAG.log
 }
 trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup; init_cleanup; fan_cleanup; bid_cleanup; shape_cleanup; where_cleanup; join_cleanup; union_cleanup; events_cleanup; pipe_cleanup; append_cleanup; routing_cleanup' EXIT
 
@@ -2033,19 +2039,18 @@ fi
 rm -f "${RTCONFIG}.bad"
 # the routing column is not the key, so a delete carries it only under FULL:
 # the pipeline refuses to start rather than strand documents on their shards
-if $BIN run -c "$RTCONFIG" > /tmp/pg2osync-e2e-routing.log 2>&1 & then
-  sleep 3
-  pkill -f "pg2osync run" 2>/dev/null || true
-  wait 2> /dev/null || true
-fi
-if grep -q "REPLICA IDENTITY FULL" /tmp/pg2osync-e2e-routing.log; then
+: > /tmp/pg2osync-e2e-routing-$TAG.log
+sync_spawn "$RTCONFIG" /tmp/pg2osync-e2e-routing-$TAG.log
+sleep 3
+sync_stop
+if grep -q "REPLICA IDENTITY FULL" /tmp/pg2osync-e2e-routing-$TAG.log; then
   ok "a non-key routing column on a non-FULL table is refused with the ALTER to run"
 else
   bad "the pipeline started despite a routing it could not derive on a delete"
 fi
 pg "ALTER TABLE tenanted REPLICA IDENTITY FULL;" > /dev/null 2>&1
 
-nohup $BIN run -c "$RTCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$RTCONFIG"
 for _ in $(seq 1 60); do
   refresh
   [ "$(os_count e2e_routing)" = "2" ] && break
@@ -2106,7 +2111,7 @@ esac
 check "and removed it under its own routing" "$(os_rstatus e2e_routing 2 globex)" "404"
 
 # a TRUNCATE is index-wide, so routing has nothing to do with it
-nohup $BIN run -c "$RTCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$RTCONFIG"
 sleep 3
 pg "TRUNCATE tenanted;" > /dev/null
 for _ in $(seq 1 30); do refresh; [ "$(os_count e2e_routing)" = "0" ] && break; sleep 1; done
@@ -2121,7 +2126,7 @@ echo -e "\n\033[1m== 30. a rebuild into a fresh index, then the alias onto it ==
 # pipeline was stopped — and the command refuses everything it cannot do
 # safely, a live stream first among them.
 XCONFIG=$(mktemp /tmp/pg2osync-e2e-reindex.XXXXXX)
-XMAPPING=$(dirname "$XCONFIG")/pg2osync-e2e-reindex-mapping.json
+XMAPPING=$(dirname "$XCONFIG")/pg2osync-e2e-reindex-mapping-$TAG.json
 XSLOT=pg2osync_e2e_reindex
 XALIAS=e2e_reindex_live
 drop_idle_probe_slots
@@ -2136,12 +2141,12 @@ url = "$OS"
 flavor = "$TARGET_FLAVOR"
 
 [metrics]
-bind = "127.0.0.1:9132"
+bind = "127.0.0.1:$((PORT_BASE + 32))"
 
 [sync.reindex]
 table = "public.reindex_probe"
 index = "e2e_reindex"
-mapping_file = "pg2osync-e2e-reindex-mapping.json"
+mapping_file = "pg2osync-e2e-reindex-mapping-$TAG.json"
 TOML
 cat > "$XMAPPING" <<'JSON'
 { "mappings": { "properties": { "v": { "type": "text" } } } }
@@ -2154,7 +2159,7 @@ drop_reindex_indices() {
   done
 }
 reindex_cleanup() {
-  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  sync_kill
   pg "SELECT pg_drop_replication_slot('$XSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$XSLOT');" > /dev/null 2>&1 || true
   pg "DROP PUBLICATION IF EXISTS ${XSLOT}_pub; DROP TABLE IF EXISTS reindex_probe;" > /dev/null 2>&1 || true
   drop_reindex_indices
@@ -2168,7 +2173,7 @@ pg "DROP PUBLICATION IF EXISTS ${XSLOT}_pub; CREATE PUBLICATION ${XSLOT}_pub FOR
 drop_reindex_indices
 curl -s -XDELETE "$OS/.pg2osync_meta/_doc/postgres-$XSLOT" > /dev/null
 
-nohup $BIN run -c "$XCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$XCONFIG"
 for _ in $(seq 1 60); do
   refresh
   [ "$(os_count e2e_reindex)" = "3" ] && break
@@ -2221,7 +2226,7 @@ pg "INSERT INTO reindex_probe VALUES (4,'added-while-stopped');" > /dev/null
 refresh
 check "the rebuilt index cannot know about them yet" "$(os_field "$new_index" 1 v)" "one"
 sed "s#^index = \"e2e_reindex\"\$#index = \"$new_index\"#" "$XCONFIG" > "${XCONFIG}.new"
-nohup $BIN run -c "${XCONFIG}.new" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "${XCONFIG}.new"
 for _ in $(seq 1 60); do
   refresh
   [ "$(os_status "$new_index" 4)" = "200" ] && break
@@ -2270,7 +2275,7 @@ echo -e "\n\033[1m== 31. the load obeys a rate limit the operator asked for ==\0
 # commands that run a load converge — so a re-snapshot is the cheapest way to
 # see it, and it needs no slot and no pipeline.
 RTCONFIG=$(mktemp /tmp/pg2osync-e2e-rate.XXXXXX)
-RTLOG=/tmp/pg2osync-e2e-rate.log
+RTLOG=/tmp/pg2osync-e2e-rate-$TAG.log
 : > "$RTLOG"
 cat > "$RTCONFIG" <<TOML
 [source]
@@ -2292,7 +2297,7 @@ TOML
 rate_cleanup() {
   pg "DROP TABLE IF EXISTS rate_probe;" > /dev/null 2>&1 || true
   curl -s -XDELETE "$OS/e2e_rate" > /dev/null 2>&1 || true
-  rm -f "$RTCONFIG"
+  rm -f "$RTCONFIG" "$RTLOG"
 }
 trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup; init_cleanup; fan_cleanup; bid_cleanup; shape_cleanup; where_cleanup; join_cleanup; union_cleanup; events_cleanup; pipe_cleanup; append_cleanup; routing_cleanup; reindex_cleanup; rate_cleanup' EXIT
 
@@ -2339,7 +2344,7 @@ url = "$OS"
 flavor = "$TARGET_FLAVOR"
 
 [metrics]
-bind = "127.0.0.1:9133"
+bind = "127.0.0.1:$((PORT_BASE + 33))"
 
 [sync.books]
 table = "public.books"
@@ -2353,7 +2358,7 @@ foreign_key = "book_id"
 through_key = "author_id"
 TOML
 through_cleanup() {
-  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  sync_kill
   pg "SELECT pg_drop_replication_slot('$TSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$TSLOT');" > /dev/null 2>&1 || true
   pg "DROP PUBLICATION IF EXISTS ${TSLOT}_pub; DROP TABLE IF EXISTS book_author; DROP TABLE IF EXISTS authors; DROP TABLE IF EXISTS books;" > /dev/null 2>&1 || true
   curl -s -XDELETE "$OS/e2e_through,e2e_through_capped?ignore_unavailable=true" > /dev/null 2>&1 || true
@@ -2386,7 +2391,7 @@ else
   bad "validate says nothing about the junction: $vout"
 fi
 
-nohup $BIN run -c "$TCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$TCONFIG"
 for _ in $(seq 1 60); do
   refresh
   [ "$(os_count e2e_through)" = "3" ] && break
@@ -2450,7 +2455,7 @@ stop_sync
 { sed 's#^index = "e2e_through"$#index = "e2e_through_capped"#' "$TCONFIG"; echo 'max_rows = 2'; } > "${TCONFIG}.capped"
 curl -s -XDELETE "$OS/e2e_through_capped?ignore_unavailable=true" > /dev/null
 curl -s -XDELETE "$OS/.pg2osync_meta/_doc/postgres-$TSLOT" > /dev/null
-nohup $BIN run -c "${TCONFIG}.capped" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "${TCONFIG}.capped"
 for _ in $(seq 1 60); do
   refresh
   [ "$(os_count e2e_through_capped)" = "3" ] && break
@@ -2473,7 +2478,7 @@ echo -e "\n\033[1m== 33. require_alias refuses a write that bypasses the alias =
 # refusal instead of a silence, and validate catches it before the first write.
 RACONFIG=$(mktemp /tmp/pg2osync-e2e-require-alias.XXXXXX)
 ra_cleanup() {
-  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  sync_kill
   rm -f "$RACONFIG" "${RACONFIG}.raw"
 }
 trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup; init_cleanup; fan_cleanup; bid_cleanup; shape_cleanup; where_cleanup; join_cleanup; union_cleanup; events_cleanup; pipe_cleanup; append_cleanup; routing_cleanup; reindex_cleanup; rate_cleanup; through_cleanup; ra_cleanup' EXIT
@@ -2490,7 +2495,7 @@ flavor = "$TARGET_FLAVOR"
 require_alias = true
 
 [metrics]
-bind = "127.0.0.1:9134"
+bind = "127.0.0.1:$((PORT_BASE + 34))"
 
 [sync.reindex]
 table = "public.reindex_probe"
@@ -2504,7 +2509,7 @@ case "$out" in
   *) bad "validate did not confirm the alias: $out" ;;
 esac
 
-nohup $BIN run -c "$RACONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$RACONFIG"
 sleep 3
 pg "INSERT INTO reindex_probe VALUES (5,'through-the-alias');" > /dev/null
 for _ in $(seq 1 60); do
@@ -2529,7 +2534,7 @@ esac
 # started anyway, the target refuses the first write itself, and a name that is
 # an index and not an alias never becomes one — so it halts rather than retries
 halts_before=$(grep -c "must go through one" "$LOG" || true)
-nohup $BIN run -c "${RACONFIG}.raw" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "${RACONFIG}.raw"
 sleep 3
 pg "INSERT INTO reindex_probe VALUES (6,'past-the-alias');" > /dev/null
 for _ in $(seq 1 30); do
@@ -2573,7 +2578,7 @@ url = "$OS"
 flavor = "$TARGET_FLAVOR"
 
 [metrics]
-bind = "127.0.0.1:9135"
+bind = "127.0.0.1:$((PORT_BASE + 35))"
 
 [sync.people]
 table = "public.pseudo_people"
@@ -2590,7 +2595,7 @@ index = "e2e_pseudo_orders"
 owner_email = { op = "pseudonym", key_env = "PG2OSYNC_E2E_PSEUDONYM_KEY", scope = "public.pseudo_people.email" }
 TOML
 pseudo_cleanup() {
-  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  sync_kill
   pg "SELECT pg_drop_replication_slot('$PSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$PSLOT');" > /dev/null 2>&1 || true
   pg "DROP PUBLICATION IF EXISTS ${PSLOT}_pub; DROP TABLE IF EXISTS pseudo_people, pseudo_orders;" > /dev/null 2>&1 || true
   curl -s -XDELETE "$OS/e2e_pseudo_people" > /dev/null 2>&1 || true
@@ -2639,7 +2644,7 @@ case "$accepted" in
   *) bad "validate does not report the key: $accepted" ;;
 esac
 
-nohup $BIN run -c "$PCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$PCONFIG"
 for _ in $(seq 1 60); do
   refresh
   [ "$(os_count e2e_pseudo_people)" = "3" ] && [ "$(os_count e2e_pseudo_orders)" = "1" ] && break
@@ -2687,10 +2692,10 @@ echo -e "\n\033[1m== 35. SIGHUP re-reads the configuration without a restart ==\
 # was rather than taking the pipeline down with it.
 RLCONFIG=$(mktemp /tmp/pg2osync-e2e-reload.XXXXXX)
 RLSLOT=pg2osync_e2e_reload
-RLLOG=/tmp/pg2osync-e2e-reload.log
+RLLOG=/tmp/pg2osync-e2e-reload-$TAG.log
 : > "$RLLOG"
 drop_idle_probe_slots
-rl_metric() { curl -s 127.0.0.1:9136/metrics | grep -v '^#' | grep -E "$1" | awk '{print $2}' | head -1; }
+rl_metric() { curl -s 127.0.0.1:$((PORT_BASE + 36))/metrics | grep -v '^#' | grep -E "$1" | awk '{print $2}' | head -1; }
 rl_write_config() {
   cat > "$RLCONFIG" <<TOML
 [source]
@@ -2703,7 +2708,7 @@ url = "$OS"
 flavor = "$TARGET_FLAVOR"
 
 [metrics]
-bind = "127.0.0.1:9136"
+bind = "127.0.0.1:$((PORT_BASE + 36))"
 
 [engine]
 batch_size = $1
@@ -2716,11 +2721,11 @@ $2
 TOML
 }
 rl_cleanup() {
-  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  sync_kill
   pg "SELECT pg_drop_replication_slot('$RLSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$RLSLOT');" > /dev/null 2>&1 || true
   pg "DROP PUBLICATION IF EXISTS ${RLSLOT}_pub; DROP TABLE IF EXISTS reload_probe;" > /dev/null 2>&1 || true
   curl -s -XDELETE "$OS/e2e_reload" > /dev/null 2>&1 || true
-  rm -f "$RLCONFIG"
+  rm -f "$RLCONFIG" "$RLLOG"
 }
 trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup; init_cleanup; fan_cleanup; bid_cleanup; shape_cleanup; where_cleanup; join_cleanup; union_cleanup; events_cleanup; pipe_cleanup; append_cleanup; routing_cleanup; reindex_cleanup; rate_cleanup; through_cleanup; ra_cleanup; pseudo_cleanup; rl_cleanup' EXIT
 
@@ -2729,9 +2734,8 @@ pg "INSERT INTO reload_probe VALUES (1,'seed');" > /dev/null
 curl -s -XDELETE "$OS/e2e_reload" > /dev/null 2>&1
 rl_write_config 500 ""
 
-nohup $BIN run -c "$RLCONFIG" >> "$RLLOG" 2>&1 < /dev/null &
-RLPID=$!
-disown
+sync_spawn "$RLCONFIG" "$RLLOG"
+RLPID=$SYNC_PID
 for _ in $(seq 1 60); do
   refresh
   [ "$(os_count e2e_reload)" = "1" ] && break
@@ -2850,7 +2854,7 @@ drop_idle_probe_slots
 OTCONFIG=$(mktemp /tmp/pg2osync-e2e-otel.XXXXXX)
 OTSLOT=pg2osync_e2e_otel
 otel_cleanup() {
-  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  sync_kill
   pg "SELECT pg_drop_replication_slot('$OTSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$OTSLOT');" > /dev/null 2>&1 || true
   rm -f "$OTCONFIG"
 }
@@ -2867,7 +2871,7 @@ url = "$OS"
 flavor = "$TARGET_FLAVOR"
 
 [metrics]
-bind = "127.0.0.1:9137"
+bind = "127.0.0.1:$((PORT_BASE + 37))"
 
 [sync.users]
 table = "public.users"
@@ -2879,10 +2883,11 @@ curl -s -XDELETE "$OS/e2e_otel?ignore_unavailable=true" > /dev/null
 curl -s -XDELETE "$OS/.pg2osync_meta/_doc/postgres-$OTSLOT" > /dev/null
 # nothing listens on 4417; the exporter can only fail, which is the case under test
 drops_before=$(grep -c "spans are not reaching the OTLP endpoint" "$LOG" || true)
-PG2OSYNC_OTLP_ENDPOINT=http://127.0.0.1:4417 \
-PG2OSYNC_OTLP_SAMPLE_RATIO=1.0 \
-PG2OSYNC_OTLP_SERVICE_NAME=e2e-otel \
-  nohup $BIN run -c "$OTCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+export PG2OSYNC_OTLP_ENDPOINT=http://127.0.0.1:4417
+export PG2OSYNC_OTLP_SAMPLE_RATIO=1.0
+export PG2OSYNC_OTLP_SERVICE_NAME=e2e-otel
+sync_spawn "$OTCONFIG"
+unset PG2OSYNC_OTLP_ENDPOINT PG2OSYNC_OTLP_SAMPLE_RATIO PG2OSYNC_OTLP_SERVICE_NAME
 for _ in $(seq 1 60); do
   refresh
   [ "$(os_count e2e_otel)" -gt 0 ] && break

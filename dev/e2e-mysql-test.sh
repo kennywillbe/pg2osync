@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # End-to-end test suite for the MySQL/MariaDB source.
 #
-# Runs one at a time: stopping the pipeline kills every pg2osync process, so
-# two suites at once take each other's down and report failures that are not.
+# One suite at a time per stack: the tables and the indices are fixed, so two
+# suites against the same server and target overwrite each other's state.
+# dev/e2e-lock.sh enforces that on the shared dev stack with a machine-wide
+# lock; a run with a stack of its own — ci-local --isolated — passes
+# E2E_LOCK=none, because a stop only ever signals the pipelines this run
+# started (dev/e2e-pipeline.sh).
 #
 # Prerequisites: a MySQL 8.0+ or MariaDB 10.6+ server with log_bin,
 # binlog_format=ROW, binlog_row_image=FULL and a mysql_native_password user
@@ -12,9 +16,13 @@
 #   OS_URL         target base URL          (default http://localhost:9200)
 #   TARGET_FLAVOR  opensearch|elasticsearch (default opensearch)
 #   E2E_LOG        pipeline log file        (default /tmp/pg2osync-mysql-e2e.log)
+#   E2E_LOCK       lock directory, or none  (default /tmp/pg2osync-e2e.lock)
+#   E2E_PORT_BASE  first metrics/API port   (default 9100, a 40-port block)
 set -euo pipefail
 # shellcheck source=dev/e2e-lock.sh
 source "$(dirname "$0")/e2e-lock.sh"
+# shellcheck source=dev/e2e-pipeline.sh
+source "$(dirname "$0")/e2e-pipeline.sh"
 e2e_lock
 
 cd "$(dirname "$0")/.."
@@ -34,7 +42,17 @@ CLIENT=${MYSQL_CLIENT:-mysql}
 CONFIG=$(mktemp /tmp/pg2osync-mysql.XXXXXX)
 # a file of this run's own, so two suites do not read each other's log lines
 LOG=${E2E_LOG:-/tmp/pg2osync-mysql-e2e.log}
+
+# mktemp's suffix, reused for every other file this run writes: two suites at
+# once — each against a stack of its own — must not read or delete each other's
+# mapping files and probe logs.
+TAG=${CONFIG##*.}
 export PG2OSYNC_MYSQL_URL="mysql://$USER:$PASSWORD@localhost:$PORT/sourcedb"
+# Every pipeline the suite starts binds its metrics and API ports on this
+# machine rather than inside a container, so two suites at once need two
+# blocks: E2E_PORT_BASE moves every port this one uses.
+PORT_BASE=${E2E_PORT_BASE:-9100}
+
 PASS=0; FAIL=0
 
 say()   { printf "\n\033[1m== %s ==\033[0m\n" "$1"; }
@@ -62,10 +80,10 @@ await_count() {
     sleep 1
   done
 }
-synced()    { curl -s "http://127.0.0.1:9132/synced?refresh=true&timeout=10000" > /dev/null; refresh; }
+synced()    { curl -s "http://127.0.0.1:$((PORT_BASE + 32))/synced?refresh=true&timeout=10000" > /dev/null; refresh; }
 
-start_sync() { nohup $BIN run -c "$CONFIG" >> "$LOG" 2>&1 < /dev/null & disown; }
-stop_sync()  { pkill -f "pg2osync run" 2> /dev/null || true; }
+start_sync() { sync_spawn "$CONFIG"; }
+stop_sync()  { sync_stop; }
 cleanup()    { stop_sync; rm -f "$CONFIG"; e2e_unlock; }
 trap cleanup EXIT
 
@@ -80,11 +98,11 @@ url = "$OS"
 flavor = "$TARGET_FLAVOR"
 
 [metrics]
-bind = "127.0.0.1:9112"
+bind = "127.0.0.1:$((PORT_BASE + 12))"
 
 [api]
 enabled = true
-bind = "127.0.0.1:9132"
+bind = "127.0.0.1:$((PORT_BASE + 32))"
 
 [sync.shop_users]
 table = "sourcedb.shop_users"
@@ -201,7 +219,7 @@ else
 fi
 
 say "7. reconnects after the server kills the dump thread"
-before_pid=$(pgrep -f "pg2osync run" | head -1)
+before_pid=$SYNC_PID
 # information_schema.PROCESSLIST rather than performance_schema.threads:
 # MariaDB ships with performance_schema disabled, so the latter finds nothing
 # and the kill silently becomes a no-op
@@ -213,15 +231,15 @@ else
 fi
 my "INSERT INTO shop_users (id,name,email) VALUES (9,'written-while-disconnected','w@test.io');"
 synced
-check "same process recovered" "$(pgrep -f "pg2osync run" | head -1)" "$before_pid"
+check "same process recovered" "$(sync_pid)" "$before_pid"
 check "row written while disconnected arrived" "$(os_field e2e_mysql_users 9 name)" "written-while-disconnected"
-metrics=$(curl -s http://127.0.0.1:9112/metrics)
+metrics=$(curl -s http://127.0.0.1:$((PORT_BASE + 12))/metrics)
 reconnects=$(awk '/^pg2osync_reconnects_total\{/ {print $2}' <<< "$metrics")
 if [ "${reconnects:-0}" -ge 1 ]; then ok "reconnects_total counted it ($reconnects)"; else bad "reconnects_total still zero"; fi
 
 say "8. read-your-writes"
 my "INSERT INTO shop_users (id,name,email) VALUES (11,'ryw','r@test.io');"
-synced=$(curl -s "http://127.0.0.1:9132/synced?refresh=true&timeout=8000")
+synced=$(curl -s "http://127.0.0.1:$((PORT_BASE + 32))/synced?refresh=true&timeout=8000")
 found=$(curl -s "$OS/e2e_mysql_users/_search" -H 'Content-Type: application/json' \
   -d '{"query":{"term":{"id":11}}}' | jqf "d['hits']['total']['value']")
 check "the row is searchable the moment /synced returns" "$found" "1"
@@ -234,7 +252,7 @@ say "8b. a column added under the pipeline is counted as drift"
 my "ALTER TABLE shop_users ADD COLUMN drift_probe varchar(32);"
 my "INSERT INTO shop_users (id,name,email,drift_probe) VALUES (91,'drift','d@test.io','later');"
 synced
-metrics=$(curl -s http://127.0.0.1:9112/metrics)
+metrics=$(curl -s http://127.0.0.1:$((PORT_BASE + 12))/metrics)
 check "the shape change is counted" \
   "$(awk '/^pg2osync_schema_drift_total\{source="[^"]*",table="sourcedb.shop_users"\} /{print $2}' <<< "$metrics")" "1"
 check "and the row after it still lands" "$(os_field e2e_mysql_users 91 drift_probe)" "later"
@@ -244,7 +262,7 @@ my "ALTER TABLE shop_users DROP COLUMN drift_probe;"
 
 say "9. crash recovery resumes from the binlog position"
 loads_before=$(grep -c 'rows from sourcedb' "$LOG")
-pkill -9 -f "pg2osync run"; sleep 1
+sync_kill; sleep 1
 my "INSERT INTO shop_users (id,name,email) VALUES (5,'eve-during-downtime','eve@test.io');"
 start_sync
 sleep 6; refresh
@@ -259,7 +277,7 @@ say "9b. a DDL replayed after a crash does not wedge the stream"
 # checkpoint, reached the same event and failed again, so nothing after it was
 # replicated. Running the whole DDL while the process is down is what makes
 # that replay certain rather than a race against the checkpoint interval.
-pkill -9 -f "pg2osync run"; sleep 1
+sync_kill; sleep 1
 my "ALTER TABLE shop_users ADD COLUMN drift_probe varchar(32);"
 my "INSERT INTO shop_users (id,name,email,drift_probe) VALUES (92,'old-shape','o@test.io','gone');"
 my "DELETE FROM shop_users WHERE id=92;"
@@ -297,7 +315,7 @@ url = "$OS"
 flavor = "$TARGET_FLAVOR"
 
 [metrics]
-bind = "127.0.0.1:9113"
+bind = "127.0.0.1:$((PORT_BASE + 13))"
 
 [sync.big]
 table = "sourcedb.resume_probe"
@@ -308,7 +326,7 @@ table = "sourcedb.composite_probe"
 index = "e2e_mysql_composite"
 TOML
 resume_cleanup() {
-  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  sync_kill
   my "DROP TABLE IF EXISTS resume_probe; DROP TABLE IF EXISTS composite_probe;" > /dev/null 2>&1 || true
   rm -f "$RCONFIG"
 }
@@ -344,13 +362,13 @@ big_rows=$(my 'SELECT count(*) FROM resume_probe;')
 composite_rows=$(my 'SELECT count(*) FROM composite_probe;')
 
 cursor_len() { curl -s "$OS/.pg2osync_meta/_doc/$PROG" | jqf "len((d.get('_source') or {}).get('after') or [])"; }
-nohup $BIN run -c "$RCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$RCONFIG"
 for _ in $(seq 1 120); do
   [ "$(cursor_len)" -ge 1 ] 2> /dev/null && break
   sleep 0.2
 done
 cursor_at_kill=$(cursor_len)
-pkill -9 -f "pg2osync run"; sleep 1
+sync_kill; sleep 1
 if [ "$cursor_at_kill" -ge 1 ]; then
   ok "progress recorded per chunk, as a key"
 else
@@ -364,7 +382,7 @@ my "INSERT INTO resume_probe(id,v) VALUES (400001,'added-while-down');"
 my "UPDATE resume_probe SET v='updated-while-down' WHERE id = 77;"
 src_rows=$(my 'SELECT count(*) FROM resume_probe;')
 
-nohup $BIN run -c "$RCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$RCONFIG"
 # The load now runs beside the stream, so a row can change while the chunk
 # holding it is still being read. The streamed change carries a higher binlog
 # position than the chunk did, so it has to win — the version is the only thing
@@ -417,14 +435,14 @@ url = "$OS"
 flavor = "$TARGET_FLAVOR"
 
 [metrics]
-bind = "127.0.0.1:9114"
+bind = "127.0.0.1:$((PORT_BASE + 14))"
 
 [sync.types]
 table = "sourcedb.types_probe"
 index = "e2e_mysql_types"
 TOML
 types_cleanup() {
-  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  sync_kill
   my "DROP TABLE IF EXISTS types_probe;" > /dev/null 2>&1 || true
   rm -f "$TCONFIG"
 }
@@ -451,7 +469,7 @@ curl -s -XDELETE "$OS/e2e_mysql_types" > /dev/null
 curl -s -XDELETE "$OS/.pg2osync_meta/_doc/checkpoint-mysql-990003" > /dev/null
 curl -s -XDELETE "$OS/.pg2osync_meta/_doc/load-mysql-990003-sourcedb_types_probe" > /dev/null
 
-nohup $BIN run -c "$TCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$TCONFIG"
 for _ in $(seq 1 60); do
   refresh
   [ "$(os_count e2e_mysql_types)" = "1" ] && break
@@ -487,7 +505,7 @@ stop_sync
 say "14. re-snapshot one table on demand"
 # The MySQL loader is a separate implementation from PostgreSQL's, so the command
 # is exercised on both rather than assumed to work from one.
-nohup $BIN run -c "$RCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$RCONFIG"
 sleep 4
 curl -s -XDELETE "$OS/e2e_mysql_resume/_doc/500" > /dev/null
 # Corrupting by hand uses internal versioning, which bumps the version one past
@@ -549,7 +567,7 @@ url = "$OS"
 flavor = "$TARGET_FLAVOR"
 
 [metrics]
-bind = "127.0.0.1:9116"
+bind = "127.0.0.1:$((PORT_BASE + 16))"
 
 [sync.kid_parent]
 table = "sourcedb.kid_parent"
@@ -575,7 +593,7 @@ table = "sourcedb.kid_item"
 index = "e2e_mysql_kid_item"
 TOML
 child_cleanup() {
-  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  sync_kill
   my "DROP TABLE IF EXISTS kid_item; DROP TABLE IF EXISTS kid_profile; DROP TABLE IF EXISTS kid_parent;" > /dev/null 2>&1 || true
   rm -f "$CCONFIG"
 }
@@ -601,7 +619,7 @@ my "INSERT INTO kid_item VALUES (10,1,0x00FF10,12.34,b'0000000011111111','a,c','
 curl -s -XDELETE "$OS/e2e_mysql_kid,e2e_mysql_kid_item?ignore_unavailable=true" > /dev/null
 curl -s -XDELETE "$OS/.pg2osync_meta/_doc/mysql-$CSID" > /dev/null
 
-nohup $BIN run -c "$CCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$CCONFIG"
 for _ in $(seq 1 60); do
   refresh
   [ "$(os_count e2e_mysql_kid)" = "2" ] && break
@@ -721,7 +739,7 @@ table = "sourcedb.gtid_probe"
 index = "e2e_mysql_gtid"
 TOML
   curl -s -XDELETE "$OS/e2e_mysql_gtid,.pg2osync_meta?ignore_unavailable=true" > /dev/null
-  nohup $BIN run -c "$GCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+  sync_spawn "$GCONFIG"
   for _ in $(seq 1 30); do
     refresh
     [ "$(os_count e2e_mysql_gtid)" = "1" ] && break
@@ -765,7 +783,7 @@ TOML
   stop_sync; sleep 1
   # And it resumes from it, without losing what happened while it was down
   my "INSERT INTO gtid_probe VALUES (3,'while-down');"
-  nohup $BIN run -c "$GCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+  sync_spawn "$GCONFIG"
   for _ in $(seq 1 30); do
     refresh
     [ "$(os_count e2e_mysql_gtid)" = "3" ] && break
@@ -800,7 +818,7 @@ url = "$OS"
 flavor = "$TARGET_FLAVOR"
 
 [metrics]
-bind = "127.0.0.1:9117"
+bind = "127.0.0.1:$((PORT_BASE + 17))"
 
 [sync.where_probe]
 table = "sourcedb.where_probe"
@@ -808,7 +826,7 @@ index = "e2e_mysql_where"
 where = "status = 'active' AND dec > 10"
 TOML
 where_cleanup() {
-  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  sync_kill
   my "DROP TABLE IF EXISTS where_probe;" > /dev/null 2>&1 || true
   rm -f "$WCONFIG"
 }
@@ -820,7 +838,7 @@ my "CREATE TABLE where_probe(id bigint primary key, status varchar(20), \`dec\` 
 # as a string, and a byte-wise '10.00' > '10' would let row 3 through.
 my "INSERT INTO where_probe VALUES (1,'active',20.00),(2,'archived',20.00),(3,'active',10.00),(4,'active',10.01);"
 curl -s -XDELETE "$OS/e2e_mysql_where" > /dev/null
-nohup $BIN run -c "$WCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$WCONFIG"
 await_count e2e_mysql_where 2
 check "the load indexed only the matching rows" "$(os_count e2e_mysql_where)" "2"
 check "a matching row is indexed" "$(os_status e2e_mysql_where 1)" "200"
@@ -854,7 +872,7 @@ say "18. a row chooses the index it lands in"
 # so the refusal it would give a templated table is not observable here.
 stop_sync
 ECONFIG=$(mktemp /tmp/pg2osync-mysql-events.XXXXXX)
-EMAPPING=$(dirname "$ECONFIG")/pg2osync-mysql-events-mapping.json
+EMAPPING=$(dirname "$ECONFIG")/pg2osync-mysql-events-mapping-$TAG.json
 ESID=990006
 cat > "$ECONFIG" <<TOML
 [source]
@@ -867,18 +885,18 @@ url = "$OS"
 flavor = "$TARGET_FLAVOR"
 
 [metrics]
-bind = "127.0.0.1:9118"
+bind = "127.0.0.1:$((PORT_BASE + 18))"
 
 [sync.events]
 table = "sourcedb.events_probe"
 index = "e2e-mysql-events-{tenant}"
-mapping_file = "pg2osync-mysql-events-mapping.json"
+mapping_file = "pg2osync-mysql-events-mapping-$TAG.json"
 TOML
 cat > "$EMAPPING" <<'JSON'
 {"mappings":{"properties":{"tenant":{"type":"keyword"}}}}
 JSON
 events_cleanup() {
-  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  sync_kill
   my "DROP TABLE IF EXISTS events_probe;" > /dev/null 2>&1 || true
   curl -s -XDELETE "$OS/e2e-mysql-events-*?ignore_unavailable=true" > /dev/null 2>&1 || true
   rm -f "$ECONFIG" "$EMAPPING"
@@ -902,7 +920,7 @@ else
   bad "validate accepted an index template that would claim every index"
 fi
 rm -f "${ECONFIG}.bad"
-nohup $BIN run -c "$ECONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$ECONFIG"
 await_count e2e-mysql-events-acme 1
 check "the row lands in the index its tenant column names" "$(os_status e2e-mysql-events-acme 1)" "200"
 # the index did not exist before the row did, so a keyword here says the
@@ -971,7 +989,7 @@ url = "$OS"
 flavor = "$TARGET_FLAVOR"
 
 [metrics]
-bind = "127.0.0.1:9119"
+bind = "127.0.0.1:$((PORT_BASE + 19))"
 
 [sync.pipe]
 table = "sourcedb.pipe_probe"
@@ -979,7 +997,7 @@ index = "e2e_mysql_pipe"
 pipeline = "e2e-tag-mysql"
 TOML
 pipe_cleanup() {
-  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  sync_kill
   my "DROP TABLE IF EXISTS pipe_probe;" > /dev/null 2>&1 || true
   curl -s -XDELETE "$OS/_ingest/pipeline/e2e-tag-mysql" > /dev/null 2>&1 || true
   curl -s -XDELETE "$OS/e2e_mysql_pipe?ignore_unavailable=true" > /dev/null 2>&1 || true
@@ -1010,7 +1028,7 @@ if grep -q "ingest pipeline e2e-tag-mysql exists" <<< "$out"; then
 else
   bad "validate did not report the pipeline the target has"
 fi
-nohup $BIN run -c "$PCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$PCONFIG"
 await_count e2e_mysql_pipe 1
 # the field exists in no row: only the pipeline could have put it there
 check "the load goes through the pipeline" "$(os_field e2e_mysql_pipe 1 tagged)" "yes"
@@ -1042,7 +1060,7 @@ url = "$OS"
 flavor = "$TARGET_FLAVOR"
 
 [metrics]
-bind = "127.0.0.1:9120"
+bind = "127.0.0.1:$((PORT_BASE + 20))"
 
 [sync.events_log]
 table = "sourcedb.events_log"
@@ -1050,7 +1068,7 @@ index = "e2e_mysql_append"
 append_only = true
 TOML
 append_cleanup() {
-  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  sync_kill
   my "DROP TABLE IF EXISTS events_log;" > /dev/null 2>&1 || true
   curl -s -XDELETE "$OS/e2e_mysql_append?ignore_unavailable=true" > /dev/null 2>&1 || true
   rm -f "$ACONFIG"
@@ -1068,7 +1086,7 @@ if $BIN validate -c "$ACONFIG" 2>&1 | grep -q "all checks passed"; then
 else
   bad "validate refused an append_only table with no primary key"
 fi
-nohup $BIN run -c "$ACONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$ACONFIG"
 await_count e2e_mysql_append 2
 check "the load files three rows as two documents: the duplicate is the same one" "$(os_count e2e_mysql_append)" "2"
 my "INSERT INTO events_log VALUES ('2024-01-01 00:00:02','login','bob');"
@@ -1114,7 +1132,7 @@ server_id = $RTSID
 url = "$OS"
 
 [metrics]
-bind = "127.0.0.1:9121"
+bind = "127.0.0.1:$((PORT_BASE + 21))"
 
 [sync.tenanted]
 table = "sourcedb.tenanted"
@@ -1122,7 +1140,7 @@ index = "e2e_mysql_routing"
 routing = "tenant"
 TOML
 routing_cleanup() {
-  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  sync_kill
   my "DROP TABLE IF EXISTS tenanted;" > /dev/null 2>&1 || true
   curl -s -XDELETE "$OS/e2e_mysql_routing?ignore_unavailable=true" > /dev/null 2>&1 || true
   rm -f "$RTCONFIG"
@@ -1144,7 +1162,7 @@ if $BIN validate -c "$RTCONFIG" 2>&1 | grep -q "all checks passed"; then
 else
   bad "validate refused a routing column"
 fi
-nohup $BIN run -c "$RTCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$RTCONFIG"
 await_count e2e_mysql_routing 2
 check "the load writes both rows" "$(os_count e2e_mysql_routing)" "2"
 check "a document is found under its tenant's routing" "$(os_rstatus e2e_mysql_routing 1 acme)" "200"
@@ -1195,7 +1213,7 @@ url = "$OS"
 flavor = "$TARGET_FLAVOR"
 
 [metrics]
-bind = "127.0.0.1:9122"
+bind = "127.0.0.1:$((PORT_BASE + 22))"
 
 [sync.books]
 table = "sourcedb.books"
@@ -1215,7 +1233,7 @@ table = "sourcedb.authors"
 index = "e2e_mysql_through_author"
 TOML
 through_cleanup() {
-  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  sync_kill
   my "DROP TABLE IF EXISTS book_author; DROP TABLE IF EXISTS authors; DROP TABLE IF EXISTS books;" > /dev/null 2>&1 || true
   curl -s -XDELETE "$OS/e2e_mysql_through,e2e_mysql_through_author,e2e_mysql_through_capped?ignore_unavailable=true" > /dev/null 2>&1 || true
   rm -f "$TCONFIG" "${TCONFIG}.capped"
@@ -1245,7 +1263,7 @@ else
   bad "validate says nothing about the junction: $vout"
 fi
 
-nohup $BIN run -c "$TCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$TCONFIG"
 await_count e2e_mysql_through 3
 check "the load embeds both authors of a book" "$(os_len e2e_mysql_through 1 authors)" "2"
 check "a book nobody wrote gets an empty array" "$(os_len e2e_mysql_through 3 authors)" "0"
@@ -1301,7 +1319,7 @@ url = "$OS"
 flavor = "$TARGET_FLAVOR"
 
 [metrics]
-bind = "127.0.0.1:9122"
+bind = "127.0.0.1:$((PORT_BASE + 22))"
 
 [sync.books]
 table = "sourcedb.books"
@@ -1317,7 +1335,7 @@ max_rows = 2
 TOML
 curl -s -XDELETE "$OS/e2e_mysql_through_capped?ignore_unavailable=true" > /dev/null
 curl -s -XDELETE "$OS/.pg2osync_meta/_doc/mysql-$TSID" > /dev/null
-nohup $BIN run -c "${TCONFIG}.capped" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "${TCONFIG}.capped"
 await_count e2e_mysql_through_capped 3
 check "a capped collection embeds max_rows of them" "$(os_len e2e_mysql_through_capped 3 authors)" "2"
 check "and says it is not the whole collection" \
@@ -1346,7 +1364,7 @@ server_id = $PSSID
 url = "$OS"
 
 [metrics]
-bind = "127.0.0.1:9123"
+bind = "127.0.0.1:$((PORT_BASE + 23))"
 
 [sync.people]
 table = "sourcedb.pseudo_people"
@@ -1356,7 +1374,7 @@ index = "e2e_mysql_pseudo"
 email = { op = "pseudonym", key_env = "PG2OSYNC_E2E_PSEUDONYM_KEY" }
 TOML
 pseudo_cleanup() {
-  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  sync_kill
   my "DROP TABLE IF EXISTS pseudo_people;" > /dev/null 2>&1 || true
   curl -s -XDELETE "$OS/e2e_mysql_pseudo?ignore_unavailable=true" > /dev/null 2>&1 || true
   rm -f "$PSCONFIG"
@@ -1369,7 +1387,7 @@ my "INSERT INTO pseudo_people VALUES (1,'alice@example.com'),(2,'alice@example.c
 curl -s -XDELETE "$OS/e2e_mysql_pseudo?ignore_unavailable=true" > /dev/null
 curl -s -XDELETE "$OS/.pg2osync_meta/_doc/mysql-$PSSID" > /dev/null
 
-nohup $BIN run -c "$PSCONFIG" >> "$LOG" 2>&1 < /dev/null & disown
+sync_spawn "$PSCONFIG"
 await_count e2e_mysql_pseudo 3
 one=$(os_field e2e_mysql_pseudo 1 email)
 check "two rows sharing an address share a token" "$one" "$(os_field e2e_mysql_pseudo 2 email)"
@@ -1389,9 +1407,9 @@ say "24. SIGHUP re-reads the configuration without a restart"
 # file that does not parse leaves the process running.
 RLCONFIG=$(mktemp /tmp/pg2osync-mysql-reload.XXXXXX)
 RLSID=990011
-RLLOG=/tmp/pg2osync-mysql-e2e-reload.log
+RLLOG=/tmp/pg2osync-mysql-e2e-reload-$TAG.log
 : > "$RLLOG"
-rl_metric() { curl -s 127.0.0.1:9124/metrics | grep -v '^#' | grep -E "$1" | awk '{print $2}' | head -1; }
+rl_metric() { curl -s 127.0.0.1:$((PORT_BASE + 24))/metrics | grep -v '^#' | grep -E "$1" | awk '{print $2}' | head -1; }
 rl_write_config() {
   cat > "$RLCONFIG" <<TOML
 [source]
@@ -1404,7 +1422,7 @@ url = "$OS"
 flavor = "$TARGET_FLAVOR"
 
 [metrics]
-bind = "127.0.0.1:9124"
+bind = "127.0.0.1:$((PORT_BASE + 24))"
 
 [engine]
 batch_size = $1
@@ -1417,10 +1435,10 @@ $2
 TOML
 }
 rl_cleanup() {
-  pkill -9 -f "pg2osync run" 2> /dev/null || true
+  sync_kill
   my "DROP TABLE IF EXISTS reload_probe;" > /dev/null 2>&1 || true
   curl -s -XDELETE "$OS/e2e_mysql_reload?ignore_unavailable=true" > /dev/null 2>&1 || true
-  rm -f "$RLCONFIG"
+  rm -f "$RLCONFIG" "$RLLOG"
 }
 trap 'cleanup; resume_cleanup; types_cleanup; child_cleanup; where_cleanup; events_cleanup; pipe_cleanup; append_cleanup; routing_cleanup; through_cleanup; pseudo_cleanup; rl_cleanup' EXIT
 
@@ -1431,9 +1449,8 @@ curl -s -XDELETE "$OS/e2e_mysql_reload?ignore_unavailable=true" > /dev/null
 curl -s -XDELETE "$OS/.pg2osync_meta/_doc/mysql-$RLSID" > /dev/null
 rl_write_config 500 ""
 
-nohup $BIN run -c "$RLCONFIG" >> "$RLLOG" 2>&1 < /dev/null &
-RLPID=$!
-disown
+sync_spawn "$RLCONFIG" "$RLLOG"
+RLPID=$SYNC_PID
 await_count e2e_mysql_reload 1
 check "the pipeline is up on the batch_size it started with" "$(os_count e2e_mysql_reload)" "1"
 batches_before=$(rl_metric '^pg2osync_batches_flushed\{')

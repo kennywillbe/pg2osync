@@ -8,8 +8,12 @@
 # this target swaps the fresh index into the live name instead of moving an
 # alias onto it.
 #
-# Runs one at a time: stopping the pipeline kills every pg2osync process, so
-# two suites at once take each other's down and report failures that are not.
+# One suite at a time per stack: the index names are fixed, so two suites
+# against the same PostgreSQL and Meilisearch overwrite each other's state.
+# dev/e2e-lock.sh enforces that on the shared dev stack with a machine-wide
+# lock; a run with a stack of its own — ci-local --isolated — passes
+# E2E_LOCK=none, because a stop only ever signals the pipelines this run
+# started (dev/e2e-pipeline.sh).
 #
 # Prerequisites:
 #   a PostgreSQL with logical replication, seeded with dev/seed.sql
@@ -22,9 +26,13 @@
 #   PG_CONTAINER      psql container name   (default dev-postgres-1)
 #   PG_PORT           source port           (default 15432)
 #   E2E_LOG           pipeline log file     (default /tmp/pg2osync-meili-smoke.log)
+#   E2E_LOCK          lock directory, or none (default /tmp/pg2osync-e2e.lock)
+#   E2E_PORT_BASE     first metrics port    (default 9100, a 40-port block)
 set -euo pipefail
 # shellcheck source=dev/e2e-lock.sh
 source "$(dirname "$0")/e2e-lock.sh"
+# shellcheck source=dev/e2e-pipeline.sh
+source "$(dirname "$0")/e2e-pipeline.sh"
 e2e_lock
 
 cd "$(dirname "$0")/.."
@@ -44,6 +52,11 @@ STATE_DIR=$(mktemp -d /tmp/pg2osync-meili-state.XXXXXX)
 # a file of this run's own, so two suites do not read each other's log lines
 LOG=${E2E_LOG:-/tmp/pg2osync-meili-smoke.log}
 export PG2OSYNC_SOURCE_URL="postgres://postgres:postgres@localhost:$PG_PORT/sourcedb"
+# Every pipeline the suite starts binds its metrics and API ports on this
+# machine rather than inside a container, so two suites at once need two
+# blocks: E2E_PORT_BASE moves every port this one uses.
+PORT_BASE=${E2E_PORT_BASE:-9100}
+
 PASS=0; FAIL=0
 
 say()   { printf "\n\033[1m== %s ==\033[0m\n" "$1"; }
@@ -69,16 +82,12 @@ mi_drop_indexes() {
 }
 pg()       { docker exec "$PG_CONTAINER" psql -U postgres -d sourcedb -qtAc "$1"; }
 
-start_sync() { nohup $BIN run -c "$CONFIG" >> "$LOG" 2>&1 < /dev/null & disown; }
+start_sync() { sync_spawn "$CONFIG"; }
 # A restart has to wait for the old process to let go of the replication slot:
 # starting on a slot the previous run still holds fails outright, and the
 # failure looks exactly like a checkpoint that did not resume.
 stop_sync() {
-  pkill -f "pg2osync run" 2> /dev/null || true
-  for _ in $(seq 1 30); do
-    pgrep -f "pg2osync run" > /dev/null || break
-    sleep 1
-  done
+  sync_stop
   for _ in $(seq 1 30); do
     [ "$(pg "SELECT count(*) FROM pg_replication_slots WHERE slot_name='$SLOT' AND active;")" = "0" ] && break
     sleep 1
@@ -121,7 +130,7 @@ api_key_env = "MEILI_MASTER_KEY"
 state_dir = "$STATE_DIR"
 
 [metrics]
-bind = "127.0.0.1:9121"
+bind = "127.0.0.1:$((PORT_BASE + 21))"
 
 [sync.users]
 table = "public.users"

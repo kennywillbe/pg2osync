@@ -51,7 +51,10 @@ automatically for exactly the changes a pull request would; `--matrix` forces
 them. Each cell is a throwaway container on a port of its own — PostgreSQL
 15433, OpenSearch 9201, Elasticsearch 9202, Meilisearch 7701, MySQL/MariaDB
 13307 — so the dev stack on 15432/9200/13306 keeps running beside it, and the
-containers are removed however the cell ends.
+containers are removed however the cell ends. Those ports are one set, so the
+cells go one at a time. `--isolated` gives every cell containers and ports of
+its own instead, which lets the run take two at a time and lets it run beside
+another run on the same machine.
 
 ## When a nightly run fails
 
