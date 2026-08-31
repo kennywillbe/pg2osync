@@ -108,8 +108,10 @@ exercised: [docs/compatibility.md](docs/compatibility.md).
 
 Stated up front, because finding these out in production is expensive:
 
-- **One instance per replication slot.** Two processes on the same slot fight
-  over its position. Scale by splitting tables across instances.
+- **One process per replication slot.** Two processes on the same slot fight
+  over its position. Several source databases do fit in one process
+  (`run --config-dir`), each with a slot of its own; scale beyond that by
+  splitting the files across processes.
 - **No schema migration.** A column added, dropped or retyped under a running
   pipeline is reported, never applied: new documents take the new shape and
   every document written before it keeps the old one until the index is

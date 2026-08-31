@@ -5,5 +5,4 @@ metadata:
   labels:
     {{- include "pg2osync.labels" . | nindent 4 }}
 data:
-  pg2osync.toml: |
-    {{- include "pg2osync.config" . | nindent 4 }}
+  {{- include "pg2osync.configData" . | trim | nindent 2 }}

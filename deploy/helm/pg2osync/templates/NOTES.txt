@@ -14,16 +14,27 @@ Check how far behind it is:
 WARNING: no credentials were provided. Set `secrets` or `existingSecret`,
 otherwise the process cannot resolve source.url_env and will exit.
 {{- end }}
-{{- if not .Values.config.sync }}
+{{- if .Values.configs }}
+
+{{ len .Values.configs }} source(s) run in this one process: {{ keys .Values.configs | sortAlpha | join ", " }}.
+Each has a pipeline, a checkpoint and a /healthz of its own:
+
+  curl -s localhost:{{ .Values.service.port }}/healthz/{{ keys .Values.configs | sortAlpha | first }}
+  curl -s localhost:{{ .Values.service.port }}/metrics | grep pg2osync_source_state
+
+Their credentials all come from the one Secret, one key per file's url_env.
+{{- end }}
+{{- if and (not .Values.configs) (not .Values.config.sync) }}
 
 WARNING: config.sync is empty, so there is nothing to synchronize and the
-process will exit. Add at least one table.
+process will exit. Add at least one table, or set `configs` for several
+source databases in one process.
 {{- end }}
-{{- if and (eq .Values.config.target.url "http://opensearch:9200") }}
+{{- if and (not .Values.configs) (eq .Values.config.target.url "http://opensearch:9200") }}
 
 NOTE: target.url is still the chart default (http://opensearch:9200).
 {{- end }}
-{{- if not (hasKey .Values.config.source "flavor") }}
+{{- if and (not .Values.configs) (not (hasKey .Values.config.source "flavor")) }}
 
 NOTE: on PostgreSQL, set `max_slot_wal_keep_size` on the server before this
 runs in earnest:

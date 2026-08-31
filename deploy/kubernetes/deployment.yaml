@@ -6,9 +6,11 @@ metadata:
   labels:
     app.kubernetes.io/name: pg2osync
 spec:
-  # Exactly one replica: two processes on the same replication slot fight over
-  # the position and undo each other's progress. Scale by splitting tables
-  # across Deployments with their own slot_name instead.
+  # This Deployment owns these slots. Two processes streaming one slot fight
+  # over its position and undo each other's progress, so a second replica is
+  # not more throughput. To carry more source databases, add a file to the
+  # ConfigMap and run --config-dir (see below); to spread them over nodes, use
+  # a second Deployment with the other files.
   replicas: 1
   strategy:
     type: Recreate
@@ -32,6 +34,8 @@ spec:
       containers:
         - name: pg2osync
           image: ghcr.io/kennywillbe/pg2osync:1.0.0
+          # one file, one source. With several *.toml in the ConfigMap:
+          #   args: ["run", "--config-dir", "/etc/pg2osync"]
           args: ["run", "-c", "/etc/pg2osync/pg2osync.toml"]
           env:
             - name: RUST_LOG
@@ -88,7 +92,8 @@ spec:
               mountPath: /etc/pg2osync
               readOnly: true
       # SIGTERM stops the stream between messages; the checkpoint is already
-      # durable, so a short grace period is enough
+      # durable, so a short grace period is enough. It is the whole pod's:
+      # every source in it drains within this budget, not each.
       terminationGracePeriodSeconds: 30
       volumes:
         - name: config

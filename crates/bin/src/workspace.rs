@@ -278,17 +278,18 @@ fn agree<T: PartialEq + Default + Clone>(
     Ok(declared.map_or(default, |(_, value)| value.clone()))
 }
 
+/// Configs on disk, for the tests of anything that reads a directory of them.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod fixtures {
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    /// A directory of the test's own, removed with it: what this module does
+    /// A directory of the test's own, removed with it: what a workspace does
     /// is read a mount, so the fixtures are on disk.
-    struct TempDir(PathBuf);
+    pub(crate) struct TempDir(PathBuf);
 
     impl TempDir {
-        fn new(tag: &str) -> Self {
+        pub(crate) fn new(tag: &str) -> Self {
             static NEXT: AtomicU32 = AtomicU32::new(0);
             let path = std::env::temp_dir().join(format!(
                 "pg2osync-workspace-{}-{tag}-{}",
@@ -299,7 +300,7 @@ mod tests {
             Self(path)
         }
 
-        fn write(&self, name: &str, body: &str) -> PathBuf {
+        pub(crate) fn write(&self, name: &str, body: &str) -> PathBuf {
             let path = self.0.join(name);
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).expect("a fixture directory");
@@ -308,7 +309,7 @@ mod tests {
             path
         }
 
-        fn path(&self) -> &Path {
+        pub(crate) fn path(&self) -> &Path {
             &self.0
         }
     }
@@ -321,13 +322,19 @@ mod tests {
 
     /// The smallest config that loads, with whatever the test is about
     /// appended to `[source]` and a table of its own.
-    fn config(source_extra: &str, table: &str) -> String {
+    pub(crate) fn config(source_extra: &str, table: &str) -> String {
         format!(
             "[source]\nurl_env = \"PG2OSYNC_SOURCE_URL\"\n{source_extra}\n\
              [target]\nurl = \"http://localhost:9200\"\n\
              [sync.{table}]\ntable = \"public.{table}\"\n"
         )
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::{TempDir, config};
+    use super::*;
 
     fn names(ws: &Workspace) -> Vec<&str> {
         ws.sources.iter().map(|s| s.name.as_str()).collect()

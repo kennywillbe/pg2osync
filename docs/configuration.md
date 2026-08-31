@@ -1582,14 +1582,39 @@ a `source` label, `/healthz/<name>` answers for one source and `/synced` takes
 `?source=` — [operations](operations.md#health) has the endpoints,
 [architecture](architecture.md#several-sources-in-one-process) the shape.
 `--source <name>` narrows the directory to that one source, which is how a
-single tenant is restarted or debugged without moving files. `bootstrap`
-still takes one `--config`: it creates objects and exits.
+single tenant is restarted or debugged without moving files.
 
 There is deliberately no write budget across the files. The sum of every
 `[engine] write_concurrency` and `batch_size` in the directory is what the
 process costs, and sizing it is the operator's — a shared cap would make
 every source wait on every other's slowest target, which is the coupling
 running them apart avoided.
+
+### Which commands take a `--source`
+
+Every subcommand but `init` takes `--config` or `--config-dir`; `init` writes
+the first config file, so a directory means nothing to it. What differs is what
+they do with several sources:
+
+| Command | Without `--source` | With it |
+|---|---|---|
+| `run`, `bootstrap` | every source in the directory, in one process | that source only |
+| `validate`, `status` | every source, reported one after another, and a failure anywhere is the exit code | that source only |
+| `resnapshot`, `reindex`, `switch-alias`, `reconcile`, `drop-slot`, `setup-sql`, `rejects` | refused when the directory holds more than one, naming the choices | that source |
+
+The second group changes what one source owns — its index, its slot, its
+documents — and a directory does not say which. Rather than acting on the first
+file or on all of them, they ask:
+
+```
+drop-slot acts on one source, and this directory has 2: billing, orders. Name
+one with --source
+```
+
+`rejects` is the exception worth knowing: the quarantine store belongs to the
+**target**, not to a source, so every source writing to that target shares it.
+`--source` there picks the configuration the command reaches the target with,
+not which documents are listed.
 
 What the directory adds is everything two files can disagree about, none of
 which is visible from inside either one.

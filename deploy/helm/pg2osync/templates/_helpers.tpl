@@ -45,20 +45,23 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
 {{/*
-Render the values tree as TOML. Helm has no toToml, so tables are emitted
-explicitly: [source], [target], [metrics], [engine] and one [sync.<key>] per
-table. Anything else belongs in .Values.extraConfig.
+Render one config tree as TOML. Helm has no toToml, so tables are emitted
+explicitly: [source], [target], [engine], [metrics], [api], [log] and one
+[sync.<key>] per table. Anything else belongs in that tree's extraConfig.
+
+Takes the tree itself, not the root context, so one file and one of many are
+rendered by the same template.
 */}}
-{{- define "pg2osync.config" -}}
-{{- range $section := list "source" "target" "engine" "metrics" }}
-{{- with index $.Values.config $section }}
+{{- define "pg2osync.configTree" -}}
+{{- range $section := list "source" "target" "engine" "metrics" "api" "log" }}
+{{- with index $ $section }}
 [{{ $section }}]
 {{- range $k, $v := . }}
 {{ $k }} = {{ toJson $v }}
 {{- end }}
 {{ end }}
 {{- end }}
-{{- range $key, $table := .Values.config.sync }}
+{{- range $key, $table := (index $ "sync") }}
 [sync.{{ $key }}]
 {{- range $k, $v := $table }}
 {{- if ne $k "transform" }}
@@ -73,7 +76,47 @@ table. Anything else belongs in .Values.extraConfig.
 {{- end }}
 {{- end }}
 {{ end }}
+{{- with (index $ "extraConfig") }}
+{{ . }}
+{{- end }}
+{{- end -}}
+
+{{- define "pg2osync.config" -}}
+{{- include "pg2osync.configTree" .Values.config }}
 {{- with .Values.extraConfig }}
 {{ . }}
 {{- end }}
+{{- end -}}
+
+{{/*
+The ConfigMap's data, and what the pod's checksum is taken over: one
+pg2osync.toml, or one <name>.toml per entry in `configs`. Both the ConfigMap
+and the Deployment include it, so a source added to the set is a config file
+and a rollout, never one without the other.
+*/}}
+{{- define "pg2osync.configData" -}}
+{{- if .Values.configs }}
+{{- if .Values.config.sync }}
+{{- fail "config and configs are both set: a process reads one file or one directory, not both. Move the tables under `config` into an entry of `configs`, or leave `config.sync` empty" }}
+{{- end }}
+{{- range $name, $tree := .Values.configs }}
+{{ $name }}.toml: |
+  {{- include "pg2osync.configTree" $tree | trim | nindent 2 }}
+{{- end }}
+{{- else }}
+pg2osync.toml: |
+  {{- include "pg2osync.config" . | trim | nindent 2 }}
+{{- end }}
+{{- end -}}
+
+{{/*
+What the container runs when `args` is not overridden: one file, or the whole
+mounted directory as one process.
+*/}}
+{{- define "pg2osync.args" -}}
+{{- if .Values.configs -}}
+{{- toYaml (list "run" "--config-dir" "/etc/pg2osync") -}}
+{{- else -}}
+{{- toYaml (list "run" "-c" "/etc/pg2osync/pg2osync.toml") -}}
+{{- end -}}
 {{- end -}}

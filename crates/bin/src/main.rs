@@ -28,59 +28,69 @@ struct Cli {
     command: Command,
 }
 
+/// Where the configuration comes from: one file, or a directory of them.
+///
+/// Alternatives everywhere they appear — a command reads one file or one
+/// directory, and clap refuses both.
+#[derive(clap::Args)]
+struct ConfigArgs {
+    #[arg(
+        short,
+        long,
+        value_name = "FILE",
+        default_value = "pg2osync.toml",
+        group = "configs"
+    )]
+    config: PathBuf,
+    /// Every *.toml directly in this directory, loaded and validated as one
+    /// set.
+    #[arg(long, value_name = "DIR", group = "configs")]
+    config_dir: Option<PathBuf>,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Initial load plus continuous streaming (main mode).
+    ///
+    /// A directory runs as one process: one metrics port, one /synced
+    /// endpoint, and a pipeline of its own per file.
     Run {
-        #[arg(
-            short,
-            long,
-            value_name = "FILE",
-            default_value = "pg2osync.toml",
-            group = "configs"
-        )]
-        config: PathBuf,
-        /// Run every *.toml in this directory as one process: one metrics
-        /// port, one /synced endpoint, and a pipeline of its own per file.
-        #[arg(long, value_name = "DIR", group = "configs")]
-        config_dir: Option<PathBuf>,
-        /// Run only the source of this name out of the directory.
+        #[command(flatten)]
+        config: ConfigArgs,
+        /// Act on this source only. Without it, every source the config
+        /// names.
         #[arg(long, value_name = "NAME")]
         source: Option<String>,
     },
     /// Validate the config and check both connections.
+    ///
+    /// A directory is checked as one set — two sources sharing a slot, an
+    /// index or a name — and every failure in it is reported, not the first.
     Validate {
-        #[arg(
-            short,
-            long,
-            value_name = "FILE",
-            default_value = "pg2osync.toml",
-            group = "configs"
-        )]
-        config: PathBuf,
-        /// Validate every *.toml in this directory as one set, and check what
-        /// they mean together: two sources sharing a slot, an index or a name.
-        #[arg(long, value_name = "DIR", group = "configs")]
-        config_dir: Option<PathBuf>,
+        #[command(flatten)]
+        config: ConfigArgs,
+        /// Act on this source only. Without it, every source the config
+        /// names.
+        #[arg(long, value_name = "NAME")]
+        source: Option<String>,
     },
     /// Create source-side objects and target indices, then exit.
     Bootstrap {
-        #[arg(short, long, value_name = "FILE", default_value = "pg2osync.toml")]
-        config: PathBuf,
+        #[command(flatten)]
+        config: ConfigArgs,
+        /// Act on this source only. Without it, every source the config
+        /// names.
+        #[arg(long, value_name = "NAME")]
+        source: Option<String>,
     },
     /// Show the checkpoint and the source's current position.
     Status {
-        #[arg(
-            short,
-            long,
-            value_name = "FILE",
-            default_value = "pg2osync.toml",
-            group = "configs"
-        )]
-        config: PathBuf,
-        /// Report every *.toml in this directory, one source after another.
-        #[arg(long, value_name = "DIR", group = "configs")]
-        config_dir: Option<PathBuf>,
+        #[command(flatten)]
+        config: ConfigArgs,
+        /// Act on this source only. Without it, every source the config
+        /// names.
+        #[arg(long, value_name = "NAME")]
+        source: Option<String>,
         /// Exit 0 only once the checkpoint has reached the source's current
         /// position, so a script can wait instead of comparing by eye.
         #[arg(long)]
@@ -96,8 +106,12 @@ enum Command {
     },
     /// Point an alias at this config's index, atomically.
     SwitchAlias {
-        #[arg(short, long, value_name = "FILE", default_value = "pg2osync.toml")]
-        config: PathBuf,
+        #[command(flatten)]
+        config: ConfigArgs,
+        /// Which source to act on. Required when --config-dir names more
+        /// than one.
+        #[arg(long, value_name = "NAME")]
+        source: Option<String>,
         /// The alias to move. Applies to the single configured table.
         #[arg(long)]
         alias: String,
@@ -105,8 +119,12 @@ enum Command {
     /// Compare each index against its source table and report documents whose
     /// row is gone. Reports only unless --delete is given.
     Reconcile {
-        #[arg(short, long, value_name = "FILE", default_value = "pg2osync.toml")]
-        config: PathBuf,
+        #[command(flatten)]
+        config: ConfigArgs,
+        /// Which source to act on. Required when --config-dir names more
+        /// than one.
+        #[arg(long, value_name = "NAME")]
+        source: Option<String>,
         /// Remove the documents instead of only naming them.
         #[arg(long)]
         delete: bool,
@@ -138,8 +156,12 @@ enum Command {
     },
     /// Print the SQL a DBA needs to run, derived from the config.
     SetupSql {
-        #[arg(short, long, value_name = "FILE", default_value = "pg2osync.toml")]
-        config: PathBuf,
+        #[command(flatten)]
+        config: ConfigArgs,
+        /// Which source to act on. Required when --config-dir names more
+        /// than one.
+        #[arg(long, value_name = "NAME")]
+        source: Option<String>,
     },
     /// Read one table again into its index, without reloading everything else.
     ///
@@ -147,8 +169,12 @@ enum Command {
     /// run while the pipeline is streaming: its rows carry the position they were
     /// read at, so a concurrent change wins.
     Resnapshot {
-        #[arg(short, long, value_name = "FILE", default_value = "pg2osync.toml")]
-        config: PathBuf,
+        #[command(flatten)]
+        config: ConfigArgs,
+        /// Which source to act on. Required when --config-dir names more
+        /// than one.
+        #[arg(long, value_name = "NAME")]
+        source: Option<String>,
         /// Qualified table name, as it appears in the config.
         #[arg(long, value_name = "SCHEMA.TABLE")]
         table: String,
@@ -163,8 +189,12 @@ enum Command {
     /// to lose to. The checkpoint does not move, so the restart replays
     /// everything committed since.
     Reindex {
-        #[arg(short, long, value_name = "FILE", default_value = "pg2osync.toml")]
-        config: PathBuf,
+        #[command(flatten)]
+        config: ConfigArgs,
+        /// Which source to act on. Required when --config-dir names more
+        /// than one.
+        #[arg(long, value_name = "NAME")]
+        source: Option<String>,
         /// Qualified table name, as it appears in the config.
         #[arg(long, value_name = "SCHEMA.TABLE")]
         table: String,
@@ -180,9 +210,18 @@ enum Command {
     },
     /// List the documents the target refused and, with --replay, submit them
     /// again once the mapping that refused them is fixed.
+    ///
+    /// The quarantine store belongs to the target, not to a source: every
+    /// source writing to that target shares it. So --source picks the
+    /// configuration this reaches the target with, not which documents are
+    /// listed.
     Rejects {
-        #[arg(short, long, value_name = "FILE", default_value = "pg2osync.toml")]
-        config: PathBuf,
+        #[command(flatten)]
+        config: ConfigArgs,
+        /// Which source to act on. Required when --config-dir names more
+        /// than one.
+        #[arg(long, value_name = "NAME")]
+        source: Option<String>,
         /// Submit each one again, clearing the ones the target now accepts.
         #[arg(long)]
         replay: bool,
@@ -192,8 +231,12 @@ enum Command {
     },
     /// Drop the replication slot (PostgreSQL only).
     DropSlot {
-        #[arg(short, long, value_name = "FILE", default_value = "pg2osync.toml")]
-        config: PathBuf,
+        #[command(flatten)]
+        config: ConfigArgs,
+        /// Which source to act on. Required when --config-dir names more
+        /// than one.
+        #[arg(long, value_name = "NAME")]
+        source: Option<String>,
         /// Also drop the publication. Off by default: a second pipeline may be
         /// reading the same one.
         #[arg(long)]
@@ -466,40 +509,50 @@ async fn main() -> Result<()> {
 
 async fn run_command(command: Command) -> Result<()> {
     match command {
-        Command::Run {
-            config,
-            config_dir,
-            source,
-        } => {
-            let ws = workspace::Workspace::load(&config, config_dir.as_deref())?;
-            let ws = match source {
-                Some(name) => ws.only(&name)?,
-                None => ws,
-            };
-            pipeline(ws, run::Mode::Run).await
+        Command::Run { config, source } => {
+            pipeline(chosen_sources(&config, source.as_deref())?, run::Mode::Run).await
         }
-        Command::Bootstrap { config } => {
+        Command::Bootstrap { config, source } => {
             pipeline(
-                workspace::Workspace::load_file(&config)?,
+                chosen_sources(&config, source.as_deref())?,
                 run::Mode::Bootstrap,
             )
             .await
         }
-        Command::Validate { config, config_dir } => {
-            validate(workspace::Workspace::load(&config, config_dir.as_deref())?).await
+        Command::Validate { config, source } => {
+            validate(chosen_sources(&config, source.as_deref())?).await
         }
         Command::Status {
             config,
-            config_dir,
+            source,
             caught_up,
             timeout,
             max_retained_mb,
         } => {
-            let ws = workspace::Workspace::load(&config, config_dir.as_deref())?;
-            status(ws, caught_up, timeout, max_retained_mb).await
+            status(
+                chosen_sources(&config, source.as_deref())?,
+                caught_up,
+                timeout,
+                max_retained_mb,
+            )
+            .await
         }
-        Command::Reconcile { config, delete } => reconcile_cmd(&config, delete).await,
-        Command::SwitchAlias { config, alias } => switch_alias(&config, &alias).await,
+        Command::Reconcile {
+            config,
+            source,
+            delete,
+        } => reconcile_cmd(one_source(&config, source.as_deref(), "reconcile")?, delete).await,
+        Command::SwitchAlias {
+            config,
+            source,
+            alias,
+        } => {
+            switch_alias(
+                one_source(&config, source.as_deref(), "switch-alias")?,
+                &alias,
+            )
+            .await
+        }
         Command::Init {
             config,
             tables,
@@ -508,28 +561,103 @@ async fn run_command(command: Command) -> Result<()> {
             flavor,
             force,
         } => init(&config, &tables, source, &target, &flavor, force).await,
-        Command::SetupSql { config } => setup_sql(&config),
+        Command::SetupSql { config, source } => {
+            setup_sql(one_source(&config, source.as_deref(), "setup-sql")?)
+        }
         Command::Resnapshot {
             config,
+            source,
             table,
             filter,
-        } => resnapshot_cmd(&config, &table, filter).await,
+        } => {
+            resnapshot_cmd(
+                one_source(&config, source.as_deref(), "resnapshot")?,
+                &table,
+                filter,
+            )
+            .await
+        }
         Command::Reindex {
             config,
+            source,
             table,
             alias,
             drop_old,
-        } => reindex_cmd(&config, &table, &alias, drop_old).await,
+        } => {
+            reindex_cmd(
+                one_source(&config, source.as_deref(), "reindex")?,
+                &table,
+                &alias,
+                drop_old,
+            )
+            .await
+        }
         Command::Rejects {
             config,
+            source,
             replay,
             limit,
-        } => rejects_cmd(&config, replay, limit).await,
+        } => {
+            rejects_cmd(
+                one_source(&config, source.as_deref(), "rejects")?,
+                replay,
+                limit,
+            )
+            .await
+        }
         Command::DropSlot {
             config,
+            source,
             publication,
-        } => drop_slot(&config, publication).await,
+        } => {
+            drop_slot(
+                one_source(&config, source.as_deref(), "drop-slot")?,
+                publication,
+            )
+            .await
+        }
     }
+}
+
+/// Every source the command was pointed at, narrowed to one when `--source`
+/// names one.
+fn chosen_sources(config: &ConfigArgs, source: Option<&str>) -> Result<workspace::Workspace> {
+    let ws = workspace::Workspace::load(&config.config, config.config_dir.as_deref())?;
+    match source {
+        Some(name) => ws.only(name),
+        None => Ok(ws),
+    }
+}
+
+/// The single source a maintenance command acts on.
+///
+/// These commands rebuild an index, drop a slot, re-read a table: each one
+/// changes what one source owns, and a directory does not say which. Rather
+/// than picking the first file or running over all of them, the name is asked
+/// for — the destructive ones are the last place to guess.
+fn one_source(
+    config: &ConfigArgs,
+    source: Option<&str>,
+    command: &str,
+) -> Result<config::AppConfig> {
+    let ws = chosen_sources(config, source)?;
+    if ws.sources.len() > 1 {
+        let names: Vec<&str> = ws.sources.iter().map(|s| s.name.as_str()).collect();
+        bail!(
+            "{command} acts on one source, and this directory has {}: {}. Name one \
+             with --source",
+            names.len(),
+            names.join(", ")
+        );
+    }
+    // A workspace that loaded holds at least one source: an empty directory is
+    // refused by the loader, and `only` refuses a name that matches nothing.
+    Ok(ws
+        .sources
+        .into_iter()
+        .next()
+        .expect("a loaded workspace has a source")
+        .cfg)
 }
 
 /// Hand the workspace to the supervisor. One source or thirty is the same
@@ -807,8 +935,7 @@ fn starter_config(tables: &[SourceTable], target: &str, mysql: bool) -> String {
 ///
 /// Offline on purpose: the point is to hand something to whoever holds the
 /// privileges, which is usually not whoever is running this.
-fn setup_sql(path: &Path) -> Result<()> {
-    let cfg = config::AppConfig::load(path)?;
+fn setup_sql(cfg: config::AppConfig) -> Result<()> {
     let secrets = cfg.resolve_secrets()?;
     let url = url::Url::parse(&secrets.source_url).context("source url is not a valid URL")?;
     let user = match url.username() {
@@ -862,8 +989,7 @@ fn setup_sql(path: &Path) -> Result<()> {
 ///
 /// Run it when the pipeline is caught up: a document whose row was inserted
 /// seconds ago and has not been loaded yet looks exactly like an orphan.
-async fn reconcile_cmd(path: &Path, delete: bool) -> Result<()> {
-    let cfg = config::AppConfig::load(path)?;
+async fn reconcile_cmd(cfg: config::AppConfig, delete: bool) -> Result<()> {
     if cfg.source.flavor == "mysql" {
         bail!("reconcile is PostgreSQL-only for now");
     }
@@ -959,8 +1085,7 @@ async fn reconcile_cmd(path: &Path, delete: bool) -> Result<()> {
 /// The last step of a reindex, and the one that has to be atomic: a reader
 /// resolving the alias between a remove and an add gets an error, which is
 /// exactly what the exercise was avoiding.
-async fn switch_alias(path: &Path, alias: &str) -> Result<()> {
-    let cfg = config::AppConfig::load(path)?;
+async fn switch_alias(cfg: config::AppConfig, alias: &str) -> Result<()> {
     let indices = run::index_names(&cfg)?;
     // an alias points at one index, and a template's glob is not one
     if let Some((key, _)) = cfg.sync.iter().find(|(_, tbl)| tbl.is_templated()) {
@@ -1042,8 +1167,7 @@ async fn wait_until_caught_up(cfg: config::AppConfig, timeout_secs: u64) -> Resu
     }
 }
 
-async fn resnapshot_cmd(path: &Path, table: &str, filter: Option<String>) -> Result<()> {
-    let cfg = config::AppConfig::load(path)?;
+async fn resnapshot_cmd(cfg: config::AppConfig, table: &str, filter: Option<String>) -> Result<()> {
     let secrets = cfg.resolve_secrets()?;
     for warning in &secrets.warnings {
         tracing::warn!(target: "pg2osync::config", "{warning}");
@@ -1060,8 +1184,12 @@ async fn resnapshot_cmd(path: &Path, table: &str, filter: Option<String>) -> Res
 }
 
 /// Rebuild one table's index and hand the alias to the copy.
-async fn reindex_cmd(path: &Path, table: &str, alias: &str, drop_old: bool) -> Result<()> {
-    let cfg = config::AppConfig::load(path)?;
+async fn reindex_cmd(
+    cfg: config::AppConfig,
+    table: &str,
+    alias: &str,
+    drop_old: bool,
+) -> Result<()> {
     let secrets = cfg.resolve_secrets()?;
     for warning in &secrets.warnings {
         tracing::warn!(target: "pg2osync::config", "{warning}");
@@ -1084,8 +1212,7 @@ async fn reindex_cmd(path: &Path, table: &str, alias: &str, drop_old: bool) -> R
 /// position as its version, so anything the source has since superseded is
 /// refused by the version rule and the newer value stands — which is what
 /// should happen, and costs no special handling here.
-async fn rejects_cmd(path: &Path, replay: bool, limit: usize) -> Result<()> {
-    let cfg = config::AppConfig::load(path)?;
+async fn rejects_cmd(cfg: config::AppConfig, replay: bool, limit: usize) -> Result<()> {
     let secrets = cfg.resolve_secrets()?;
     let sink = run::build_sink(&cfg, secrets.target_password)?;
     let (stored, total) = sink.list_rejects(limit).await?;
@@ -2225,8 +2352,7 @@ async fn status_of(cfg: config::AppConfig, max_retained_mb: Option<u64>) -> Resu
     Ok(())
 }
 
-async fn drop_slot(path: &Path, publication: bool) -> Result<()> {
-    let cfg = config::AppConfig::load(path)?;
+async fn drop_slot(cfg: config::AppConfig, publication: bool) -> Result<()> {
     if cfg.source.flavor == "mysql" {
         bail!("drop-slot is PostgreSQL-only; MySQL keeps no server-side state for us");
     }
@@ -2293,6 +2419,111 @@ fn mysql_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace::fixtures::{TempDir, config as config_toml};
+    use clap::Parser;
+
+    /// What the command line accepts, without running anything.
+    fn parse(args: &[&str]) -> Result<Command, clap::Error> {
+        Cli::try_parse_from(std::iter::once("pg2osync").chain(args.iter().copied()))
+            .map(|cli| cli.command)
+    }
+
+    /// Two sources in a directory, and the arguments a command reads them
+    /// with.
+    fn two_sources(tag: &str) -> (TempDir, ConfigArgs) {
+        let dir = TempDir::new(tag);
+        dir.write("orders.toml", &config_toml("", "orders"));
+        dir.write(
+            "billing.toml",
+            &config_toml("slot_name = \"billing\"", "invoices"),
+        );
+        let args = ConfigArgs {
+            config: PathBuf::from("pg2osync.toml"),
+            config_dir: Some(dir.path().to_path_buf()),
+        };
+        (dir, args)
+    }
+
+    #[test]
+    fn a_file_and_a_directory_are_alternatives_on_every_subcommand_that_takes_both() {
+        for command in [
+            "run",
+            "validate",
+            "bootstrap",
+            "status",
+            "setup-sql",
+            "drop-slot",
+            "rejects",
+        ] {
+            parse(&[command, "--config-dir", "/etc/pg2osync"])
+                .unwrap_or_else(|e| panic!("{command} takes a directory: {e}"));
+            assert!(
+                parse(&[command, "-c", "one.toml", "--config-dir", "/etc/pg2osync"]).is_err(),
+                "{command} must refuse a file and a directory at once"
+            );
+        }
+    }
+
+    #[test]
+    fn init_is_the_one_command_a_directory_means_nothing_to() {
+        // It writes the first config; there is no set of them to write into.
+        assert!(parse(&["init", "--config-dir", "/etc/pg2osync"]).is_err());
+        parse(&["init", "-c", "pg2osync.toml"]).expect("a file is what init writes");
+    }
+
+    #[test]
+    fn a_maintenance_command_over_a_directory_asks_which_source() {
+        let (_dir, args) = two_sources("maintenance");
+        let why = format!(
+            "{:#}",
+            one_source(&args, None, "drop-slot").expect_err("two sources, no name")
+        );
+        assert!(
+            why.contains("drop-slot acts on one source") && why.contains("billing, orders"),
+            "the refusal has to name the command and the choices: {why}"
+        );
+
+        let cfg = one_source(&args, Some("billing"), "drop-slot").expect("a named source");
+        assert_eq!(cfg.source.slot_name, "billing");
+        assert!(
+            one_source(&args, Some("typo"), "drop-slot").is_err(),
+            "a name no file carries is a refusal, not the first file"
+        );
+    }
+
+    #[test]
+    fn one_file_needs_no_name_and_a_directory_of_one_does_not_either() {
+        let dir = TempDir::new("single");
+        let path = dir.write("orders.toml", &config_toml("", "orders"));
+        let file = ConfigArgs {
+            config: path,
+            config_dir: None,
+        };
+        one_source(&file, None, "rejects").expect("one file is the source");
+
+        let whole_dir = ConfigArgs {
+            config: PathBuf::from("pg2osync.toml"),
+            config_dir: Some(dir.path().to_path_buf()),
+        };
+        one_source(&whole_dir, None, "rejects")
+            .expect("a directory holding one source names it unambiguously");
+    }
+
+    #[test]
+    fn a_command_over_every_source_narrows_to_one_when_asked() {
+        let (_dir, args) = two_sources("narrowing");
+        let all = chosen_sources(&args, None).expect("both sources");
+        assert_eq!(all.sources.len(), 2);
+        let one = chosen_sources(&args, Some("orders")).expect("one source");
+        assert_eq!(
+            one.sources
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            ["orders"]
+        );
+        assert!(chosen_sources(&args, Some("typo")).is_err());
+    }
 
     #[test]
     fn a_log_format_is_named_in_any_case_and_nothing_else_is_accepted() {

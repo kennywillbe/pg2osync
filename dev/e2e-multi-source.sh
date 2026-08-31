@@ -274,6 +274,11 @@ check "/synced still answers for the source that is up" \
 say "7. the halted source resumes from its checkpoint"
 docker start "$MYSQL_CONTAINER" > /dev/null
 for _ in $(seq 1 90); do my "SELECT 1;" > /dev/null 2>&1 && break; sleep 1; done
+# A container Docker chose the host port for — an isolated run's — is published
+# on a different one every time it starts, so the URL the restarted process
+# reads has to be read back rather than remembered.
+MYSQL_PORT=$(docker port "$MYSQL_CONTAINER" 3306/tcp | head -1 | sed 's/.*://')
+export PG2OSYNC_MYSQL_URL="mysql://$MYSQL_USER:$MYSQL_PASSWORD@localhost:$MYSQL_PORT/sourcedb"
 my "INSERT INTO shop_users (id,name,email,password_hash,balance) VALUES (4,'mysql-dave','md@test.io','secret-4',4.00);"
 # a halted source is not restarted on its own: that is the documented contract
 check "it stays halted until the process is restarted" "$(state_of mysrc)" "halted"
@@ -311,6 +316,24 @@ check "the PostgreSQL checkpoint is its own document" \
   "$(os_status .pg2osync_meta postgres-pg2osync_multi)" "200"
 check "the MySQL checkpoint is its own document" \
   "$(os_status .pg2osync_meta mysql-990002)" "200"
+
+say "9. a subcommand acts on the source it was given"
+# The process is down, so these talk to the databases and the target directly.
+BOTH=$($BIN status --config-dir "$CONFIG_DIR" 2>&1 || true)
+check "status reports every source" "$(echo "$BOTH" | grep -c '^checkpoint: ')" "2"
+ONE=$($BIN status --config-dir "$CONFIG_DIR" --source pgsrc 2>&1 || true)
+check "--source reports that one" \
+  "$(echo "$ONE" | grep -c 'stream=pg2osync_multi')" "1"
+check "and not the other" "$(echo "$ONE" | grep -c 'stream=990002')" "0"
+# drop-slot destroys what one source owns; over a directory it has to be told
+# which, and the refusal comes before anything connects
+REFUSED=$($BIN drop-slot --config-dir "$CONFIG_DIR" 2>&1 || true)
+check "drop-slot refuses to guess" \
+  "$(echo "$REFUSED" | grep -c 'drop-slot acts on one source')" "1"
+check "the refusal names the choices" \
+  "$(echo "$REFUSED" | grep -c 'mysrc, pgsrc')" "1"
+check "the slot it did not drop is still there" \
+  "$(pg "SELECT count(*) FROM pg_replication_slots WHERE slot_name='pg2osync_multi';")" "1"
 
 say "Result"
 printf "  %d passed, %d failed\n" "$PASS" "$FAIL"

@@ -15,9 +15,11 @@ metadata:
   labels:
     {{- include "pg2osync.labels" . | nindent 4 }}
 spec:
-  # Exactly one instance per replication slot: two processes on the same slot
-  # fight over its position and undo each other's progress. Scale by splitting
-  # tables across releases, each with its own slot_name.
+  # This release owns these slots. Two processes streaming one slot fight over
+  # its position and undo each other's progress, so a second replica is not
+  # more throughput, it is two pipelines corrupting one checkpoint. To carry
+  # more sources, add files to `configs` — one process runs them all; to spread
+  # them over nodes, install the chart again with the other files.
   replicas: 1
   strategy:
     type: Recreate
@@ -29,7 +31,7 @@ spec:
       annotations:
         {{- if eq .Values.reloadOnChange "restart" }}
         # restarts the pod when the rendered config changes
-        checksum/config: {{ include "pg2osync.config" . | sha256sum }}
+        checksum/config: {{ include "pg2osync.configData" . | sha256sum }}
         {{- end }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
@@ -51,6 +53,9 @@ spec:
       # the sidecar has to be able to see — and signal — the pipeline process
       shareProcessNamespace: true
       {{- end }}
+      # Shared by every source in the pod: SIGTERM drains them in parallel,
+      # but the budget is the whole set's, and a source killed mid-drain
+      # replays from its checkpoint on the next start.
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       containers:
         - name: pg2osync
@@ -61,7 +66,11 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           args:
-            {{- toYaml (.Values.args | default (list "run" "-c" "/etc/pg2osync/pg2osync.toml")) | nindent 12 }}
+            {{- if .Values.args }}
+            {{- toYaml .Values.args | nindent 12 }}
+            {{- else }}
+            {{- include "pg2osync.args" . | nindent 12 }}
+            {{- end }}
           env:
             {{- range $k, $v := .Values.env }}
             - name: {{ $k }}
@@ -139,9 +148,16 @@ spec:
             - |
               seen=""
               while :; do
+                {{- if .Values.configs }}
+                # the directory, not one file: the kubelet swaps the whole
+                # ..data symlink, and any file in the set may be the one that
+                # changed
+                now="$(stat -c %Y /etc/pg2osync 2>/dev/null || echo missing)"
+                {{- else }}
                 now="$(stat -c %Y /etc/pg2osync/pg2osync.toml 2>/dev/null || echo missing)"
+                {{- end }}
                 if [ -n "$seen" ] && [ "$now" != "$seen" ]; then
-                  echo "pg2osync.toml changed; sending SIGHUP"
+                  echo "the mounted configuration changed; sending SIGHUP"
                   pkill -HUP -x pg2osync || echo "no pg2osync process to signal"
                 fi
                 seen="$now"
