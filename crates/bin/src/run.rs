@@ -124,13 +124,13 @@ pub fn embedded_children_with_own_section(cfg: &AppConfig) -> Vec<String> {
 /// mappings, where nothing could create the index a row chose with the shape
 /// it should have.
 pub fn check_rejection_policy(cfg: &AppConfig, sink: &dyn Sink) -> Result<()> {
-    if cfg.target.flavor == "meilisearch"
+    if matches!(cfg.target.flavor.as_str(), "meilisearch" | "postgres")
         && let Some((key, tbl)) = cfg.sync.iter().find(|(_, t)| t.is_templated())
     {
         bail!(
             "[sync.{key}] index {:?} chooses an index per row, which needs a target that can \
-             create one on demand with the mapping it should have, and {} has no mappings to \
-             create it with. Give this table a fixed index",
+             create one on demand with the shape it should have, and {} cannot say what a name \
+             a row renders should be created with. Give this table a fixed index",
             tbl.index_name(key),
             cfg.target.flavor
         );
@@ -161,6 +161,14 @@ pub fn build_sink(cfg: &AppConfig, target_password: Option<String>) -> Result<Ar
         .api_key_env
         .as_ref()
         .and_then(|k| std::env::var(k).ok());
+    // A PostgreSQL target keeps its password in the URL, so the URL itself is
+    // the secret and `url_env` is how it stays out of a config file.
+    let url = match &cfg.target.url_env {
+        Some(key) => std::env::var(key).map_err(|_| {
+            anyhow::anyhow!("target.url_env={key:?} is set but variable is missing")
+        })?,
+        None => cfg.target.url.clone(),
+    };
     let retry = pg2osync_sink::RetryPolicy::new(
         cfg.engine.retry_max.max(1),
         cfg.engine.retry_backoff_ms.max(1),
@@ -169,7 +177,7 @@ pub fn build_sink(cfg: &AppConfig, target_password: Option<String>) -> Result<Ar
     let sink: Arc<dyn Sink> = match cfg.target.flavor.as_str() {
         "elasticsearch" => Arc::new(pg2osync_sink::elasticsearch::ElasticsearchSink::new(
             pg2osync_sink::elasticsearch::ElasticsearchSinkConfig {
-                url: cfg.target.url.clone(),
+                url: url.clone(),
                 username: cfg.target.username.clone(),
                 password: target_password,
                 api_key,
@@ -180,14 +188,14 @@ pub fn build_sink(cfg: &AppConfig, target_password: Option<String>) -> Result<Ar
         )?),
         "meilisearch" => Arc::new(pg2osync_sink::meilisearch::MeilisearchSink::new(
             pg2osync_sink::meilisearch::MeilisearchSinkConfig {
-                url: cfg.target.url.clone(),
+                url: url.clone(),
                 api_key: api_key.or(target_password),
                 state_dir: cfg.target.state_dir.clone(),
             },
         )?),
         "opensearch" => Arc::new(pg2osync_sink::OpenSearchSink::new(
             pg2osync_sink::OpenSearchSinkConfig {
-                url: cfg.target.url.clone(),
+                url: url.clone(),
                 username: cfg.target.username.clone(),
                 password: target_password,
                 tls_verify: cfg.target.tls_verify,
@@ -195,9 +203,12 @@ pub fn build_sink(cfg: &AppConfig, target_password: Option<String>) -> Result<Ar
                 require_alias: cfg.target.require_alias,
             },
         )?),
+        "postgres" => Arc::new(pg2osync_sink::postgres::PostgresSink::new(
+            pg2osync_sink::postgres::PostgresSinkConfig { url, retry },
+        )?),
         other => bail!(
             "unsupported target.flavor {other:?}; expected \"opensearch\", \
-             \"elasticsearch\" or \"meilisearch\""
+             \"elasticsearch\", \"meilisearch\" or \"postgres\""
         ),
     };
     Ok(sink)

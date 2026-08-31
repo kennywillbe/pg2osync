@@ -224,6 +224,18 @@ fn refuse_unsupported(
 ) -> Result<()> {
     let index = tbl.index_name(key);
     let index = index.as_str();
+    // A rebuild ends in an atomic switch of the name readers use, and this
+    // target has neither an alias namespace to move a pointer inside nor a
+    // swap that exchanges two names in one step. Refused rather than
+    // approximated with a rename: the window where the name resolves to
+    // nothing is exactly what a zero-downtime rebuild exists to avoid.
+    if cfg.target.flavor == "postgres" {
+        bail!(
+            "a rebuild switches the name readers use onto a freshly filled one in a single \
+             step, and a PostgreSQL target has no such step. Build the new table beside this \
+             one with a second instance of the whole config, then point your readers at it"
+        );
+    }
     // an alias points at one index, and a template's glob is not one
     if tbl.is_templated() {
         bail!(

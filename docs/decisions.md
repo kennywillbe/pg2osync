@@ -1195,6 +1195,55 @@ outcome, with one write path instead of two. Worth revisiting only if something
 a data stream alone can do turns up in practice: a `logs-*` convention that has
 to be honoured, or a managed service that refuses a plain index.
 
+**PostgreSQL is a target because pgvector is a search backend. This is not
+database replication.** (#185.) Retrieval increasingly lives in PostgreSQL
+itself — the embeddings in pgvector, full-text search beside them — and a team
+on that stack needs exactly what this tool gives every other backend: a
+consistent initial load, live upserts, real deletes, transforms and
+projections, a checkpoint in the target. So PostgreSQL is a fourth `Sink`, on
+the same terms as the other three, and on no others: **no schema mirroring, no
+DDL propagation, no promise beyond the document model every other sink gets.**
+
+The distinction is not pedantry, because the two products diverge at the first
+design question. A replica derives the target's shape from the source's;
+this derives it from the operator's, who writes the `CREATE TABLE` in
+`mapping_file` the way they write a mapping today. A replica applies the
+source's DDL; here a field with no column of that name is a permanent
+rejection naming the column, which takes the same quarantine-or-halt path as a
+mapping conflict on OpenSearch. A replica copies a table; here a section writes
+a *document* — projected, transformed, with its children embedded and its id
+derived — into a table that need not resemble the source at all. Anyone who
+actually wants a replica has logical replication, which is better at it than
+this will ever be.
+
+**Vector columns are bring-your-own-embedding: a vector produced by the source
+database or the application is carried like any other column; the sink computes
+nothing.** It calls no model and has no embedding configuration; a JSON array of
+numbers reaches a `vector(n)` column through PostgreSQL's own input function,
+so the value in the index is the value you produced. This is the same refusal
+`pipeline` makes on the other targets — the embedding is computed by something
+that holds the model, and that is never this process.
+
+What the target does not have, it refuses by name rather than approximating:
+`require_alias`, `join`, `routing`, `pipeline`, a per-row index, and `reindex`,
+which ends in an atomic switch of the name readers use and has no equivalent
+here. What it does have is a `_version` column, which is what lets a `TRUNCATE`
+clear the rows written before it and keep the ones written after — the same
+ordering rule external versions give on OpenSearch, expressed as a comparison
+in the `WHERE` clause.
+
+**A sink conformance kit, so the contract has more than one witness.** (#186.)
+The `Sink` trait's doc comments state the rules; before this, only the
+implementations and their e2e suites proved them, and each new sink
+re-discovered them one bug at a time. `pg2osync_core::testkit` is a suite any
+implementation runs against a live instance of its target: idempotent replay,
+versioned truncate, read-back in request order and in a form the target takes
+back, a partial batch around a refused document, checkpoint durability. Two
+things stay the caller's — the documents its target accepts, and one it
+refuses — because only the caller knows them, and a target with no document it
+can refuse reports that check as skipped rather than faking it. Behind a
+feature flag, so a release binary carries none of it.
+
 **Sinks are search targets, and nothing else.** pgstream and Conduit fan the
 same change stream out to webhooks, and the request here was a `webhook` sink
 for cache invalidation and integrations. It is the first step toward the

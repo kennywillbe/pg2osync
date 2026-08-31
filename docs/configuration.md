@@ -129,8 +129,8 @@ It re-reads rows whose timestamp column advanced since the last cycle.
 
 | Option | Default | Description |
 |---|---|---|
-| `flavor` | `"opensearch"` | `"opensearch"`, `"elasticsearch"` or `"meilisearch"` |
-| `url` | *(required)* | Base URL, e.g. `http://localhost:9200` |
+| `flavor` | `"opensearch"` | `"opensearch"`, `"elasticsearch"`, `"meilisearch"` or `"postgres"` |
+| `url` / `url_env` | *(one required)* | Base URL, e.g. `http://localhost:9200`; for `postgres` a connection string, which carries a password and therefore belongs in `url_env` |
 | `username` | — | Basic-auth user |
 | `password` / `password_env` | — | Basic-auth password |
 | `api_key_env` | — | Elasticsearch API key, or Meilisearch master key |
@@ -141,6 +141,14 @@ It re-reads rows whose timestamp column advanced since the last cycle.
 Meilisearch has no place to store an arbitrary document, so its checkpoint is a
 local file. Give that directory persistent storage, or a restart re-runs the
 initial load.
+
+A `postgres` target is a pgvector-equipped database used as a search backend:
+each section writes one table, the operator declares that table's DDL through
+`mapping_file`, and the checkpoint lives in a state table of the target
+database. It is not database replication — no schema is mirrored and no DDL is
+propagated. Everything it refuses, and why, is in
+[the PostgreSQL sink page](sinks/postgresql.md). TLS follows `sslmode` in the
+connection string, the way `[source]` reads it.
 
 ## `[sync.<key>]`
 
@@ -163,7 +171,7 @@ One section per table. `<key>` is the index name when `index` is omitted.
 | `where` | Restricted SQL predicate deciding which rows are indexed, e.g. `status = 'active' AND deleted_at IS NULL`; see [Row filters](#row-filters) |
 | `poll_column` | Poll mode: overrides `[source] poll_column` for this table |
 | `soft_delete` | SQL predicate marking a row as deleted, e.g. `deleted_at IS NOT NULL` |
-| `mapping_file` | JSON mapping to create the index with, see below |
+| `mapping_file` | JSON mapping to create the index with, see below; for a `postgres` target the `.sql` file that creates the table, and required there |
 | `pipeline` | Ingest pipeline the target runs on every document of this section, e.g. `"embed-products"`; OpenSearch and Elasticsearch only, see [Ingest pipelines](#ingest-pipelines) |
 | `routing` | Column whose value decides the shard this section's documents live on, e.g. `"tenant_id"`; OpenSearch and Elasticsearch only, see [Routing](#routing) |
 | `children` | Nested child collections, see below |
@@ -1034,6 +1042,10 @@ indices.
 Meilisearch has no field types to declare; `mapping_file` is refused for that
 target rather than ignored.
 
+For a `postgres` target the file is SQL rather than JSON, and it is required:
+what an index mapping is to OpenSearch, the `CREATE TABLE` is there. See
+[the PostgreSQL sink page](sinks/postgresql.md).
+
 ### Ingest pipelines
 
 A vector field is the one thing a mapping can declare that no row can fill:
@@ -1635,9 +1647,10 @@ stops the pipeline instead of skipping the document, because skipping is silent
 data loss. `on_permanent_rejection = "quarantine"` trades that for availability:
 the document is recorded with its position before the position is acknowledged,
 so nothing is lost, but the transaction it belonged to is applied without it.
-`pg2osync rejects --replay` puts it back once the mapping is fixed. Only the
-OpenSearch and Elasticsearch targets can quarantine; configuring it against
-Meilisearch fails at startup.
+`pg2osync rejects --replay` puts it back once the mapping is fixed. The
+OpenSearch, Elasticsearch and PostgreSQL targets can quarantine — the last in a
+`pg2osync_rejects` table of the target database; configuring it against
+Meilisearch, which has nowhere to keep a refused document, fails at startup.
 
 ## `[api]`
 

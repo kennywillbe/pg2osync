@@ -8,8 +8,8 @@ accident.
 
 pg2osync keeps a search index in sync with a relational database in real time:
 PostgreSQL (logical replication) or MySQL/MariaDB (binlog) into OpenSearch,
-Elasticsearch or Meilisearch. One static binary, one TOML file, no Kafka, no
-Logstash, no Redis.
+Elasticsearch, Meilisearch or a pgvector table. One static binary, one TOML
+file, no Kafka, no Logstash, no Redis.
 
 - How the pipeline works: [docs/architecture.md](docs/architecture.md)
 - Every config option: [docs/configuration.md](docs/configuration.md)
@@ -32,8 +32,8 @@ Breaking one of these is a bug even if the tests pass:
 - A partial transaction must never be visible as a complete one.
 - A source position is acknowledged only after the data is durably written and
   checkpointed. Acknowledging early loses data on crash-restart.
-- Checkpoint state lives in the target (a hidden index, or a state file for
-  Meilisearch), never in the source database.
+- Checkpoint state lives in the target (a hidden index, a state table, or a
+  state file for Meilisearch), never in the source database.
 
 If a change contradicts [docs/decisions.md](docs/decisions.md), update that
 document in the same change and say why.
@@ -79,6 +79,7 @@ What it covers, job by job:
 | `e2e PostgreSQL to OpenSearch` | `ci.yml` |
 | `e2e MySQL to OpenSearch` | `ci.yml` |
 | `e2e several sources in one process` | `ci.yml` |
+| `e2e PostgreSQL to pgvector` | `ci.yml` |
 | `container image builds` | `ci.yml` |
 | `helm chart lints` | `ci.yml` |
 | `the book builds` | `docs.yml` |

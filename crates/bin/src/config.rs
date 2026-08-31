@@ -166,8 +166,16 @@ fn default_publication() -> String {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TargetConfig {
+    #[serde(default)]
     pub url: String,
-    /// "opensearch" (default) | "elasticsearch" | "meilisearch"
+    /// Environment variable holding the target URL.
+    ///
+    /// A PostgreSQL target's URL carries its password, so it belongs in the
+    /// environment for the reason `[source] url_env` does. The other targets
+    /// keep their secret in `password_env` or `api_key_env` and have nothing
+    /// in the URL worth hiding.
+    pub url_env: Option<String>,
+    /// "opensearch" (default) | "elasticsearch" | "meilisearch" | "postgres"
     #[serde(default = "default_target_flavor")]
     pub flavor: String,
     pub username: Option<String>,
@@ -186,6 +194,31 @@ pub struct TargetConfig {
     /// that writes to indices directly is not wrong, only un-flippable.
     #[serde(default)]
     pub require_alias: bool,
+}
+
+impl TargetConfig {
+    /// How to name the target in output, with no secret in it.
+    ///
+    /// A PostgreSQL target's URL carries its password, and a line saying where
+    /// the target is must never be the place it leaks.
+    pub fn endpoint(&self) -> String {
+        match &self.url_env {
+            Some(key) => format!("the URL in {key}"),
+            None => redact_userinfo(&self.url),
+        }
+    }
+}
+
+/// A URL with `user:password@` taken out of it.
+fn redact_userinfo(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    match rest[..authority_end].rfind('@') {
+        Some(at) => format!("{scheme}://{}", &rest[at + 1..]),
+        None => url.to_string(),
+    }
 }
 
 fn default_target_flavor() -> String {
@@ -879,6 +912,12 @@ impl AppConfig {
         let mut cfg: AppConfig =
             toml::from_str(&raw).with_context(|| format!("invalid TOML in {}", path.display()))?;
         let base = path.parent().unwrap_or_else(|| Path::new("."));
+        // What a mapping *is* differs by target: an index mapping is JSON, and
+        // the equivalent for a table is the DDL that creates it. Both arrive
+        // through mapping_file because both answer the same question — what
+        // this section's documents are stored as — and the sink is the only
+        // thing that has to know which.
+        let ddl_target = cfg.target.flavor == "postgres";
         for (key, table) in cfg.sync.iter_mut() {
             let Some(file) = &table.mapping_file else {
                 continue;
@@ -887,6 +926,17 @@ impl AppConfig {
             let text = std::fs::read_to_string(&full).with_context(|| {
                 format!("[sync.{key}] cannot read mapping_file {}", full.display())
             })?;
+            if ddl_target {
+                if text.trim().is_empty() {
+                    anyhow::bail!(
+                        "[sync.{key}] {} is empty; it has to hold the CREATE TABLE this \
+                         section writes to",
+                        full.display()
+                    );
+                }
+                table.mapping = Some(serde_json::Value::String(text));
+                continue;
+            }
             let mapping: serde_json::Value = serde_json::from_str(&text)
                 .with_context(|| format!("[sync.{key}] {} is not valid JSON", full.display()))?;
             if !mapping.is_object() {
@@ -918,11 +968,27 @@ impl AppConfig {
         }
     }
 
+    /// How to name this target in a refusal, when it has none of the data model
+    /// `join`, `routing` and `pipeline` are expressed in — or `None` when it
+    /// does.
+    ///
+    /// One place rather than a check per feature per flavor: every one of those
+    /// options is refused for the same reason, and the reason is a property of
+    /// the target rather than of the option.
+    fn target_without_the_search_engine_model(&self) -> Option<&'static str> {
+        match self.target.flavor.as_str() {
+            "meilisearch" => Some("Meilisearch"),
+            "postgres" => Some("PostgreSQL"),
+            _ => None,
+        }
+    }
+
     /// Structural validation. Connection checks happen in `validate` command;
     /// this function never touches the network.
     pub fn validate(&self) -> Result<()> {
         const SOURCE_FLAVORS: [&str; 3] = ["postgres", "postgresql", "mysql"];
-        const TARGET_FLAVORS: [&str; 3] = ["opensearch", "elasticsearch", "meilisearch"];
+        const TARGET_FLAVORS: [&str; 4] =
+            ["opensearch", "elasticsearch", "meilisearch", "postgres"];
         const SOURCE_MODES: [&str; 2] = ["wal", "poll"];
 
         if let Some(name) = &self.source.name {
@@ -940,11 +1006,47 @@ impl AppConfig {
                 self.target.flavor
             );
         }
+        if self.target.url.is_empty() && self.target.url_env.is_none() {
+            anyhow::bail!("either [target] url or [target] url_env is required");
+        }
+        if self.target.flavor == "postgres" {
+            // This target creates nothing on its own — it has no dynamic
+            // mapping to infer a shape from the first document, and inventing a
+            // table from the source's columns would be the schema mirroring
+            // this sink deliberately is not. So the DDL is required, once per
+            // table rather than once per section, because two sections feeding
+            // one table still describe one table.
+            let described: std::collections::HashSet<String> = self
+                .sync
+                .iter()
+                .filter(|(_, tbl)| tbl.mapping_file.is_some())
+                .map(|(key, tbl)| tbl.index_name(key))
+                .collect();
+            if let Some((key, tbl)) = self
+                .sync
+                .iter()
+                .find(|(key, tbl)| !described.contains(&tbl.index_name(key)))
+            {
+                anyhow::bail!(
+                    "[sync.{key}] needs mapping_file: a PostgreSQL target writes table {} and \
+                     creates nothing on its own, so the section has to name the .sql file that \
+                     creates it",
+                    tbl.index_name(key)
+                );
+            }
+        }
         if self.target.require_alias && self.target.flavor == "meilisearch" {
             anyhow::bail!(
                 "[target] require_alias is an OpenSearch and Elasticsearch flag; Meilisearch \
                  has no alias namespace — the name a section writes to is an index uid — so \
                  there is nothing for it to require"
+            );
+        }
+        if self.target.require_alias && self.target.flavor == "postgres" {
+            anyhow::bail!(
+                "[target] require_alias is an OpenSearch and Elasticsearch flag; PostgreSQL \
+                 has no alias namespace — the name a section writes to is a table — so there \
+                 is nothing for it to require"
             );
         }
         if !SOURCE_MODES.contains(&self.source.mode.as_str()) {
@@ -1062,10 +1164,10 @@ impl AppConfig {
                          join field"
                     );
                 }
-                if self.target.flavor == "meilisearch" {
+                if let Some(target) = self.target_without_the_search_engine_model() {
                     anyhow::bail!(
                         "[sync.{key}] join is an OpenSearch and Elasticsearch data model, which \
-                         Meilisearch has no equivalent for; remove join for this target"
+                         {target} has no equivalent for; remove join for this target"
                     );
                 }
                 if tbl
@@ -1094,10 +1196,10 @@ impl AppConfig {
                 if pipeline.is_empty() {
                     anyhow::bail!("[sync.{key}] pipeline must not be empty");
                 }
-                if self.target.flavor == "meilisearch" {
+                if let Some(target) = self.target_without_the_search_engine_model() {
                     anyhow::bail!(
                         "[sync.{key}] pipeline is an OpenSearch and Elasticsearch feature, which \
-                         Meilisearch has no equivalent for; remove pipeline for this target"
+                         {target} has no equivalent for; remove pipeline for this target"
                     );
                 }
             }
@@ -1112,10 +1214,10 @@ impl AppConfig {
                          the shard its parent is on"
                     );
                 }
-                if self.target.flavor == "meilisearch" {
+                if let Some(target) = self.target_without_the_search_engine_model() {
                     anyhow::bail!(
                         "[sync.{key}] routing is an OpenSearch and Elasticsearch feature, which \
-                         Meilisearch has no equivalent for; remove routing for this target"
+                         {target} has no equivalent for; remove routing for this target"
                     );
                 }
             }
@@ -2027,6 +2129,92 @@ url = "http://localhost:9200"
 [sync.users]
 table = "public.users"
 "#;
+
+    /// A PostgreSQL target, which needs the DDL of the table it writes.
+    const PG_TARGET: &str = r#"
+[source]
+url = "postgres://u:p@localhost/db"
+[target]
+flavor = "postgres"
+url_env = "PG2OSYNC_TEST_TARGET_URL"
+[sync.users]
+table = "public.users"
+mapping_file = "users.sql"
+"#;
+
+    #[test]
+    fn a_postgres_target_takes_its_url_from_the_environment() {
+        let cfg = parse(PG_TARGET).expect("valid");
+        assert_eq!(cfg.target.flavor, "postgres");
+        assert_eq!(cfg.target.endpoint(), "the URL in PG2OSYNC_TEST_TARGET_URL");
+    }
+
+    #[test]
+    fn a_target_named_nowhere_is_refused() {
+        let missing = PG_TARGET.replace("url_env = \"PG2OSYNC_TEST_TARGET_URL\"\n", "");
+        assert!(parse(&missing).is_err(), "a target with no url at all");
+    }
+
+    #[test]
+    fn a_postgres_target_needs_the_ddl_of_the_table_it_writes() {
+        let no_ddl = PG_TARGET.replace("mapping_file = \"users.sql\"\n", "");
+        let why = parse(&no_ddl)
+            .expect_err("a section with no DDL")
+            .to_string();
+        assert!(why.contains("mapping_file"), "{why}");
+        assert!(why.contains(".sql"), "{why}");
+    }
+
+    #[test]
+    fn the_search_engine_features_are_refused_for_a_postgres_target_by_name() {
+        for (option, line) in [
+            ("routing", "routing = \"tenant_id\"\n"),
+            ("pipeline", "pipeline = \"enrich\"\n"),
+            (
+                "join",
+                "[sync.users.join]\nfield = \"rel\"\nname = \"user\"\n",
+            ),
+        ] {
+            let why = parse(&format!("{PG_TARGET}{line}"))
+                .expect_err("an OpenSearch-only option")
+                .to_string();
+            assert!(why.contains(option), "{option}: {why}");
+            assert!(why.contains("PostgreSQL"), "{option}: {why}");
+        }
+    }
+
+    #[test]
+    fn require_alias_is_refused_for_a_target_with_no_alias_namespace() {
+        let why = parse(&PG_TARGET.replace(
+            "flavor = \"postgres\"",
+            "flavor = \"postgres\"\nrequire_alias = true",
+        ))
+        .expect_err("require_alias against a table")
+        .to_string();
+        assert!(why.contains("no alias namespace"), "{why}");
+    }
+
+    #[test]
+    fn a_password_in_a_target_url_is_never_printed() {
+        let cfg = parse(&PG_TARGET.replace(
+            "url_env = \"PG2OSYNC_TEST_TARGET_URL\"",
+            "url = \"postgres://writer:hunter2@db.internal:5432/search\"",
+        ))
+        .expect("valid");
+        let shown = cfg.target.endpoint();
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert_eq!(shown, "postgres://db.internal:5432/search");
+    }
+
+    #[test]
+    fn a_url_with_nothing_to_redact_is_left_alone() {
+        assert_eq!(
+            redact_userinfo("http://localhost:9200"),
+            "http://localhost:9200"
+        );
+        // the `@` belongs to the path, not to a user name
+        assert_eq!(redact_userinfo("http://h/a@b"), "http://h/a@b");
+    }
 
     #[test]
     fn minimal_config_defaults_to_postgres_and_opensearch() {

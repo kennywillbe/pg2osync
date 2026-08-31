@@ -1,8 +1,10 @@
-//! Sink implementations: OpenSearch (reference), Elasticsearch, Meilisearch.
+//! Sink implementations: OpenSearch (reference), Elasticsearch, Meilisearch
+//! and PostgreSQL.
 
 pub mod elasticsearch;
 pub mod mapping;
 pub mod meilisearch;
+pub mod postgres;
 
 use async_trait::async_trait;
 use opensearch::auth::Credentials;

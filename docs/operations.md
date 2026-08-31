@@ -474,6 +474,8 @@ scratch:
 # the document is named after the stream: <source>-<slot_name|server_id>
 curl -XDELETE "$OS/.pg2osync_meta/_doc/postgres-pg2osync"   # OpenSearch / Elasticsearch
 rm .pg2osync-state/checkpoint-postgres-pg2osync.json        # Meilisearch
+psql "$TARGET" -c \
+  "DELETE FROM pg2osync_state WHERE key = 'checkpoint-postgres-pg2osync'"  # PostgreSQL
 ```
 
 **Source history expired** (WAL recycled, binlog purged). The next start detects

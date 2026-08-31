@@ -35,7 +35,8 @@ tell you a change is red.
 It covers `fmt + clippy + unit tests`, the MSRV check, `e2e PostgreSQL to
 OpenSearch`, `e2e MySQL to OpenSearch`, `e2e several sources in one process`
 (both databases in one `run --config-dir`, which is where per-source metrics,
-health and isolation are proved), the container image build, the helm
+health and isolation are proved), `e2e PostgreSQL to pgvector`, the container
+image build, the helm
 lints, the book (`docs.yml`), your pull request title (`pr-title.yml`),
 `cargo audit` when a Cargo file moved, and the eight compatibility cells when
 CI would run them — that is, when you touched `.github/workflows/compat.yml`
@@ -99,6 +100,11 @@ Deeper probes are not part of CI and stay manual:
 ./dev/many-tables.sh                 # what a table costs, apart from its rows
 ./dev/resource-limits.sh             # how many cores it needs (needs the container image)
 ```
+
+`e2e-postgres-sink.sh` is the suite to run when the PostgreSQL sink changes.
+It is also where the sink conformance kit runs against that target; the same
+kit runs against OpenSearch as a step of the `e2e PostgreSQL to OpenSearch`
+job, so a change to `crates/core/src/testkit.rs` is answered by two targets.
 
 `e2e-meili-smoke.sh` is the suite to run when the Meilisearch sink changes.
 The full PostgreSQL suite cannot cover that target — it asserts over mappings,
