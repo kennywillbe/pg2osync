@@ -77,7 +77,7 @@ not expressions) — if you need those, you want Kafka.
 | **MySQL 8.0 / MariaDB 10.6+ → any of the above** | ✅ MySQL 8.0 on every pull request; MySQL 8.4 and MariaDB 10.6/11.8 nightly |
 | Consistent initial load, then live streaming | ✅ |
 | Crash recovery with no data loss (`kill -9` safe) | ✅ verified by the e2e suite |
-| Nested child collections (one level) | ✅ PostgreSQL and MySQL/MariaDB; the parent document embeds child arrays, resolved once per collection per transaction, with their own `columns` / `exclude_columns` projection, or `single = true` to embed a 1:1 relation as an object |
+| Nested child collections (one level) | ✅ PostgreSQL and MySQL/MariaDB; the parent document embeds child arrays, resolved once per collection per transaction, with their own `columns` / `exclude_columns` projection, or `single = true` to embed a 1:1 relation as an object, or `flatten = true` with it to lift the element's columns onto the parent document |
 | Many-to-many children (`through`) | ✅ PostgreSQL and MySQL/MariaDB; a junction table is joined inside the same aggregation, and both the junction and the child are streamed |
 | Aggregate children (`aggregates`) | ✅ PostgreSQL and MySQL/MariaDB; a count from a child table lands on the parent document and is kept live by the same machinery, one grouped query per aggregate per transaction |
 | Parent-child as a join field (`join`) | ✅ OpenSearch and Elasticsearch; shared index, per-document routing, parent delete cascades to its children |

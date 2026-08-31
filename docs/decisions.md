@@ -804,6 +804,23 @@ promise, so a re-snapshot embeds the same row rather than rewriting the document
 No metric counts it: neither source crate holds a `Metrics` handle, and a warning
 already names what to fix.
 
+`flatten = true` is the same child, assembled differently: the source still
+reads and nests it, and the engine lifts the element onto the parent after the
+renames have given its columns their target names — one step in the same place
+projection, transforms, renames and constants already are, so every path that
+writes a document (initial load, streamed re-fetch, re-snapshot) gets it, and no
+source learns a new shape. It requires `single`, because an array has no one row
+to lift, and `columns`, because the lifted names are what could bury something
+the parent already writes and a name nobody knows before a row arrives cannot be
+refused where it can still be fixed. `field` stays required and keeps naming the
+child rather than a field of the document: it is the key the child's renames,
+its warnings and its refusals are written against, and making it optional would
+buy one line of TOML for a second way to identify a child. A parent with no
+child row carries none of the lifted fields, rather than a row of nulls: the
+nested form can say "no child" with one null, a flattened one cannot say it at
+all, and inventing nulls for columns the source never read would be a claim the
+data does not make.
+
 **A many-to-many child is one more join inside the same builder.** `through`
 names a junction table and changes nothing else: the aggregation gains
 `JOIN junction j ON j.<through_key> = t.<child primary key>` and keys on

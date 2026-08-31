@@ -9,8 +9,8 @@ use pg2osync_core::event::ChangeEvent;
 use pg2osync_core::lsn::Lsn;
 use pg2osync_core::sink::{IndexSpec, Sink};
 use pg2osync_engine::mapping::{
-    Constants, DurableLsn, IndexTarget, JoinParent, JoinRule, Joins, ParentId, Projection,
-    Projections, Rename, Renames, TableMapping, Transforms,
+    Constants, DurableLsn, Flattens, IndexTarget, JoinParent, JoinRule, Joins, ParentId,
+    Projection, Projections, Rename, Renames, TableMapping, Transforms,
 };
 use pg2osync_engine::metrics::{SharedMetrics, SourceState};
 use pg2osync_engine::{PipelineCtx, PositionRenderer};
@@ -335,6 +335,25 @@ fn renames(cfg: &AppConfig) -> Renames {
     }))
 }
 
+/// The children whose element is lifted onto the parent, by the field they
+/// arrive under: the source nests them as any other one-to-one child, and the
+/// engine lifts them once the child's own renames have run.
+fn flattens(cfg: &AppConfig) -> Flattens {
+    Flattens::from_pairs(cfg.sync.values().filter_map(|tbl| {
+        let fields: Vec<String> = tbl
+            .children
+            .iter()
+            .filter(|child| child.flatten)
+            .map(|child| child.field.clone())
+            .collect();
+        if fields.is_empty() {
+            return None;
+        }
+        let (schema, table) = split_qualified(&tbl.table);
+        Some(((schema.to_string(), table.to_string()), fields))
+    }))
+}
+
 /// Rendered once here, so the engine inserts literals and never sees a
 /// template. `validate` already refused a bad one, but `run` does not go
 /// through `validate`, so the error is mapped rather than assumed away.
@@ -653,6 +672,7 @@ pub fn pipeline_ctx(
         projections: projections(cfg),
         transforms: transforms(cfg)?,
         renames: renames(cfg),
+        flattens: flattens(cfg),
         constants: constants(cfg)?,
         id_templates: id_templates(cfg)?,
         fan_outs: fan_outs(cfg)?,

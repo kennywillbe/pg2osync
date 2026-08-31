@@ -1761,5 +1761,98 @@ refresh
 check "one document per member, and no orphan" "$(os_count e2e_mysql_element)" "5"
 stop_sync
 
+say "27. a one-to-one child flattened onto the parent document"
+# The PostgreSQL suite's section 39 (#181) on the binlog path: the element is
+# lifted onto the parent instead of nested, and the lifted field has to stay
+# live through a change to the child alone and through its deletion.
+stop_sync
+FLCONFIG=$(mktemp /tmp/pg2osync-mysql-flatten.XXXXXX)
+FLSID=990017
+cat > "$FLCONFIG" <<TOML
+[source]
+flavor = "mysql"
+url_env = "PG2OSYNC_MYSQL_URL"
+server_id = $FLSID
+
+[target]
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
+
+[metrics]
+bind = "127.0.0.1:$((PORT_BASE + 27))"
+
+[sync.contacts]
+table = "sourcedb.flat_contact"
+index = "e2e_mysql_flat"
+
+[[sync.contacts.children]]
+table = "sourcedb.flat_company"
+field = "company"
+foreign_key = "contact_id"
+single = true
+flatten = true
+columns = ["customer_name"]
+
+[sync.contacts.children.fields]
+customer_name = "company_name"
+TOML
+flatten_cleanup() {
+  sync_kill
+  my "DROP TABLE IF EXISTS flat_company, flat_contact;" > /dev/null 2>&1 || true
+  curl -s -XDELETE "$OS/e2e_mysql_flat?ignore_unavailable=true" > /dev/null 2>&1 || true
+  rm -f "$FLCONFIG"
+}
+trap 'cleanup; resume_cleanup; types_cleanup; child_cleanup; where_cleanup; events_cleanup; pipe_cleanup; append_cleanup; routing_cleanup; through_cleanup; pseudo_cleanup; rl_cleanup; agg_cleanup; element_cleanup; flatten_cleanup' EXIT
+
+my "DROP TABLE IF EXISTS flat_company, flat_contact;"
+my "CREATE TABLE flat_contact(id bigint primary key, name varchar(40));"
+my "CREATE TABLE flat_company(id bigint primary key, contact_id bigint, customer_name varchar(40), INDEX(contact_id));"
+my "INSERT INTO flat_contact VALUES (1,'ada'),(2,'grace');"
+# contact 2 has no company at all: nothing is lifted onto it
+my "INSERT INTO flat_company VALUES (100,1,'acme');"
+curl -s -XDELETE "$OS/e2e_mysql_flat?ignore_unavailable=true" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/mysql-$FLSID" > /dev/null
+
+# captured first: a refusal exits non-zero, which under pipefail would hide a
+# grep that matched
+sed '/^single = true$/d' "$FLCONFIG" > "${FLCONFIG}.bad"
+out=$($BIN validate -c "${FLCONFIG}.bad" 2>&1 || true)
+if grep -q "flatten needs single = true" <<< "$out"; then
+  ok "validate refuses flatten on a relation nothing declares one-to-one"
+else
+  bad "validate accepted flatten without single: $out"
+fi
+rm -f "${FLCONFIG}.bad"
+
+sync_spawn "$FLCONFIG"
+await_count e2e_mysql_flat 2
+check "the load lifts the child column under its new name" \
+  "$(os_field e2e_mysql_flat 1 company_name)" "acme"
+check "the field the child would have nested under is absent" \
+  "$(os_has e2e_mysql_flat 1 company)" "False"
+check "a parent with no child row carries none of it" \
+  "$(os_has e2e_mysql_flat 2 company_name)" "False"
+
+# the acceptance test: the parent row is never touched, and the flat field moves
+my "UPDATE flat_company SET customer_name = 'acme-renamed' WHERE id = 100;"
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_field e2e_mysql_flat 1 company_name)" = "acme-renamed" ] && break
+  sleep 1
+done
+check "a change to the child alone moves the parent's flat field" \
+  "$(os_field e2e_mysql_flat 1 company_name)" "acme-renamed"
+
+my "DELETE FROM flat_company WHERE id = 100;"
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_has e2e_mysql_flat 1 company_name)" = "False" ] && break
+  sleep 1
+done
+check "the deleted child row takes the lifted field with it" \
+  "$(os_has e2e_mysql_flat 1 company_name)" "False"
+check "and the parent document is still there" "$(os_field e2e_mysql_flat 1 name)" "ada"
+stop_sync
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]
