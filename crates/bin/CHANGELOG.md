@@ -16,6 +16,38 @@ What a major version promises here: the **configuration file** and the
 make an existing `pg2osync.toml` stop loading, or make a running pipeline
 re-read a table from the start, is a major version.
 
+## [1.5.0](https://github.com/kennywillbe/pg2osync/compare/v1.4.0...v1.5.0) (2026-08-31)
+
+
+### Features
+
+* a --source for every subcommand, and the operations story ([#188](https://github.com/kennywillbe/pg2osync/issues/188)) ([b69a0b4](https://github.com/kennywillbe/pg2osync/commit/b69a0b454e0b143d18060461f6c2374aef0a6078))
+* a ceiling on total retry time ([#162](https://github.com/kennywillbe/pg2osync/issues/162)) ([547df29](https://github.com/kennywillbe/pg2osync/commit/547df296dbc25fea0c4d5f4688877d3c201dc33a))
+* a keyed pseudonym transform ([#164](https://github.com/kennywillbe/pg2osync/issues/164)) ([d118b38](https://github.com/kennywillbe/pg2osync/commit/d118b38fef5bae05019fa1c5dbdcc1b110ce9df8)), closes [#143](https://github.com/kennywillbe/pg2osync/issues/143)
+* a Kubernetes operator ([#202](https://github.com/kennywillbe/pg2osync/issues/202)) ([bb7c06d](https://github.com/kennywillbe/pg2osync/commit/bb7c06d8c2fbe24b7b742d7c1d1ab0a45d7c50f6)), closes [#147](https://github.com/kennywillbe/pg2osync/issues/147)
+* a lookup transform ([#165](https://github.com/kennywillbe/pg2osync/issues/165)) ([60ab49e](https://github.com/kennywillbe/pg2osync/commit/60ab49e9bb4a5390490e03f63f63dd0ce1fe66fa))
+* a pgvector sink ([#193](https://github.com/kennywillbe/pg2osync/issues/193)) ([8781038](https://github.com/kennywillbe/pg2osync/commit/8781038045f25106789510117b5348c0f69acfe2)), closes [#185](https://github.com/kennywillbe/pg2osync/issues/185) [#186](https://github.com/kennywillbe/pg2osync/issues/186)
+* a Qdrant sink ([#194](https://github.com/kennywillbe/pg2osync/issues/194)) ([1d22926](https://github.com/kennywillbe/pg2osync/commit/1d229261b4b3d9355ae04a223307d1e72e7288a4)), closes [#187](https://github.com/kennywillbe/pg2osync/issues/187)
+* a rate limit for the initial load ([#155](https://github.com/kennywillbe/pg2osync/issues/155)) ([5ff180d](https://github.com/kennywillbe/pg2osync/commit/5ff180d79a0081264add9464a00f60199ab3d14c)), closes [#144](https://github.com/kennywillbe/pg2osync/issues/144)
+* add and remove a table on reload ([#199](https://github.com/kennywillbe/pg2osync/issues/199)) ([293a7ac](https://github.com/kennywillbe/pg2osync/commit/293a7ace68c080f7164b30cf5657e2b29f8ecd41)), closes [#170](https://github.com/kennywillbe/pg2osync/issues/170)
+* aggregate children keep a count live ([#189](https://github.com/kennywillbe/pg2osync/issues/189)) ([ba5ab79](https://github.com/kennywillbe/pg2osync/commit/ba5ab7917558ccbe881842fc471798b6db2734cc)), closes [#179](https://github.com/kennywillbe/pg2osync/issues/179)
+* fan out a delimited column, and let the element be the join parent ([#190](https://github.com/kennywillbe/pg2osync/issues/190)) ([ee0c0ae](https://github.com/kennywillbe/pg2osync/commit/ee0c0ae07687569e7f1c2f76e7fc9b7691a85483)), closes [#180](https://github.com/kennywillbe/pg2osync/issues/180)
+* flatten a one-to-one child into the parent document ([#191](https://github.com/kennywillbe/pg2osync/issues/191)) ([ad72c29](https://github.com/kennywillbe/pg2osync/commit/ad72c29c9bc05b7e47828a082b47920be81bf205))
+* Helm readiness probe and PodDisruptionBudget ([#160](https://github.com/kennywillbe/pg2osync/issues/160)) ([8172a82](https://github.com/kennywillbe/pg2osync/commit/8172a8210b16c8264476d62edf89b7dbdcc1f22c))
+* load a directory of configs and validate them together ([#168](https://github.com/kennywillbe/pg2osync/issues/168)) ([ccd8427](https://github.com/kennywillbe/pg2osync/commit/ccd8427582586e0273b34c8967625f2244779974))
+* many-to-many children through a junction table ([#156](https://github.com/kennywillbe/pg2osync/issues/156)) ([2c5b2c5](https://github.com/kennywillbe/pg2osync/commit/2c5b2c59936a5d59b5008dde7a1f63732f785f42))
+* opt-in OpenTelemetry traces ([#167](https://github.com/kennywillbe/pg2osync/issues/167)) ([afdd8ff](https://github.com/kennywillbe/pg2osync/commit/afdd8ff10707b5e22ae5fe4e24e7b853f4bb10ad)), closes [#152](https://github.com/kennywillbe/pg2osync/issues/152)
+* reload the configuration without a restart ([#169](https://github.com/kennywillbe/pg2osync/issues/169)) ([ab2ad96](https://github.com/kennywillbe/pg2osync/commit/ab2ad9612402d57e6fede252ab5ebc48e889086e)), closes [#145](https://github.com/kennywillbe/pg2osync/issues/145)
+* require_alias refuses writes past the alias ([#158](https://github.com/kennywillbe/pg2osync/issues/158)) ([e6fe2a4](https://github.com/kennywillbe/pg2osync/commit/e6fe2a4b17fdca5065f90d1909285510dc94bc28))
+* retry a source that is unreachable at startup ([#197](https://github.com/kennywillbe/pg2osync/issues/197)) ([510b91f](https://github.com/kennywillbe/pg2osync/commit/510b91f217cc8759a2c090d34a7d6ac5ba7adeb0)), closes [#172](https://github.com/kennywillbe/pg2osync/issues/172)
+* run every configured source in one process ([#174](https://github.com/kennywillbe/pg2osync/issues/174)) ([99570b3](https://github.com/kennywillbe/pg2osync/commit/99570b3a7069623c0444c48687d3714aa887e55f))
+
+
+### Bug Fixes
+
+* a MySQL table removed on reload stops being decoded ([#200](https://github.com/kennywillbe/pg2osync/issues/200)) ([8c037e7](https://github.com/kennywillbe/pg2osync/commit/8c037e7230bb643cdeb7fb2210b1e6ba5248476f))
+* writes through the alias satisfy require_alias on Elasticsearch ([#196](https://github.com/kennywillbe/pg2osync/issues/196)) ([8dabf40](https://github.com/kennywillbe/pg2osync/commit/8dabf40b3c19c8e4f6f72ede48a4bf3bc09f2caf)), closes [#178](https://github.com/kennywillbe/pg2osync/issues/178)
+
 ## [1.4.0](https://github.com/kennywillbe/pg2osync/compare/v1.3.0...v1.4.0) (2026-08-30)
 
 
