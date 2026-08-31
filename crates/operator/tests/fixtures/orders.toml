@@ -1,0 +1,21 @@
+[source]
+publication = "pg2osync_pub"
+slot_name = "pg2osync_orders"
+url_env = "PG2OSYNC_ORDERS_URL"
+
+[target]
+url = "http://opensearch:9200"
+
+[metrics]
+bind = "0.0.0.0:9100"
+
+[sync.orders]
+exclude_columns = ["secret_note"]
+index = "orders"
+table = "public.orders"
+
+[sync.orders.transform]
+email = "redact"
+
+[[sync.orders.children]]
+table = "public.order_lines"

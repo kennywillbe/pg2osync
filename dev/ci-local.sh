@@ -33,7 +33,7 @@
 #   docs                 the book builds                       (docs.yml)
 #   pr-title             the title is a conventional commit    (pr-title.yml)
 #   audit                dependencies have no known advisories (audit.yml)
-#   compat-*             the nine compatibility cells and the
+#   compat-*             the ten compatibility cells and the
 #                        sink conformance kit                  (compat.yml)
 #
 # By default the e2e jobs use the shared dev stack (dev/docker-compose.yml plus
@@ -52,8 +52,9 @@
 # fails within seconds naming the container rather than hanging: readiness is
 # polled, and a container that is no longer running ends the wait.
 #
-# Tools: docker, helm, kubectl, mdbook, rustup/cargo, curl, python3; gh only
-# when --title is not given; cargo-audit is installed on demand.
+# Tools: docker, helm, kubectl, mdbook, rustup/cargo, curl, python3, and kind
+# for the operator cell; gh only when --title is not given; cargo-audit is
+# installed on demand.
 # shellcheck disable=SC2329
 # every job and probe below is reached by name from run_job, never literally
 set -euo pipefail
@@ -112,7 +113,7 @@ docker helm docs
 pr-title audit
 compat-postgres15 compat-timescaledb compat-supabase compat-elasticsearch
 compat-meilisearch compat-qdrant compat-conformance-kit compat-mysql84
-compat-mariadb106 compat-mariadb118"
+compat-mariadb106 compat-mariadb118 compat-operator"
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 note() { printf '  %s\n' "$*"; }
@@ -251,12 +252,12 @@ case "$MATRIX" in
   force) MATRIX_ON=1; MATRIX_REASON="--matrix" ;;
   never) MATRIX_ON=0; MATRIX_REASON="--no-matrix" ;;
   *)
-    if changed_matches '^(\.github/workflows/compat\.yml|dev/e2e-.*\.sh|crates/sink/.*|crates/core/src/(sink|testkit)\.rs)$'; then
+    if changed_matches '^(\.github/workflows/compat\.yml|dev/e2e-.*\.sh|crates/sink/.*|crates/core/src/(sink|testkit)\.rs|crates/operator/.*|deploy/operator/.*|Dockerfile)$'; then
       MATRIX_ON=1
-      MATRIX_REASON="compat.yml, dev/e2e-*.sh, a sink or the contract changed, so a pull request runs it"
+      MATRIX_REASON="compat.yml, dev/e2e-*.sh, a sink, the contract, the operator or the Dockerfile changed, so a pull request runs it"
     else
       MATRIX_ON=0
-      MATRIX_REASON="compat.yml, dev/e2e-*.sh, the sinks and the contract are unchanged, as on CI"
+      MATRIX_REASON="compat.yml, dev/e2e-*.sh, the sinks, the contract and the operator are unchanged, as on CI"
     fi ;;
 esac
 
@@ -699,12 +700,14 @@ job_docker() {
   # docker/build-push-action with push: false and no build args; its caches are
   # GitHub's and have no local equivalent.
   docker build --file Dockerfile --tag pg2osync:ci-local . || return 1
+  docker build --file Dockerfile --target operator --tag pg2osync-operator:ci-local . || return 1
 }
 
 job_helm() {
   helm lint deploy/helm/pg2osync || return 1
   helm template pg2osync deploy/helm/pg2osync --set config.sync.users.table=public.users || return 1
   kubectl kustomize deploy/kubernetes || return 1
+  kubectl kustomize deploy/operator || return 1
 }
 
 # -------------------------------------------------------------------- docs.yml
@@ -970,6 +973,17 @@ compat_mariadb() {
 job_compat_mariadb106() { compat_mariadb "$COMPAT_MARIADB_1"; }
 job_compat_mariadb118() { compat_mariadb "$COMPAT_MARIADB_2"; }
 
+# The one cell that brings its own cluster: it takes no container from the pool
+# and no port on this machine, so the only thing it needs from the run is a
+# cluster name nobody else is using.
+job_compat_operator() {
+  if ! command -v kind > /dev/null; then
+    echo "kind is missing: brew install kind, or see dev/e2e-operator.sh"
+    return 1
+  fi
+  KIND_CLUSTER=pg2osync-op-$RUN_ID ./dev/e2e-operator.sh || return 1
+}
+
 # ------------------------------------------------------------------------ main
 mkdir -p "$RUN_DIR"
 
@@ -1051,6 +1065,7 @@ compat-conformance-kit|sink conformance kit|conformance-kit
 compat-mysql84|MySQL 8.4 to OpenSearch|compat-mysql
 compat-mariadb106|MariaDB 10.6 to OpenSearch|compat-mariadb
 compat-mariadb118|MariaDB 11.8 to OpenSearch|compat-mariadb
+compat-operator|the operator on kind|compat-operator
 CELLS
 fi
 

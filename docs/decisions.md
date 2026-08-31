@@ -1380,6 +1380,67 @@ explainable is that a target is a document store with versions. Someone who
 needs a side effect per change has the database's own tools — LISTEN/NOTIFY, a
 trigger — or a CDC platform built to fan out.
 
+## The Kubernetes operator
+
+**A separate binary, a separate image, and no new dependency in the pipeline.**
+(#147.) `crates/operator` is the only place kube-rs and k8s-openapi appear;
+`pg2osync` links neither, because a binary that advertises running anywhere
+must not carry a Kubernetes client to run on a VM. The Dockerfile grew a second
+target rather than a second repository: the two share a builder stage, so a
+`Cargo.lock` the pipeline compiles and the operator does not is caught by the
+same build, and `cargo audit` covers both because both are workspace members.
+
+**The spec is the chart's `configs:` map, not a schema of its own.** The
+operator renders each entry to `<name>.toml` and runs `run --config-dir` over
+the directory, section for section in the order the chart's template emits
+them. So the sections are opaque objects in the CRD, with
+`x-kubernetes-preserve-unknown-fields`, and every option is validated by the
+pipeline that reads the file. Teaching the CRD the config tree would make the
+operator the second place an option has to be added and the first place a new
+one is silently dropped, and it would make moving a Helm release onto the
+operator a rewrite instead of a copy.
+
+**A credential in the spec is refused, not warned about.** Everywhere else an
+inline secret warns and works ([Secrets from the
+environment](#implementation-choices)); here it does not. A config file is
+readable by whoever can read the file, but a `Pg2osync` is readable by everyone
+with `get` on the resource and is what a GitOps repository holds, so `[source]
+url`, a password, an API key or a metrics token in a spec is a refusal with the
+`*_env` form named in `status.message`. The operator correspondingly has no
+verb on secrets at all: the kubelet resolves `envFrom`, so a bug in the
+controller cannot leak one.
+
+**Status reports the Deployment's readiness, and nothing per source.** The
+operator can see whether a replica is ready; it cannot see whether a source has
+halted without polling every pod's `/healthz/<name>` and copying the answer
+into an object that is stale the moment it is written. `/healthz/<name>` and
+`pg2osync_source_state` already answer that from the process that knows, so
+`status` carries `observedGeneration`, `ready` and how many sources were
+rendered, and points at them for the rest.
+
+**It owns Kubernetes objects; it does not own the source database.** Everything
+it creates carries an owner reference, so deletion is the API server's garbage
+collector and there is no cleanup path of the operator's own to get wrong. The
+replication slot is deliberately outside that: it lives in a database the
+operator has no credentials for, and it outlives the pipeline on purpose, so a
+resource deleted by accident resumes instead of replaying the table. There is
+therefore no finalizer — one that only logged would be a deletion that can hang
+in exchange for nothing — and dropping the slot stays the documented manual
+step it is for every other deployment shape.
+
+**Namespaced by default.** A `Role`, not a `ClusterRole`, and one controller
+per namespace. Watching every namespace from one process makes it a
+cluster-wide blast radius and needs cluster-admin to install; the cost of the
+other choice is a second operator for a second namespace, which is the cheaper
+mistake to make.
+
+**`v1alpha1`, and what it leaves out.** No leader election (one replica; while
+it is down the pipelines keep streaming and only reconciliation pauses), no
+admission webhook beyond the CRD schema, no cross-namespace secret reading, no
+operator-managed version upgrades. Each is a guarantee nobody has asked for
+yet, and an operator's API is the hardest thing in this repository to take
+back.
+
 ## Implementation choices
 
 **Hand-rolled metrics endpoint.** Six counters and one summary do not justify a

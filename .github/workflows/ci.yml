@@ -316,6 +316,16 @@ jobs:
           # layers instead, which is where the 10 minutes of dependency
           # build actually comes from.
           cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max' || '' }}
+      # The operator is a second target of the same Dockerfile, and it shares
+      # the builder stage: a Cargo.lock the pipeline image compiles fine and
+      # the operator does not is exactly what this catches.
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: operator
+          push: false
+          cache-from: type=gha
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max' || '' }}
 
   helm:
     name: helm chart lints
@@ -327,3 +337,4 @@ jobs:
       - run: helm lint deploy/helm/pg2osync
       - run: helm template pg2osync deploy/helm/pg2osync --set config.sync.users.table=public.users
       - run: kubectl kustomize deploy/kubernetes
+      - run: kubectl kustomize deploy/operator

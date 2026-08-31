@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pg2osync-operator
+  namespace: pg2osync
+  labels:
+    app.kubernetes.io/name: pg2osync-operator
+spec:
+  # One reconciler: there is no leader election, and two controllers writing
+  # the same objects is churn rather than availability. A restart re-lists and
+  # reconciles everything, so the cost of the single replica is a gap of
+  # seconds in reconciliation, never a stopped pipeline — the pods it created
+  # keep streaming while it is down.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pg2osync-operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pg2osync-operator
+    spec:
+      serviceAccountName: pg2osync-operator
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: operator
+          image: ghcr.io/kennywillbe/pg2osync-operator:1.4.0
+          args:
+            - run
+            # The version every pipeline pod runs. Pinned here rather than
+            # defaulted in the binary, so upgrading the pipelines is an edit
+            # somebody reviewed.
+            - --pipeline-image
+            - ghcr.io/kennywillbe/pg2osync:1.4.0
+          env:
+            - name: RUST_LOG
+              value: pg2osync_operator=info,kube=warn
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

@@ -121,3 +121,23 @@ jobs:
           # 10 GB of Actions cache is worth more to the jobs that run on every
           # pull request than to a build that happens once a release.
           cache-from: type=gha
+      # The operator, from the same Dockerfile and on the same tags: the
+      # manifests in deploy/operator pin both images to the release, so a
+      # version of one that has no matching other is an install that cannot
+      # come up.
+      - id: meta-operator
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}-operator
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          target: operator
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta-operator.outputs.tags }}
+          labels: ${{ steps.meta-operator.outputs.labels }}
+          cache-from: type=gha

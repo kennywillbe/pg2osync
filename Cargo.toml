@@ -8,6 +8,7 @@ members = [
     "crates/sink",
     "crates/engine",
     "crates/bin",
+    "crates/operator",
 ]
 
 [workspace.package]

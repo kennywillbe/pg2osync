@@ -53,7 +53,11 @@ consider zero commits and propose nothing.
 
 Watch the **Release** workflow afterwards. It builds static binaries for Linux
 and macOS on x86-64 and arm64, attaches them with checksums, and pushes
-`ghcr.io/kennywillbe/pg2osync` tagged with the version and with `major.minor`.
+`ghcr.io/kennywillbe/pg2osync` and `ghcr.io/kennywillbe/pg2osync-operator`,
+each tagged with the version and with `major.minor`. Both images come from the
+same Dockerfile and always ship together: `deploy/operator` pins both, so an
+operator release with no matching pipeline image is an install that cannot come
+up.
 The release body starts as the changelog entry release-please wrote; once the
 binaries are attached, the workflow appends GitHub's "What's Changed" pull
 request list under it, once.

@@ -79,7 +79,7 @@ scripts, a sink crate or the `Sink` contract, so the change that would break it
 is tested before the night it would be reported — and a sink change is answered
 by the cells that are the only witness of that target.
 
-`./dev/ci-local.sh` runs the same nine cells and that job on your machine, and
+`./dev/ci-local.sh` runs the same ten cells and that job on your machine, and
 runs them automatically for exactly the changes a pull request would;
 `--matrix` forces them. Each cell is a throwaway container on a port of its
 own — PostgreSQL 15433, OpenSearch 9201, Elasticsearch 9202, Meilisearch 7701,

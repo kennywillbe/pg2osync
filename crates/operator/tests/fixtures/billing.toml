@@ -1,0 +1,9 @@
+[source]
+url_env = "PG2OSYNC_BILLING_URL"
+
+[target]
+url = "http://opensearch:9200"
+
+[sync.invoices]
+index = "invoices"
+table = "public.invoices"
