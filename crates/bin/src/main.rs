@@ -2086,6 +2086,9 @@ async fn report_privileges(
     }
     if !pre.slot_exists && !pre.can_replicate {
         println!("  - the REPLICATION attribute is required to create a slot");
+        if let Some(service) = pre.service {
+            println!("    {}", service.replication_role_remedy());
+        }
     }
     println!("\nAsk a privileged role to run this once, then re-run validate:\n");
     for statement in pre.setup_sql(&cfg.source.publication, &cfg.source.slot_name, tables) {

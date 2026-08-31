@@ -89,6 +89,76 @@ jobs:
       - run: docker exec -i dev-postgres-1 psql -U postgres -d sourcedb < dev/seed.sql
       - run: ./dev/e2e-test.sh
 
+  # "PostgreSQL-derived" is a claim each service has to prove: the cells below
+  # run the same suite against the images that can be a plain container, so the
+  # equivalence argument in docs/compatibility.md rests on a run rather than on
+  # the wire protocol being the same. Neon and CockroachDB cannot be one — the
+  # first separates storage from compute, the second is wire-compatible but not
+  # replication-compatible — and are documented instead.
+  compat-derived:
+    name: ${{ matrix.name }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # TimescaleDB loads its extension through shared_preload_libraries,
+          # so this cell is a server with the extension in it, not a plain one.
+          - name: TimescaleDB 2.29.2 to OpenSearch 2.19.6
+            pg_image: timescale/timescaledb:2.29.2-pg17
+            pg_env: -e POSTGRES_USER=postgres
+            pg_flags: ""
+            pg_creates_db_as: ""
+          # Supabase's image creates its own roles as supabase_admin and fails
+          # to initialise when POSTGRES_USER names another one; it ships
+          # listen_addresses = localhost, which no published port can reach;
+          # and the database it creates belongs to supabase_admin, while
+          # publishing a table requires owning it.
+          - name: Supabase PostgreSQL 17.6 to OpenSearch 2.19.6
+            pg_image: supabase/postgres:17.6.1.167
+            pg_env: ""
+            pg_flags: -c listen_addresses=0.0.0.0
+            pg_creates_db_as: supabase_admin
+    services:
+      opensearch:
+        image: opensearchproject/opensearch:2.19.6
+        env:
+          discovery.type: single-node
+          DISABLE_SECURITY_PLUGIN: "true"
+          OPENSEARCH_JAVA_OPTS: -Xms512m -Xmx512m
+        ports: ["9200:9200"]
+        options: >-
+          --health-cmd "curl -s http://localhost:9200/_cluster/health | grep -q green"
+          --health-interval 10s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: pg2osync
+          path: target/release
+      - run: chmod +x target/release/pg2osync
+      - name: Start the derived PostgreSQL
+        run: |
+          docker run -d --name dev-postgres-1 -p 15432:5432 \
+            ${{ matrix.pg_env }} -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_DB=sourcedb ${{ matrix.pg_image }} ${{ matrix.pg_flags }} \
+            -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10
+          for _ in $(seq 1 90); do
+            docker exec dev-postgres-1 pg_isready -U postgres -d sourcedb && break
+            sleep 2
+          done
+      # A hosted project hands you a database your own role owns; an image
+      # that creates it as its own bootstrap role does not.
+      - name: Hand the database to the role the suite connects as
+        if: matrix.pg_creates_db_as != ''
+        run: |
+          docker exec dev-postgres-1 psql -U ${{ matrix.pg_creates_db_as }} \
+            -d postgres -c "ALTER DATABASE sourcedb OWNER TO postgres"
+      - run: docker exec -i dev-postgres-1 psql -U postgres -d sourcedb < dev/seed.sql
+      - run: ./dev/e2e-test.sh
+
   compat-elasticsearch:
     name: PostgreSQL 17 to Elasticsearch 8.19.20
     needs: build
@@ -306,7 +376,9 @@ jobs:
 
   report:
     name: file a nightly failure
-    needs: [build, compat-postgres, compat-elasticsearch, compat-meilisearch, compat-mysql, compat-mariadb]
+    needs:
+      [build, compat-postgres, compat-derived, compat-elasticsearch,
+       compat-meilisearch, compat-mysql, compat-mariadb]
     # A pull request already reports itself on the pull request; only the
     # scheduled run has nobody watching it.
     if: failure() && github.event_name == 'schedule'

@@ -74,6 +74,7 @@ not expressions) — if you need those, you want Kafka.
 | **PostgreSQL → OpenSearch** (logical replication) | ✅ full suite on every pull request (PostgreSQL 17, OpenSearch 2.19) |
 | PostgreSQL → Elasticsearch 8.x | ✅ full suite nightly, [one known gap](docs/compatibility.md) |
 | PostgreSQL → Meilisearch 1.x | ✅ smoke suite nightly (file-based checkpoint), [one known gap](docs/compatibility.md) |
+| PostgreSQL-derived services | ✅ TimescaleDB and Supabase's image run the full suite nightly (plain tables; hypertables are not published); RDS, Aurora and Neon speak the same pgoutput and `validate` names each one's switch — CockroachDB is wire-compatible, not replication-compatible: [what is proven and what is argued](docs/compatibility.md#postgresql-derived-services) |
 | **MySQL 8.0 / MariaDB 10.6+ → any of the above** | ✅ MySQL 8.0 on every pull request; MySQL 8.4 and MariaDB 10.6/11.8 nightly |
 | Consistent initial load, then live streaming | ✅ |
 | Crash recovery with no data loss (`kill -9` safe) | ✅ verified by the e2e suite |

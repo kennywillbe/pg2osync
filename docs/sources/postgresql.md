@@ -7,7 +7,9 @@ for real-time change capture with a consistent-snapshot backfill.
 
 - PostgreSQL 15 or newer — 17 runs on every pull request and 15, the floor,
   runs nightly (see [compatibility](../compatibility.md))
-- `wal_level = logical` in `postgresql.conf` (restart required)
+- `wal_level = logical` in `postgresql.conf` (restart required) — a managed
+  service has its own name for that switch, and `validate` names it for you;
+  see [PostgreSQL-derived services](../compatibility.md#postgresql-derived-services)
 - Sync user needs:
   - `REPLICATION` privilege (or superuser)
   - `SELECT` on all synced tables (used by backfill and child queries)

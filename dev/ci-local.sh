@@ -32,7 +32,7 @@
 #   docs                 the book builds                       (docs.yml)
 #   pr-title             the title is a conventional commit    (pr-title.yml)
 #   audit                dependencies have no known advisories (audit.yml)
-#   compat-*             the six compatibility cells           (compat.yml)
+#   compat-*             the eight compatibility cells         (compat.yml)
 #
 # By default the e2e jobs use the shared dev stack (dev/docker-compose.yml plus
 # the mysql-test container): nothing to pull, nothing to start, and the suites
@@ -101,8 +101,8 @@ PR_TITLE_GIVEN=0
 
 ALL_JOBS="lint msrv e2e-postgres e2e-mysql e2e-multi-source docker helm docs
 pr-title audit
-compat-postgres15 compat-elasticsearch compat-meilisearch compat-mysql84
-compat-mariadb106 compat-mariadb118"
+compat-postgres15 compat-timescaledb compat-supabase compat-elasticsearch
+compat-meilisearch compat-mysql84 compat-mariadb106 compat-mariadb118"
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 note() { printf '  %s\n' "$*"; }
@@ -146,6 +146,8 @@ ADVISORY_JOBS=$(awk '/^  [a-z0-9-]+:/ { job = substr($1, 1, length($1) - 1) }
 
 COMPAT_PG15_IMAGE=$(first_match 's|^ *pg_image: \(postgres:[^ ]*\)$|\1|p' "$COMPAT_WF")
 COMPAT_PG_IMAGE=$(first_match 's|.*POSTGRES_DB=sourcedb \(postgres:[^ ]*\).*|\1|p' "$COMPAT_WF")
+COMPAT_TIMESCALE_IMAGE=$(first_match 's|^ *pg_image: \(timescale/timescaledb:[^ ]*\)$|\1|p' "$COMPAT_WF")
+COMPAT_SUPABASE_IMAGE=$(first_match 's|^ *pg_image: \(supabase/postgres:[^ ]*\)$|\1|p' "$COMPAT_WF")
 COMPAT_OS_IMAGE=$(first_match 's|^ *image: \(opensearchproject/opensearch:[^ ]*\)$|\1|p' "$COMPAT_WF")
 COMPAT_ES_IMAGE=$(first_match 's|^ *image: \(docker.elastic.co/elasticsearch/elasticsearch:[^ ]*\)$|\1|p' "$COMPAT_WF")
 COMPAT_MEILI_IMAGE=$(first_match 's|^ *image: \(getmeili/meilisearch:[^ ]*\)$|\1|p' "$COMPAT_WF")
@@ -154,7 +156,8 @@ COMPAT_MARIADB_1=$(sed -n 's|^ *image: \(mariadb:[^ ]*\)$|\1|p' "$COMPAT_WF" | s
 COMPAT_MARIADB_2=$(sed -n 's|^ *image: \(mariadb:[^ ]*\)$|\1|p' "$COMPAT_WF" | sed -n 2p)
 
 for name in PG_IMAGE OS_IMAGE MYSQL_IMAGE MSRV CARGO_MSRV MDBOOK_VERSION \
-  TITLE_PATTERN AUDIT_CMD COMPAT_PG15_IMAGE COMPAT_PG_IMAGE COMPAT_OS_IMAGE \
+  TITLE_PATTERN AUDIT_CMD COMPAT_PG15_IMAGE COMPAT_PG_IMAGE \
+  COMPAT_TIMESCALE_IMAGE COMPAT_SUPABASE_IMAGE COMPAT_OS_IMAGE \
   COMPAT_ES_IMAGE COMPAT_MEILI_IMAGE COMPAT_MYSQL_IMAGE COMPAT_MARIADB_1 \
   COMPAT_MARIADB_2; do
   eval "value=\${$name}"
@@ -721,13 +724,28 @@ cell_opensearch() {
 
 # The suite needs logical replication from the first connection and a service
 # container takes no server flags, so compat.yml starts this one by hand too.
+# $2 and $3 are what a derived image insists on, as compat.yml's matrix rows
+# spell them out: Supabase creates its roles as supabase_admin and will not
+# initialise when POSTGRES_USER names another one, and it ships
+# listen_addresses = localhost, which no published port can reach.
 cell_postgres() {
+  local image=$1 env_args=${2--e POSTGRES_USER=postgres} flags=${3-} creates_db_as=${4-}
+  # shellcheck disable=SC2086
   docker run -d --name "$CELL_PG" -p "$CELL_PG_PORT:5432" \
-    -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
-    -e POSTGRES_DB=sourcedb "$1" \
+    $env_args -e POSTGRES_PASSWORD=postgres \
+    -e POSTGRES_DB=sourcedb "$image" $flags \
     -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10 > /dev/null || return 1
   CELL_PG_PORT=$(published_port "$CELL_PG" 5432)
-  wait_for_container "$CELL_PG" "PostgreSQL" 60 pg_ready "$CELL_PG" || return 1
+  # a derived image carries a whole platform's bootstrap, so it takes longer
+  # than a plain postgres to answer
+  wait_for_container "$CELL_PG" "PostgreSQL" 90 pg_ready "$CELL_PG" || return 1
+  # A hosted project hands you a database your own role owns; an image that
+  # creates it as its own bootstrap role does not, and publishing a table
+  # requires owning it.
+  if [ -n "$creates_db_as" ]; then
+    docker exec "$CELL_PG" psql -U "$creates_db_as" -d postgres \
+      -c "ALTER DATABASE sourcedb OWNER TO postgres" > /dev/null || return 1
+  fi
   docker exec -i "$CELL_PG" psql -U postgres -d sourcedb < dev/seed.sql || return 1
 }
 
@@ -760,6 +778,25 @@ job_compat_postgres15() {
   PG_CONTAINER=$CELL_PG PG_PORT=$CELL_PG_PORT \
     OS_URL=$CELL_OS_URL E2E_LOG=$RUN_DIR/compat-postgres15-pipeline.log \
     ./dev/e2e-test.sh || return 1
+}
+
+# Same suite, same flags: what the cell proves is that a derived server
+# decodes as the plain one does, so nothing here may be special-cased.
+compat_derived() {
+  cell_start "$CELL_PG" "$CELL_OS" || return 1
+  cell_opensearch "$COMPAT_OS_IMAGE" || return 1
+  cell_postgres "$1" "$2" "$3" "$4" || return 1
+  PG_CONTAINER=$CELL_PG PG_PORT=$CELL_PG_PORT \
+    OS_URL=$CELL_OS_URL E2E_LOG=$RUN_DIR/$5-pipeline.log \
+    ./dev/e2e-test.sh || return 1
+}
+
+job_compat_timescaledb() {
+  compat_derived "$COMPAT_TIMESCALE_IMAGE" "-e POSTGRES_USER=postgres" "" "" compat-timescaledb
+}
+
+job_compat_supabase() {
+  compat_derived "$COMPAT_SUPABASE_IMAGE" "" "-c listen_addresses=0.0.0.0" supabase_admin compat-supabase
 }
 
 job_compat_elasticsearch() {
@@ -855,7 +892,8 @@ note "mdbook      $MDBOOK_VERSION ($DOCS_WF)"
 note "audit       $AUDIT_CMD ($AUDIT_WF) — $AUDIT_REASON"
 note "matrix      $([ "$MATRIX_ON" = 1 ] && echo on || echo off) — $MATRIX_REASON"
 if [ "$MATRIX_ON" = 1 ]; then
-  note "  images    $COMPAT_PG15_IMAGE, $COMPAT_PG_IMAGE, $COMPAT_ES_IMAGE, $COMPAT_MEILI_IMAGE,"
+  note "  images    $COMPAT_PG15_IMAGE, $COMPAT_PG_IMAGE, $COMPAT_TIMESCALE_IMAGE,"
+  note "            $COMPAT_SUPABASE_IMAGE, $COMPAT_ES_IMAGE, $COMPAT_MEILI_IMAGE,"
   note "            $COMPAT_MYSQL_IMAGE, $COMPAT_MARIADB_1, $COMPAT_MARIADB_2"
   if [ "$ISOLATED" = 1 ]; then
     note "  ports     assigned by Docker"
@@ -891,6 +929,8 @@ if [ "$MATRIX_ON" = 1 ] && [ "$FAST" = 0 ]; then
   # slug, title, and the compat.yml job the advisory list is keyed by
   run_cells <<CELLS
 compat-postgres15|PostgreSQL 15 to OpenSearch|compat-postgres
+compat-timescaledb|TimescaleDB to OpenSearch|compat-derived
+compat-supabase|Supabase PostgreSQL to OpenSearch|compat-derived
 compat-elasticsearch|PostgreSQL 17 to Elasticsearch|compat-elasticsearch
 compat-meilisearch|PostgreSQL 17 to Meilisearch|compat-meilisearch
 compat-mysql84|MySQL 8.4 to OpenSearch|compat-mysql
