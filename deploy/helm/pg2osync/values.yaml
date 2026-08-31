@@ -10,6 +10,8 @@ fullnameOverride: ""
 
 # The pipeline configuration, rendered into a ConfigMap as pg2osync.toml.
 # Credentials belong in `secrets` or `existingSecret`, never here.
+#
+# For several source databases in one process, use `configs` below instead.
 config:
   source:
     url_env: PG2OSYNC_SOURCE_URL
@@ -39,11 +41,62 @@ config:
 # tree cannot express, such as repeated [[sync.x.children]] blocks.
 extraConfig: ""
 
+# Several source databases in one process. Each entry is a whole config tree,
+# in the shape of `config` above, rendered into the same ConfigMap as
+# `<name>.toml`; the container then runs `run --config-dir /etc/pg2osync` and
+# gives every file a pipeline of its own. The entry's name is the source's,
+# unless its `source.name` says otherwise — it labels every metric, answers
+# /healthz/<name> and is what `--source` takes.
+#
+# `config` and `configs` are alternatives: leave `config.sync` empty when using
+# this, or the render fails rather than silently ignoring one of them.
+#
+# Every file needs a slot_name (PostgreSQL) or server_id (MySQL) of its own:
+# the checkpoint is bound to the stream, and two files naming one slot resume
+# from each other's position. pg2osync refuses that at startup.
+#
+# [metrics], [api] and [log] describe the process rather than a source, so one
+# process opens one metrics port whatever the files say. Put them in one entry,
+# or the same in all of them; a file that leaves them out takes what the others
+# declare, and two files declaring them differently are refused.
+#
+# Per-entry raw TOML goes under that entry's own `extraConfig` key.
+configs: {}
+#  orders:
+#    source:
+#      url_env: PG2OSYNC_ORDERS_URL
+#      slot_name: pg2osync_orders
+#      publication: pg2osync_pub
+#    target:
+#      url: http://opensearch:9200
+#    metrics:
+#      bind: 0.0.0.0:9100
+#    sync:
+#      orders:
+#        table: public.orders
+#        index: orders
+#  billing:
+#    source:
+#      url_env: PG2OSYNC_BILLING_URL
+#      slot_name: pg2osync_billing
+#      publication: pg2osync_pub
+#    target:
+#      url: http://opensearch:9200
+#    sync:
+#      invoices:
+#        table: public.invoices
+#        index: invoices
+
 # Rendered into a Secret and exposed as environment variables. Prefer
 # existingSecret in production so credentials never enter values.yaml.
+#
+# One Secret serves the whole pod: with `configs`, add one key per file, named
+# by the `url_env` (and `password_env`) that file reads.
 secrets: {}
 #  PG2OSYNC_SOURCE_URL: postgres://user:pass@postgres:5432/appdb
 #  PG2OSYNC_TARGET_PASSWORD: changeme
+#  PG2OSYNC_ORDERS_URL: postgres://user:pass@orders-db:5432/appdb
+#  PG2OSYNC_BILLING_URL: postgres://user:pass@billing-db:5432/appdb
 
 # Name of a Secret that already holds the same keys (External Secrets, Vault,
 # SOPS). Takes precedence over `secrets`.
@@ -53,10 +106,11 @@ env:
   RUST_LOG: pg2osync=info
 extraEnv: []
 
-# Entrypoint and arguments. Empty means the image's own
-# `pg2osync run -c /etc/pg2osync/pg2osync.toml`. Override both when the
-# credentials arrive as a file a shell has to source first, as with the Vault
-# Agent Injector; see docs/deployment.md.
+# Entrypoint and arguments. Empty means `pg2osync run -c
+# /etc/pg2osync/pg2osync.toml`, or `pg2osync run --config-dir /etc/pg2osync`
+# when `configs` is set. Override both when the credentials arrive as a file a
+# shell has to source first, as with the Vault Agent Injector; see
+# docs/deployment.md.
 command: []
 args: []
 
@@ -201,4 +255,5 @@ tolerations: []
 affinity: {}
 podAnnotations: {}
 podLabels: {}
+# One budget for the whole pod: every source drains within it, not each.
 terminationGracePeriodSeconds: 30

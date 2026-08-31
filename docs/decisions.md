@@ -948,6 +948,17 @@ than before the listener opens, since MySQL cannot render a position until it
 has read the binlog prefix off the server; one that has not registered yet
 answers 503 rather than being mistaken for a name that does not exist.
 
+The subcommands split in two on the same question. `run`, `bootstrap`,
+`validate` and `status` describe or act on the whole set, so a directory is
+every source in it and `--source` narrows to one. Everything else —
+`resnapshot`, `reindex`, `switch-alias`, `reconcile`, `drop-slot`, `setup-sql`,
+`rejects` — changes what one source owns, and a directory does not say which,
+so it is refused until one is named. Acting on the first file would be a guess,
+and looping over all of them would make `reconcile --delete` and `drop-slot`
+thirty times as destructive as the operator asked for. `init` takes no
+directory at all: it writes the first config, and there is no set yet to write
+into.
+
 A halted source is a state, not an exit. One source failing — a permanent
 rejection, an exhausted quarantine, a `reconnect_max` run out — is logged
 against its name, sets its state and leaves the others streaming; the process

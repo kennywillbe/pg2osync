@@ -1,11 +1,58 @@
 # Deployment
 
 pg2osync is a single process with no local state (except the Meilisearch
-checkpoint file). Run one instance per replication slot.
+checkpoint file). One process can serve one source database or thirty; what it
+must never serve twice is one replication slot.
 
-> **One instance per slot.** Two processes streaming the same PostgreSQL slot
-> fight over its position and undo each other's progress. To scale, split
-> tables across instances, each with its own `slot_name` and `publication`.
+> **One slot, one stream, one checkpoint.** Two processes streaming the same
+> PostgreSQL slot fight over its position and undo each other's progress, and
+> two configs naming the same `slot_name` share one checkpoint document
+> wherever they run. Everything below is about which process runs what;
+> nothing below changes that line.
+
+## Scaling: one process, many sources, or many processes
+
+There are two ways to grow, and they answer different questions.
+
+**More sources, one process.** Put one config file per source database in a
+directory and run `pg2osync run --config-dir /etc/pg2osync`. Each file gets a
+pipeline of its own — its own slot, sink, engine, checkpoint, retry policy and
+initial load — and what they share is the process: one metrics endpoint, one
+`/synced`, one log stream, one set of limits, one thing to probe and page on.
+Thirty tenant databases that are individually almost idle are the case this
+exists for: thirty processes cost thirty scrape targets, thirty probes and
+thirty pod-sized floors of memory for work that fits in one.
+
+What they still do not share is anything a stream is identified by. Every file
+needs its own `slot_name` (PostgreSQL) or `server_id` (MySQL); files copied
+from one template are refused at startup, naming the checkpoint document they
+would have collided in. One source failing is a state, not an exit: it is
+logged against its name, `/healthz/<name>` turns 503 and
+`pg2osync_source_state{state="halted"}` goes to 1 while the others keep
+streaming — see [operations](operations.md#health). The process exits non-zero
+only when every source has halted.
+
+The cost is what a shared process always costs. The sum of every `[engine]
+write_concurrency` and `batch_size` in the directory is what the pod has to be
+sized for, and there is deliberately no cap across the files: a shared budget
+would make every source wait on the slowest target of any other. One
+`terminationGracePeriodSeconds` covers the whole drain, not each source. A
+restart — a node drain, a rollout, an OOM — restarts all of them, and each
+resumes from its own checkpoint.
+
+**More processes.** Split the files across releases when you want failure or
+scheduling to be separate: a source whose target is on a different cluster, a
+tenant that must not share a memory limit with the others, or simply more CPU
+than one pod is given. Nothing changes in the configs — the same files, in a
+different directory — because a file is a source wherever it runs.
+
+**Not: more replicas.** `replicas: 2` is not twice the throughput, it is two
+processes on one slot. Where one pipeline is genuinely too slow for one table,
+split the tables across configs with a `slot_name` each; the source's write
+rate, not pg2osync, is what that trades against.
+
+One source, one file, `run -c pg2osync.toml`, remains exactly what it was: the
+directory is an option, not a migration.
 
 ## Container image
 
@@ -74,6 +121,7 @@ Key values:
 | Value | Default | Notes |
 |---|---|---|
 | `config` | see `values.yaml` | Rendered into `pg2osync.toml` in a ConfigMap |
+| `configs` | `{}` | One entry per source database, each a whole `config` tree; rendered as `<name>.toml` and run with `--config-dir` |
 | `extraConfig` | `""` | Raw TOML appended — use it for `[[sync.x.children]]` |
 | `secrets` | `{}` | Rendered into a Secret; dev convenience only |
 | `existingSecret` | `""` | Name of a Secret you manage; wins over `secrets` |
@@ -105,6 +153,53 @@ extraConfig: |
   foreign_key = "customer_id"
 ```
 
+### Several sources in one release
+
+`configs` replaces `config` with a map of them. Each entry is rendered into the
+same ConfigMap as `<name>.toml`, and the container runs
+`run --config-dir /etc/pg2osync`:
+
+```yaml
+configs:
+  orders:
+    source:
+      url_env: PG2OSYNC_ORDERS_URL
+      slot_name: pg2osync_orders      # one slot per file, always
+      publication: pg2osync_pub
+    target:
+      url: http://opensearch.search.svc:9200
+    metrics:
+      bind: 0.0.0.0:9100              # the process's, not this source's
+    sync:
+      orders:
+        table: public.orders
+        index: orders
+  billing:
+    source:
+      url_env: PG2OSYNC_BILLING_URL
+      slot_name: pg2osync_billing
+      publication: pg2osync_pub
+    target:
+      url: http://opensearch.search.svc:9200
+    sync:
+      invoices:
+        table: public.invoices
+        index: invoices
+
+existingSecret: pg2osync-credentials  # one Secret, one key per url_env
+```
+
+The entry's name is the source's name: it labels every metric, answers
+`/healthz/orders`, and is what `--source orders` takes. `[metrics]`, `[api]`
+and `[log]` describe the process rather than a source, so put them in one entry
+or the same in all of them — a file that leaves them out takes what the others
+declare, and two files declaring them differently are refused at startup.
+Per-entry raw TOML goes under that entry's own `extraConfig` key.
+
+`config` and `configs` are alternatives: setting tables under both fails the
+render rather than quietly ignoring one. The checksum that rolls the pod is
+taken over the whole set, so adding a file is a rollout.
+
 Verify before installing:
 
 ```sh
@@ -127,7 +222,7 @@ What they set up:
 |---|---|
 | `namespace.yaml` | `pg2osync` namespace |
 | `secret.yaml` | connection URL and target password as environment variables |
-| `configmap.yaml` | `pg2osync.toml`, mounted read-only |
+| `configmap.yaml` | `pg2osync.toml`, mounted read-only — one key per source, with `run --config-dir` for several |
 | `deployment.yaml` | one replica, `Recreate` strategy, non-root, read-only rootfs |
 | `service.yaml` | headless service exposing the metrics port |
 | `servicemonitor.yaml` | Prometheus Operator scrape config (optional) |
@@ -594,7 +689,8 @@ load.
 
 ## Operational checklist
 
-- [ ] One instance per slot, and the slot name is unique per environment
+- [ ] One process per slot, and the slot name is unique per environment — a
+      directory of configs is fine, two of them naming one slot is not
 - [ ] Credentials come from the environment, not from the config file
 - [ ] `[metrics] bind` reachable by your scraper, and lag is alerted on
 - [ ] Disk alert on the source: an inactive slot retains WAL indefinitely
