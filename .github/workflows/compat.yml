@@ -19,6 +19,11 @@ on:
       - "crates/sink/**"
       - "crates/core/src/sink.rs"
       - "crates/core/src/testkit.rs"
+      # The operator cell is the only place a Pg2osync is reconciled against a
+      # real API server, and the manifests are what a cluster installs.
+      - "crates/operator/**"
+      - "deploy/operator/**"
+      - "Dockerfile"
 
 permissions:
   contents: read
@@ -478,12 +483,33 @@ jobs:
         env:
           MYSQL_CLIENT: mariadb
 
+  # The operator, against a real API server. It needs no prebuilt binary — it
+  # builds both images and loads them into a kind cluster — and it is the
+  # heaviest cell here, which is why it lives in the nightly matrix rather than
+  # on every pull request.
+  compat-operator:
+    name: the operator on kind
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      # The binary and nothing else: the cluster, its node image and everything
+      # in it belong to the suite, so the same command reproduces the cell on a
+      # laptop.
+      - name: Install kind
+        run: |
+          sudo curl -sSLo /usr/local/bin/kind \
+            https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
+          sudo chmod +x /usr/local/bin/kind
+          kind version
+      - run: ./dev/e2e-operator.sh
+
   report:
     name: file a nightly failure
     needs:
       [build, compat-postgres, compat-derived, compat-elasticsearch,
        compat-meilisearch, compat-qdrant, conformance-kit, compat-mysql,
-       compat-mariadb]
+       compat-mariadb, compat-operator]
     # A pull request already reports itself on the pull request; only the
     # scheduled run has nobody watching it.
     if: failure() && github.event_name == 'schedule'

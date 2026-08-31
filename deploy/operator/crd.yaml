@@ -1,0 +1,168 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: pg2osyncs.pg2osync.io
+spec:
+  group: pg2osync.io
+  names:
+    kind: Pg2osync
+    plural: pg2osyncs
+    shortNames:
+    - p2o
+    singular: pg2osync
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.ready
+      name: Ready
+      type: string
+    - jsonPath: .status.sources
+      name: Sources
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for Pg2osyncSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              config:
+                description: One source database, rendered as `pg2osync.toml`.
+                nullable: true
+                properties:
+                  api:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                  engine:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                  extraConfig:
+                    description: |-
+                      Raw TOML appended to this file, for constructs the tree cannot express
+                      — repeated `[[sync.x.children]]` blocks above all.
+                    nullable: true
+                    type: string
+                  log:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                  metrics:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                  source:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                  sync:
+                    description: One entry per table, keyed the way `[sync.<key>]` is keyed.
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                  target:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                type: object
+              configs:
+                additionalProperties:
+                  description: One config file's tree, in the shape of one entry of the chart's `configs`.
+                  properties:
+                    api:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    engine:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    extraConfig:
+                      description: |-
+                        Raw TOML appended to this file, for constructs the tree cannot express
+                        — repeated `[[sync.x.children]]` blocks above all.
+                      nullable: true
+                      type: string
+                    log:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    metrics:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    source:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    sync:
+                      description: One entry per table, keyed the way `[sync.<key>]` is keyed.
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    target:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                  type: object
+                description: |-
+                  Several source databases in one process, each rendered as
+                  `<name>.toml`. Alternative to `config`, never both.
+                nullable: true
+                type: object
+              env:
+                additionalProperties:
+                  type: string
+                description: Plain environment variables — never credentials.
+                type: object
+              image:
+                description: |-
+                  Overrides the image the operator was started with, for a tenant pinned
+                  to another version.
+                nullable: true
+                type: string
+              reloadOnChange:
+                default: restart
+                description: What a change to the rendered config does to the running pod.
+                enum:
+                - restart
+                - signal
+                type: string
+              secretRefs:
+                description: |-
+                  Secrets in this namespace whose keys become environment variables. This
+                  is the only way credentials reach the pipeline: a password written into
+                  the spec is refused.
+                items:
+                  type: string
+                type: array
+              serviceMonitor:
+                default: false
+                description: |-
+                  Ask Prometheus to scrape this pipeline. Ignored, with a log line, in a
+                  cluster without prometheus-operator.
+                type: boolean
+            type: object
+          status:
+            nullable: true
+            properties:
+              message:
+                description: Why the pipeline is not ready, or why the spec was refused.
+                nullable: true
+                type: string
+              observedGeneration:
+                description: The `metadata.generation` this status describes.
+                format: int64
+                nullable: true
+                type: integer
+              ready:
+                description: |-
+                  The Deployment has its replica ready. This is what the operator can
+                  see; per-source health is `/healthz/<name>` on the pod.
+                type: boolean
+              sources:
+                description: How many sources the rendered config carries.
+                format: int32
+                type: integer
+            required:
+            - ready
+            - sources
+            type: object
+        required:
+        - spec
+        title: Pg2osync
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

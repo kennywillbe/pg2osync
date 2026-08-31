@@ -240,6 +240,15 @@ Before applying either variant:
 4. Pin the image tag to a release, not `latest`, so a restart cannot silently
    change versions.
 
+### With an operator instead
+
+Both variants above describe one deployment, edited by hand. Where there are
+many source databases — a tenant per database, each arriving and leaving on its
+own schedule — the [Kubernetes operator](operator.md) makes adding one a
+`Pg2osync` object, and reconciles the ConfigMap, Deployment and ServiceMonitor
+this page assembles. It renders the same files from the same tree, so a chart
+release moves onto it by copying `configs:`.
+
 ### Probes
 
 `replicas: 1` plus `strategy: Recreate` prevents two instances from briefly

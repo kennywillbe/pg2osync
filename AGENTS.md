@@ -91,7 +91,7 @@ What it covers, job by job:
 | `the book builds` | `docs.yml` |
 | `the title is a conventional commit` | `pr-title.yml` |
 | `dependencies have no known advisories` | `audit.yml`, when a Cargo file moved |
-| the nine compatibility cells and `sink conformance kit` | `compat.yml`, when it, `dev/e2e-*.sh`, a sink crate or the `Sink` contract changed |
+| the ten compatibility cells and `sink conformance kit` | `compat.yml`, when it, `dev/e2e-*.sh`, a sink crate, the `Sink` contract, the operator or the `Dockerfile` changed |
 
 The cell `compat.yml` marks `continue-on-error` is reported as advisory (`!`)
 here too: a known gap being tracked does not make the run red.
@@ -102,7 +102,7 @@ second run waits. `--isolated` instead gives the run throwaway containers of
 its own, `pg2osync-ci-<run id>-*`, on ports Docker assigns — it takes no lock,
 never touches the dev stack, and is how you run beside someone else's run. An
 8 GB Docker VM fits about two isolated runs next to the dev stack. Because each
-cell there is a namespace of its own, an isolated run also takes the nine
+cell there is a namespace of its own, an isolated run also takes the ten
 compatibility cells two at a time (`--jobs <n>`), which halves the matrix.
 Every run prints its mode and run id first, and logs land in
 `/tmp/pg2osync-ci-local/<run id>`, one file per job plus the pipeline log of
@@ -116,8 +116,9 @@ the image build and the matrix — it is a quick loop while you work, **not**
 the definition of done.
 
 Tools it needs: Docker, `helm`, `kubectl`, `mdbook`, `rustup`/`cargo`, `curl`,
-`python3`. `gh` is optional (only to read the title of an existing pull
-request); `cargo-audit` and a missing MSRV toolchain are installed on demand.
+`python3`, and `kind` for the operator cell. `gh` is optional (only to read
+the title of an existing pull request); `cargo-audit` and a missing MSRV
+toolchain are installed on demand.
 
 Every bug fix ships with a regression test that fails without the fix. For
 protocol decoders, that means a byte-level test vector.

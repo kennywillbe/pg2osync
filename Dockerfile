@@ -16,13 +16,14 @@ COPY crates/source-mysql/Cargo.toml crates/source-mysql/
 COPY crates/sink/Cargo.toml crates/sink/
 COPY crates/engine/Cargo.toml crates/engine/
 COPY crates/bin/Cargo.toml crates/bin/
+COPY crates/operator/Cargo.toml crates/operator/
 # BuildKit cache mounts survive the layer cache: when a Cargo.lock change
 # invalidates this layer, the dependencies already compiled are still in the
 # mount and only what actually changed is rebuilt.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
     mkdir -p crates/core/src crates/tls/src crates/source/src crates/source-mysql/src \
-             crates/sink/src crates/engine/src crates/bin/src \
+             crates/sink/src crates/engine/src crates/bin/src crates/operator/src \
     && echo "" > crates/core/src/lib.rs \
     && echo "" > crates/tls/src/lib.rs \
     && echo "" > crates/source/src/lib.rs \
@@ -30,6 +31,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     && echo "" > crates/sink/src/lib.rs \
     && echo "" > crates/engine/src/lib.rs \
     && echo "fn main() {}" > crates/bin/src/main.rs \
+    && echo "fn main() {}" > crates/operator/src/main.rs \
     && cargo build --release --locked -p pg2osync \
     && rm -rf crates/*/src
 
@@ -45,7 +47,36 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     && strip target/release/pg2osync \
     && cp target/release/pg2osync /build/pg2osync
 
-FROM alpine:3.24
+# The Kubernetes operator, `--target operator`. A stage of its own rather than
+# a second binary in the image above: kube-rs and k8s-openapi are the
+# operator's dependencies, and a pipeline that runs outside Kubernetes must not
+# carry them. The pipeline image is unaffected because nothing in the default
+# target reaches this stage.
+FROM builder AS operator-builder
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    cargo build --release --locked -p pg2osync-operator \
+    && strip target/release/pg2osync-operator \
+    && cp target/release/pg2osync-operator /build/pg2osync-operator
+
+FROM alpine:3.24 AS operator
+RUN apk add --no-cache ca-certificates tzdata \
+    && adduser -D -u 10001 pg2osync
+COPY LICENSE /usr/share/licenses/pg2osync/LICENSE
+COPY --from=operator-builder /build/pg2osync-operator /usr/local/bin/pg2osync-operator
+
+LABEL org.opencontainers.image.title="pg2osync-operator" \
+      org.opencontainers.image.description="Kubernetes operator reconciling Pg2osync resources into pipelines" \
+      org.opencontainers.image.source="https://github.com/kennywillbe/pg2osync" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
+USER 10001:10001
+# No CMD: the pipeline image the operator deploys is pinned by its own
+# Deployment's args, so the container is never useful without them.
+ENTRYPOINT ["pg2osync-operator"]
+
+# Last, so a build with no --target is still the pipeline image.
+FROM alpine:3.24 AS pipeline
 RUN apk add --no-cache ca-certificates tzdata \
     && adduser -D -u 10001 pg2osync
 COPY LICENSE /usr/share/licenses/pg2osync/LICENSE

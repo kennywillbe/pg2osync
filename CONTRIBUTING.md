@@ -38,9 +38,10 @@ OpenSearch`, `e2e MySQL to OpenSearch`, `e2e several sources in one process`
 health and isolation are proved), `e2e PostgreSQL to pgvector`, the container
 image build, the helm
 lints, the book (`docs.yml`), your pull request title (`pr-title.yml`),
-`cargo audit` when a Cargo file moved, and the nine compatibility cells when
-CI would run them — that is, when you touched `.github/workflows/compat.yml`
-or `dev/e2e-*.sh`. `--matrix` runs those cells anyway; `--no-matrix` skips
+`cargo audit` when a Cargo file moved, and the ten compatibility cells when
+CI would run them — that is, when you touched `.github/workflows/compat.yml`,
+`dev/e2e-*.sh`, a sink, the `Sink` contract, the operator or the `Dockerfile`.
+`--matrix` runs those cells anyway; `--no-matrix` skips
 them, which is worth it only when you know they cannot be affected. They are
 throwaway containers on ports of their own (PostgreSQL 15433, OpenSearch 9201,
 Elasticsearch 9202, Meilisearch 7701, Qdrant 6334, MySQL/MariaDB 13307), so the
@@ -70,7 +71,7 @@ CI seeds its service containers and removed when the job ends; the pipelines
 the suites start get a block of localhost ports of their own too, because they
 run on your machine rather than in a container. Such a run takes no lock and
 leaves the dev stack alone, so it can go beside a shared run or another
-isolated one. It also runs the nine compatibility cells two at a time
+isolated one. It also runs the ten compatibility cells two at a time
 rather than one after the other, because each of them now has containers and
 ports of its own; `--jobs <n>` sets how many, and more than two is what a
 larger Docker VM buys you. A cell measures about 1 GB — 0.9 of it OpenSearch

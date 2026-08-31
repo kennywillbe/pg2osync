@@ -1,0 +1,15 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# The definition is cluster-scoped and generated: regenerate it with
+# `cargo run -p pg2osync-operator -- crd > deploy/operator/crd.yaml`, which a
+# unit test also asserts.
+resources:
+  - namespace.yaml
+  - crd.yaml
+  - rbac.yaml
+  - deployment.yaml
+
+images:
+  - name: ghcr.io/kennywillbe/pg2osync-operator
+    newTag: 1.4.0

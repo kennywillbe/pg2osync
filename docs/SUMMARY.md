@@ -17,6 +17,7 @@
 - [Compatibility](compatibility.md)
 - [Proxies and connection poolers](proxies.md)
 - [Deployment](deployment.md)
+- [Kubernetes operator](operator.md)
 
 # Running it
 

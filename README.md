@@ -220,7 +220,9 @@ Kubernetes manifests are in [deploy/kubernetes](deploy/kubernetes)
 (`kubectl apply -k deploy/kubernetes`); see
 [docs/deployment.md](docs/deployment.md) for probes, scaling, systemd and
 the recipes that feed the credentials from Vault, AWS Secrets Manager or the
-External Secrets Operator.
+External Secrets Operator. With many source databases, the
+[operator](docs/operator.md) makes adding one a `Pg2osync` object instead of a
+release of its own.
 
 ## Try it locally
 
@@ -445,6 +447,7 @@ from `docs/` on every change.
 - [Database impact](docs/database-impact.md) — connections, privileges and the load it puts on your source
 - [Configuration](docs/configuration.md) — every option
 - [Deployment](docs/deployment.md) — Docker, Kubernetes, systemd, secrets managers
+- [Kubernetes operator](docs/operator.md) — one `Pg2osync` object per tenant
 - [Operations](docs/operations.md) — metrics, failure modes, recovery
 - [Design decisions](docs/decisions.md) — why it is built this way
 - Sources: [PostgreSQL](docs/sources/postgresql.md) · [MySQL/MariaDB](docs/sources/mysql.md)

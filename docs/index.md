@@ -27,6 +27,8 @@ feature matrix are in the
   [Qdrant](sinks/qdrant.md), including where they differ in what they can
   guarantee.
 - **[Deployment](deployment.md)** — Docker, Kubernetes, systemd, probes.
+- **[Kubernetes operator](operator.md)** — a `Pg2osync` per source database,
+  reconciled into the deployment the page above describes.
 - **[Operations](operations.md)** — metrics, every failure mode, and the
   recovery for each.
 - **[What it costs your database](database-impact.md)** — connections,

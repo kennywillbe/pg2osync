@@ -1,0 +1,50 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pg2osync-operator
+  namespace: pg2osync
+---
+# A Role, not a ClusterRole: the operator reconciles the namespace it runs in,
+# so a compromised controller reaches one tenant's objects rather than every
+# namespace's. Watching a second namespace means a second operator in it; the
+# trade-off is in docs/operator.md.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pg2osync-operator
+  namespace: pg2osync
+rules:
+  - apiGroups: ["pg2osync.io"]
+    resources: ["pg2osyncs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["pg2osync.io"]
+    resources: ["pg2osyncs/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["configmaps", "services"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Optional, and the operator carries on without it: a cluster with no
+  # prometheus-operator has no such kind to grant.
+  - apiGroups: ["monitoring.coreos.com"]
+    resources: ["servicemonitors"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+# Deliberately absent: any verb on secrets. The pipeline's credentials reach
+# its pod through envFrom, which the kubelet resolves — the operator never
+# reads them, so a bug in it cannot leak one.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pg2osync-operator
+  namespace: pg2osync
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: pg2osync-operator
+subjects:
+  - kind: ServiceAccount
+    name: pg2osync-operator
+    namespace: pg2osync
