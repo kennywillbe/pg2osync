@@ -22,8 +22,10 @@ pub struct MySqlSourceConfig {
     pub user: String,
     pub password: String,
     pub server_id: u32,
-    /// (schema, table) pairs to replicate.
-    pub tables: Vec<(String, String)>,
+    /// The tables this stream admits and what its decoder needs to know about
+    /// each of them, shared rather than owned: a reload puts a table on a
+    /// running stream through this handle.
+    pub tables: pg2osync_core::tables::SharedTables,
     /// Resume coordinate; None starts from the server's current position.
     pub start_file: Option<String>,
     pub start_pos: u32,
@@ -43,10 +45,6 @@ pub struct MySqlSourceConfig {
     pub gtid: Option<std::sync::Arc<std::sync::Mutex<crate::gtid::GtidTracker>>>,
     /// The GTID position to ask the server to resume from, when there is one.
     pub gtid_resume: Option<crate::gtid::GtidPosition>,
-    /// Tables declared `append_only`: a primary key is not required, their
-    /// inserts carry no key, and an update or delete on one is an error
-    /// rather than a document nothing can find.
-    pub append_only: std::collections::HashSet<(String, String)>,
     /// Added to every coordinate to make the ordering token and the document
     /// version. A failover moves to a different, often lower, coordinate space,
     /// and versions may only go up — so the generation lives here rather than
@@ -68,7 +66,9 @@ impl MySqlSourceConfig {
     }
 
     fn is_append_only(&self, schema: &str, table: &str) -> bool {
-        self.append_only
+        self.tables
+            .snapshot()
+            .append_only
             .contains(&(schema.to_string(), table.to_string()))
     }
 }
@@ -103,7 +103,7 @@ impl MySqlSource {
     /// `binlog_row_image`) and that every configured table is usable.
     pub async fn bootstrap(&self, admin: &mut MySqlConnection) -> Result<()> {
         catalog::check_prerequisites(admin).await?;
-        for (schema, table) in &self.cfg.tables {
+        for (schema, table) in &self.cfg.tables.snapshot().tables {
             let resolved =
                 catalog::table_schema(admin, schema, table, self.cfg.is_append_only(schema, table))
                     .await?;
@@ -559,10 +559,7 @@ impl MySqlSource {
     }
 
     fn is_configured(&self, schema: &str, table: &str) -> bool {
-        self.cfg
-            .tables
-            .iter()
-            .any(|(s, t)| s == schema && t == table)
+        self.cfg.tables.contains(schema, table)
     }
 }
 

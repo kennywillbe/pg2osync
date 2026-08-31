@@ -1854,5 +1854,169 @@ check "the deleted child row takes the lifted field with it" \
 check "and the parent document is still there" "$(os_field e2e_mysql_flat 1 name)" "ada"
 stop_sync
 
+say "28. a table joins and leaves the pipeline on SIGHUP"
+# The PostgreSQL suite's section 40 (#170) on the binlog path. There is no
+# publication to join here, so what admits a table is the filter the reload
+# swaps — and the ordering claim is the same one either way: a row written
+# while the reload is running is in no log anybody would read again unless the
+# filter is swapped before the load reads its first chunk. A tight insert loop
+# runs across the whole window and the index is compared with the table.
+ADCONFIG=$(mktemp /tmp/pg2osync-mysql-addtable.XXXXXX)
+ADSID=990013
+ADLOG=/tmp/pg2osync-mysql-e2e-addtable-$TAG.log
+: > "$ADLOG"
+ad_metric() { curl -s 127.0.0.1:$((PORT_BASE + 28))/metrics | grep -v '^#' | grep -E "$1" | awk '{print $2}' | head -1; }
+ad_write_config() {
+  cat > "$ADCONFIG" <<TOML
+[source]
+flavor = "mysql"
+url_env = "PG2OSYNC_MYSQL_URL"
+server_id = $ADSID
+
+[target]
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
+
+[metrics]
+bind = "127.0.0.1:$((PORT_BASE + 28))"
+
+[engine]
+checkpoint_interval_ms = 200
+
+[sync.anchor]
+table = "sourcedb.add_anchor"
+index = "e2e_mysql_add_anchor"
+$1
+TOML
+}
+add_cleanup() {
+  sync_kill
+  my "DROP TABLE IF EXISTS add_anchor, add_late, add_lines;" > /dev/null 2>&1 || true
+  curl -s -XDELETE "$OS/e2e_mysql_add_anchor,e2e_mysql_add_late?ignore_unavailable=true" > /dev/null 2>&1 || true
+  rm -f "$ADCONFIG" "$ADLOG" "/tmp/pg2osync-mysql-addstop-$TAG"
+}
+trap 'cleanup; resume_cleanup; types_cleanup; child_cleanup; where_cleanup; events_cleanup; pipe_cleanup; append_cleanup; routing_cleanup; through_cleanup; pseudo_cleanup; rl_cleanup; agg_cleanup; element_cleanup; flatten_cleanup; add_cleanup' EXIT
+
+my "DROP TABLE IF EXISTS add_anchor, add_late, add_lines;" > /dev/null 2>&1
+my "CREATE TABLE add_anchor(id BIGINT PRIMARY KEY, v VARCHAR(64));" > /dev/null
+my "CREATE TABLE add_late(id BIGINT PRIMARY KEY, v VARCHAR(64));" > /dev/null
+my "CREATE TABLE add_lines(id BIGINT PRIMARY KEY, late_id BIGINT);" > /dev/null
+my "INSERT INTO add_anchor VALUES (1,'anchor');" > /dev/null
+my "INSERT INTO add_late SELECT seq, CONCAT('before-', seq) FROM (WITH RECURSIVE s(seq) AS (SELECT 1 UNION ALL SELECT seq+1 FROM s WHERE seq < 500) SELECT seq FROM s) g;" > /dev/null
+curl -s -XDELETE "$OS/e2e_mysql_add_anchor,e2e_mysql_add_late?ignore_unavailable=true" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/mysql-$ADSID" > /dev/null
+# a finished load record from a previous run would skip the read this
+# section is about
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/load-mysql-${ADSID}-sourcedb_add_late" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/load-mysql-${ADSID}-sourcedb_add_anchor" > /dev/null
+
+ad_write_config ""
+sync_spawn "$ADCONFIG" "$ADLOG"
+ADPID=$SYNC_PID
+await_count e2e_mysql_add_anchor 1
+check "the pipeline is streaming one table" "$(os_count e2e_mysql_add_anchor)" "1"
+ad_reconnects_before=$(ad_metric '^pg2osync_reconnects_total\{')
+
+# The ordering proof: writes run continuously from before the SIGHUP until
+# after the load has finished, so some of them land in every phase there is.
+rm -f "/tmp/pg2osync-mysql-addstop-$TAG"
+( id=100000
+  while [ ! -f "/tmp/pg2osync-mysql-addstop-$TAG" ]; do
+    my "INSERT INTO add_late VALUES ($id, 'during-$id');" > /dev/null 2>&1
+    id=$((id + 1))
+  done ) &
+AD_WRITER=$!
+sleep 1
+
+ad_write_config '
+[sync.late]
+table = "sourcedb.add_late"
+index = "e2e_mysql_add_late"'
+kill -HUP "$ADPID"
+for _ in $(seq 1 120); do
+  grep -q "sourcedb.add_late is synced" "$ADLOG" && break
+  sleep 1
+done
+if grep -q "sourcedb.add_late is synced" "$ADLOG"; then
+  ok "the reload read the added table beside the stream and said so"
+else
+  bad "the table never joined: $(grep -i 'sync.late' "$ADLOG" | tail -3)"
+fi
+# keep writing for a moment past the load, so the stream half is exercised too
+sleep 2
+touch "/tmp/pg2osync-mysql-addstop-$TAG"
+wait "$AD_WRITER" 2> /dev/null || true
+
+check "the process is the same process" "$(kill -0 "$ADPID" 2> /dev/null && echo alive)" "alive"
+check "and nothing reconnected to do it" \
+  "$(ad_metric '^pg2osync_reconnects_total\{')" "$ad_reconnects_before"
+check "the reload is counted as applied" \
+  "$(ad_metric '^pg2osync_config_reloads_total\{source="[^"]*",result="applied"\}')" "1"
+
+ad_rows=$(my "SELECT count(*) FROM add_late;")
+await_count e2e_mysql_add_late "$ad_rows"
+check "the rows that were already there arrived" "$(os_field e2e_mysql_add_late 1 v)" "before-1"
+# the assertion the whole section exists for
+check "and so did every row written while the reload was running" \
+  "$(os_count e2e_mysql_add_late)" "$ad_rows"
+
+my "UPDATE add_late SET v = 'streamed' WHERE id = 1;" > /dev/null
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_field e2e_mysql_add_late 1 v)" = "streamed" ] && break
+  sleep 1
+done
+check "the added table is streaming, not just loaded" \
+  "$(os_field e2e_mysql_add_late 1 v)" "streamed"
+
+# Removing it stops the routing and leaves the index exactly as it is.
+ad_write_config ""
+kill -HUP "$ADPID"
+for _ in $(seq 1 60); do
+  grep -q "sourcedb.add_late is no longer synced" "$ADLOG" && break
+  sleep 1
+done
+if grep -qF 'index "e2e_mysql_add_late" is left exactly as it is' "$ADLOG"; then
+  ok "the removal names the index it is leaving behind"
+else
+  bad "the removal did not say what happens to the index: $(grep -i 'no longer synced' "$ADLOG" | tail -2)"
+fi
+# Written first, so a row of the anchor table arriving is proof the stream got
+# this far: a straggler is then absent because it was dropped, not because
+# nothing has been read yet.
+my "INSERT INTO add_late VALUES (900001,'after-the-removal');" > /dev/null
+my "INSERT INTO add_anchor VALUES (2,'still-streaming');" > /dev/null
+await_count e2e_mysql_add_anchor 2
+check "the anchor table is still streaming" "$(os_count e2e_mysql_add_anchor)" "2"
+check "a row written after the removal is not indexed" \
+  "$(os_status e2e_mysql_add_late 900001)" "404"
+check "its index is left exactly as it was" "$(os_status e2e_mysql_add_late 1)" "200"
+
+# A section whose shape the stream was built with is still a restart.
+ad_write_config '
+[sync.withkids]
+table = "sourcedb.add_late"
+index = "e2e_mysql_add_late"
+
+[[sync.withkids.children]]
+table = "sourcedb.add_lines"
+field = "lines"
+foreign_key = "late_id"'
+kill -HUP "$ADPID"
+for _ in $(seq 1 30); do
+  grep -q "Add it and restart" "$ADLOG" && break
+  sleep 1
+done
+if grep -qF "Add it and restart" "$ADLOG"; then
+  ok "a new section declaring children is refused with the restart it needs"
+else
+  bad "the unswappable section was not refused: $(grep -i 'sync.withkids' "$ADLOG" | tail -2)"
+fi
+check "and it is counted as refused" \
+  "$(ad_metric '^pg2osync_config_reloads_total\{source="[^"]*",result="refused"\}')" "1"
+check "the process survived that too" "$(kill -0 "$ADPID" 2> /dev/null && echo alive)" "alive"
+stop_sync
+
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

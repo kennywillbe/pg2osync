@@ -71,9 +71,10 @@ pub async fn run(
         .catalog_ctx(|| "cannot set the load session's isolation level".into())?;
 
     let chunk_rows = chunk_rows.max(1);
-    // One counter for the whole load: a mark only has to be increasing, and a
-    // single sequence keeps the wait condition a comparison.
-    let mut mark: u64 = 0;
+    // One sequence for the whole load, and for anything else reading down the
+    // same channel: a mark only has to be increasing, and a single sequence
+    // keeps the wait condition a comparison.
+    let marks = &scope.marks;
     let mut progress_keys: Vec<String> = Vec::new();
 
     for (schema, table) in tables {
@@ -231,7 +232,7 @@ pub async fn run(
             // crash anywhere in it can only lose the chunk and redo it, which an
             // idempotent write makes free — the reverse order would claim a
             // chunk that was never written.
-            mark += 1;
+            let mark = marks.next();
             tx.send(ChangeEvent::LoadMark(mark)).await.map_err(|_| {
                 MySqlError::LoadInterrupted("engine closed during the initial load".into())
             })?;

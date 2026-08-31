@@ -146,6 +146,9 @@ pub(crate) async fn load_one(
         ack_tx,
         load_done_tx,
         settings_rx,
+        // a one-shot read has nothing to reload, so the rules are the file's
+        // for its whole duration
+        watch::channel(Arc::new(run::rule_set(cfg)?)).1,
     )?;
     let engine = run::spawn_engine(
         events_rx,
@@ -240,11 +243,10 @@ async fn mysql(
     load_done: watch::Receiver<u64>,
     scope: &LoadScope,
 ) -> Result<()> {
-    let src_cfg = run::mysql_config_for(cfg, source_url)?;
-    let tables = src_cfg.tables.clone();
+    let src_cfg = run::mysql_config_for(cfg, source_url, None)?;
+    let admitted = src_cfg.tables.snapshot();
     let mut children = src_cfg.children.clone();
     let src_aggregates = src_cfg.aggregates.clone();
-    let append_only = src_cfg.append_only.clone();
     let source = pg2osync_source_mysql::runner::MySqlSource::new(src_cfg);
     let mut conn = source.admin_connection().await?;
     run::resolve_mysql_child_order(&mut children, &mut conn).await?;
@@ -259,7 +261,7 @@ async fn mysql(
         .unwrap_or(0);
     Ok(pg2osync_source_mysql::load::run(
         &mut conn,
-        &tables,
+        &admitted.tables,
         cfg.source.load_chunk_rows.max(1) as u64,
         copy_tx,
         sink,
@@ -269,7 +271,7 @@ async fn mysql(
         &children,
         &src_aggregates,
         version_base,
-        &append_only,
+        &admitted.append_only,
         cfg.engine.load_max_rows_per_sec,
     )
     .await?)

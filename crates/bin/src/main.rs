@@ -2490,14 +2490,18 @@ fn mysql_source(
             user: url.username().into(),
             password: url.password().unwrap_or_default().into(),
             server_id: cfg.source.server_id,
-            tables: cfg
-                .sync
-                .values()
-                .map(|t| {
-                    let (schema, table) = backfill::split_qualified(&t.table);
-                    (schema.to_string(), table.to_string())
-                })
-                .collect(),
+            tables: pg2osync_core::tables::SharedTables::new(pg2osync_core::tables::TableSet {
+                tables: cfg
+                    .sync
+                    .values()
+                    .map(|t| {
+                        let (schema, table) = backfill::split_qualified(&t.table);
+                        (schema.to_string(), table.to_string())
+                    })
+                    .collect(),
+                append_only: run::append_only_tables(cfg),
+                ..Default::default()
+            }),
             start_file: None,
             start_pos: 0,
             children: Default::default(),
@@ -2507,7 +2511,6 @@ fn mysql_source(
             // so it records nothing and resumes from nowhere
             gtid: None,
             gtid_resume: None,
-            append_only: run::append_only_tables(cfg),
             version_base: 0,
             tls: cfg.tls_settings(source_url)?,
         },

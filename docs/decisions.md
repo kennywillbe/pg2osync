@@ -1123,10 +1123,32 @@ re-snapshot.
 `poll_column` is a third class of one: it decides which rows the poll query
 reads rather than what a document is or how it is shaped, so neither answer
 applies and the fix is a plain restart.
-Adding or removing a section is refused too: a table joins a running pipeline
-only once its rows are loaded beside the stream and — on PostgreSQL — its name
-is in the publication, and the ordering that makes that safe is the initial
-load's argument, not something to approximate. Refusing loudly is the point. A
+Adding or removing a plain `[sync.*]` section is applied, in one strict order
+that is the initial load's own argument. The stream has to be admitting the
+table before the load reads its first range, or a row changed in between is in
+no log anybody will read again — the load would not see it, because it changed
+after the range was read, and the stream would have dropped it, because at that
+moment the table was not ours. So, on PostgreSQL: `ALTER PUBLICATION … ADD
+TABLE`, which is the same act `CREATE PUBLICATION` performs at bootstrap and
+not drift being applied, and only where the role owns both the publication and
+the table — otherwise the exact statement is printed, as the setup script
+prints its own; then a marker and a wait until the acknowledged position has
+passed the `ALTER`, because a walsender picks up publication membership at a
+transaction boundary and an acknowledged position is the only proof this
+process has that it did; then the same per-table checks a start makes; then the
+index; then the source's filter, then the engine's rules — that order, because
+a row admitted before the rules know the table hits the "no index is
+configured" guard, which is noisy and never wrong, while a row read before the
+filter admits it is a row nothing would ever correct. Only then are the rows
+read, on the channel the running attempt already holds, recording their
+progress so a crash finishes the job rather than leaving a table silently half
+indexed, and without the bulk-load settings, whose indices are live. Removing a
+section stops the routing and drops the table from the publication; the index
+is left exactly as it is, named in the log, because nothing here deletes
+documents. What still takes a restart is a new section whose shape the stream
+was built with — `children`, `join`, `fan_out`, `aggregates`, a per-row index,
+or anything at all under a polling source, whose query names its tables when
+the attempt builds it. Refusing loudly is the point. A
 reload that silently ignored half the file would be worse than no reload,
 because the file would stop describing the process. Every outcome is counted as
 `pg2osync_config_reloads_total{result}`, for the same reason schema drift is:
