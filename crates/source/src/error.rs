@@ -18,6 +18,17 @@ pub enum SourceError {
         source: Option<BoxError>,
     },
 
+    /// The server was reached and answered with an error of its own: a
+    /// password it will not accept, a database that is not there. Separate
+    /// from `Connect` because the two want opposite treatment before a stream
+    /// exists — one is worth waiting for, the other is a verdict.
+    #[error("{context}")]
+    Refused {
+        context: String,
+        #[source]
+        source: Option<BoxError>,
+    },
+
     /// A catalogue read, or a statement that prepares the objects the pipeline
     /// needs, failed.
     #[error("{context}")]
@@ -66,8 +77,27 @@ impl SourceError {
         !matches!(self, Self::Config(_))
     }
 
+    /// Whether the server was never reached.
+    ///
+    /// What the setup phase asks, where `is_retryable` is too generous: before
+    /// a stream has ever run, a catalogue read that fails is far more often a
+    /// table that is not there than a server that went away mid-read, and an
+    /// answer the server sent — a password it refuses — is the same answer
+    /// every attempt gets. Waiting is only ever right for something nothing
+    /// answered.
+    pub fn is_unreachable(&self) -> bool {
+        matches!(self, Self::Connect { .. })
+    }
+
     pub fn connect(context: impl Into<String>, source: impl Into<BoxError>) -> Self {
         Self::Connect {
+            context: context.into(),
+            source: Some(source.into()),
+        }
+    }
+
+    pub fn refused(context: impl Into<String>, source: impl Into<BoxError>) -> Self {
+        Self::Refused {
             context: context.into(),
             source: Some(source.into()),
         }
@@ -124,3 +154,47 @@ where
 }
 
 pub type Result<T, E = SourceError> = std::result::Result<T, E>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_server_that_was_never_reached_is_worth_waiting_for() {
+        assert!(
+            SourceError::Connect {
+                context: "connection failed".into(),
+                source: None,
+            }
+            .is_unreachable()
+        );
+        assert!(
+            !SourceError::Refused {
+                context: "password authentication failed".into(),
+                source: None,
+            }
+            .is_unreachable(),
+            "an answer the server sent is the answer every attempt gets"
+        );
+        assert!(
+            !SourceError::Catalog {
+                context: "relation \"public.orders\" does not exist".into(),
+                source: None,
+            }
+            .is_unreachable()
+        );
+        assert!(!SourceError::Config("no primary key".into()).is_unreachable());
+    }
+
+    #[test]
+    fn a_stream_that_dropped_retries_wider_than_a_setup_does() {
+        // a server that answered has still lost the connection the stream was
+        // on, and the position it left is resumable
+        let refused = SourceError::Refused {
+            context: "the database system is starting up".into(),
+            source: None,
+        };
+        assert!(refused.is_retryable());
+        assert!(!refused.is_unreachable());
+    }
+}

@@ -3,7 +3,8 @@
 #
 # PostgreSQL and MySQL in a single `pg2osync run --config-dir`: both index,
 # both report themselves, and — the point of the whole feature — one of them
-# going away does not touch the other.
+# going away does not touch the other, whether it goes away mid-stream or was
+# never there when the process started.
 #
 # One suite at a time per stack: the slot, the tables and the indices are
 # fixed, so two suites against the same PostgreSQL, MySQL and OpenSearch
@@ -55,11 +56,12 @@ MYSQL_CLIENT=${MYSQL_CLIENT:-mysql}
 CONFIG_DIR=$(mktemp -d /tmp/pg2osync-multi.XXXXXX)
 LOG=${E2E_LOG:-/tmp/pg2osync-multi-e2e.log}
 # The process binds its metrics and API ports on this machine rather than
-# inside a container, so two suites at once need two blocks: E2E_PORT_BASE
-# moves both ports this one uses.
+# inside a container, and the last section listens on one more, so two suites at
+# once need two blocks: E2E_PORT_BASE moves every port this one uses.
 PORT_BASE=${E2E_PORT_BASE:-9100}
 METRICS=127.0.0.1:$((PORT_BASE + 38))
 API=127.0.0.1:$((PORT_BASE + 39))
+RELAY_PORT=$((PORT_BASE + 37))
 export PG2OSYNC_SOURCE_URL="postgres://postgres:postgres@localhost:$PG_PORT/sourcedb"
 export PG2OSYNC_MYSQL_URL="mysql://$MYSQL_USER:$MYSQL_PASSWORD@localhost:$MYSQL_PORT/sourcedb"
 PASS=0; FAIL=0
@@ -108,11 +110,33 @@ stop_sync() { sync_stop; }
 # How many of the pipelines this run started are still up. Counting every
 # pg2osync on the machine would count the suite running beside this one.
 sync_count() { live_syncs || true; printf '%s' "$LIVE_SYNCS" | wc -w | tr -d ' '; }
-drop_own_slot() { pg "SELECT pg_drop_replication_slot('pg2osync_multi') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='pg2osync_multi');" > /dev/null 2>&1 || true; }
+drop_slot() { pg "SELECT pg_drop_replication_slot('$1') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$1');" > /dev/null 2>&1 || true; }
+# both PostgreSQL sources this suite owns: the second one only exists for the
+# last section, and a run killed inside it must not leave a slot retaining WAL
+drop_own_slot() {
+  drop_slot pg2osync_multi
+  drop_slot pg2osync_multi_late
+  pg "DROP PUBLICATION IF EXISTS pg2osync_multi_late_pub;" > /dev/null 2>&1 || true
+}
+# The last section needs a source that is unreachable and then reachable, at an
+# address that does not move: a container Docker chose the host port for gets a
+# new one every time it is restarted, so what is stopped and started here is a
+# relay in front of the database rather than the database itself.
+start_relay() {
+  python3 "$CONFIG_DIR/relay.py" "$RELAY_PORT" "$PG_PORT" >> "$LOG" 2>&1 &
+  RELAY_PID=$!
+}
+stop_relay() {
+  if [ -n "${RELAY_PID:-}" ]; then
+    kill "$RELAY_PID" 2> /dev/null || true
+    RELAY_PID=
+  fi
+}
 # a suite that stopped MySQL and then failed must not leave it stopped for the
 # suites that follow
 cleanup() {
   stop_sync
+  stop_relay
   docker start "$MYSQL_CONTAINER" > /dev/null 2>&1 || true
   drop_own_slot
   rm -rf "$CONFIG_DIR"
@@ -192,7 +216,7 @@ my "INSERT INTO shop_users (id,name,email,password_hash,balance) VALUES
       (1,'mysql-alice','ma@test.io','secret-1',1.00),
       (2,'mysql-bob','mb@test.io','secret-2',2.00),
       (3,'mysql-carol','mc@test.io','secret-3',3.00);"
-curl -s -XDELETE "$OS/e2e_multi_pg_users,e2e_multi_my_users,.pg2osync_meta?ignore_unavailable=true" > /dev/null
+curl -s -XDELETE "$OS/e2e_multi_pg_users,e2e_multi_my_users,e2e_multi_late_users,.pg2osync_meta?ignore_unavailable=true" > /dev/null
 ok "two sources seeded, indices cleared"
 
 say "1. validate --config-dir"
@@ -334,6 +358,102 @@ check "the refusal names the choices" \
   "$(echo "$REFUSED" | grep -c 'mysrc, pgsrc')" "1"
 check "the slot it did not drop is still there" \
   "$(pg "SELECT count(*) FROM pg_replication_slots WHERE slot_name='pg2osync_multi';")" "1"
+
+say "10. a source whose database is unreachable at startup waits for it"
+# A byte relay standing in for the database: with nothing listening, the very
+# first connect is refused, which is exactly what a database that has not
+# finished booting looks like.
+cat > "$CONFIG_DIR/relay.py" <<'PY'
+import asyncio, sys
+
+listen_port, target_port = int(sys.argv[1]), int(sys.argv[2])
+
+
+async def pipe(reader, writer):
+    try:
+        while data := await reader.read(65536):
+            writer.write(data)
+            await writer.drain()
+    except OSError:
+        pass
+    finally:
+        writer.close()
+
+
+async def handle(client_reader, client_writer):
+    server_reader, server_writer = await asyncio.open_connection("127.0.0.1", target_port)
+    await asyncio.gather(
+        pipe(client_reader, server_writer), pipe(server_reader, client_writer)
+    )
+
+
+async def main():
+    server = await asyncio.start_server(handle, "127.0.0.1", listen_port)
+    async with server:
+        await server.serve_forever()
+
+
+asyncio.run(main())
+PY
+# 127.0.0.1 rather than localhost: the relay listens on IPv4 only, and
+# localhost resolves to ::1 first on some machines
+export PG2OSYNC_LATE_URL="postgres://postgres:postgres@127.0.0.1:$RELAY_PORT/sourcedb"
+# a short backoff so the section is not spent waiting, and enough attempts that
+# the relay coming up a few seconds later still finds the source trying
+cat > "$CONFIG_DIR/latesrc.toml" <<TOML
+[source]
+url_env = "PG2OSYNC_LATE_URL"
+slot_name = "pg2osync_multi_late"
+publication = "pg2osync_multi_late_pub"
+reconnect_max = 20
+reconnect_backoff_ms = 500
+
+[target]
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
+
+[metrics]
+bind = "$METRICS"
+
+[api]
+enabled = true
+bind = "$API"
+
+[sync.users]
+table = "public.users"
+index = "e2e_multi_late_users"
+exclude_columns = ["password_hash"]
+TOML
+
+start_sync
+BOOTING=$SYNC_PID
+if await_state latesrc reconnecting; then
+  ok "the source that cannot reach its database is reconnecting, not halted"
+else
+  bad "the source is $(state_of latesrc), want reconnecting"
+fi
+# the whole point: setup failing is one source's problem, exactly as a dropped
+# stream already was
+await_state pgsrc streaming || true
+check "the sources that are up keep streaming" "$(state_of pgsrc)" "streaming"
+check "liveness stays up" "$(http_code "http://$METRICS/healthz")" "200"
+check "a source still trying is not a source that failed" \
+  "$(http_code "http://$METRICS/healthz/latesrc")" "200"
+
+start_relay
+await_count e2e_multi_late_users 4
+check "it indexes once the database answers" "$(os_count e2e_multi_late_users)" "4"
+await_state latesrc streaming || true
+check "and reports itself streaming" "$(state_of latesrc)" "streaming"
+# no restart brought it back, which is the whole point
+if kill -0 "$BOOTING" 2> /dev/null; then
+  ok "the process that started without a database is the one that indexed"
+else
+  bad "the process was restarted, which is what this section says is unnecessary"
+fi
+check "one process" "$(sync_count)" "1"
+stop_sync
+stop_relay
 
 say "Result"
 printf "  %d passed, %d failed\n" "$PASS" "$FAIL"

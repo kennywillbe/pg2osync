@@ -4,7 +4,7 @@
 //! source; what lives here is how a PostgreSQL connection and the replication
 //! transport consume them.
 
-use crate::error::{Context as _, Result, SourceError};
+use crate::error::{Result, SourceError};
 use tokio_postgres::Client;
 
 pub use pg2osync_tls::{ConfiguredTls, SslMode, TlsSettings};
@@ -14,14 +14,14 @@ pub async fn connect(tls: &TlsSettings, url: &str) -> Result<Client> {
     if tls.mode == SslMode::Disable {
         let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls)
             .await
-            .connect_ctx(|| "connection failed".into())?;
+            .map_err(|e| connect_failure("connection failed".into(), e))?;
         spawn_connection_task(connection);
         return Ok(client);
     }
 
     let mut config: tokio_postgres::Config = url
         .parse()
-        .connect_ctx(|| "invalid connection url".into())?;
+        .map_err(|e| SourceError::Config(format!("invalid connection url: {e}")))?;
     // tokio-postgres only distinguishes "must be encrypted" from "try";
     // certificate and hostname checking is the connector's job.
     config.ssl_mode(if tls.mode.requires_tls() {
@@ -38,11 +38,26 @@ pub async fn connect(tls: &TlsSettings, url: &str) -> Result<Client> {
                 Some(hint) => format!("connection failed (sslmode={}): {hint}", tls.mode.as_str()),
                 None => format!("connection failed (sslmode={})", tls.mode.as_str()),
             };
-            return Err(SourceError::connect(context, e));
+            return Err(connect_failure(context, e));
         }
     };
     spawn_connection_task(connection);
     Ok(client)
+}
+
+/// Whether the server answered at all.
+///
+/// A `db error` carries a SQLSTATE the server itself sent, so the connection
+/// got there and was turned away — a password it will not accept, a database
+/// that is not there, a role without the replication attribute. Anything else
+/// (refused, timed out, no such host, a handshake that never completed) never
+/// reached a server that could have an opinion, which is the only case where
+/// trying again later is more than a delay.
+fn connect_failure(context: String, e: tokio_postgres::Error) -> SourceError {
+    match e.as_db_error() {
+        Some(_) => SourceError::refused(context, e),
+        None => SourceError::connect(context, e),
+    }
 }
 
 /// One line holding every layer of a failure.
