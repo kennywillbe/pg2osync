@@ -1556,6 +1556,23 @@ fn check_configured_columns(
             );
         }
     }
+    // a flattened child lands where the parent's own columns land, and the
+    // config check can only see this where the section lists its `columns`
+    for child in &table.children {
+        for name in child.lifted_fields() {
+            if let Some(c) = live
+                .iter()
+                .find(|c| c.eq_ignore_ascii_case(&name) && survives(c))
+            {
+                bail!(
+                    "table {} has a column {c}; child {} lifts {name} onto the document and \
+                     would overwrite it",
+                    table.table,
+                    child.table
+                );
+            }
+        }
+    }
     // and for the join field, written after the constants
     if let Some(join) = &table.join
         && let Some(c) = live
@@ -2768,6 +2785,45 @@ mod tests {
             &[],
         )
         .expect("an excluded column leaves its name free");
+    }
+
+    #[test]
+    fn a_flattened_child_may_not_lift_a_name_the_parent_already_carries() {
+        let table = |extra: &str| -> config::TableSync {
+            toml::from_str(&format!("table = \"public.contacts\"\n{extra}")).expect("parses")
+        };
+        let live: Vec<String> = ["id", "company_name"]
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        let pk = vec!["id".to_string()];
+        const CHILD: &str = "[[children]]\ntable = \"public.company\"\nfield = \"company\"\n\
+                             foreign_key = \"company_id\"\nsingle = true\nflatten = true\n\
+                             columns = [\"customer_name\"]\n";
+
+        check_configured_columns(&table(CHILD), &live, &pk, &[])
+            .expect("customer_name is not a column of the parent");
+        let err = check_configured_columns(
+            &table(&format!(
+                "{CHILD}[children.fields]\ncustomer_name = \"company_name\"\n"
+            )),
+            &live,
+            &pk,
+            &[],
+        )
+        .expect_err("the lifted name is a column of the parent");
+        assert!(err.to_string().contains("lifts company_name"), "{err}");
+        // the parent's own column is renamed out of the way, so the name is free
+        check_configured_columns(
+            &table(&format!(
+                "[fields]\ncompany_name = \"legacy_name\"\n{CHILD}\
+                 [children.fields]\ncustomer_name = \"company_name\"\n"
+            )),
+            &live,
+            &pk,
+            &[],
+        )
+        .expect("a renamed column leaves its name free");
     }
 
     #[test]

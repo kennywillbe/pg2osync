@@ -207,6 +207,9 @@ pub struct PipelineCtx {
     pub transforms: crate::mapping::Transforms,
     /// Target field names; applied after everything else has shaped the document.
     pub renames: crate::mapping::Renames,
+    /// One-to-one children lifted onto the parent document, after the renames
+    /// that gave their columns their target names.
+    pub flattens: crate::mapping::Flattens,
     /// Fields that come from no column; added last, so a projection cannot
     /// strip them.
     pub constants: crate::mapping::Constants,
@@ -594,6 +597,7 @@ pub async fn run(
                     projections: &ctx.projections,
                     transforms: &ctx.transforms,
                     renames: &ctx.renames,
+                    flattens: &ctx.flattens,
                     constants: &ctx.constants,
                     id_templates: &ctx.id_templates,
                     fan_outs: &ctx.fan_outs,
@@ -1440,6 +1444,7 @@ pub struct Rules<'a> {
     pub projections: &'a crate::mapping::Projections,
     pub transforms: &'a crate::mapping::Transforms,
     pub renames: &'a crate::mapping::Renames,
+    pub flattens: &'a crate::mapping::Flattens,
     pub constants: &'a crate::mapping::Constants,
     pub id_templates: &'a crate::mapping::IdTemplates,
     pub fan_outs: &'a crate::mapping::FanOuts,
@@ -1864,6 +1869,7 @@ fn materialize(
                         .map(str::to_string),
                 );
                 rules.renames.apply(table.0, table.1, &mut doc);
+                rules.flattens.apply(table.0, table.1, &mut doc);
                 rules.constants.apply(table.0, table.1, &mut doc);
                 // last, like a constant: the join field is not a column, and
                 // a projection must not be able to strip it. A routing column
@@ -2448,6 +2454,7 @@ mod pipeline_tests {
             projections: crate::mapping::Projections::default(),
             transforms: crate::mapping::Transforms::default(),
             renames: crate::mapping::Renames::default(),
+            flattens: crate::mapping::Flattens::default(),
             constants: crate::mapping::Constants::default(),
             id_templates: crate::mapping::IdTemplates::default(),
             fan_outs: crate::mapping::FanOuts::default(),
@@ -3519,6 +3526,7 @@ mod pipeline_tests {
             projections: crate::mapping::Projections::default(),
             transforms: crate::mapping::Transforms::default(),
             renames,
+            flattens: crate::mapping::Flattens::default(),
             constants,
             id_templates: ids,
             fan_outs: fan,
@@ -3666,6 +3674,7 @@ mod pipeline_tests {
             )]),
             transforms: crate::mapping::Transforms::default(),
             renames: crate::mapping::Renames::default(),
+            flattens: crate::mapping::Flattens::default(),
             constants: users_constants(&[("entity", json!("user"))]),
             id_templates: Default::default(),
             fan_outs: Default::default(),
@@ -3729,6 +3738,7 @@ mod pipeline_tests {
                 )]),
             )]),
             renames: crate::mapping::Renames::default(),
+            flattens: crate::mapping::Flattens::default(),
             constants: crate::mapping::Constants::default(),
             id_templates: Default::default(),
             fan_outs: Default::default(),
@@ -3796,6 +3806,7 @@ mod pipeline_tests {
                 )]),
             )]),
             renames: crate::mapping::Renames::default(),
+            flattens: crate::mapping::Flattens::default(),
             constants: crate::mapping::Constants::default(),
             id_templates: Default::default(),
             fan_outs: Default::default(),
@@ -4115,6 +4126,7 @@ mod pipeline_tests {
             projections: crate::mapping::Projections::default(),
             transforms: crate::mapping::Transforms::default(),
             renames: crate::mapping::Renames::default(),
+            flattens: crate::mapping::Flattens::default(),
             constants: crate::mapping::Constants::default(),
             id_templates: users_ids("user-{tenant}", &["tenant"]),
             fan_outs: Default::default(),
@@ -4184,6 +4196,7 @@ mod pipeline_tests {
             projections: crate::mapping::Projections::default(),
             transforms: crate::mapping::Transforms::default(),
             renames: crate::mapping::Renames::default(),
+            flattens: crate::mapping::Flattens::default(),
             constants: crate::mapping::Constants::default(),
             id_templates: Default::default(),
             fan_outs: Default::default(),
@@ -4498,6 +4511,7 @@ mod pipeline_tests {
             projections: crate::mapping::Projections::default(),
             transforms: crate::mapping::Transforms::default(),
             renames: crate::mapping::Renames::default(),
+            flattens: crate::mapping::Flattens::default(),
             constants: crate::mapping::Constants::default(),
             id_templates: ids,
             fan_outs: fan,
@@ -4882,6 +4896,7 @@ mod pipeline_tests {
             projections: crate::mapping::Projections::default(),
             transforms: crate::mapping::Transforms::default(),
             renames: crate::mapping::Renames::default(),
+            flattens: crate::mapping::Flattens::default(),
             constants: crate::mapping::Constants::default(),
             id_templates: crate::mapping::IdTemplates::from_pairs([
                 (
@@ -5241,6 +5256,7 @@ mod pipeline_tests {
             projections: crate::mapping::Projections::default(),
             transforms: crate::mapping::Transforms::default(),
             renames: crate::mapping::Renames::default(),
+            flattens: crate::mapping::Flattens::default(),
             constants: crate::mapping::Constants::default(),
             id_templates: crate::mapping::IdTemplates::from_pairs([(
                 ("public".to_string(), "docs".to_string()),
@@ -5495,6 +5511,7 @@ mod pipeline_tests {
             projections: crate::mapping::Projections::default(),
             transforms: crate::mapping::Transforms::default(),
             renames: crate::mapping::Renames::default(),
+            flattens: crate::mapping::Flattens::default(),
             constants: crate::mapping::Constants::default(),
             id_templates: ids,
             fan_outs: Default::default(),
@@ -5699,6 +5716,7 @@ mod pipeline_tests {
             projections: crate::mapping::Projections::default(),
             transforms: crate::mapping::Transforms::default(),
             renames: crate::mapping::Renames::default(),
+            flattens: crate::mapping::Flattens::default(),
             constants: crate::mapping::Constants::default(),
             id_templates: crate::mapping::IdTemplates::default(),
             fan_outs: crate::mapping::FanOuts::default(),

@@ -1110,6 +1110,7 @@ field = "orders"             # array field on the parent document
 foreign_key = "customer_id"  # column on the CHILD referencing the parent key
 # max_rows = 1000            # optional: embed at most this many, see below
 # single = true              # optional: a 1:1 relation, see below
+# flatten = true             # optional: with single, lift it onto the parent
 ```
 
 A child's columns are renamed the same way, on the child element rather than
@@ -1304,6 +1305,55 @@ reason the array form has a cap — does not apply.
   warning naming the collection, how many parents matched twice and the worst of
   them. Fix the data, or drop `single`, and the next change to those parents
   rewrites them.
+
+##### Flattening it onto the parent
+
+Sometimes the document wants one column of that child at the top level — a
+display name from a lookup table as plain `company_name`, not
+`company.customer_name`, so a client written against a flat field needs no
+query change. `flatten = true` lifts the element's columns onto the parent
+instead of nesting them:
+
+```toml
+[[sync.contacts.children]]
+table   = "public.company"
+single  = true
+flatten = true
+field   = "company"           # names the child, not a field of the document
+columns = ["customer_name"]   # what is lifted
+
+[sync.contacts.children.fields]
+customer_name = "company_name"
+```
+
+```json
+{ "id": 42, "name": "…", "company_name": "acme" }
+```
+
+The projection and the renames are applied first, exactly as they are for a
+nested child; what they leave is what lands on the parent. Everything else is
+unchanged: the same aggregation reads the child, a change to it re-reads its
+parents the same way, and the lifted values move on the initial load, on a
+streamed re-fetch and on a re-snapshot alike.
+
+- `field` is still required. It names the child — in the child's own `fields`
+  block, in refusals and in the warning a duplicate logs — but a flattened
+  child writes no field of that name on the document, so `company` above is
+  free for a column, a constant or another child.
+- A parent with **no** matching child row carries none of the lifted fields.
+  They are absent rather than null: the source read no row, and a document of
+  nulls would claim it read one. This is the one place a flattened child
+  differs from a nested one, where the field is always present.
+- `columns` is required with `flatten`: the lifted names are what could
+  collide with the rest of the document, and a collision can only be refused
+  where those names are known before a row arrives.
+- `single = true` is required. An array of children has no one row to lift.
+
+Refused at load: `flatten` without `single` or without `columns`, and a lifted
+name that is also a `constants` entry, an aggregate `field`, a name written by
+another child (flattened or not), a parent rename key or target, or a
+surviving entry of the parent's `columns`. `validate` additionally refuses a
+lifted name that equals a live column of the parent that is not renamed away.
 
 ### Aggregates
 

@@ -477,6 +477,48 @@ fn rename_keys(
     }
 }
 
+/// One-to-one children whose element is lifted onto the parent document
+/// instead of nested under a field, from `flatten = true`.
+///
+/// Applied after the renames, so what is lifted carries the names the child's
+/// own `fields` chose — and before the constants, which are written last
+/// whatever else the document holds. Nothing here has to decide a winner: a
+/// lifted name that anything else on the document claims is refused at
+/// configuration time.
+#[derive(Debug, Clone, Default)]
+pub struct Flattens {
+    map: HashMap<(String, String), Vec<String>>,
+}
+
+impl Flattens {
+    pub fn from_pairs(pairs: impl IntoIterator<Item = ((String, String), Vec<String>)>) -> Self {
+        Self {
+            map: pairs.into_iter().collect(),
+        }
+    }
+
+    /// Lift each named child onto the document in place.
+    ///
+    /// A parent with no child row has nothing to lift, and the fields are
+    /// absent rather than null: the source read no row, and a row of nulls
+    /// would claim it read one.
+    pub fn apply(&self, schema: &str, table: &str, doc: &mut serde_json::Value) {
+        let Some(fields) = self.map.get(&(schema.to_string(), table.to_string())) else {
+            return;
+        };
+        let Some(obj) = doc.as_object_mut() else {
+            return;
+        };
+        for field in fields {
+            // the field goes either way: a flattened child names nothing on
+            // the document, not even when it matched nothing
+            if let Some(serde_json::Value::Object(element)) = obj.remove(field) {
+                obj.extend(element);
+            }
+        }
+    }
+}
+
 /// Per-table fields that come from no column, from `[sync.x.constants]`.
 ///
 /// The values arrive rendered: `{schema}`/`{table}` were resolved once at
@@ -1822,6 +1864,65 @@ mod tests {
         assert_eq!(r.target_name("public", "users", "bio"), "about");
         assert_eq!(r.target_name("public", "users", "id"), "id");
         assert_eq!(r.target_name("public", "orders", "bio"), "bio");
+    }
+
+    fn users_flattens(fields: &[&str]) -> Flattens {
+        Flattens::from_pairs([(
+            ("public".into(), "users".into()),
+            fields.iter().map(|f| f.to_string()).collect(),
+        )])
+    }
+
+    #[test]
+    fn a_flattened_child_lands_at_the_top_level_under_its_renamed_names() {
+        let r = users_renames(&[], &[("company", &[("customer_name", "company_name")])]);
+        let f = users_flattens(&["company"]);
+        let mut doc = json!({"id": 1, "company": {"customer_name": "acme"}});
+        r.apply("public", "users", &mut doc);
+        f.apply("public", "users", &mut doc);
+        assert_eq!(doc, json!({"id": 1, "company_name": "acme"}));
+
+        let mut other = json!({"id": 1, "company": {"customer_name": "acme"}});
+        f.apply("public", "orders", &mut other);
+        assert_eq!(
+            other,
+            json!({"id": 1, "company": {"customer_name": "acme"}}),
+            "another table's document keeps its shape"
+        );
+    }
+
+    #[test]
+    fn a_parent_with_no_child_row_carries_none_of_the_lifted_fields() {
+        let f = users_flattens(&["company"]);
+        let mut doc = json!({"id": 1, "company": null});
+        f.apply("public", "users", &mut doc);
+        assert_eq!(
+            doc,
+            json!({"id": 1}),
+            "the field the child arrived under goes too"
+        );
+
+        let mut never = json!({"id": 1});
+        f.apply("public", "users", &mut never);
+        assert_eq!(never, json!({"id": 1}));
+    }
+
+    #[test]
+    fn two_flattened_children_both_reach_the_document() {
+        let f = users_flattens(&["company", "plan"]);
+        let mut doc = json!({"id": 1, "company": {"name": "acme"}, "plan": {"tier": "gold"}});
+        f.apply("public", "users", &mut doc);
+        assert_eq!(doc, json!({"id": 1, "name": "acme", "tier": "gold"}));
+    }
+
+    #[test]
+    fn a_flattened_child_lifts_only_what_the_projection_left() {
+        // the read projects, so the element holds the chosen columns and the
+        // lift carries exactly those
+        let f = users_flattens(&["company"]);
+        let mut doc = json!({"id": 1, "company": {"customer_name": "acme"}});
+        f.apply("public", "users", &mut doc);
+        assert_eq!(doc, json!({"id": 1, "customer_name": "acme"}));
     }
 
     fn users_constants(pairs: &[(&str, serde_json::Value)]) -> Constants {

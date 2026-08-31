@@ -3201,5 +3201,123 @@ done
 check "a deleted row takes every element document with it" "$(os_count e2e_element)" "3"
 stop_sync
 
+echo -e "\n\033[1m== 39. a one-to-one child flattened onto the parent document ==\033[0m"
+# #181: the same watching and re-fetching a `single` child already has, with
+# the element lifted onto the parent instead of nested. What has to hold is
+# that the lifted field is live: a change to the child alone moves it, and a
+# parent whose child row is gone carries none of it.
+drop_idle_probe_slots
+FLCONFIG=$(mktemp /tmp/pg2osync-e2e-flatten.XXXXXX)
+FLSLOT=pg2osync_e2e_flatten
+cat > "$FLCONFIG" <<TOML
+[source]
+url_env = "PG2OSYNC_SOURCE_URL"
+slot_name = "$FLSLOT"
+publication = "${FLSLOT}_pub"
+
+[target]
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
+
+[metrics]
+bind = "127.0.0.1:$((PORT_BASE + 40))"
+
+[sync.contacts]
+table = "public.flat_contact"
+index = "e2e_flat"
+
+[[sync.contacts.children]]
+table = "public.flat_company"
+field = "company"
+foreign_key = "contact_id"
+single = true
+flatten = true
+columns = ["customer_name"]
+
+[sync.contacts.children.fields]
+customer_name = "company_name"
+TOML
+flatten_cleanup() {
+  sync_kill
+  pg "SELECT pg_drop_replication_slot('$FLSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$FLSLOT');" > /dev/null 2>&1 || true
+  pg "DROP PUBLICATION IF EXISTS ${FLSLOT}_pub; DROP TABLE IF EXISTS flat_company, flat_contact;" > /dev/null 2>&1 || true
+  curl -s -XDELETE "$OS/e2e_flat?ignore_unavailable=true" > /dev/null 2>&1 || true
+  rm -f "$FLCONFIG"
+}
+trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup; init_cleanup; fan_cleanup; bid_cleanup; shape_cleanup; where_cleanup; join_cleanup; union_cleanup; events_cleanup; pipe_cleanup; append_cleanup; routing_cleanup; reindex_cleanup; rate_cleanup; through_cleanup; ra_cleanup; pseudo_cleanup; rl_cleanup; otel_cleanup; agg_cleanup; element_cleanup; flatten_cleanup' EXIT
+
+pg "DROP TABLE IF EXISTS flat_company, flat_contact;" > /dev/null 2>&1
+pg "CREATE TABLE flat_contact(id bigint primary key, name text);" > /dev/null
+pg "CREATE TABLE flat_company(id bigint primary key, contact_id bigint, customer_name text);" > /dev/null
+# the foreign key is not the company's own key, so a DELETE names the parent
+# only under FULL
+pg "ALTER TABLE flat_company REPLICA IDENTITY FULL;" > /dev/null 2>&1
+pg "INSERT INTO flat_contact VALUES (1,'ada'),(2,'grace');" > /dev/null
+# contact 2 has no company at all: nothing is lifted onto it
+pg "INSERT INTO flat_company VALUES (100,1,'acme');" > /dev/null
+pg "DROP PUBLICATION IF EXISTS ${FLSLOT}_pub; CREATE PUBLICATION ${FLSLOT}_pub FOR TABLE flat_contact, flat_company;" > /dev/null 2>&1
+curl -s -XDELETE "$OS/e2e_flat?ignore_unavailable=true" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/postgres-$FLSLOT" > /dev/null
+
+# captured first: a refusal exits non-zero, which under pipefail would hide a
+# grep that matched
+sed '/^single = true$/d' "$FLCONFIG" > "${FLCONFIG}.bad"
+out=$($BIN validate -c "${FLCONFIG}.bad" 2>&1 || true)
+if grep -q "flatten needs single = true" <<< "$out"; then
+  ok "validate refuses flatten on a relation nothing declares one-to-one"
+else
+  bad "validate accepted flatten without single: $out"
+fi
+rm -f "${FLCONFIG}.bad"
+if $BIN validate -c "$FLCONFIG" 2>&1 | grep -q "all checks passed"; then
+  ok "validate accepts the flattened child"
+else
+  bad "validate refused the flattened child"
+fi
+
+sync_spawn "$FLCONFIG"
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_count e2e_flat)" = "2" ] && break
+  sleep 1
+done
+check "the load lifts the child column under its new name" \
+  "$(os_field e2e_flat 1 company_name)" "acme"
+check "the source name of the lifted column is gone" "$(os_has e2e_flat 1 customer_name)" "False"
+check "and so is the field the child would have nested under" \
+  "$(os_has e2e_flat 1 company)" "False"
+check "a parent with no child row carries none of it" \
+  "$(os_has e2e_flat 2 company_name)" "False"
+
+# the acceptance test: the parent row is never touched, and the flat field moves
+pg "UPDATE flat_company SET customer_name = 'acme-renamed' WHERE id = 100;" > /dev/null
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_field e2e_flat 1 company_name)" = "acme-renamed" ] && break
+  sleep 1
+done
+check "a change to the child alone moves the parent's flat field" \
+  "$(os_field e2e_flat 1 company_name)" "acme-renamed"
+
+pg "INSERT INTO flat_company VALUES (101,2,'globex');" > /dev/null
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_has e2e_flat 2 company_name)" = "True" ] && break
+  sleep 1
+done
+check "a child row appearing lifts onto the parent that had none" \
+  "$(os_field e2e_flat 2 company_name)" "globex"
+
+pg "DELETE FROM flat_company WHERE id = 100;" > /dev/null
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_has e2e_flat 1 company_name)" = "False" ] && break
+  sleep 1
+done
+check "and the deleted child row takes the lifted field with it" \
+  "$(os_has e2e_flat 1 company_name)" "False"
+check "the parent document is still there" "$(os_field e2e_flat 1 name)" "ada"
+stop_sync
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

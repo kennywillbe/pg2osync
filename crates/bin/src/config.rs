@@ -680,6 +680,13 @@ pub struct ChildJoin {
     /// relation declared one-to-one contradicts it.
     #[serde(default)]
     pub single: bool,
+    /// Lift the element's columns onto the parent instead of nesting them.
+    ///
+    /// Needs `single` — an array has no one row to lift — and `columns`, which
+    /// is what makes the lifted names knowable before a row arrives, and so
+    /// checkable against everything else the parent document writes.
+    #[serde(default)]
+    pub flatten: bool,
 }
 
 /// A number derived from a child table, carried on the parent document.
@@ -719,7 +726,12 @@ impl ChildJoin {
     ///
     /// A one-to-one child writes neither of those: it cannot be capped, so
     /// claiming the names would refuse configuration that nothing collides with.
+    /// A flattened one writes no `field` at all — the lifted names are what
+    /// lands on the document, and `field` only names the child internally.
     fn claimed_fields(&self) -> Vec<String> {
+        if self.flatten {
+            return self.lifted_fields();
+        }
         if self.single {
             return vec![self.field.clone()];
         }
@@ -728,6 +740,32 @@ impl ChildJoin {
             format!("{}_truncated", self.field),
             format!("{}_total", self.field),
         ]
+    }
+
+    /// The top-level names a flattened child lifts onto the parent: its
+    /// projection, under the names its own `fields` chose for them.
+    ///
+    /// Empty for a child that nests, and for a flattened one without
+    /// `columns` — which validation refuses, precisely so that this list is
+    /// the whole truth.
+    pub(crate) fn lifted_fields(&self) -> Vec<String> {
+        if !self.flatten {
+            return Vec::new();
+        }
+        self.columns
+            .iter()
+            .flatten()
+            .map(|col| self.fields.get(col).unwrap_or(col).clone())
+            .collect()
+    }
+
+    /// How a refusal names what this child writes on the parent document.
+    fn claim(&self) -> String {
+        if self.flatten {
+            format!("lifted onto the parent by flattened child {}", self.table)
+        } else {
+            format!("the field of child {}", self.table)
+        }
     }
 }
 
@@ -1046,9 +1084,9 @@ impl AppConfig {
                     .find(|child| child.claimed_fields().contains(&join.field))
                 {
                     anyhow::bail!(
-                        "[sync.{key}] {} is the join field and also the field of child {}",
+                        "[sync.{key}] {} is the join field and also {}",
                         join.field,
-                        child.table
+                        child.claim()
                     );
                 }
             }
@@ -1262,9 +1300,9 @@ impl AppConfig {
                 for name in &child.claimed_fields() {
                     if tbl.fields.contains_key(name) || tbl.fields.values().any(|t| t == name) {
                         anyhow::bail!(
-                            "[sync.{key}.fields] {name:?} is the field of child {}; \
+                            "[sync.{key}.fields] {name:?} is {}; \
                              rename the child's columns in its own fields instead",
-                            child.table
+                            child.claim()
                         );
                     }
                 }
@@ -1319,6 +1357,38 @@ impl AppConfig {
                          declared one-to-one has nothing to cap"
                     );
                 }
+                if child.flatten && !child.single {
+                    anyhow::bail!(
+                        "[{child_key}] flatten needs single = true: an array of children has \
+                         no one row to lift onto the parent. Add single = true, or drop \
+                         flatten and query the array"
+                    );
+                }
+                if child.flatten && child.columns.is_none() {
+                    anyhow::bail!(
+                        "[{child_key}] flatten needs columns: what it lifts lands next to the \
+                         parent's own fields, and a collision can only be refused where the \
+                         lifted names are known. List the columns to lift"
+                    );
+                }
+                // A lifted name is written where the parent's columns are, so a
+                // column of that name would be buried by it. Only an explicit
+                // `columns` list shows this offline; `validate` sees the rest in
+                // the catalogue.
+                for name in child.lifted_fields() {
+                    if tbl
+                        .columns
+                        .as_ref()
+                        .is_some_and(|cols| cols.contains(&name))
+                        && !tbl.fields.contains_key(&name)
+                    {
+                        anyhow::bail!(
+                            "[{child_key}] flatten lifts {name}, which is also a column of \
+                             {}; rename it in the child's fields",
+                            tbl.table
+                        );
+                    }
+                }
                 for (col, target) in &child.fields {
                     // a rename is a promise that the column reaches the target;
                     // projection dropping it would break that promise silently
@@ -1343,6 +1413,21 @@ impl AppConfig {
                         anyhow::bail!(
                             "[{child_key}.fields] {col} = {target:?} would overwrite column \
                              {target}"
+                        );
+                    }
+                }
+            }
+            // Two children writing the same name leave whichever landed last,
+            // which is no answer at all. A flattened child makes this reachable
+            // without a duplicated `field`: the names it lifts are its columns.
+            let mut written: HashMap<String, String> = HashMap::new();
+            for child in &tbl.children {
+                for name in child.claimed_fields() {
+                    if let Some(first) = written.insert(name.clone(), child.table.clone()) {
+                        anyhow::bail!(
+                            "[sync.{key}] {name:?} is written by child {first} and by child \
+                             {}; one field holds one value",
+                            child.table
                         );
                     }
                 }
@@ -1398,11 +1483,7 @@ impl AppConfig {
                     .iter()
                     .find(|child| child.claimed_fields().contains(&agg.field))
                 {
-                    anyhow::bail!(
-                        "[{agg_key}] field {:?} is the field of child {}",
-                        agg.field,
-                        child.table
-                    );
+                    anyhow::bail!("[{agg_key}] field {:?} is {}", agg.field, child.claim());
                 }
                 if tbl
                     .aggregates
@@ -1455,10 +1536,7 @@ impl AppConfig {
                     .iter()
                     .find(|child| child.claimed_fields().contains(name))
                 {
-                    anyhow::bail!(
-                        "[sync.{key}.constants] {name} is the field of child {}",
-                        child.table
-                    );
+                    anyhow::bail!("[sync.{key}.constants] {name} is {}", child.claim());
                 }
                 if tbl.fan_out.as_ref().is_some_and(|fan| &fan.field == name) {
                     anyhow::bail!(
@@ -2823,6 +2901,96 @@ id = "user-{id}"
             .is_err(),
             "the field itself is still claimed"
         );
+    }
+
+    #[test]
+    fn a_flattened_child_needs_one_row_and_names_what_it_lifts() {
+        const FLAT: &str = "[[sync.users.children]]\ntable = \"public.company\"\n\
+                            field = \"company\"\nforeign_key = \"company_id\"\n\
+                            single = true\nflatten = true\ncolumns = [\"customer_name\"]\n";
+        const RENAME: &str = "[sync.users.children.fields]\ncustomer_name = \"company_name\"\n";
+
+        let refused = [
+            (
+                FLAT.replace("single = true\n", ""),
+                "flatten needs single = true",
+                "an array of children has no one row to lift",
+            ),
+            (
+                FLAT.replace("columns = [\"customer_name\"]\n", ""),
+                "flatten needs columns",
+                "an unknown set of lifted names can collide with anything",
+            ),
+            (
+                format!("{FLAT}{RENAME}[sync.users.constants]\ncompany_name = \"acme\"\n"),
+                "is lifted onto the parent by flattened child public.company",
+                "a constant would bury the lifted value",
+            ),
+            (
+                format!(
+                    "{FLAT}{RENAME}[[sync.users.aggregates]]\nfield = \"company_name\"\n\
+                     table = \"public.deals\"\nforeign_key = \"user_id\"\n"
+                ),
+                "is lifted onto the parent by flattened child public.company",
+                "an aggregate holds one number, not a lifted column",
+            ),
+            (
+                format!(
+                    "{FLAT}{RENAME}[[sync.users.children]]\ntable = \"public.plans\"\n\
+                     field = \"company_name\"\nforeign_key = \"user_id\"\nsingle = true\n"
+                ),
+                "is written by child public.company and by child public.plans",
+                "another child's field is the same name",
+            ),
+            (
+                format!(
+                    "{FLAT}{RENAME}[[sync.users.children]]\ntable = \"public.plans\"\n\
+                     field = \"plan\"\nforeign_key = \"user_id\"\nsingle = true\n\
+                     flatten = true\ncolumns = [\"company_name\"]\n"
+                ),
+                "is written by child public.company and by child public.plans",
+                "two flattened children lifting one name",
+            ),
+            (
+                format!("{FLAT}{RENAME}[sync.users.fields]\nname = \"company_name\"\n"),
+                "is lifted onto the parent by flattened child public.company",
+                "a parent rename onto a lifted name",
+            ),
+        ];
+        for (extra, message, why) in refused {
+            let err = parse(&format!("{MINIMAL}{extra}")).expect_err(why);
+            assert!(
+                err.to_string().contains(message),
+                "{why}: {err}\nwanted {message:?}"
+            );
+        }
+
+        // the parent lists the column the child lifts onto it: one of the two
+        // would be buried, and which one is not for the pipeline to decide
+        let err = parse(&format!(
+            "{MINIMAL}columns = [\"id\", \"company_name\"]\n{FLAT}{RENAME}"
+        ))
+        .expect_err("a lifted name is also a parent column");
+        assert!(
+            err.to_string().contains("also a column of public.users"),
+            "{err}"
+        );
+
+        let cfg = parse(&format!("{MINIMAL}{FLAT}{RENAME}"))
+            .expect("a flattened one-to-one child parses");
+        let child = &cfg.sync["users"].children[0];
+        assert!(child.flatten && child.single);
+        assert_eq!(
+            child.lifted_fields(),
+            vec!["company_name".to_string()],
+            "what lands on the document is the projection, renamed"
+        );
+        // the field is the child's name, not a name on the document, so
+        // nothing that writes `company` collides with it
+        parse(&format!(
+            "{MINIMAL}{FLAT}{RENAME}[sync.users.constants]\ncompany = \"acme\"\n"
+        ))
+        .expect("a flattened child claims no field of its own");
     }
 
     #[test]
