@@ -1018,6 +1018,104 @@ fn worth_retrying(error: &anyhow::Error) -> bool {
     true
 }
 
+/// Whether a setup failure is one that waiting could get past.
+///
+/// The mirror image of [`worth_retrying`], and deliberately narrower. A stream
+/// that has run proves the credentials, the tables and the publication were all
+/// good a moment ago, so anything but a hopeless configuration is worth another
+/// attempt. Nothing has been proved yet at startup: the failures that dominate
+/// there are a table nobody created, a password with a typo in it and an index
+/// the target refuses, and retrying one of those for the whole backoff schedule
+/// only buries the sentence that says how to fix it. So the rule is inverted —
+/// something has to claim it could not reach its server before a wait is worth
+/// anything.
+fn worth_retrying_setup(error: &anyhow::Error) -> bool {
+    if let Some(e) = error.downcast_ref::<pg2osync_source::SourceError>() {
+        return e.is_unreachable();
+    }
+    if let Some(e) = error.downcast_ref::<pg2osync_source_mysql::MySqlError>() {
+        return e.is_unreachable();
+    }
+    if let Some(e) = error.downcast_ref::<pg2osync_core::CoreError>() {
+        // the sinks classify at construction time; a target that answered with
+        // a refusal is not a target that could not be reached
+        return matches!(e, pg2osync_core::CoreError::SinkTransient(_));
+    }
+    false
+}
+
+/// What the setup phase retries under.
+///
+/// `run` shares the stream's policy rather than owning one: a source that is
+/// unreachable at startup and a source that becomes unreachable an hour later
+/// are the same outage, and an operator who sized `[source] reconnect_max` for
+/// one has sized it for the other. `bootstrap` is a command somebody is waiting
+/// on at a terminal, so it still fails on the spot.
+fn setup_policy(cfg: &AppConfig, mode: Mode) -> ReconnectPolicy {
+    match mode {
+        Mode::Run => cfg.source.reconnect_policy(),
+        Mode::Bootstrap => ReconnectPolicy {
+            max_attempts: 0,
+            ..cfg.source.reconnect_policy()
+        },
+    }
+}
+
+/// Run the setup phase until it succeeds, the policy gives up, or the process
+/// is asked to stop.
+///
+/// `Ok(None)` is the shutdown: a SIGTERM that arrives between two attempts ends
+/// the source rather than waiting out the backoff it was in the middle of.
+async fn setup_with_retry<F, Fut, T>(
+    policy: ReconnectPolicy,
+    metrics: &SharedMetrics,
+    shutdown: &watch::Receiver<bool>,
+    mut setup: F,
+) -> Result<Option<T>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut shutdown = shutdown.clone();
+    let mut failures = 0u32;
+    loop {
+        if *shutdown.borrow() {
+            return Ok(None);
+        }
+        let error = match setup().await {
+            Ok(ready) => return Ok(Some(ready)),
+            Err(e) => e,
+        };
+        if *shutdown.borrow() {
+            return Ok(None);
+        }
+        if !worth_retrying_setup(&error) {
+            return Err(error);
+        }
+        if !policy.should_retry(failures) {
+            return Err(error.context(format!(
+                "giving up after {} consecutive attempts to start",
+                failures + 1
+            )));
+        }
+
+        let delay = policy.delay_for(failures);
+        failures += 1;
+        metrics.reconnects_total.fetch_add(1, Ordering::Relaxed);
+        // Not halted, and no longer merely starting: the source is retrying,
+        // which is the same thing a dropped stream does and is reported the
+        // same way.
+        metrics.set_state(SourceState::Reconnecting);
+        tracing::warn!(target: "pg2osync::run",
+            "source setup failed ({error:#}); retrying in {:.1}s (attempt {failures})",
+            delay.as_secs_f64());
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = shutdown.changed() => {}
+        }
+    }
+}
+
 /// A stored checkpoint is only usable when it belongs to this exact stream.
 fn usable_checkpoint(stored: Option<Checkpoint>, expected: &StreamId) -> Option<Checkpoint> {
     let stored = stored?;
@@ -1058,60 +1156,72 @@ async fn run_postgres(
     tracing::info!(target: "pg2osync::run", "source sslmode={} client_cert={}",
         tls.mode.as_str(),
         if tls.presents_client_certificate() { "yes" } else { "no" });
-    let admin = pg2osync_source::tls::connect(&tls, &admin_url)
-        .await
-        .context("cannot connect to source PostgreSQL")?;
+    // Every attempt starts from a connection of its own, because a source that
+    // was not there yet left nothing behind that a second attempt could reuse;
+    // and none of them outlives the setup, since each streaming attempt opens
+    // the SQL connection it needs and holding this one would be a third doing
+    // nothing.
+    let ready = setup_with_retry(setup_policy(&cfg, mode), &metrics, &shutdown_rx, || async {
+        let admin = pg2osync_source::tls::connect(&tls, &admin_url)
+            .await
+            .context("cannot connect to source PostgreSQL")?;
 
-    let mut children = child_specs_for(&cfg)?;
-    resolve_child_order(&mut children, &admin).await?;
-    let aggregates = aggregate_specs_for(&cfg)?;
-    let mut tables: Vec<String> = cfg.sync.values().map(|t| t.table.clone()).collect();
-    // Child tables must join the publication or their changes never reach us,
-    // and so must a junction: each of the two carries half of what a
-    // many-to-many collection is made of.
-    for tbl in cfg.sync.values() {
-        for child in &tbl.children {
-            for table in [Some(&child.table), child.through.as_ref()]
-                .into_iter()
-                .flatten()
-            {
-                if !tables.contains(table) {
-                    tables.push(table.clone());
+        let mut children = child_specs_for(&cfg)?;
+        resolve_child_order(&mut children, &admin).await?;
+        let aggregates = aggregate_specs_for(&cfg)?;
+        let mut tables: Vec<String> = cfg.sync.values().map(|t| t.table.clone()).collect();
+        // Child tables must join the publication or their changes never reach
+        // us, and so must a junction: each of the two carries half of what a
+        // many-to-many collection is made of.
+        for tbl in cfg.sync.values() {
+            for child in &tbl.children {
+                for table in [Some(&child.table), child.through.as_ref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    if !tables.contains(table) {
+                        tables.push(table.clone());
+                    }
                 }
             }
         }
-    }
 
-    // an aggregated table must join the publication or its changes never reach
-    // us, exactly as a child table must
-    for table in aggregated_tables(&cfg) {
-        if !tables.contains(&table) {
-            tables.push(table);
+        // an aggregated table must join the publication or its changes never
+        // reach us, exactly as a child table must
+        for table in aggregated_tables(&cfg) {
+            if !tables.contains(&table) {
+                tables.push(table);
+            }
         }
-    }
 
-    let src_cfg: WalSourceConfig = wal_config(
-        &cfg,
-        &source_url,
-        &admin_url,
-        &tables,
-        &children,
-        &aggregates,
-        &durable,
-        &tls,
-    )?;
-    let mut src_cfg = src_cfg;
-    if !polling {
-        src_cfg.key_columns = key_columns_for(&cfg, &admin).await?;
-    }
-    let source = WalSource::new(src_cfg.clone());
+        let mut src_cfg: WalSourceConfig = wal_config(
+            &cfg,
+            &source_url,
+            &admin_url,
+            &tables,
+            &children,
+            &aggregates,
+            &durable,
+            &tls,
+        )?;
+        if !polling {
+            src_cfg.key_columns = key_columns_for(&cfg, &admin).await?;
+        }
+        let source = WalSource::new(src_cfg.clone());
 
-    if !polling {
-        source.bootstrap(&admin).await?;
-        warn_on_child_replica_identity(&cfg, &admin).await?;
-        check_derived_identity_requirements(&cfg, &admin).await?;
-    }
-    sink.ensure_ready(&index_specs).await?;
+        if !polling {
+            source.bootstrap(&admin).await?;
+            warn_on_child_replica_identity(&cfg, &admin).await?;
+            check_derived_identity_requirements(&cfg, &admin).await?;
+        }
+        sink.ensure_ready(&index_specs).await?;
+        Ok((children, src_cfg))
+    })
+    .await?;
+    let Some((children, src_cfg)) = ready else {
+        metrics.set_state(SourceState::Stopped);
+        return Ok(());
+    };
 
     if mode == Mode::Bootstrap {
         println!("✓ source objects and target indices are ready");
@@ -1185,10 +1295,6 @@ async fn run_postgres(
             indices: index_names(&cfg)?,
         },
     );
-
-    // setup is done; each attempt opens the SQL connection it needs, so holding
-    // this one open would be a third connection doing nothing
-    drop(admin);
 
     // shared with every attempt rather than borrowed by it
     let cfg = Arc::new(cfg);
@@ -1751,16 +1857,40 @@ async fn run_mysql(
         ..
     } = rt.clone();
 
-    let src_cfg = mysql_config_for(&cfg, &source_url)?;
-    let source = MySqlSource::new(src_cfg);
-    let mut admin = source.admin_connection().await?;
-    source.bootstrap(&mut admin).await?;
-    sink.ensure_ready(&index_specs).await?;
+    // Every attempt opens the connection it needs, because a server that was
+    // not up yet left nothing behind for a second attempt to reuse.
+    let policy = setup_policy(&cfg, mode);
+    let ready = setup_with_retry(policy, &metrics, &shutdown_rx, || async {
+        let source = MySqlSource::new(mysql_config_for(&cfg, &source_url)?);
+        let mut admin = source.admin_connection().await?;
+        source.bootstrap(&mut admin).await?;
+        sink.ensure_ready(&index_specs).await?;
+        Ok(())
+    })
+    .await?;
+    if ready.is_none() {
+        metrics.set_state(SourceState::Stopped);
+        return Ok(());
+    }
 
     if mode == Mode::Bootstrap {
         println!("✓ MySQL prerequisites met and target indices are ready");
         return Ok(());
     }
+
+    // The endpoints speak binlog coordinates, so the prefix they render with is
+    // part of being set up rather than of streaming — and it is one more round
+    // trip a server that is not up yet cannot answer. Bootstrap never gets
+    // here: it opens no endpoints, so it needs neither the prefix nor the grant
+    // that reads one.
+    let Some(api_prefix) = setup_with_retry(policy, &metrics, &shutdown_rx, || {
+        mysql_binlog_prefix(&cfg, &source_url)
+    })
+    .await?
+    else {
+        metrics.set_state(SourceState::Stopped);
+        return Ok(());
+    };
 
     let stream_id = cfg.stream_id();
     // Reloads are watched from here rather than from `main`, because this is
@@ -1781,9 +1911,6 @@ async fn run_mysql(
     // outside the retry loop. They speak binlog coordinates, the pipeline
     // speaks versions, and after a failover those differ by exactly this.
     let version_base = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    // the binlog prefix is only known once a position has been read, so the
-    // renderer and parser are built from the source's own vocabulary
-    let api_prefix = mysql_binlog_prefix(&cfg, &source_url).await?;
     {
         let prefix = api_prefix.clone();
         let render: PositionRenderer = {
@@ -2719,5 +2846,157 @@ parent = "{element}"
         let mut same = stored;
         same.stream.stream = "slot_a".into();
         assert!(usable_checkpoint(Some(same), &expected).is_some());
+    }
+
+    /// A source that is up on the `n`th attempt, counting the attempts.
+    fn flaky(
+        failures: usize,
+        error: impl Fn() -> anyhow::Error,
+    ) -> impl FnMut() -> std::future::Ready<Result<&'static str>> {
+        let mut seen = 0usize;
+        move || {
+            seen += 1;
+            std::future::ready(if seen > failures {
+                Ok("ready")
+            } else {
+                Err(error())
+            })
+        }
+    }
+
+    fn unreachable_source() -> anyhow::Error {
+        anyhow::Error::new(pg2osync_source::SourceError::Connect {
+            context: "connection failed".into(),
+            source: None,
+        })
+        .context("cannot connect to source PostgreSQL")
+    }
+
+    fn quick() -> ReconnectPolicy {
+        ReconnectPolicy {
+            max_attempts: 5,
+            base_backoff_ms: 1,
+        }
+    }
+
+    fn metrics() -> SharedMetrics {
+        pg2osync_engine::metrics::Registry::default().register("t")
+    }
+
+    #[test]
+    fn only_being_unable_to_reach_something_is_waited_out() {
+        assert!(worth_retrying_setup(&unreachable_source()));
+        assert!(worth_retrying_setup(&anyhow::Error::new(
+            pg2osync_source_mysql::MySqlError::connect(
+                "mysql admin connection failed",
+                std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+            )
+        )));
+        assert!(worth_retrying_setup(&anyhow::Error::new(
+            pg2osync_core::CoreError::SinkTransient("http status 503".into())
+        )));
+
+        // the server answered, and it answers the same on every attempt
+        assert!(!worth_retrying_setup(&anyhow::Error::new(
+            pg2osync_source::SourceError::Refused {
+                context: "password authentication failed for user \"repl\"".into(),
+                source: None,
+            }
+        )));
+        assert!(!worth_retrying_setup(&anyhow::Error::new(
+            pg2osync_source_mysql::MySqlError::connect(
+                "mysql admin connection failed",
+                pg2osync_source_mysql::MySqlError::auth("access denied for user 'repl'"),
+            )
+        )));
+        assert!(!worth_retrying_setup(&anyhow::Error::new(
+            pg2osync_source::SourceError::Catalog {
+                context: "relation \"public.orders\" does not exist".into(),
+                source: None,
+            }
+        )));
+        assert!(!worth_retrying_setup(&anyhow::Error::new(
+            pg2osync_source::SourceError::Config("public.orders has no REPLICA IDENTITY".into())
+        )));
+        assert!(!worth_retrying_setup(&anyhow::Error::new(
+            pg2osync_core::CoreError::Sink("mapping is not valid".into())
+        )));
+        // where the streaming rule gives an unclassified failure the benefit of
+        // the doubt, setup refuses to: nothing has claimed it could recover
+        assert!(!worth_retrying_setup(&anyhow::anyhow!("something else")));
+    }
+
+    #[tokio::test]
+    async fn a_source_that_is_down_at_startup_is_waited_for() {
+        let metrics = metrics();
+        let (_tx, shutdown) = watch::channel(false);
+        let ready = setup_with_retry(quick(), &metrics, &shutdown, flaky(3, unreachable_source))
+            .await
+            .expect("the fourth attempt found it up");
+        assert_eq!(ready, Some("ready"));
+        assert_eq!(metrics.reconnects_total.load(Ordering::Relaxed), 3);
+        assert_ne!(
+            metrics.state(),
+            SourceState::Halted,
+            "a source that came up was never halted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_permanent_rejection_is_not_waited_out() {
+        let metrics = metrics();
+        let (_tx, shutdown) = watch::channel(false);
+        let refused = || {
+            anyhow::Error::new(pg2osync_source::SourceError::Config(
+                "public.orders has no primary key".into(),
+            ))
+        };
+        let error = setup_with_retry(quick(), &metrics, &shutdown, flaky(99, refused))
+            .await
+            .expect_err("a configuration nothing can satisfy halts the source");
+        assert!(format!("{error:#}").contains("no primary key"), "{error:#}");
+        assert_eq!(
+            metrics.reconnects_total.load(Ordering::Relaxed),
+            0,
+            "the first attempt is the last one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_source_that_never_comes_up_halts_like_a_stream_that_never_reconnects() {
+        let metrics = metrics();
+        let (_tx, shutdown) = watch::channel(false);
+        let policy = ReconnectPolicy {
+            max_attempts: 2,
+            base_backoff_ms: 1,
+        };
+        let error = setup_with_retry(policy, &metrics, &shutdown, flaky(99, unreachable_source))
+            .await
+            .expect_err("the policy ran out");
+        assert!(
+            format!("{error:#}").contains("giving up after 3 consecutive attempts"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_mid_backoff_does_not_wait_it_out() {
+        let metrics = metrics();
+        let (tx, shutdown) = watch::channel(false);
+        let policy = ReconnectPolicy {
+            max_attempts: 100,
+            // long enough that finishing one sleep would outlast the test
+            base_backoff_ms: 30_000,
+        };
+        let stopping = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tx.send(true).expect("the receiver is in the retry loop");
+        });
+        let ready: Option<&str> =
+            setup_with_retry(policy, &metrics, &shutdown, flaky(99, unreachable_source))
+                .await
+                .expect("a drain is not a failure");
+        assert!(ready.is_none(), "the source stopped instead of starting");
+        stopping.await.expect("the signal task");
     }
 }

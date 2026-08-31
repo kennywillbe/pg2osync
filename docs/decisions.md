@@ -1045,10 +1045,32 @@ A halted source is a state, not an exit. One source failing — a permanent
 rejection, an exhausted quarantine, a `reconnect_max` run out — is logged
 against its name, sets its state and leaves the others streaming; the process
 exits non-zero only when every source has halted, which for a single source is
-bit-identical to what it always did. What is not retried is the setup before
-streaming begins, so a source unreachable at boot halts rather than waiting for
-its database to come back; that is [#172](https://github.com/kennywillbe/pg2osync/issues/172),
-not this change.
+bit-identical to what it always did.
+
+**Boot and stream share one retry discipline.** The setup a source does before
+it streams — connecting, introspecting the catalog, creating the slot or
+reading the binlog position, ensuring the target indices exist — retries under
+the same `[source] reconnect_max` and `reconnect_backoff_ms` a dropped stream
+does, and the source reports itself `reconnecting` while it does. A database
+that is slow to come back after a node reboot is the same outage whether the
+process happened to be started before it or after, and the operator who sized
+the policy for one has sized it for the other. When the attempts run out the
+source halts exactly as an exhausted reconnect does; `bootstrap` keeps failing
+on the first attempt, because it is a command somebody is waiting on.
+
+What is deliberately *not* waited out is a rejection. Streaming retries
+everything but a configuration the source calls hopeless, which it can afford
+because a stream that ran proves the credentials, the tables and the
+publication were all good a moment ago. Nothing is proved at startup, so there
+the rule is inverted: only a failure that claims it never reached its server is
+retried, and a missing table, a refused `REPLICA IDENTITY`, an invalid
+publication or an index the target will not create halts immediately with the
+message it always had. Credentials the server rejects count as a rejection, not
+as an outage — the transient case is a failover, and a failover happens to a
+pipeline that is already streaming, where the wider rule applies. Getting that
+one wrong the other way would turn the commonest startup mistake, a password
+with a typo in it, into a source that looks like it is merely waiting for a
+database while the sentence naming the mistake scrolls past once.
 
 ## Scope
 

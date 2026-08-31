@@ -43,7 +43,7 @@ startup. Secrets never appear in logs or error messages.
 | `sslcert` | — | PEM client certificate chain presented to the server; requires `sslkey` |
 | `sslkey` | — | PEM private key for `sslcert`; PKCS#8, RSA or EC, unencrypted |
 | `admin_url_env` | falls back to the source URL | Separate connection for catalog and nested-child queries |
-| `reconnect_max` | `10` | Consecutive stream failures tolerated before exiting; `0` exits on the first |
+| `reconnect_max` | `10` | Consecutive failures tolerated, at startup as well as on a dropped stream, before the source halts; `0` gives up on the first |
 | `reconnect_backoff_ms` | `1000` | Initial reconnect delay, doubled per failure, capped at 30 s |
 | `load_workers` | `1` | Ranges of the initial load read at once, each on its own connection. PostgreSQL only. Worth raising only for tables with nested children, where the server does per-row work: measured +53% there, +5–8% on ordinary tables for four times the read load |
 | `load_chunk_rows` | `50000` | Rows one initial-load piece covers: a sampled range on PostgreSQL, a keyset chunk on MySQL. On PostgreSQL it is also how often the load can react to WAL pressure, since a range cannot be interrupted |

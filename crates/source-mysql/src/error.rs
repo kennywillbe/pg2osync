@@ -81,6 +81,28 @@ impl MySqlError {
         !matches!(self, Self::Config(_))
     }
 
+    /// Whether the server was never reached.
+    ///
+    /// What the setup phase asks, where `is_retryable` is too generous: before
+    /// a stream has ever run, a catalogue read that fails is far more often a
+    /// table that is not there than a server that went away mid-read, and an
+    /// account the server refuses is refused just as firmly on the next
+    /// attempt. Opening a connection is one operation from the outside and a
+    /// TCP connect followed by a handshake from the inside, so a `Connect` that
+    /// carries a verdict underneath is judged by that verdict.
+    pub fn is_unreachable(&self) -> bool {
+        match self {
+            Self::Connect {
+                source: Some(inner),
+                ..
+            } => inner
+                .downcast_ref::<MySqlError>()
+                .is_none_or(MySqlError::is_unreachable),
+            Self::Connect { .. } | Self::Io(_) => true,
+            _ => false,
+        }
+    }
+
     pub fn connect(context: impl Into<String>, source: impl Into<BoxError>) -> Self {
         Self::Connect {
             context: context.into(),
@@ -142,3 +164,51 @@ where
 }
 
 pub type Result<T, E = MySqlError> = std::result::Result<T, E>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What `admin_connection` does to whatever the handshake returned.
+    fn wrapped(inner: MySqlError) -> MySqlError {
+        MySqlError::connect("mysql admin connection failed", inner)
+    }
+
+    #[test]
+    fn only_a_server_that_was_never_reached_is_worth_waiting_for() {
+        assert!(
+            wrapped(MySqlError::connect(
+                "mysql tcp connect failed",
+                std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+            ))
+            .is_unreachable()
+        );
+        assert!(
+            !wrapped(MySqlError::auth("access denied for user 'repl'")).is_unreachable(),
+            "an account the server refuses is refused on every attempt"
+        );
+        assert!(
+            !wrapped(MySqlError::Config(
+                "sslmode=require was requested but the server does not offer TLS".into()
+            ))
+            .is_unreachable()
+        );
+        assert!(
+            !MySqlError::Catalog {
+                context: "sourcedb.orders is not there".into(),
+                source: None,
+            }
+            .is_unreachable()
+        );
+    }
+
+    #[test]
+    fn a_stream_that_dropped_retries_wider_than_a_setup_does() {
+        // credentials that were accepted once can be refused mid-failover
+        // while the promoted server is still warming up, and by then the
+        // pipeline has a position to resume from
+        let refused = wrapped(MySqlError::auth("access denied for user 'repl'"));
+        assert!(refused.is_retryable());
+        assert!(!refused.is_unreachable());
+    }
+}

@@ -425,6 +425,18 @@ once a connection has lasted longer than that cap. After
 minutes) the source halts; once every source the process runs has halted, the
 process exits and hands over.
 
+A database that is not up when the process starts is the same outage and waits
+the same way: the setup before streaming — connecting, reading the catalog,
+creating the slot or reading the binlog position, ensuring the target indices
+exist — retries under that same policy, and the source reports itself
+`reconnecting` until it succeeds or the attempts run out. It comes up on its
+own once the database answers; no restart is needed. What does not wait is a
+refusal, because every attempt would get the same one: a missing table, a
+`REPLICA IDENTITY` the table does not have, a publication that does not match,
+an index the target will not create, or credentials the server rejects. Those
+halt the source immediately with the message that says what to fix.
+`pg2osync bootstrap` never waits at all — it is a command you are watching.
+
 A target that is down is retried the same way, one request at a time, on
 `[engine] retry_max` attempts with `retry_backoff_ms` doubling between them and
 capped at 30 seconds — nine waits summing to about two minutes on the defaults.

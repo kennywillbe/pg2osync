@@ -35,7 +35,10 @@ fully is the point rather than the cost: a partially buffered transaction is
 invalid once the stream repositions, and the teardown is what discards it.
 Retries back off exponentially and stop after `[source] reconnect_max`
 consecutive failures, so a real outage still reaches whatever supervises the
-process instead of being hidden by an endless retry loop.
+process instead of being hidden by an endless retry loop. The setup that runs
+before the first stream retries under the same policy, so a source whose
+database is not up yet waits for it in `reconnecting` rather than halting —
+unless the failure is a refusal, which no amount of waiting changes.
 
 ### Engine task
 
