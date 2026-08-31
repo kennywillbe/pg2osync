@@ -3,6 +3,47 @@
 Why pg2osync is built the way it is. Code that contradicts a decision here is a
 bug: change this document first, then the code.
 
+## What is in here
+
+Each decision is a bold lead sentence followed by the reasoning, grouped by
+section. They are deliberately not headings of their own: ninety-nine anchors
+would be ninety-nine things to keep stable, and a decision is read in the
+company of the ones around it. So a link into this document names its section,
+and the bold sentence is what to search for inside it.
+
+| Section | What it decides |
+|---|---|
+| [Change capture](#change-capture) | Where changes come from, and why not from triggers or timestamps |
+| [Protocol code is ours](#protocol-code-is-ours) | What is a dependency and what is written here |
+| [Boundaries](#boundaries) | Which crate may know about which, and why the compiler enforces it |
+| [Correctness](#correctness) | Delivery, identity, document shape, transactions, rejections, and what a checkpoint is bound to |
+| [Initial load](#initial-load) | Reading a table beside a live stream, and what a rebuild is |
+| [Checkpoints](#checkpoints) | Where the position lives and what it records |
+| [Types](#types) | How each source's types become JSON |
+| [Operating limits](#operating-limits) | Retention, retries, and what several sources in one process share |
+| [Scope](#scope) | What pg2osync deliberately does not do, and what each refusal buys |
+| [The Kubernetes operator](#the-kubernetes-operator) | Why a second binary, and what its resource says |
+| [Implementation choices](#implementation-choices) | The smaller calls: metrics, traces, errors, secrets, dependencies |
+
+### Read these first
+
+The load-bearing ones. Breaking any of these is a bug even when the tests pass,
+which is why [AGENTS.md](https://github.com/kennywillbe/pg2osync/blob/main/AGENTS.md)
+repeats most of them.
+
+- **Read the replication log, not triggers or timestamps.** — [Change capture](#change-capture)
+- **`core` depends on nothing.** — [Boundaries](#boundaries)
+- **The engine is source-agnostic.** — [Boundaries](#boundaries)
+- **New targets implement `Sink`.** — [Boundaries](#boundaries)
+- **At-least-once with idempotent writes.** — [Correctness](#correctness)
+- **Buffer until commit.** — [Correctness](#correctness)
+- **Never acknowledge a position before it is durable.** — [Correctness](#correctness)
+- **Stop on permanent rejection, unless told to quarantine.** — [Correctness](#correctness)
+- **A checkpoint is bound to its stream.** — [Correctness](#correctness)
+- **The load runs beside the stream, not before it.** — [Initial load](#initial-load)
+- **State lives in the target.** — [Checkpoints](#checkpoints)
+- **Boot and stream share one retry discipline.** — [Operating limits](#operating-limits)
+
 ## Change capture
 
 **Read the replication log, not triggers or timestamps.** Logical replication

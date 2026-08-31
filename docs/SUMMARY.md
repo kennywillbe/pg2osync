@@ -24,6 +24,14 @@
 - [Operations](operations.md)
 - [What it costs your database](database-impact.md)
 
+# Guides
+
+- [Migrating from Logstash](guides/migrating-from-logstash.md)
+- [Setting up a managed PostgreSQL](guides/managed-postgres.md)
+- [Add a source table without a restart](guides/add-a-source-table-without-a-restart.md)
+- [Choosing a rebuild](guides/choosing-a-rebuild.md)
+- [Rotating a pseudonym key](guides/rotating-a-pseudonym-key.md)
+
 # How it works
 
 - [Architecture](architecture.md)
