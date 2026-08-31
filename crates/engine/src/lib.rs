@@ -199,9 +199,15 @@ pub type PositionRenderer = Arc<dyn Fn(u64) -> String + Send + Sync>;
 /// a clear rejection rather than a nonsensical wait.
 pub type PositionParser = Arc<dyn Fn(&str) -> Option<u64> + Send + Sync>;
 
-/// Runtime handles shared by all pipeline tasks.
-pub struct PipelineCtx {
-    pub sink: Arc<dyn Sink>,
+/// Everything the engine knows about the configured tables, as one value.
+///
+/// One structure rather than a field per rule because they are swapped
+/// together: a reload that had added a table to the index mapping but not yet
+/// to the id templates would file that table's rows under an id nobody asked
+/// for, for as long as the gap lasted. Swapping an `Arc` of the whole set
+/// makes that gap unreachable, and costs a batch one atomic read.
+#[derive(Debug, Default)]
+pub struct RuleSet {
     pub mapping: TableMapping,
     pub projections: crate::mapping::Projections,
     pub transforms: crate::mapping::Transforms,
@@ -229,6 +235,15 @@ pub struct PipelineCtx {
     /// Tables with no key: insert-only, filed under a content hash unless
     /// the section configures an id.
     pub append_only: crate::mapping::AppendOnly,
+}
+
+/// Runtime handles shared by all pipeline tasks.
+pub struct PipelineCtx {
+    pub sink: Arc<dyn Sink>,
+    /// What every configured table's rows are turned into, re-read at the top
+    /// of every turn so a reload that adds or removes a section reaches the
+    /// next batch without the pipeline being rebuilt.
+    pub rules: watch::Receiver<Arc<RuleSet>>,
     pub cfg: EngineConfig,
     /// The settings the engine re-reads, so a configuration reload reaches the
     /// next batch without the pipeline being rebuilt.
@@ -412,7 +427,10 @@ pub async fn run(
 
     let result = loop {
         // The batch boundary is decided from here down, so a reload that
-        // landed since the last turn moves it from this batch onwards.
+        // landed since the last turn moves it from this batch onwards. The
+        // rules are taken the same way and for the same reason, and held for
+        // the turn so one batch is shaped by one version of them.
+        let active = ctx.rules.borrow().clone();
         let latest = *ctx.settings.borrow();
         if latest != settings {
             settings = latest;
@@ -442,8 +460,8 @@ pub async fn run(
                         ev = copy.recv(), if copy_open => match ev {
                             Some(ev) => got = Some(ev),
                             None => {
-                                // the load is over, so there is nothing left for
-                                // the window to protect
+                                // the attempt is over, so there is nothing left
+                                // for the window to protect
                                 copy_open = false;
                                 superseded.clear();
                                 cleared.clear();
@@ -594,18 +612,18 @@ pub async fn run(
                 ctx.metrics.incr_event_by("row", rows.len() as u64);
                 let batch = batch_span.get_or_insert_with(new_batch_span).clone();
                 let rules = Rules {
-                    projections: &ctx.projections,
-                    transforms: &ctx.transforms,
-                    renames: &ctx.renames,
-                    flattens: &ctx.flattens,
-                    constants: &ctx.constants,
-                    id_templates: &ctx.id_templates,
-                    fan_outs: &ctx.fan_outs,
-                    joins: &ctx.joins,
-                    filters: &ctx.filters,
-                    pipelines: &ctx.pipelines,
-                    routings: &ctx.routings,
-                    append_only: &ctx.append_only,
+                    projections: &active.projections,
+                    transforms: &active.transforms,
+                    renames: &active.renames,
+                    flattens: &active.flattens,
+                    constants: &active.constants,
+                    id_templates: &active.id_templates,
+                    fan_outs: &active.fan_outs,
+                    joins: &active.joins,
+                    filters: &active.filters,
+                    pipelines: &active.pipelines,
+                    routings: &active.routings,
+                    append_only: &active.append_only,
                 };
                 // The engine's share of decoding a change: the source hands over
                 // what the replication protocol carried, and what it could not —
@@ -619,7 +637,7 @@ pub async fn run(
                 );
                 let completions = match fetch_completions(
                     &rows,
-                    &ctx.mapping,
+                    &active.mapping,
                     ctx.sink.as_ref(),
                     &ctx.metrics,
                     &rules,
@@ -645,16 +663,20 @@ pub async fn run(
                     // drops what it cannot map, and a panic in a worker thread
                     // is the worst way to find out it missed something — it
                     // takes the process down and every reconnect repeats it.
-                    let Some(target) = ctx.mapping.target_for(&row.schema, &row.table) else {
+                    let Some(target) = active.mapping.target_for(&row.schema, &row.table) else {
                         tracing::error!(target: "pg2osync::engine",
                             "no index is configured for {}.{}; its rows are being dropped",
                             row.schema, row.table);
                         continue;
                     };
-                    let previous =
-                        completion_key(&row.kind, &rules, &ctx.mapping, (&row.schema, &row.table))
-                            .and_then(|(key, _)| completions.get(&key))
-                            .and_then(Option::as_ref);
+                    let previous = completion_key(
+                        &row.kind,
+                        &rules,
+                        &active.mapping,
+                        (&row.schema, &row.table),
+                    )
+                    .and_then(|(key, _)| completions.get(&key))
+                    .and_then(Option::as_ref);
                     let mut left_as_is = Vec::new();
                     let ops = match transform.in_scope(|| {
                         materialize(
@@ -679,7 +701,7 @@ pub async fn run(
                             .fetch_add(left_as_is.len() as u64, Ordering::Relaxed);
                         for col in left_as_is {
                             if transform_warned.insert((row.table.clone(), col.clone())) {
-                                let rule = ctx
+                                let rule = active
                                     .transforms
                                     .for_table(&row.schema, &row.table)
                                     .and_then(|rules| rules.get(&col));
@@ -758,7 +780,7 @@ pub async fn run(
                     }
                     // Remembered only while a load is running: with no copy
                     // row to outrank there is nothing for this to protect.
-                    if copy_open {
+                    if copy.load_running {
                         for op in &ops {
                             if let DocumentOp::Delete {
                                 index,
@@ -805,6 +827,14 @@ pub async fn run(
                     break Err(e);
                 }
             }
+            // Both are read off the load's channel before they reach here,
+            // which is where the window they open and close is kept; all that
+            // is left to do is drop what the window was holding.
+            ChangeEvent::LoadStarted => {}
+            ChangeEvent::LoadFinished => {
+                superseded.clear();
+                cleared.clear();
+            }
             ChangeEvent::SchemaDrift {
                 schema,
                 table,
@@ -824,7 +854,7 @@ pub async fn run(
                 version,
             } => {
                 ctx.metrics.incr_event("truncate");
-                let Some(target) = ctx.mapping.target_for(&schema, &table) else {
+                let Some(target) = active.mapping.target_for(&schema, &table) else {
                     continue;
                 };
                 // every index the table's rows could have rendered into
@@ -836,11 +866,11 @@ pub async fn run(
                 // is and said so — halting would replay the same TRUNCATE
                 // from the slot at every restart, with nothing the operator
                 // could change to get past it.
-                let only = ctx
+                let only = active
                     .joins
                     .for_table(&schema, &table)
                     .map(|join| (join.field.clone(), join.name.clone()));
-                if only.is_none() && ctx.mapping.is_shared(&index) {
+                if only.is_none() && active.mapping.is_shared(&index) {
                     ctx.metrics.incr_event("truncate_skipped");
                     tracing::error!(target: "pg2osync::engine",
                         "{schema}.{table}: TRUNCATE not applied to index {index}, which other \
@@ -868,7 +898,7 @@ pub async fn run(
                 // would drop the other half's copied rows too. The window that
                 // leaves — a copied row of the truncated relation landing after
                 // the clear — is one reconcile finds.
-                if copy_open
+                if copy.load_running
                     && only.is_none()
                     && let Some(version) = version
                 {
@@ -928,6 +958,13 @@ struct LoadIntake {
     configured: Option<u32>,
     /// When the limit will let another row through; `None` means now.
     open_at: Option<std::time::Instant>,
+    /// Whether a copied row may still be in flight, which is what the
+    /// superseded and cleared windows exist to outrank.
+    ///
+    /// It lives here because this is the only place that can still tell a
+    /// copied row from a streamed one: by the time the engine's loop has an
+    /// event, the two producers have been merged into one.
+    load_running: bool,
 }
 
 impl LoadIntake {
@@ -937,6 +974,10 @@ impl LoadIntake {
             limit: max_rows_per_sec.map(RateLimit::new),
             configured: max_rows_per_sec,
             open_at: None,
+            // True until a load says it has finished, which is what the
+            // channel closing used to mean: an attempt begins with its
+            // initial load either running or about to.
+            load_running: true,
         }
     }
 
@@ -964,7 +1005,7 @@ impl LoadIntake {
             return None;
         }
         let ev = self.rx.try_recv().ok()?;
-        self.charge(&ev);
+        self.took(&ev);
         Some(ev)
     }
 
@@ -976,7 +1017,7 @@ impl LoadIntake {
             self.open_at = None;
         }
         let ev = self.rx.recv().await?;
-        self.charge(&ev);
+        self.took(&ev);
         Some(ev)
     }
 
@@ -991,9 +1032,17 @@ impl LoadIntake {
         }
     }
 
-    /// Only rows are counted: a mark or a boundary costs the source nothing to
-    /// produce, and delaying one would only stall the load without saving work.
-    fn charge(&mut self, ev: &ChangeEvent) {
+    /// Account for an event taken off the load's channel.
+    ///
+    /// Only rows are charged against the rate: a mark or a boundary costs the
+    /// source nothing to produce, and delaying one would only stall the load
+    /// without saving work.
+    fn took(&mut self, ev: &ChangeEvent) {
+        match ev {
+            ChangeEvent::LoadStarted => self.load_running = true,
+            ChangeEvent::LoadFinished => self.load_running = false,
+            _ => {}
+        }
         if let (Some(limit), ChangeEvent::Row(_)) = (self.limit.as_mut(), ev) {
             let now = std::time::Instant::now();
             let wait = limit.charge(1, now);
@@ -2101,6 +2150,11 @@ mod pipeline_tests {
         watch::channel(cfg.settings()).1
     }
 
+    /// Rules that never change, for the same reason and in the same way.
+    fn fixed_rules(rules: RuleSet) -> watch::Receiver<Arc<RuleSet>> {
+        watch::channel(Arc::new(rules)).1
+    }
+
     /// Records what the pipeline asks of a sink, so ordering and checkpoint
     /// behaviour can be asserted without a live cluster.
     #[derive(Default)]
@@ -2447,22 +2501,13 @@ mod pipeline_tests {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let ctx = Arc::new(PipelineCtx {
             sink: sink.clone(),
-            mapping: TableMapping::from_pairs([(
-                ("public".to_string(), "users".to_string()),
-                "users".to_string(),
-            )]),
-            projections: crate::mapping::Projections::default(),
-            transforms: crate::mapping::Transforms::default(),
-            renames: crate::mapping::Renames::default(),
-            flattens: crate::mapping::Flattens::default(),
-            constants: crate::mapping::Constants::default(),
-            id_templates: crate::mapping::IdTemplates::default(),
-            fan_outs: crate::mapping::FanOuts::default(),
-            joins: crate::mapping::Joins::default(),
-            filters: crate::mapping::Filters::default(),
-            pipelines: crate::mapping::Pipelines::default(),
-            routings: Default::default(),
-            append_only: Default::default(),
+            rules: fixed_rules(RuleSet {
+                mapping: TableMapping::from_pairs([(
+                    ("public".to_string(), "users".to_string()),
+                    "users".to_string(),
+                )]),
+                ..Default::default()
+            }),
             settings: fixed_settings(&cfg),
             cfg,
             ack_tx,
@@ -2808,6 +2853,49 @@ mod pipeline_tests {
             vec!["write[delete:1]"],
             "the delete stands and the stale copy row is gone"
         );
+    }
+
+    #[tokio::test]
+    async fn a_load_that_has_finished_stops_the_stream_remembering_its_deletes() {
+        // The window costs a lookup per copied row and an entry per delete, so
+        // it closes when the load is over. It used to close when the copy
+        // channel did; now the channel outlives the load, and this is what
+        // says so.
+        let (sink, _) = drive_split(
+            500,
+            vec![deleted_at(1, 0x200), commit(0x200)],
+            vec![
+                ChangeEvent::LoadFinished,
+                row_at(1, Some(0x100)),
+                ChangeEvent::LoadMark(1),
+            ],
+        )
+        .await;
+        assert_eq!(
+            sink.events(),
+            vec!["write[delete:1 upsert:1@256]"],
+            "with no load running there is nothing for the delete to outrank"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_load_that_has_finished_leaves_its_channel_usable() {
+        // What a table added by a reload is read down. The channel used to
+        // close here, and an engine that treated `LoadFinished` as the end of
+        // the copy would have nothing left to read one with.
+        let (sink, mark) = drive_split(
+            500,
+            Vec::new(),
+            vec![
+                row_at(1, Some(0x100)),
+                ChangeEvent::LoadFinished,
+                row_at(2, Some(0x200)),
+                ChangeEvent::LoadMark(7),
+            ],
+        )
+        .await;
+        assert_eq!(sink.events(), vec!["write[upsert:1@256 upsert:2@512]"]);
+        assert_eq!(mark, 7, "the load channel kept working after it said so");
     }
 
     #[tokio::test]
@@ -3519,22 +3607,22 @@ mod pipeline_tests {
         };
         let ctx = Arc::new(PipelineCtx {
             sink: sink.clone(),
-            mapping: TableMapping::from_pairs([(
-                ("public".to_string(), "users".to_string()),
-                "users".to_string(),
-            )]),
-            projections: crate::mapping::Projections::default(),
-            transforms: crate::mapping::Transforms::default(),
-            renames,
-            flattens: crate::mapping::Flattens::default(),
-            constants,
-            id_templates: ids,
-            fan_outs: fan,
-            joins: crate::mapping::Joins::default(),
-            filters,
-            pipelines,
-            routings: Default::default(),
-            append_only: Default::default(),
+            rules: fixed_rules(RuleSet {
+                mapping: TableMapping::from_pairs([(
+                    ("public".to_string(), "users".to_string()),
+                    "users".to_string(),
+                )]),
+                transforms: crate::mapping::Transforms::default(),
+                renames,
+                flattens: crate::mapping::Flattens::default(),
+                constants,
+                id_templates: ids,
+                fan_outs: fan,
+                joins: crate::mapping::Joins::default(),
+                filters,
+                pipelines,
+                ..Default::default()
+            }),
             settings: fixed_settings(&engine_cfg),
             cfg: engine_cfg,
             ack_tx,
@@ -3664,25 +3752,18 @@ mod pipeline_tests {
         let sink = Arc::new(RecordingSink::default());
         let ctx = Arc::new(PipelineCtx {
             sink: sink.clone(),
-            mapping: TableMapping::from_pairs([(
-                ("public".to_string(), "users".to_string()),
-                "users".to_string(),
-            )]),
-            projections: crate::mapping::Projections::from_pairs([(
-                ("public".to_string(), "users".to_string()),
-                crate::mapping::Projection::Include(vec!["id".into()]),
-            )]),
-            transforms: crate::mapping::Transforms::default(),
-            renames: crate::mapping::Renames::default(),
-            flattens: crate::mapping::Flattens::default(),
-            constants: users_constants(&[("entity", json!("user"))]),
-            id_templates: Default::default(),
-            fan_outs: Default::default(),
-            joins: Default::default(),
-            filters: Default::default(),
-            pipelines: Default::default(),
-            routings: Default::default(),
-            append_only: Default::default(),
+            rules: fixed_rules(RuleSet {
+                mapping: TableMapping::from_pairs([(
+                    ("public".to_string(), "users".to_string()),
+                    "users".to_string(),
+                )]),
+                projections: crate::mapping::Projections::from_pairs([(
+                    ("public".to_string(), "users".to_string()),
+                    crate::mapping::Projection::Include(vec!["id".into()]),
+                )]),
+                constants: users_constants(&[("entity", json!("user"))]),
+                ..Default::default()
+            }),
             settings: fixed_settings(&EngineConfig::default()),
             cfg: EngineConfig::default(),
             ack_tx,
@@ -3725,28 +3806,20 @@ mod pipeline_tests {
         let metrics = Arc::new(crate::metrics::Metrics::default());
         let ctx = Arc::new(PipelineCtx {
             sink: sink.clone(),
-            mapping: TableMapping::from_pairs([(
-                ("public".to_string(), "users".to_string()),
-                "users".to_string(),
-            )]),
-            projections: crate::mapping::Projections::default(),
-            transforms: crate::mapping::Transforms::from_pairs([(
-                ("public".to_string(), "users".to_string()),
-                std::collections::HashMap::from([(
-                    "price".to_string(),
-                    crate::mapping::TransformOp::Number,
+            rules: fixed_rules(RuleSet {
+                mapping: TableMapping::from_pairs([(
+                    ("public".to_string(), "users".to_string()),
+                    "users".to_string(),
                 )]),
-            )]),
-            renames: crate::mapping::Renames::default(),
-            flattens: crate::mapping::Flattens::default(),
-            constants: crate::mapping::Constants::default(),
-            id_templates: Default::default(),
-            fan_outs: Default::default(),
-            joins: Default::default(),
-            filters: Default::default(),
-            pipelines: Default::default(),
-            routings: Default::default(),
-            append_only: Default::default(),
+                transforms: crate::mapping::Transforms::from_pairs([(
+                    ("public".to_string(), "users".to_string()),
+                    std::collections::HashMap::from([(
+                        "price".to_string(),
+                        crate::mapping::TransformOp::Number,
+                    )]),
+                )]),
+                ..Default::default()
+            }),
             settings: fixed_settings(&EngineConfig::default()),
             cfg: EngineConfig::default(),
             ack_tx,
@@ -3793,28 +3866,20 @@ mod pipeline_tests {
         sink.store(json!({"bio": "already-a-digest"}));
         let ctx = Arc::new(PipelineCtx {
             sink: sink.clone(),
-            mapping: TableMapping::from_pairs([(
-                ("public".to_string(), "users".to_string()),
-                "users".to_string(),
-            )]),
-            projections: crate::mapping::Projections::default(),
-            transforms: crate::mapping::Transforms::from_pairs([(
-                ("public".to_string(), "users".to_string()),
-                std::collections::HashMap::from([(
-                    "bio".to_string(),
-                    crate::mapping::TransformOp::Hash,
+            rules: fixed_rules(RuleSet {
+                mapping: TableMapping::from_pairs([(
+                    ("public".to_string(), "users".to_string()),
+                    "users".to_string(),
                 )]),
-            )]),
-            renames: crate::mapping::Renames::default(),
-            flattens: crate::mapping::Flattens::default(),
-            constants: crate::mapping::Constants::default(),
-            id_templates: Default::default(),
-            fan_outs: Default::default(),
-            joins: Default::default(),
-            filters: Default::default(),
-            pipelines: Default::default(),
-            routings: Default::default(),
-            append_only: Default::default(),
+                transforms: crate::mapping::Transforms::from_pairs([(
+                    ("public".to_string(), "users".to_string()),
+                    std::collections::HashMap::from([(
+                        "bio".to_string(),
+                        crate::mapping::TransformOp::Hash,
+                    )]),
+                )]),
+                ..Default::default()
+            }),
             settings: fixed_settings(&EngineConfig::default()),
             cfg: EngineConfig::default(),
             ack_tx,
@@ -4119,22 +4184,14 @@ mod pipeline_tests {
         let sink = Arc::new(RecordingSink::default());
         let ctx = Arc::new(PipelineCtx {
             sink,
-            mapping: TableMapping::from_pairs([(
-                ("public".to_string(), "users".to_string()),
-                "users".to_string(),
-            )]),
-            projections: crate::mapping::Projections::default(),
-            transforms: crate::mapping::Transforms::default(),
-            renames: crate::mapping::Renames::default(),
-            flattens: crate::mapping::Flattens::default(),
-            constants: crate::mapping::Constants::default(),
-            id_templates: users_ids("user-{tenant}", &["tenant"]),
-            fan_outs: Default::default(),
-            joins: Default::default(),
-            filters: Default::default(),
-            pipelines: Default::default(),
-            routings: Default::default(),
-            append_only: Default::default(),
+            rules: fixed_rules(RuleSet {
+                mapping: TableMapping::from_pairs([(
+                    ("public".to_string(), "users".to_string()),
+                    "users".to_string(),
+                )]),
+                id_templates: users_ids("user-{tenant}", &["tenant"]),
+                ..Default::default()
+            }),
             settings: fixed_settings(&EngineConfig::default()),
             cfg: EngineConfig::default(),
             ack_tx,
@@ -4183,28 +4240,21 @@ mod pipeline_tests {
         let (load_done_tx, _load_done_rx) = watch::channel(0u64);
         let ctx = Arc::new(PipelineCtx {
             sink,
-            mapping: TableMapping::from_pairs([
-                (
-                    ("public".to_string(), "users".to_string()),
-                    "shared".to_string(),
-                ),
-                (
-                    ("public".to_string(), "orders".to_string()),
-                    "shared".to_string(),
-                ),
-            ]),
-            projections: crate::mapping::Projections::default(),
-            transforms: crate::mapping::Transforms::default(),
-            renames: crate::mapping::Renames::default(),
-            flattens: crate::mapping::Flattens::default(),
-            constants: crate::mapping::Constants::default(),
-            id_templates: Default::default(),
-            fan_outs: Default::default(),
-            joins,
-            filters: Default::default(),
-            pipelines: Default::default(),
-            routings: Default::default(),
-            append_only: Default::default(),
+            rules: fixed_rules(RuleSet {
+                mapping: TableMapping::from_pairs([
+                    (
+                        ("public".to_string(), "users".to_string()),
+                        "shared".to_string(),
+                    ),
+                    (
+                        ("public".to_string(), "orders".to_string()),
+                        "shared".to_string(),
+                    ),
+                ]),
+                fan_outs: Default::default(),
+                joins,
+                ..Default::default()
+            }),
             settings: fixed_settings(&EngineConfig::default()),
             cfg: EngineConfig::default(),
             ack_tx: ack_tx.clone(),
@@ -4504,22 +4554,17 @@ mod pipeline_tests {
         };
         let ctx = Arc::new(PipelineCtx {
             sink,
-            mapping: TableMapping::from_pairs([(
-                ("public".to_string(), "users".to_string()),
-                target,
-            )]),
-            projections: crate::mapping::Projections::default(),
-            transforms: crate::mapping::Transforms::default(),
-            renames: crate::mapping::Renames::default(),
-            flattens: crate::mapping::Flattens::default(),
-            constants: crate::mapping::Constants::default(),
-            id_templates: ids,
-            fan_outs: fan,
-            joins: crate::mapping::Joins::default(),
-            filters,
-            pipelines: crate::mapping::Pipelines::default(),
-            routings: Default::default(),
-            append_only: Default::default(),
+            rules: fixed_rules(RuleSet {
+                mapping: TableMapping::from_pairs([(
+                    ("public".to_string(), "users".to_string()),
+                    target,
+                )]),
+                id_templates: ids,
+                fan_outs: fan,
+                joins: crate::mapping::Joins::default(),
+                filters,
+                ..Default::default()
+            }),
             settings: fixed_settings(&engine_cfg),
             cfg: engine_cfg,
             ack_tx,
@@ -4879,45 +4924,39 @@ mod pipeline_tests {
         };
         let ctx = Arc::new(PipelineCtx {
             sink,
-            mapping: TableMapping::from_pairs([
-                (
-                    ("public".to_string(), "customers".to_string()),
-                    "shop".to_string(),
-                ),
-                (
-                    ("public".to_string(), "orders".to_string()),
-                    "shop".to_string(),
-                ),
-                (
-                    ("public".to_string(), "links".to_string()),
-                    "shop".to_string(),
-                ),
-            ]),
-            projections: crate::mapping::Projections::default(),
-            transforms: crate::mapping::Transforms::default(),
-            renames: crate::mapping::Renames::default(),
-            flattens: crate::mapping::Flattens::default(),
-            constants: crate::mapping::Constants::default(),
-            id_templates: crate::mapping::IdTemplates::from_pairs([
-                (
-                    ("public".to_string(), "customers".to_string()),
-                    ids("customer-{id}"),
-                ),
-                (
-                    ("public".to_string(), "orders".to_string()),
-                    ids("order-{id}"),
-                ),
-                (
-                    ("public".to_string(), "links".to_string()),
-                    ids("link-{id}"),
-                ),
-            ]),
-            fan_outs,
-            joins: shop_joins(),
-            filters: crate::mapping::Filters::default(),
-            pipelines: crate::mapping::Pipelines::default(),
-            routings: Default::default(),
-            append_only: Default::default(),
+            rules: fixed_rules(RuleSet {
+                mapping: TableMapping::from_pairs([
+                    (
+                        ("public".to_string(), "customers".to_string()),
+                        "shop".to_string(),
+                    ),
+                    (
+                        ("public".to_string(), "orders".to_string()),
+                        "shop".to_string(),
+                    ),
+                    (
+                        ("public".to_string(), "links".to_string()),
+                        "shop".to_string(),
+                    ),
+                ]),
+                id_templates: crate::mapping::IdTemplates::from_pairs([
+                    (
+                        ("public".to_string(), "customers".to_string()),
+                        ids("customer-{id}"),
+                    ),
+                    (
+                        ("public".to_string(), "orders".to_string()),
+                        ids("order-{id}"),
+                    ),
+                    (
+                        ("public".to_string(), "links".to_string()),
+                        ids("link-{id}"),
+                    ),
+                ]),
+                fan_outs,
+                joins: shop_joins(),
+                ..Default::default()
+            }),
             settings: fixed_settings(&engine_cfg),
             cfg: engine_cfg,
             ack_tx,
@@ -5249,32 +5288,26 @@ mod pipeline_tests {
         };
         let ctx = Arc::new(PipelineCtx {
             sink,
-            mapping: TableMapping::from_pairs([(
-                ("public".to_string(), "docs".to_string()),
-                "docs".to_string(),
-            )]),
-            projections: crate::mapping::Projections::default(),
-            transforms: crate::mapping::Transforms::default(),
-            renames: crate::mapping::Renames::default(),
-            flattens: crate::mapping::Flattens::default(),
-            constants: crate::mapping::Constants::default(),
-            id_templates: crate::mapping::IdTemplates::from_pairs([(
-                ("public".to_string(), "docs".to_string()),
-                crate::mapping::IdTemplate::parse("doc-{id}", &["id".to_string()])
-                    .expect("valid template"),
-            )]),
-            fan_outs,
-            joins: Default::default(),
-            filters: Default::default(),
-            pipelines: Default::default(),
-            routings: crate::mapping::Routings::from_pairs([(
-                ("public".to_string(), "docs".to_string()),
-                crate::mapping::RoutingColumn {
-                    column: "tenant".into(),
-                    key_column: false,
-                },
-            )]),
-            append_only: Default::default(),
+            rules: fixed_rules(RuleSet {
+                mapping: TableMapping::from_pairs([(
+                    ("public".to_string(), "docs".to_string()),
+                    "docs".to_string(),
+                )]),
+                id_templates: crate::mapping::IdTemplates::from_pairs([(
+                    ("public".to_string(), "docs".to_string()),
+                    crate::mapping::IdTemplate::parse("doc-{id}", &["id".to_string()])
+                        .expect("valid template"),
+                )]),
+                fan_outs,
+                routings: crate::mapping::Routings::from_pairs([(
+                    ("public".to_string(), "docs".to_string()),
+                    crate::mapping::RoutingColumn {
+                        column: "tenant".into(),
+                        key_column: false,
+                    },
+                )]),
+                ..Default::default()
+            }),
             settings: fixed_settings(&engine_cfg),
             cfg: engine_cfg,
             ack_tx,
@@ -5504,25 +5537,18 @@ mod pipeline_tests {
         };
         let ctx = Arc::new(PipelineCtx {
             sink: sink.clone(),
-            mapping: TableMapping::from_pairs([(
-                ("public".to_string(), "users".to_string()),
-                "users".to_string(),
-            )]),
-            projections: crate::mapping::Projections::default(),
-            transforms: crate::mapping::Transforms::default(),
-            renames: crate::mapping::Renames::default(),
-            flattens: crate::mapping::Flattens::default(),
-            constants: crate::mapping::Constants::default(),
-            id_templates: ids,
-            fan_outs: Default::default(),
-            joins: Default::default(),
-            filters: Default::default(),
-            pipelines: Default::default(),
-            routings: Default::default(),
-            append_only: crate::mapping::AppendOnly::from_iter([(
-                "public".to_string(),
-                "users".to_string(),
-            )]),
+            rules: fixed_rules(RuleSet {
+                mapping: TableMapping::from_pairs([(
+                    ("public".to_string(), "users".to_string()),
+                    "users".to_string(),
+                )]),
+                id_templates: ids,
+                append_only: crate::mapping::AppendOnly::from_iter([(
+                    "public".to_string(),
+                    "users".to_string(),
+                )]),
+                ..Default::default()
+            }),
             settings: fixed_settings(&engine_cfg),
             cfg: engine_cfg,
             ack_tx,
@@ -5709,22 +5735,13 @@ mod pipeline_tests {
         let (settings_tx, settings_rx) = engine_cfg.settings_channel();
         let ctx = Arc::new(PipelineCtx {
             sink: sink.clone(),
-            mapping: TableMapping::from_pairs([(
-                ("public".to_string(), "users".to_string()),
-                "users".to_string(),
-            )]),
-            projections: crate::mapping::Projections::default(),
-            transforms: crate::mapping::Transforms::default(),
-            renames: crate::mapping::Renames::default(),
-            flattens: crate::mapping::Flattens::default(),
-            constants: crate::mapping::Constants::default(),
-            id_templates: crate::mapping::IdTemplates::default(),
-            fan_outs: crate::mapping::FanOuts::default(),
-            joins: crate::mapping::Joins::default(),
-            filters: crate::mapping::Filters::default(),
-            pipelines: crate::mapping::Pipelines::default(),
-            routings: Default::default(),
-            append_only: Default::default(),
+            rules: fixed_rules(RuleSet {
+                mapping: TableMapping::from_pairs([(
+                    ("public".to_string(), "users".to_string()),
+                    "users".to_string(),
+                )]),
+                ..Default::default()
+            }),
             settings: settings_rx,
             cfg: engine_cfg,
             ack_tx,
@@ -5786,6 +5803,29 @@ mod pipeline_tests {
         events_tx.send(commit(20)).await.expect("engine is running");
         drop(events_tx);
         engine.await.expect("engine task").expect("engine ran");
+    }
+
+    #[test]
+    fn the_window_a_copied_row_needs_is_open_until_a_load_says_it_has_finished() {
+        // The flag lives on the intake because that is the last place a copied
+        // row can be told from a streamed one. It starts open, because an
+        // attempt begins with its initial load either running or about to.
+        let (_tx, rx) = mpsc::channel(1);
+        let mut intake = LoadIntake::new(rx, None);
+        assert!(intake.load_running);
+        intake.took(&ChangeEvent::LoadFinished);
+        assert!(!intake.load_running);
+        intake.took(&row(1));
+        assert!(
+            !intake.load_running,
+            "a stray row must not reopen the window; only a load saying it \
+             started can, and it says so before it queues one"
+        );
+        intake.took(&ChangeEvent::LoadStarted);
+        assert!(
+            intake.load_running,
+            "a table added by a reload is a load too"
+        );
     }
 
     #[test]

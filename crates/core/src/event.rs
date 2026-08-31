@@ -100,6 +100,21 @@ pub enum ChangeEvent {
     /// only recorded behind one, so a crash loses forward progress and never
     /// claims a range that was not written.
     LoadMark(u64),
+    /// A load is about to send rows down this channel.
+    ///
+    /// Sent before the first of them, because what it opens is the window in
+    /// which the engine remembers what the stream has removed: a copied row
+    /// starved behind a busy stream must lose to a delete that came after it,
+    /// and the engine can only know to remember that delete if it already
+    /// knows a copied row may be on its way.
+    LoadStarted,
+    /// The load has sent everything it is going to send.
+    ///
+    /// The copy channel closing used to say this, and cannot any more: the
+    /// channel stays open for the streaming attempt's life so a reload can
+    /// read a table added to a running pipeline down it. This says the load is
+    /// over without saying the channel is.
+    LoadFinished,
     /// A source table whose columns changed under the running pipeline, with
     /// `detail` naming what was added, removed or retyped.
     ///

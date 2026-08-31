@@ -72,8 +72,10 @@ pub struct SourceEndpoints {
     pub sink: Arc<dyn Sink>,
     pub nudge: Option<StreamNudge>,
     pub current_position: Option<CurrentPosition>,
-    /// Indices to refresh when a caller asks for search visibility.
-    pub indices: Vec<String>,
+    /// Indices to refresh when a caller asks for search visibility. Watched
+    /// rather than owned: a table added to the pipeline brings an index the
+    /// endpoint has to refresh before it may promise a write is searchable.
+    pub indices: watch::Receiver<Arc<Vec<String>>>,
 }
 
 /// What the endpoint borrows from the process rather than from one source.
@@ -276,7 +278,8 @@ async fn handle(state: &ApiState, request: &str) -> (&'static str, String) {
     if reached && refresh {
         // an accepted write is not searchable until the target refreshes, so
         // without this the guarantee would stop one step short of useful
-        if let Err(e) = source.sink.refresh(&source.indices).await {
+        let indices = source.indices.borrow().clone();
+        if let Err(e) = source.sink.refresh(&indices).await {
             tracing::warn!(target: "pg2osync::api", "refresh failed: {e}");
             return (
                 "503 Service Unavailable",
@@ -569,7 +572,7 @@ mod tests {
             sink: Arc::new(UnusedSink),
             nudge: None,
             current_position: None,
-            indices: Vec::new(),
+            indices: watch::channel(Arc::new(Vec::new())).1,
         }
     }
 

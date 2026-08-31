@@ -22,8 +22,10 @@ pub struct WalSourceConfig {
     pub database: String,
     pub slot_name: String,
     pub publication: String,
-    /// Schema-qualified tables, aligned with the publication.
-    pub tables: Vec<String>,
+    /// The tables this stream admits and what its decoder needs to know about
+    /// each of them, shared rather than owned: a reload puts a table on a
+    /// running stream through this handle.
+    pub tables: pg2osync_core::tables::SharedTables,
     /// Explicit WAL start position; None defers to the slot's
     /// confirmed_flush_lsn. Callers should resolve this from the catalog
     /// instead of passing zero — the zero path stalls on some servers.
@@ -44,14 +46,6 @@ pub struct WalSourceConfig {
     pub child_parents: HashMap<(String, String), (String, String)>,
     /// Parent PK columns for refetch queries, keyed by parent (schema, table).
     pub parent_pk_columns: HashMap<(String, String), String>,
-    /// Each synced table's primary key, from the catalogue. Under REPLICA
-    /// IDENTITY FULL pgoutput flags every column as identity, and only this
-    /// says which of them a document is actually filed under.
-    pub key_columns: HashMap<(String, String), Vec<String>>,
-    /// Tables declared `append_only`: their inserts carry no key, and an
-    /// update or delete on one is an error rather than a document nothing
-    /// can find.
-    pub append_only: std::collections::HashSet<(String, String)>,
     /// Highest durably-flushed position as reported by the engine's
     /// checkpoint task. Feedback to PostgreSQL is clamped to this: acking
     /// beyond it lets PG recycle WAL for events we have not indexed yet,
@@ -91,18 +85,19 @@ impl WalSource {
         self.cfg.children.contains_key(&key)
             || self.cfg.aggregates.contains_key(&key)
             || self.cfg.child_parents.contains_key(&key)
-            || self
-                .cfg
-                .tables
-                .iter()
-                .any(|t| t == &format!("{schema}.{table}"))
+            || self.cfg.tables.contains(schema, table)
     }
 
     /// Idempotent bootstrap: wal_level check, publication aligned to config
     /// (drift is an error, never auto-applied) and slot created if missing.
     pub async fn bootstrap(&self, admin: &tokio_postgres::Client) -> Result<()> {
         catalog::check_wal_level(admin).await?;
-        catalog::ensure_publication(admin, &self.cfg.publication, &self.cfg.tables).await?;
+        catalog::ensure_publication(
+            admin,
+            &self.cfg.publication,
+            &self.cfg.tables.snapshot().qualified(),
+        )
+        .await?;
         catalog::ensure_slot(admin, &self.cfg.slot_name).await?;
         catalog::warn_about_idle_slots(admin, &self.cfg.slot_name).await;
         Ok(())
@@ -476,11 +471,15 @@ impl WalSource {
             return Ok(Classified::Skip);
         }
 
+        // One snapshot for both facts: a set swapped between the two reads
+        // could answer for a table with one version and against it with the
+        // other.
+        let admitted = self.cfg.tables.snapshot();
         let change = super::docbuild::build_row_change(
             rel,
             incoming,
-            self.cfg.key_columns.get(&table).map(Vec::as_slice),
-            self.cfg.append_only.contains(&table),
+            admitted.key_columns.get(&table).map(Vec::as_slice),
+            admitted.append_only.contains(&table),
         )?;
         if self.cfg.children.contains_key(&table) || self.cfg.aggregates.contains_key(&table) {
             Ok(Classified::ParentRow(table, change))
@@ -699,7 +698,16 @@ mod tests {
             database: "d".into(),
             slot_name: "s".into(),
             publication: "p".into(),
-            tables: tables.iter().map(|t| t.to_string()).collect(),
+            tables: pg2osync_core::tables::SharedTables::new(pg2osync_core::tables::TableSet {
+                tables: tables
+                    .iter()
+                    .map(|t| {
+                        let (schema, table) = t.split_once('.').expect("a qualified name");
+                        (schema.to_string(), table.to_string())
+                    })
+                    .collect(),
+                ..Default::default()
+            }),
             start_lsn: None,
             admin_url: None,
             tls: Default::default(),
@@ -707,8 +715,6 @@ mod tests {
             aggregates: HashMap::new(),
             child_parents: HashMap::new(),
             parent_pk_columns: HashMap::new(),
-            key_columns: HashMap::new(),
-            append_only: Default::default(),
             durable: None,
         })
     }

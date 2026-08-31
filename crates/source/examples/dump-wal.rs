@@ -46,7 +46,10 @@ async fn main() -> Result<()> {
             .to_string(),
         slot_name: slot.clone(),
         publication: publication.clone(),
-        tables: vec![table.clone()],
+        tables: pg2osync_core::tables::SharedTables::new(pg2osync_core::tables::TableSet {
+            tables: vec![split_qualified(&table)],
+            ..Default::default()
+        }),
         start_lsn: None,
         durable: None,
         admin_url: Some(url.clone()),
@@ -54,8 +57,6 @@ async fn main() -> Result<()> {
         aggregates: Default::default(),
         child_parents: Default::default(),
         parent_pk_columns: Default::default(),
-        key_columns: Default::default(),
-        append_only: Default::default(),
     };
 
     let admin = pg2osync_source::tls::connect(&tls, &url).await?;
@@ -135,4 +136,11 @@ async fn main() -> Result<()> {
     }
     let _ = printer.await;
     Ok(result?)
+}
+
+fn split_qualified(qualified: &str) -> (String, String) {
+    match qualified.split_once('.') {
+        Some((schema, table)) => (schema.to_string(), table.to_string()),
+        None => ("public".to_string(), qualified.to_string()),
+    }
 }

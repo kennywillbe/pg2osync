@@ -288,7 +288,9 @@ helm upgrade pg2osync deploy/helm/pg2osync -n pg2osync --set reloadOnChange=sign
 
 Under `signal` the pipeline applies the settings a batch reads — batch sizes,
 the checkpoint interval, the load's rate ceiling, the retry budget, `[log]
-filter` — and refuses everything else *in place*, with one `ERROR` line naming
+filter` — and a plain `[sync.*]` section added to or removed from the file,
+which means a `helm upgrade` that adds a table starts syncing it without
+restarting the pod. It refuses everything else *in place*, with one `ERROR` line naming
 the field and what it would take. [Reloading](configuration.md#reloading) has
 the full table. So `signal` does not mean "every change is picked up"; it means
 the changes that can be applied without a restart are, and the rest are named

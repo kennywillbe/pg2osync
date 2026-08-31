@@ -44,7 +44,46 @@ pub struct Handles {
     pub settings: watch::Sender<EngineSettings>,
     pub sink: Arc<dyn Sink>,
     pub metrics: SharedMetrics,
+    /// How a `[sync]` section joins or leaves the running pipeline. `None`
+    /// where nothing is streaming that could take one.
+    pub sections: Option<ApplySection>,
 }
+
+/// One section joining or leaving the pipeline that is running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SectionEdit {
+    /// The key of a section the file added; the section itself is read out of
+    /// the file being applied.
+    Add(String),
+    /// A section the file no longer has. Its table and index travel with it
+    /// because the running definition is the last place that knows them.
+    Remove {
+        key: String,
+        table: String,
+        index: String,
+    },
+}
+
+impl SectionEdit {
+    fn key(&self) -> &str {
+        match self {
+            Self::Add(key) => key,
+            Self::Remove { key, .. } => key,
+        }
+    }
+}
+
+/// Putting a section on or off a running pipeline.
+///
+/// A function rather than something this module does, because *how* differs
+/// per source and per phase — a table joins a PostgreSQL stream through its
+/// publication and a MySQL one through nothing at all — while *whether* is the
+/// same judgement either way, and that is what this module makes.
+pub type ApplySection = Arc<
+    dyn Fn(SectionEdit, Arc<AppConfig>) -> futures::future::BoxFuture<'static, Result<()>>
+        + Send
+        + Sync,
+>;
 
 /// The values a reload is allowed to change on a running pipeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,16 +114,22 @@ pub struct Plan {
     pub hot: Hot,
     /// One line per refusal, each naming the field and what it would take.
     pub refusals: Vec<String>,
+    /// Sections the running pipeline can take, in the order they are applied:
+    /// what leaves goes first, so a table moved from one section to another
+    /// never has both routing its rows at once.
+    pub sections: Vec<SectionEdit>,
 }
 
-impl Plan {
-    /// How this reload is counted, and how its summary line reads.
-    pub fn result(&self) -> &'static str {
-        if self.refusals.is_empty() {
-            "applied"
-        } else {
-            "refused"
-        }
+/// How a reload with these refusals is counted, and how its summary reads.
+///
+/// A section that could not join is a refusal no plan could have known about
+/// in advance, so the count is taken after they have all been tried rather
+/// than from the plan alone.
+fn outcome(refusals: &[String]) -> &'static str {
+    if refusals.is_empty() {
+        "applied"
+    } else {
+        "refused"
     }
 }
 
@@ -164,7 +209,8 @@ async fn apply(path: &Path, generation: u64, current: &mut AppConfig, handles: &
     };
 
     let plan = classify(current, &new);
-    for refusal in &plan.refusals {
+    let mut refused = plan.refusals.clone();
+    for refusal in &refused {
         tracing::error!(target: "pg2osync::reload", "{refusal}");
     }
     let before = Hot::of(current);
@@ -191,9 +237,10 @@ async fn apply(path: &Path, generation: u64, current: &mut AppConfig, handles: &
             plan.hot.settings.batch_size, plan.hot.settings.batch_max_bytes,
             plan.hot.settings.txn_buffer_cap_mb, plan.hot.settings.checkpoint_interval_ms,
             plan.hot.retry_max, plan.hot.retry_backoff_ms, plan.hot.retry_max_elapsed_ms);
-    } else if plan.refusals.is_empty() {
+    } else if plan.refusals.is_empty() && plan.sections.is_empty() {
         tracing::info!(target: "pg2osync::reload", "the configuration is unchanged");
     }
+    refused.extend(apply_sections(&plan, &new, current, handles).await);
     // Only the applied half moves forward; everything else keeps running as it
     // was, which is what the refusals above said would happen.
     current.engine.batch_size = plan.hot.settings.batch_size;
@@ -206,7 +253,68 @@ async fn apply(path: &Path, generation: u64, current: &mut AppConfig, handles: &
     current.engine.retry_max_elapsed_ms = plan.hot.retry_max_elapsed_ms;
     current.log.filter = plan.hot.log_filter.clone();
 
-    handles.metrics.incr_config_reload(plan.result());
+    handles.metrics.incr_config_reload(outcome(&refused));
+}
+
+/// Put the sections the plan allows on or off the running pipeline, and
+/// advance `current` by the ones that took.
+///
+/// A section that could not join is a refusal like any other: the running
+/// pipeline is exactly as it was, the file says why, and the next SIGHUP will
+/// try it again — which is the behaviour an operator who has just granted the
+/// missing privilege wants. Each is awaited rather than spawned, because a
+/// section is not applied until its rows have been read, and a reload that
+/// reported success before that would be claiming something untrue.
+async fn apply_sections(
+    plan: &Plan,
+    new: &AppConfig,
+    current: &mut AppConfig,
+    handles: &Handles,
+) -> Vec<String> {
+    if plan.sections.is_empty() {
+        return Vec::new();
+    }
+    let Some(apply) = handles.sections.as_ref() else {
+        return plan
+            .sections
+            .iter()
+            .map(|edit| {
+                format!(
+                    "[sync.{}] was added or removed, and nothing is streaming that could take \
+                     it. Restart to pick it up",
+                    edit.key()
+                )
+            })
+            .collect();
+    };
+    let mut refusals = Vec::new();
+    for edit in &plan.sections {
+        // The file as it would be with this one edit applied and nothing else:
+        // the sections a refusal left alone are still running as they were, and
+        // handing over the file whole would put them into effect through the
+        // back door.
+        let mut next = new.clone();
+        next.sync = current.sync.clone();
+        match edit {
+            SectionEdit::Add(key) => {
+                if let Some(tbl) = new.sync.get(key) {
+                    next.sync.insert(key.clone(), tbl.clone());
+                }
+            }
+            SectionEdit::Remove { key, .. } => {
+                next.sync.remove(key);
+            }
+        }
+        match apply(edit.clone(), Arc::new(next.clone())).await {
+            Ok(()) => current.sync = next.sync,
+            Err(e) => {
+                let refusal = format!("[sync.{}] {e:#}", edit.key());
+                tracing::error!(target: "pg2osync::reload", "{refusal}");
+                refusals.push(refusal);
+            }
+        }
+    }
+    refusals
 }
 
 /// Name the fields of `$section` that differ, each with the reason a running
@@ -338,30 +446,87 @@ pub fn classify(old: &AppConfig, new: &AppConfig) -> Plan {
         [write_concurrency, on_permanent_rejection, max_rejects,]
     );
 
+    let mut sections = Vec::new();
+    for (key, tbl) in &old.sync {
+        if new.sync.contains_key(key) {
+            continue;
+        }
+        // The poll query names its tables when the attempt builds it, so the
+        // rows would keep arriving with nothing left to file them under.
+        if new.source.mode == "poll" {
+            refusals.push(format!(
+                "[sync.{key}] was removed but this source polls, and its query names the tables \
+                 it reads when the attempt is built: its rows are still being routed. Restart \
+                 to drop it. The index it writes to is left as it is either way — nothing here \
+                 deletes documents"
+            ));
+            continue;
+        }
+        sections.push(SectionEdit::Remove {
+            key: key.clone(),
+            table: tbl.table.clone(),
+            index: tbl.index_name(key),
+        });
+    }
     for (key, tbl) in &new.sync {
         match old.sync.get(key) {
-            None => refusals.push(format!(
-                "[sync.{key}] is new: a table joins a running pipeline only once its rows have \
-                 been loaded beside the stream and — on PostgreSQL — its name is in the \
-                 publication, so it is not being synced. Restart to pick it up"
-            )),
+            None => match joining_takes_a_restart(key, tbl, new) {
+                Some(refusal) => refusals.push(refusal),
+                None => sections.push(SectionEdit::Add(key.clone())),
+            },
             Some(running) => refusals.extend(section_refusals(key, running, tbl)),
-        }
-    }
-    for key in old.sync.keys() {
-        if !new.sync.contains_key(key) {
-            refusals.push(format!(
-                "[sync.{key}] was removed but its rows are still being routed: dropping a table \
-                 from a running stream is a restart. The index it writes to is left as it is \
-                 either way — nothing here deletes documents"
-            ));
         }
     }
 
     Plan {
         hot: Hot::of(new),
         refusals,
+        sections,
     }
+}
+
+/// Why a section the file has just grown cannot join the pipeline as it runs.
+///
+/// A plain table can: its rows are read beside the stream on the load channel
+/// the attempt already holds, and the rules the engine files them by are
+/// swapped as one value. What cannot is everything whose shape is decided
+/// where the stream was built — the child, junction and aggregate tables a
+/// source watches on somebody else's behalf, and the reverse routing that
+/// resolves one of their rows to a parent, are all read into the running
+/// source when its attempt starts and are not swappable; a per-row index is a
+/// glob the endpoints were told about once; and a poll query names its tables
+/// when the attempt builds it. Each of those is a restart, said so here rather
+/// than found out later.
+fn joining_takes_a_restart(
+    key: &str,
+    tbl: &crate::config::TableSync,
+    new: &AppConfig,
+) -> Option<String> {
+    let restart = |what: &str| {
+        Some(format!(
+            "[sync.{key}] is new and {what}, which is decided when the stream is built: it is \
+             not being synced. Add it and restart"
+        ))
+    };
+    if new.source.mode == "poll" {
+        return restart("this source polls, so its query names the tables it reads");
+    }
+    if !tbl.children.is_empty() {
+        return restart("declares children, whose tables the source watches for a parent");
+    }
+    if tbl.join.is_some() {
+        return restart("joins another section's index");
+    }
+    if tbl.fan_out.is_some() {
+        return restart("fans a column out into a document per element");
+    }
+    if !tbl.aggregates.is_empty() {
+        return restart("declares aggregates, whose tables the source watches for a parent");
+    }
+    if tbl.is_templated() {
+        return restart("chooses an index per row");
+    }
+    None
 }
 
 /// Why one section cannot be changed under the running pipeline.
@@ -549,7 +714,7 @@ table = "public.users"
         assert_eq!(plan.hot.settings.load_max_rows_per_sec, Some(100));
         assert_eq!(plan.hot.retry_max, 3);
         assert_eq!(plan.hot.retry_max_elapsed_ms, Some(30_000));
-        assert_eq!(plan.result(), "applied");
+        assert_eq!(outcome(&plan.refusals), "applied");
     }
 
     #[test]
@@ -559,7 +724,7 @@ table = "public.users"
             "{BASE}\n[engine]\nwrite_concurrency = 4\nmax_rejects = 7\n"
         ));
         let plan = classify(&old, &new);
-        assert_eq!(plan.result(), "refused");
+        assert_eq!(outcome(&plan.refusals), "refused");
         assert!(
             plan.refusals
                 .iter()
@@ -688,19 +853,107 @@ table = "public.users"
     }
 
     #[test]
-    fn a_section_that_appears_or_disappears_says_what_is_happening_to_its_rows() {
+    fn a_plain_section_that_appears_or_disappears_is_something_the_pipeline_takes() {
         let old = config(BASE);
         let added = config(&format!(
             "{BASE}\n[sync.orders]\ntable = \"public.orders\"\n"
         ));
         let plan = classify(&old, &added);
-        assert_eq!(plan.refusals.len(), 1);
-        assert!(plan.refusals[0].contains("[sync.orders] is new"));
+        assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+        assert_eq!(plan.sections, vec![SectionEdit::Add("orders".into())]);
 
         let plan = classify(&added, &old);
-        assert_eq!(plan.refusals.len(), 1);
-        assert!(plan.refusals[0].contains("[sync.orders] was removed"));
-        assert!(plan.refusals[0].contains("index"));
+        assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+        assert_eq!(
+            plan.sections,
+            vec![SectionEdit::Remove {
+                key: "orders".into(),
+                table: "public.orders".into(),
+                index: "orders".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn what_leaves_is_applied_before_what_joins() {
+        // one table moving from one section to another: both sections change
+        // in one file, and the pair must never route the same rows at once
+        let old = config(&format!(
+            "{BASE}\n[sync.orders]\ntable = \"public.orders\"\n"
+        ));
+        let new = config(&format!(
+            "{BASE}\n[sync.purchases]\ntable = \"public.orders\"\n"
+        ));
+        let plan = classify(&old, &new);
+        assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+        assert_eq!(plan.sections.len(), 2);
+        assert!(matches!(plan.sections[0], SectionEdit::Remove { .. }));
+        assert_eq!(plan.sections[1], SectionEdit::Add("purchases".into()));
+    }
+
+    #[test]
+    fn a_new_section_whose_shape_the_stream_was_built_with_asks_for_a_restart() {
+        let old = config(BASE);
+        for (what, body) in [
+            (
+                "children",
+                "[sync.orders]\ntable = \"public.orders\"\n\
+                 [[sync.orders.children]]\ntable = \"public.lines\"\nfield = \"lines\"\n\
+                 foreign_key = \"order_id\"\n",
+            ),
+            (
+                "join",
+                "[sync.orders]\ntable = \"public.orders\"\nindex = \"users\"\n\
+                 [sync.orders.join]\nfield = \"rel\"\nname = \"order\"\nparent = \"user_id\"\n",
+            ),
+            (
+                "fan_out",
+                "[sync.orders]\ntable = \"public.orders\"\n\
+                 [sync.orders.fan_out]\nfield = \"tags\"\nid = \"{id}-{tags}\"\n",
+            ),
+            (
+                "aggregates",
+                "[sync.orders]\ntable = \"public.orders\"\n\
+                 [[sync.orders.aggregates]]\ntable = \"public.lines\"\n\
+                 foreign_key = \"order_id\"\nfield = \"line_count\"\n",
+            ),
+            (
+                "a per-row index",
+                "[sync.orders]\ntable = \"public.orders\"\nindex = \"orders-{region}\"\n",
+            ),
+        ] {
+            let plan = classify(&old, &config(&format!("{BASE}\n{body}")));
+            assert!(
+                plan.sections.is_empty(),
+                "{what} must not join a running pipeline: {:?}",
+                plan.sections
+            );
+            assert_eq!(plan.refusals.len(), 1, "{what}: {:?}", plan.refusals);
+            assert!(
+                plan.refusals[0].contains("Add it and restart"),
+                "{what}: {}",
+                plan.refusals[0]
+            );
+        }
+    }
+
+    #[test]
+    fn a_polled_source_names_its_tables_when_the_attempt_is_built() {
+        let polled = BASE.replace("[source]", "[source]\nmode = \"poll\"");
+        let old = config(&polled);
+        let added = config(&format!(
+            "{polled}\n[sync.orders]\ntable = \"public.orders\"\n"
+        ));
+        for (before, after) in [(&old, &added), (&added, &old)] {
+            let plan = classify(before, after);
+            assert!(plan.sections.is_empty(), "{:?}", plan.sections);
+            assert_eq!(plan.refusals.len(), 1, "{:?}", plan.refusals);
+            assert!(
+                plan.refusals[0].to_lowercase().contains("restart"),
+                "{}",
+                plan.refusals[0]
+            );
+        }
     }
 
     #[test]

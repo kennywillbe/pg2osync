@@ -12,6 +12,7 @@ pub mod filter;
 pub mod load;
 pub mod lsn;
 pub mod sink;
+pub mod tables;
 /// The conformance suite a sink implementation runs against a live target.
 ///
 /// Behind a feature so it is a test dependency rather than something a release

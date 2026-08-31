@@ -45,6 +45,110 @@ const EVENT_CHANNEL_DEPTH: usize = 10_000;
 /// events jump this queue regardless, so its depth costs the stream nothing.
 pub const COPY_CHANNEL_DEPTH: usize = 2_000;
 
+/// The streaming attempt's load channel, published for as long as the attempt
+/// lasts.
+///
+/// The initial load used to own this sender and close it on the way out, which
+/// made "the channel is open" and "a load is running" the same fact. They are
+/// not the same fact any more: a table added to a running pipeline is read down
+/// this channel long after the initial load finished, so the attempt holds the
+/// sender and a `LoadFinished` event says what closing it used to.
+#[derive(Clone, Default)]
+pub struct LoadChannel(Arc<std::sync::Mutex<Option<AttemptLoad>>>);
+
+/// What reading a table beside the running stream takes.
+#[derive(Clone)]
+struct AttemptLoad {
+    rows: mpsc::Sender<ChangeEvent>,
+    /// Which load marks are durably written, which is how a loader knows a
+    /// chunk landed before it records having read it.
+    done: watch::Receiver<u64>,
+    /// Shared with the attempt's own load, so two readers of one channel
+    /// cannot claim the same mark.
+    marks: pg2osync_core::load::MarkSequence,
+}
+
+impl AttemptLoad {
+    /// Open the engine's window on this load before a row of it is queued.
+    async fn start(&self) -> Result<()> {
+        self.rows
+            .send(ChangeEvent::LoadStarted)
+            .await
+            .map_err(|_| anyhow::anyhow!("the engine is no longer reading the load channel"))
+    }
+}
+
+impl LoadChannel {
+    fn open(
+        &self,
+        rows: mpsc::Sender<ChangeEvent>,
+        done: watch::Receiver<u64>,
+        marks: pg2osync_core::load::MarkSequence,
+    ) {
+        *self.lock() = Some(AttemptLoad { rows, done, marks });
+    }
+
+    fn close(&self) {
+        *self.lock() = None;
+    }
+
+    fn current(&self) -> Option<AttemptLoad> {
+        self.lock().clone()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<AttemptLoad>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// What a reload reaches into to put a table on or off a running pipeline.
+///
+/// Two horizons, and a change has to reach both. The attempt that is streaming
+/// right now reads the rules and the admitted tables through handles it shares
+/// with this, so a swap reaches it without a rebuild; the attempt after the
+/// next reconnect is built from the configuration again, which is why that is
+/// held here too rather than owned by whoever started the pipeline.
+pub struct Live {
+    cfg: watch::Sender<Arc<AppConfig>>,
+    rules: watch::Sender<Arc<pg2osync_engine::RuleSet>>,
+    tables: pg2osync_core::tables::SharedTables,
+    /// The indices `/synced` refreshes before it answers, so a table added to
+    /// the pipeline is one the endpoint can promise for.
+    indices: watch::Sender<Arc<Vec<String>>>,
+    load: LoadChannel,
+}
+
+impl Live {
+    fn new(cfg: &AppConfig, tables: pg2osync_core::tables::TableSet) -> Result<Arc<Self>> {
+        Ok(Arc::new(Self {
+            cfg: watch::channel(Arc::new(cfg.clone())).0,
+            rules: watch::channel(Arc::new(rule_set(cfg)?)).0,
+            tables: pg2osync_core::tables::SharedTables::new(tables),
+            indices: watch::channel(Arc::new(index_names(cfg)?)).0,
+            load: LoadChannel::default(),
+        }))
+    }
+
+    fn config(&self) -> Arc<AppConfig> {
+        self.cfg.borrow().clone()
+    }
+
+    /// Put a configuration into effect: what the engine files rows by, what
+    /// `/synced` refreshes, and what the attempt after the next reconnect is
+    /// built from.
+    ///
+    /// One call rather than three, because a reload that swapped the rules but
+    /// not the configuration would lose the change at the next reconnect.
+    fn adopt(&self, cfg: &AppConfig) -> Result<()> {
+        self.rules.send_replace(Arc::new(rule_set(cfg)?));
+        self.indices.send_replace(Arc::new(index_names(cfg)?));
+        self.cfg.send_replace(Arc::new(cfg.clone()));
+        Ok(())
+    }
+}
+
 /// One source's pipeline, from its own configuration.
 ///
 /// Everything process-wide — the listeners, the exit code, the decision that a
@@ -677,17 +781,11 @@ pub fn read_token(var: Option<&str>, endpoint: &str) -> Result<Option<String>> {
     }
 }
 
-/// Build the engine context for one attempt.
-pub fn pipeline_ctx(
-    cfg: &AppConfig,
-    sink: Arc<dyn Sink>,
-    metrics: SharedMetrics,
-    ack_tx: watch::Sender<Option<Lsn>>,
-    load_done_tx: watch::Sender<u64>,
-    settings: watch::Receiver<pg2osync_engine::EngineSettings>,
-) -> Result<Arc<PipelineCtx>> {
-    Ok(Arc::new(PipelineCtx {
-        sink,
+/// Everything the engine turns the configured tables' rows into.
+///
+/// Built as one value so a reload swaps one: see [`pg2osync_engine::RuleSet`].
+pub fn rule_set(cfg: &AppConfig) -> Result<pg2osync_engine::RuleSet> {
+    Ok(pg2osync_engine::RuleSet {
         mapping: table_mapping(cfg)?,
         projections: projections(cfg),
         transforms: transforms(cfg)?,
@@ -701,12 +799,45 @@ pub fn pipeline_ctx(
         pipelines: pipelines(cfg),
         routings: routings(cfg),
         append_only: append_only(cfg),
+    })
+}
+
+/// Build the engine context for one attempt.
+pub fn pipeline_ctx(
+    cfg: &AppConfig,
+    sink: Arc<dyn Sink>,
+    metrics: SharedMetrics,
+    ack_tx: watch::Sender<Option<Lsn>>,
+    load_done_tx: watch::Sender<u64>,
+    settings: watch::Receiver<pg2osync_engine::EngineSettings>,
+    rules: watch::Receiver<Arc<pg2osync_engine::RuleSet>>,
+) -> Result<Arc<PipelineCtx>> {
+    Ok(Arc::new(PipelineCtx {
+        sink,
+        rules,
         cfg: cfg.engine.clone(),
         settings,
         ack_tx,
         load_done_tx,
         metrics,
     }))
+}
+
+/// The tables one source streams as it starts, for the handle a reload edits.
+///
+/// `key_columns` is only asked for where a source has a catalogue to ask;
+/// `admitted` is every table the stream has to let through, which is more than
+/// the sections declare — a child and a junction carry half a document each.
+fn table_set(
+    cfg: &AppConfig,
+    admitted: &[(String, String)],
+    key_columns: HashMap<(String, String), Vec<String>>,
+) -> pg2osync_core::tables::TableSet {
+    pg2osync_core::tables::TableSet {
+        tables: admitted.to_vec(),
+        key_columns,
+        append_only: append_only_tables(cfg),
+    }
 }
 
 /// Refuse to start a pipeline whose derived identity the source cannot supply.
@@ -1194,19 +1325,29 @@ async fn run_postgres(
             }
         }
 
-        let mut src_cfg: WalSourceConfig = wal_config(
+        let key_columns = if polling {
+            HashMap::new()
+        } else {
+            key_columns_for(&cfg, &admin).await?
+        };
+        let admitted: Vec<(String, String)> = tables
+            .iter()
+            .map(|t| {
+                let (schema, table) = split_qualified(t);
+                (schema.to_string(), table.to_string())
+            })
+            .collect();
+        let live = Live::new(&cfg, table_set(&cfg, &admitted, key_columns))?;
+        let src_cfg: WalSourceConfig = wal_config(
             &cfg,
             &source_url,
             &admin_url,
-            &tables,
+            live.tables.clone(),
             &children,
             &aggregates,
             &durable,
             &tls,
         )?;
-        if !polling {
-            src_cfg.key_columns = key_columns_for(&cfg, &admin).await?;
-        }
         let source = WalSource::new(src_cfg.clone());
 
         if !polling {
@@ -1215,10 +1356,10 @@ async fn run_postgres(
             check_derived_identity_requirements(&cfg, &admin).await?;
         }
         sink.ensure_ready(&index_specs).await?;
-        Ok((children, src_cfg))
+        Ok((children, src_cfg, live))
     })
     .await?;
-    let Some((children, src_cfg)) = ready else {
+    let Some((children, src_cfg, live)) = ready else {
         metrics.set_state(SourceState::Stopped);
         return Ok(());
     };
@@ -1243,6 +1384,7 @@ async fn run_postgres(
     // where the settings channel and the sink they reach into exist, and only
     // a pipeline that is actually running has anything to reload.
     let (settings_tx, settings_rx) = cfg.engine.settings_channel();
+    let (ack_tx, ack_rx) = watch::channel(None);
     crate::reload::spawn(
         reload,
         cfg.clone(),
@@ -1250,9 +1392,20 @@ async fn run_postgres(
             settings: settings_tx,
             sink: sink.clone(),
             metrics: metrics.clone(),
+            sections: postgres_sections(
+                PostgresSections {
+                    live: live.clone(),
+                    tls: tls.clone(),
+                    admin_url: admin_url.clone(),
+                    source_url: source_url.clone(),
+                    sink: sink.clone(),
+                    stream_id: stream_id.clone(),
+                    acked: ack_rx.clone(),
+                },
+                polling,
+            ),
         },
     );
-    let (ack_tx, ack_rx) = watch::channel(None);
     let nudge: Option<pg2osync_engine::api::StreamNudge> = if cfg.api.enabled {
         let url = admin_url.clone();
         let tls = tls.clone();
@@ -1292,12 +1445,11 @@ async fn run_postgres(
             // a templated section's glob is refreshed as one: OpenSearch and
             // Elasticsearch take a wildcard, and Meilisearch never sees a
             // template
-            indices: index_names(&cfg)?,
+            indices: live.indices.subscribe(),
         },
     );
 
     // shared with every attempt rather than borrowed by it
-    let cfg = Arc::new(cfg);
     let source_url: Arc<str> = Arc::from(source_url);
     let admin_url: Arc<str> = Arc::from(admin_url);
     let children = Arc::new(children);
@@ -1307,8 +1459,11 @@ async fn run_postgres(
         metrics.clone(),
         &shutdown_rx,
         || {
+            // Read per attempt, not captured once: a reload that added a
+            // section has to reach the attempt after the next reconnect as
+            // well as the one that is running.
             Box::pin(attempt_postgres(
-                cfg.clone(),
+                live.clone(),
                 source_url.clone(),
                 admin_url.clone(),
                 tls.clone(),
@@ -1380,7 +1535,7 @@ where
 /// resumes from wherever the last attempt actually got to.
 #[allow(clippy::too_many_arguments)]
 async fn attempt_postgres(
-    cfg: Arc<AppConfig>,
+    live: Arc<Live>,
     source_url: Arc<str>,
     admin_url: Arc<str>,
     tls: pg2osync_source::tls::TlsSettings,
@@ -1402,6 +1557,7 @@ async fn attempt_postgres(
     // borrows the caller's locals cannot be proven `Send`, and this one is
     // spawned: the process runs a pipeline per source, on whatever thread the
     // runtime has free.
+    let cfg = live.config();
     let cfg = &*cfg;
     let source_url = &*source_url;
     let admin_url = &*admin_url;
@@ -1453,7 +1609,21 @@ async fn attempt_postgres(
     let load_sink = sink.clone();
     let load_stream_id = stream_id.clone();
     let load_metrics = metrics.clone();
-    let ctx = pipeline_ctx(cfg, sink, metrics, ack_tx, load_done_tx, settings)?;
+    // Open for the attempt's life, not the load's: a table added by a reload
+    // is read down this channel, and closing it when the initial load ended
+    // would leave nothing to read it with until the next reconnect.
+    let marks = pg2osync_core::load::MarkSequence::default();
+    live.load
+        .open(copy_tx.clone(), load_done_rx.clone(), marks.clone());
+    let ctx = pipeline_ctx(
+        cfg,
+        sink,
+        metrics,
+        ack_tx,
+        load_done_tx,
+        settings,
+        live.rules.subscribe(),
+    )?;
     let engine = spawn_engine(
         events_rx,
         copy_rx,
@@ -1472,9 +1642,7 @@ async fn attempt_postgres(
     // position it became visible at, so a copied row that was already stale
     // loses to the streamed change regardless of which arrives first.
     let load = async {
-        // moved in, so the copy channel closes when the load is done and the
-        // engine can tell the difference between "paused" and "finished"
-        let copy_tx = copy_tx;
+        let copy_tx = copy_tx.clone();
         if resume_from.is_none() || load_pending {
             // The stream is already running beside this; what the state says
             // is that a whole table has still to arrive, which is the
@@ -1488,21 +1656,27 @@ async fn attempt_postgres(
                     admin,
                     children,
                     &src_cfg.aggregates,
-                    copy_tx,
+                    copy_tx.clone(),
                     load_sink.as_ref(),
                     &load_stream_id,
                     load_done_rx,
                     &pg2osync_core::load::LoadScope::initial_load()
+                        .with_marks(marks.clone())
                         .with_table_filters(table_filters(cfg)?),
                 )
                 .await
             })
             .await;
             load_metrics.set_state(SourceState::Streaming);
-            copied
-        } else {
-            Ok(())
+            copied?;
         }
+        // Said rather than implied by the channel closing, which no longer
+        // happens here: it is what closes the window the engine holds open
+        // while a copied row may still be in flight behind the stream.
+        copy_tx
+            .send(ChangeEvent::LoadFinished)
+            .await
+            .map_err(|_| anyhow::anyhow!("the engine stopped before the load finished"))
     };
 
     let started = std::time::Instant::now();
@@ -1522,10 +1696,13 @@ async fn attempt_postgres(
     // Either failing abandons the other: a stream error is a reconnect, and the
     // load picks up from its recorded progress on the next attempt.
     let result = futures::future::try_join(load, stream).await.map(|_| ());
-    // dropping both senders above is what lets the engine drain and exit.
+    // The attempt owns the load channel, so this is where it closes — and
+    // closing both senders is what lets the engine drain and exit.
     // An engine halt closes the change channel, which the source then
     // reports as its own failure; the engine's reason is the one that
     // matters, and the one an operator has to be able to read.
+    live.load.close();
+    drop(copy_tx);
     if let Ok(Err(e)) = engine.await {
         tracing::error!(target: "pg2osync::engine", "engine stopped: {e}");
         return Err(anyhow::Error::from(e).context("engine stopped"));
@@ -1578,7 +1755,7 @@ fn wal_config(
     cfg: &AppConfig,
     source_url: &str,
     admin_url: &str,
-    tables: &[String],
+    tables: pg2osync_core::tables::SharedTables,
     children: &HashMap<(String, String), Vec<pg2osync_source::children::ChildSpec>>,
     aggregates: &HashMap<(String, String), Vec<pg2osync_core::aggregate::AggregateSpec>>,
     durable: &DurableLsn,
@@ -1625,7 +1802,7 @@ fn wal_config(
         database: url.path().trim_start_matches('/').to_string(),
         slot_name: cfg.source.slot_name.clone(),
         publication: cfg.source.publication.clone(),
-        tables: tables.to_vec(),
+        tables,
         start_lsn: None,
         // Feedback to PostgreSQL is clamped to this: acknowledging beyond the
         // durable checkpoint lets PG recycle WAL we have not indexed yet, which
@@ -1637,8 +1814,6 @@ fn wal_config(
         aggregates: aggregates.clone(),
         child_parents,
         parent_pk_columns,
-        key_columns: HashMap::new(),
-        append_only: append_only_tables(cfg),
     })
 }
 
@@ -1861,17 +2036,19 @@ async fn run_mysql(
     // not up yet left nothing behind for a second attempt to reuse.
     let policy = setup_policy(&cfg, mode);
     let ready = setup_with_retry(policy, &metrics, &shutdown_rx, || async {
-        let source = MySqlSource::new(mysql_config_for(&cfg, &source_url)?);
+        let src_cfg = mysql_config_for(&cfg, &source_url, None)?;
+        let tables = src_cfg.tables.clone();
+        let source = MySqlSource::new(src_cfg);
         let mut admin = source.admin_connection().await?;
         source.bootstrap(&mut admin).await?;
         sink.ensure_ready(&index_specs).await?;
-        Ok(())
+        Ok(tables)
     })
     .await?;
-    if ready.is_none() {
+    let Some(tables) = ready else {
         metrics.set_state(SourceState::Stopped);
         return Ok(());
-    }
+    };
 
     if mode == Mode::Bootstrap {
         println!("✓ MySQL prerequisites met and target indices are ready");
@@ -1893,10 +2070,16 @@ async fn run_mysql(
     };
 
     let stream_id = cfg.stream_id();
+    let live = Live::new(&cfg, (*tables.snapshot()).clone())?;
     // Reloads are watched from here rather than from `main`, because this is
     // where the settings channel and the sink they reach into exist, and only
     // a pipeline that is actually running has anything to reload.
     let (settings_tx, settings_rx) = cfg.engine.settings_channel();
+    let (ack_tx, ack_rx) = watch::channel(None);
+    // The generation the pipeline is versioning in, shared with the endpoints
+    // outside the retry loop. They speak binlog coordinates, the pipeline
+    // speaks versions, and after a failover those differ by exactly this.
+    let version_base = Arc::new(std::sync::atomic::AtomicU64::new(0));
     crate::reload::spawn(
         reload,
         cfg.clone(),
@@ -1904,13 +2087,15 @@ async fn run_mysql(
             settings: settings_tx,
             sink: sink.clone(),
             metrics: metrics.clone(),
+            sections: mysql_sections(MySqlSections {
+                live: live.clone(),
+                source_url: source_url.clone(),
+                sink: sink.clone(),
+                stream_id: stream_id.clone(),
+                version_base: version_base.clone(),
+            }),
         },
     );
-    let (ack_tx, ack_rx) = watch::channel(None);
-    // The generation the pipeline is versioning in, shared with the endpoints
-    // outside the retry loop. They speak binlog coordinates, the pipeline
-    // speaks versions, and after a failover those differ by exactly this.
-    let version_base = Arc::new(std::sync::atomic::AtomicU64::new(0));
     {
         let prefix = api_prefix.clone();
         let render: PositionRenderer = {
@@ -1953,13 +2138,12 @@ async fn run_mysql(
                 // without touching a synced table
                 nudge: None,
                 current_position,
-                indices: index_names(&cfg)?,
+                indices: live.indices.subscribe(),
             },
         );
     }
 
     // shared with every attempt rather than borrowed by it
-    let cfg = Arc::new(cfg);
     let source_url: Arc<str> = Arc::from(source_url);
 
     stream_with_reconnect(
@@ -1967,8 +2151,11 @@ async fn run_mysql(
         metrics.clone(),
         &shutdown_rx,
         || {
+            // Read per attempt, not captured once: a reload that added a
+            // section has to reach the attempt after the next reconnect as
+            // well as the one that is running.
             Box::pin(attempt_mysql(
-                cfg.clone(),
+                live.clone(),
                 source_url.clone(),
                 AttemptWiring {
                     sink: sink.clone(),
@@ -2036,12 +2223,13 @@ fn version_base_for(base: u64, stored_token: u64, current_coordinate: u64) -> Ve
 }
 
 async fn attempt_mysql(
-    cfg: Arc<AppConfig>,
+    live: Arc<Live>,
     source_url: Arc<str>,
     wiring: AttemptWiring,
 ) -> Result<AttemptEnd> {
     // owned for the same reason as the PostgreSQL attempt: the pipeline is
     // spawned, so nothing it holds may borrow the caller
+    let cfg = live.config();
     let cfg = &*cfg;
     let source_url = &*source_url;
     use pg2osync_source_mysql::catalog as mysql_catalog;
@@ -2057,7 +2245,11 @@ async fn attempt_mysql(
         version_base,
         settings,
     } = wiring;
-    let source = MySqlSource::new(mysql_config_for(cfg, source_url)?);
+    let source = MySqlSource::new(mysql_config_for(
+        cfg,
+        source_url,
+        Some(live.tables.clone()),
+    )?);
     let mut admin = source.admin_connection().await?;
 
     let stored = usable_checkpoint(sink.read_checkpoint(&stream_id).await?, &stream_id);
@@ -2219,7 +2411,7 @@ async fn attempt_mysql(
         })
     };
 
-    let mut src_cfg = mysql_config_for(cfg, source_url)?;
+    let mut src_cfg = mysql_config_for(cfg, source_url, Some(live.tables.clone()))?;
     resolve_mysql_child_order(&mut src_cfg.children, &mut admin).await?;
     let load_children = src_cfg.children.clone();
     src_cfg.start_file = Some(start_file);
@@ -2234,7 +2426,19 @@ async fn attempt_mysql(
     let load_sink = sink.clone();
     let load_stream_id = stream_id.clone();
     let load_metrics = metrics.clone();
-    let ctx = pipeline_ctx(cfg, sink, metrics, ack_tx, load_done_tx, settings)?;
+    // Open for the attempt's life, not the load's: see the PostgreSQL attempt.
+    let marks = pg2osync_core::load::MarkSequence::default();
+    live.load
+        .open(copy_tx.clone(), load_done_rx.clone(), marks.clone());
+    let ctx = pipeline_ctx(
+        cfg,
+        sink,
+        metrics,
+        ack_tx,
+        load_done_tx,
+        settings,
+        live.rules.subscribe(),
+    )?;
     let engine = spawn_engine(
         events_rx,
         copy_rx,
@@ -2257,12 +2461,11 @@ async fn attempt_mysql(
     // the other way — the file we still need being purged — which pausing the
     // load would only make likelier.
     let load = async {
-        // moved in, so the copy channel closes when the load is done and the
-        // engine can tell the difference between "paused" and "finished"
-        let copy_tx = copy_tx;
+        let copy_tx = copy_tx.clone();
         if resume.is_none() || load_pending {
-            let tables = src_cfg.tables.clone();
+            let admitted = src_cfg.tables.snapshot();
             let scope = pg2osync_core::load::LoadScope::initial_load()
+                .with_marks(marks.clone())
                 .with_table_filters(table_filters(cfg)?);
             // as on PostgreSQL: the stream is already running, and the state
             // says a whole table has still to arrive
@@ -2270,7 +2473,7 @@ async fn attempt_mysql(
             let copied = with_bulk_load_settings(&load_sink, cfg, async {
                 pg2osync_source_mysql::load::run(
                     &mut admin,
-                    &tables,
+                    &admitted.tables,
                     cfg.source.load_chunk_rows.max(1) as u64,
                     &copy_tx,
                     load_sink.as_ref(),
@@ -2280,7 +2483,7 @@ async fn attempt_mysql(
                     &load_children,
                     &src_cfg.aggregates,
                     base,
-                    &src_cfg.append_only,
+                    &admitted.append_only,
                     cfg.engine.load_max_rows_per_sec,
                 )
                 .await?;
@@ -2288,10 +2491,14 @@ async fn attempt_mysql(
             })
             .await;
             load_metrics.set_state(SourceState::Streaming);
-            copied
-        } else {
-            Ok(())
+            copied?;
         }
+        // Said rather than implied by the channel closing: see the PostgreSQL
+        // attempt.
+        copy_tx
+            .send(ChangeEvent::LoadFinished)
+            .await
+            .map_err(|_| anyhow::anyhow!("the engine stopped before the load finished"))
     };
 
     let started = std::time::Instant::now();
@@ -2303,10 +2510,13 @@ async fn attempt_mysql(
     // Either failing abandons the other: a stream error is a reconnect, and the
     // load picks up from its recorded progress on the next attempt.
     let result = futures::future::try_join(load, stream).await.map(|_| ());
-    // dropping both senders above is what lets the engine drain and exit.
+    // The attempt owns the load channel, so this is where it closes — and
+    // closing both senders is what lets the engine drain and exit.
     // An engine halt closes the change channel, which the source then
     // reports as its own failure; the engine's reason is the one that
     // matters, and the one an operator has to be able to read.
+    live.load.close();
+    drop(copy_tx);
     if let Ok(Err(e)) = engine.await {
         tracing::error!(target: "pg2osync::engine", "engine stopped: {e}");
         return Err(anyhow::Error::from(e).context("engine stopped"));
@@ -2328,8 +2538,9 @@ async fn attempt_mysql(
 /// not hold — so pg2osync reads it instead of asking the caller to.
 async fn read_current_binlog_position(cfg: &AppConfig, source_url: &str) -> Option<u64> {
     use pg2osync_source_mysql::catalog as mysql_catalog;
-    let source =
-        pg2osync_source_mysql::runner::MySqlSource::new(mysql_config_for(cfg, source_url).ok()?);
+    let source = pg2osync_source_mysql::runner::MySqlSource::new(
+        mysql_config_for(cfg, source_url, None).ok()?,
+    );
     let mut admin = source.admin_connection().await.ok()?;
     let (file, pos) = mysql_catalog::master_position(&mut admin).await.ok()?;
     Some(mysql_catalog::position_token(&file, pos))
@@ -2339,7 +2550,7 @@ async fn read_current_binlog_position(cfg: &AppConfig, source_url: &str) -> Opti
 async fn mysql_binlog_prefix(cfg: &AppConfig, source_url: &str) -> Result<String> {
     use pg2osync_source_mysql::catalog as mysql_catalog;
     let source =
-        pg2osync_source_mysql::runner::MySqlSource::new(mysql_config_for(cfg, source_url)?);
+        pg2osync_source_mysql::runner::MySqlSource::new(mysql_config_for(cfg, source_url, None)?);
     let mut admin = source.admin_connection().await?;
     let (file, _) = mysql_catalog::master_position(&mut admin).await?;
     Ok(mysql_catalog::split_binlog_file(&file)
@@ -2350,12 +2561,13 @@ async fn mysql_binlog_prefix(cfg: &AppConfig, source_url: &str) -> Result<String
 pub fn mysql_config_for(
     cfg: &AppConfig,
     source_url: &str,
+    tables: Option<pg2osync_core::tables::SharedTables>,
 ) -> Result<pg2osync_source_mysql::runner::MySqlSourceConfig> {
     let url = url::Url::parse(source_url).context("source url is not a valid URL")?;
     let children = child_specs_for(cfg)?;
     let aggregates = aggregate_specs_for(cfg)?;
     let mut child_parents = HashMap::new();
-    let mut tables: Vec<(String, String)> = cfg
+    let mut tables_admitted: Vec<(String, String)> = cfg
         .sync
         .values()
         .map(|t| {
@@ -2376,8 +2588,8 @@ pub fn mysql_config_for(
                 .into_iter()
                 .flatten()
             {
-                if !tables.contains(&watched) {
-                    tables.push(watched.clone());
+                if !tables_admitted.contains(&watched) {
+                    tables_admitted.push(watched.clone());
                 }
                 child_parents.insert(watched, parent.clone());
             }
@@ -2388,8 +2600,8 @@ pub fn mysql_config_for(
     for (parent, specs) in &aggregates {
         for spec in specs {
             let watched = (spec.schema.clone(), spec.table.clone());
-            if !tables.contains(&watched) {
-                tables.push(watched.clone());
+            if !tables_admitted.contains(&watched) {
+                tables_admitted.push(watched.clone());
             }
             child_parents.insert(watched, parent.clone());
         }
@@ -2400,7 +2612,13 @@ pub fn mysql_config_for(
         user: percent_decode(url.username()),
         password: percent_decode(url.password().unwrap_or_default()),
         server_id: cfg.source.server_id,
-        tables,
+        tables: tables.unwrap_or_else(|| {
+            pg2osync_core::tables::SharedTables::new(table_set(
+                cfg,
+                &tables_admitted,
+                HashMap::new(),
+            ))
+        }),
         start_file: None,
         start_pos: 0,
         tls: cfg.tls_settings(source_url)?,
@@ -2409,7 +2627,6 @@ pub fn mysql_config_for(
         child_parents,
         gtid: None,
         gtid_resume: None,
-        append_only: append_only_tables(cfg),
         version_base: 0,
     })
 }
@@ -2433,6 +2650,315 @@ fn percent_decode(value: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+// ------------------------------------------------- a table joins, or leaves
+
+/// How long a reload waits for the stream to reach the position a table was
+/// published at.
+///
+/// Generous, because what it is waiting for is a round trip through the target
+/// and the checkpoint; short enough that a stream which is not moving at all
+/// gives the operator a refusal instead of a reload that never returns.
+const BARRIER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The file narrowed to one section.
+///
+/// Every startup check, index spec and loader already takes a whole
+/// configuration and walks its sections, so the cheapest way to run exactly
+/// those checks for exactly the new table is to hand them a configuration that
+/// has only it.
+fn only_section(cfg: &AppConfig, key: &str) -> AppConfig {
+    let mut one = cfg.clone();
+    one.sync.retain(|k, _| k == key);
+    one
+}
+
+/// Wait until everything the source had committed by `position` has been
+/// written and acknowledged.
+///
+/// The same wait `/synced` makes, for the same reason and against the same
+/// channel: an acknowledged position is the only proof this process has that
+/// the walsender is past a point, and the walsender being past the `ALTER
+/// PUBLICATION` is what makes the table's later changes ours to read.
+async fn wait_until_acked(mut acked: watch::Receiver<Option<Lsn>>, position: u64) -> bool {
+    let deadline = tokio::time::Instant::now() + BARRIER_TIMEOUT;
+    loop {
+        if acked
+            .borrow_and_update()
+            .is_some_and(|lsn| lsn.0 >= position)
+        {
+            return true;
+        }
+        if tokio::time::timeout_at(deadline, acked.changed())
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+}
+
+/// What putting a section on or off a running PostgreSQL pipeline takes.
+struct PostgresSections {
+    live: Arc<Live>,
+    tls: pg2osync_source::tls::TlsSettings,
+    admin_url: String,
+    source_url: String,
+    sink: Arc<dyn Sink>,
+    stream_id: StreamId,
+    acked: watch::Receiver<Option<Lsn>>,
+}
+
+/// `None` under a polling source: its query names the tables it reads when the
+/// attempt is built, so there is nothing here for a section to join.
+fn postgres_sections(deps: PostgresSections, polling: bool) -> Option<crate::reload::ApplySection> {
+    if polling {
+        return None;
+    }
+    let deps = Arc::new(deps);
+    Some(Arc::new(move |edit, file| {
+        let deps = deps.clone();
+        Box::pin(async move {
+            match edit {
+                crate::reload::SectionEdit::Add(key) => {
+                    add_table_postgres(&deps, &key, &file).await
+                }
+                crate::reload::SectionEdit::Remove { table, index, .. } => {
+                    remove_table_postgres(&deps, &table, &index, &file).await
+                }
+            }
+        })
+    }))
+}
+
+/// Put a table on the running PostgreSQL pipeline.
+///
+/// The order is the initial load's own argument, one step at a time. The
+/// stream has to be admitting the table before the load reads its first range,
+/// or a row changed in between is in no log anybody will read again: the load
+/// would not see it, because it changed after the range was read, and the
+/// stream would have dropped it, because at that moment the table was not
+/// ours. Everything before the swap is about making that admission mean
+/// something — the publication carries the table, and the walsender is past
+/// the point it started to — and everything after it is reading the rows that
+/// were already there.
+async fn add_table_postgres(deps: &PostgresSections, key: &str, file: &AppConfig) -> Result<()> {
+    let one = only_section(file, key);
+    let tbl = one
+        .sync
+        .get(key)
+        .ok_or_else(|| anyhow::anyhow!("the section is not in the file being applied"))?;
+    let (schema, table) = split_qualified(&tbl.table);
+    let admin = pg2osync_source::tls::connect(&deps.tls, &deps.admin_url)
+        .await
+        .context("cannot connect to source PostgreSQL")?;
+
+    pg2osync_source::catalog::add_table_to_publication(
+        &admin,
+        &file.source.publication,
+        &tbl.table,
+    )
+    .await?;
+    // A marker, because PostgreSQL omits transactions that touch no published
+    // table: on a quiet database the position the ALTER committed at is one
+    // the stream would never be handed.
+    emit_stream_marker(&deps.tls, &deps.admin_url).await?;
+    let position = read_current_lsn(&deps.tls, &deps.admin_url)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("cannot read the source's current position"))?;
+    if !wait_until_acked(deps.acked.clone(), position).await {
+        bail!(
+            "the stream did not reach {} within {}s of {} joining publication {}, so a row \
+             changed in between could be missed by both the load and the stream. It is in \
+             the publication now; the next SIGHUP takes it from there",
+            Lsn(position),
+            BARRIER_TIMEOUT.as_secs(),
+            tbl.table,
+            file.source.publication
+        );
+    }
+
+    // The same checks a start makes, for exactly this table.
+    let key_columns = key_columns_for(&one, &admin).await?;
+    check_derived_identity_requirements(&one, &admin).await?;
+    deps.sink.ensure_ready(&index_specs(&one)?).await?;
+
+    // The filter first, then the rules. A row admitted before the rules know
+    // the table hits the engine's "no index is configured" guard, which is
+    // noisy and never wrong; a row read by the load before the filter admits
+    // the table is a row nothing will ever correct.
+    deps.live.tables.add(
+        schema,
+        table,
+        key_columns
+            .get(&(schema.to_string(), table.to_string()))
+            .cloned()
+            .unwrap_or_default(),
+        tbl.append_only,
+    );
+    deps.live.adopt(file)?;
+
+    let load =
+        deps.live.load.current().ok_or_else(|| {
+            anyhow::anyhow!("no streaming attempt is running to read the table with")
+        })?;
+    tracing::info!(target: "pg2osync::reload",
+        "[sync.{key}] {} joined the pipeline; reading its rows into index {:?}",
+        tbl.table, tbl.index_name(key));
+    load.start().await?;
+    // No bulk-load settings: the other tables of these indices are live, and
+    // suspending refresh on them would make every search against them stale
+    // for as long as this takes.
+    crate::backfill::run(
+        &one,
+        &deps.source_url,
+        &deps.tls,
+        &admin,
+        &HashMap::new(),
+        &HashMap::new(),
+        load.rows,
+        deps.sink.as_ref(),
+        &deps.stream_id,
+        load.done,
+        &pg2osync_core::load::LoadScope::added_table(&tbl.table)
+            .with_marks(load.marks.clone())
+            .with_table_filters(table_filters(&one)?),
+    )
+    .await?;
+    tracing::info!(target: "pg2osync::reload", "[sync.{key}] {} is synced", tbl.table);
+    Ok(())
+}
+
+/// Take a table off the running PostgreSQL pipeline.
+async fn remove_table_postgres(
+    deps: &PostgresSections,
+    table: &str,
+    index: &str,
+    file: &AppConfig,
+) -> Result<()> {
+    let (schema, name) = split_qualified(table);
+    deps.live.tables.remove(schema, name);
+    deps.live.adopt(file)?;
+    tracing::info!(target: "pg2osync::reload",
+        "{table} is no longer synced; index {index:?} is left exactly as it is — nothing here \
+         deletes documents");
+    let admin = pg2osync_source::tls::connect(&deps.tls, &deps.admin_url)
+        .await
+        .context("cannot connect to source PostgreSQL")?;
+    if let Err(e) = pg2osync_source::catalog::drop_table_from_publication(
+        &admin,
+        &file.source.publication,
+        table,
+    )
+    .await
+    {
+        // Not a failure: nothing is being indexed from the table either way.
+        // What is left is a publication naming one table more than the file
+        // does, which the next start reads as drift.
+        tracing::warn!(target: "pg2osync::reload",
+            "{table} is still in publication {}: {e}. Run this before the next restart, or the \
+             publication and the file will disagree: \
+             ALTER PUBLICATION {} DROP TABLE {table};",
+            file.source.publication, file.source.publication);
+    }
+    Ok(())
+}
+
+/// What putting a section on or off a running MySQL pipeline takes.
+struct MySqlSections {
+    live: Arc<Live>,
+    source_url: String,
+    sink: Arc<dyn Sink>,
+    stream_id: StreamId,
+    version_base: Arc<std::sync::atomic::AtomicU64>,
+}
+
+fn mysql_sections(deps: MySqlSections) -> Option<crate::reload::ApplySection> {
+    let deps = Arc::new(deps);
+    Some(Arc::new(move |edit, file| {
+        let deps = deps.clone();
+        Box::pin(async move {
+            match edit {
+                crate::reload::SectionEdit::Add(key) => add_table_mysql(&deps, &key, &file).await,
+                crate::reload::SectionEdit::Remove { table, index, .. } => {
+                    let (schema, name) = split_qualified(&table);
+                    deps.live.tables.remove(schema, name);
+                    deps.live.adopt(&file)?;
+                    tracing::info!(target: "pg2osync::reload",
+                        "{table} is no longer synced; index {index:?} is left exactly as it is \
+                         — nothing here deletes documents");
+                    Ok(())
+                }
+            }
+        })
+    }))
+}
+
+/// Put a table on the running MySQL pipeline.
+///
+/// The same order as PostgreSQL and for the same reason, minus the two steps
+/// that are PostgreSQL's: there is no publication to join, because the binlog
+/// carries every table whatever we asked for, and so nothing to wait for the
+/// stream to pass. What decides whether a table's rows are ours is the filter
+/// this swaps, and it is swapped before the load reads a row.
+async fn add_table_mysql(deps: &MySqlSections, key: &str, file: &AppConfig) -> Result<()> {
+    let one = only_section(file, key);
+    let tbl = one
+        .sync
+        .get(key)
+        .ok_or_else(|| anyhow::anyhow!("the section is not in the file being applied"))?;
+    let (schema, table) = split_qualified(&tbl.table);
+    let source = pg2osync_source_mysql::runner::MySqlSource::new(mysql_config_for(
+        &one,
+        &deps.source_url,
+        None,
+    )?);
+    let mut conn = source.admin_connection().await?;
+    // The same check a start makes: the table exists, and it has a key unless
+    // the section says it needs none.
+    pg2osync_source_mysql::catalog::table_schema(&mut conn, schema, table, tbl.append_only).await?;
+    deps.sink.ensure_ready(&index_specs(&one)?).await?;
+
+    deps.live
+        .tables
+        .add(schema, table, Vec::new(), tbl.append_only);
+    deps.live.adopt(file)?;
+
+    let load =
+        deps.live.load.current().ok_or_else(|| {
+            anyhow::anyhow!("no streaming attempt is running to read the table with")
+        })?;
+    tracing::info!(target: "pg2osync::reload",
+        "[sync.{key}] {} joined the pipeline; reading its rows into index {:?}",
+        tbl.table, tbl.index_name(key));
+    load.start().await?;
+    let admitted = [(schema.to_string(), table.to_string())];
+    let append_only: std::collections::HashSet<(String, String)> = if tbl.append_only {
+        admitted.iter().cloned().collect()
+    } else {
+        Default::default()
+    };
+    pg2osync_source_mysql::load::run(
+        &mut conn,
+        &admitted,
+        file.source.load_chunk_rows.max(1) as u64,
+        &load.rows,
+        deps.sink.as_ref(),
+        &deps.stream_id,
+        load.done,
+        &pg2osync_core::load::LoadScope::added_table(&tbl.table)
+            .with_marks(load.marks.clone())
+            .with_table_filters(table_filters(&one)?),
+        &HashMap::new(),
+        &HashMap::new(),
+        deps.version_base.load(Ordering::Relaxed),
+        &append_only,
+        file.engine.load_max_rows_per_sec,
+    )
+    .await?;
+    tracing::info!(target: "pg2osync::reload", "[sync.{key}] {} is synced", tbl.table);
+    Ok(())
 }
 
 pub fn spawn_engine(

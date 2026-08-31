@@ -196,7 +196,13 @@ That last line is the whole reload workflow. SIGHUP makes the running process
 read its file again; the file is validated whole before anything is applied, so
 a mistake anywhere in it changes nothing, and `validate` checks exactly what the
 reload checks. Batch sizes, the checkpoint interval, the load's rate ceiling,
-the retry budget and `[log] filter` take effect on the next batch. Everything
+the retry budget and `[log] filter` take effect on the next batch. A plain
+`[sync.*]` section added to the file joins the running pipeline: on PostgreSQL
+the table is put into the publication, the reload waits for the stream to pass
+that point, and its rows are then read beside the stream — the same two lines
+above are the whole workflow, and the log says when the table is synced.
+Removing a section stops its rows being routed and leaves its index alone.
+Everything
 else is refused in place with one `ERROR` line naming the field, both values and
 what it would take — a restart, a re-snapshot or a re-index. The full table is
 in [Configuration](configuration.md#reloading); `pg2osync_config_reloads_total`

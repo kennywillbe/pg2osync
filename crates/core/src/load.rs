@@ -97,6 +97,28 @@ pub async fn unfinished(
     Ok(false)
 }
 
+/// Which load marks have been handed out on one channel.
+///
+/// A loader sends a mark, then waits for the engine to report that everything
+/// before it is durably written. The engine reports one number — the highest
+/// mark it has written — so two loaders sharing a channel must not both use
+/// the number five: one's confirmation would release the other's wait before
+/// its rows had landed, and the progress it then recorded would claim a range
+/// nothing wrote. One sequence per channel is what keeps a mark the property
+/// of the rows sent under it.
+#[derive(Clone, Debug, Default)]
+pub struct MarkSequence(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl MarkSequence {
+    /// The next mark. Never zero, so it is always above the watch channel's
+    /// initial value.
+    pub fn next(&self) -> u64 {
+        self.0
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1)
+    }
+}
+
 /// What one load run covers.
 ///
 /// Shared by both sources' loaders so they cannot drift on what a scope means:
@@ -115,6 +137,9 @@ pub struct LoadScope {
     /// spells identifiers and strings its own way, and the loader building
     /// the statement is the only place that knows which.
     pub table_filters: std::collections::HashMap<String, crate::filter::Filter>,
+    /// Where this run's load marks come from. Shared with whatever else may
+    /// be reading down the same channel; see [`MarkSequence`].
+    pub marks: MarkSequence,
     /// Whether progress is recorded, so an interruption resumes instead of
     /// starting over.
     ///
@@ -130,10 +155,23 @@ impl LoadScope {
     /// Every configured table, resumable.
     pub fn initial_load() -> Self {
         Self {
-            only: None,
-            filter: None,
-            table_filters: Default::default(),
             resumable: true,
+            ..Default::default()
+        }
+    }
+
+    /// One table that has just joined a running pipeline, resumable.
+    ///
+    /// Unlike a re-snapshot this records its progress, because there is
+    /// nothing else that could: the section is in the file from now on, so a
+    /// crash halfway through would leave the pipeline streaming a table whose
+    /// older rows were never read, with nothing saying so. Recording it under
+    /// the initial load's own key is what makes the next start finish the job.
+    pub fn added_table(qualified_table: &str) -> Self {
+        Self {
+            only: Some(qualified_table.to_string()),
+            resumable: true,
+            ..Default::default()
         }
     }
 
@@ -142,9 +180,14 @@ impl LoadScope {
         Self {
             only: Some(qualified_table.to_string()),
             filter,
-            table_filters: Default::default(),
-            resumable: false,
+            ..Default::default()
         }
+    }
+
+    /// Take the marks of a channel something else is already loading down.
+    pub fn with_marks(mut self, marks: MarkSequence) -> Self {
+        self.marks = marks;
+        self
     }
 
     /// Builder form, so neither constructor grows an argument every caller

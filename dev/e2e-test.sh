@@ -3319,5 +3319,198 @@ check "and the deleted child row takes the lifted field with it" \
 check "the parent document is still there" "$(os_field e2e_flat 1 name)" "ada"
 stop_sync
 
+echo -e "\n\033[1m== 40. a table joins and leaves the pipeline on SIGHUP ==\033[0m"
+# #170: the half of the reload that #145 cut. What has to hold is an ordering
+# claim, and only a live suite can make it: a row written *while* the reload is
+# running has to arrive. It is in no log anybody would read again if the stream
+# starts admitting the table after the load has read it — the load would not see
+# it, and the stream would have dropped it — so a tight insert loop runs across
+# the whole window and the index is compared with the table at the end.
+drop_idle_probe_slots
+ADCONFIG=$(mktemp /tmp/pg2osync-e2e-addtable.XXXXXX)
+ADSLOT=pg2osync_e2e_addtable
+ADLOG=/tmp/pg2osync-e2e-addtable-$TAG.log
+: > "$ADLOG"
+ad_metric() { curl -s 127.0.0.1:$((PORT_BASE + 41))/metrics | grep -v '^#' | grep -E "$1" | awk '{print $2}' | head -1; }
+ad_write_config() {
+  cat > "$ADCONFIG" <<TOML
+[source]
+url_env = "PG2OSYNC_SOURCE_URL"
+slot_name = "$ADSLOT"
+publication = "${ADSLOT}_pub"
+
+[target]
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
+
+[metrics]
+bind = "127.0.0.1:$((PORT_BASE + 41))"
+
+[engine]
+checkpoint_interval_ms = 200
+
+[sync.anchor]
+table = "public.add_anchor"
+index = "e2e_add_anchor"
+$1
+TOML
+}
+add_cleanup() {
+  sync_kill
+  pg "SELECT pg_drop_replication_slot('$ADSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$ADSLOT');" > /dev/null 2>&1 || true
+  pg "DROP PUBLICATION IF EXISTS ${ADSLOT}_pub; DROP TABLE IF EXISTS add_anchor, add_late, add_lines;" > /dev/null 2>&1 || true
+  curl -s -XDELETE "$OS/e2e_add_anchor,e2e_add_late?ignore_unavailable=true" > /dev/null 2>&1 || true
+  rm -f "$ADCONFIG" "$ADLOG" "/tmp/pg2osync-e2e-addstop-$TAG"
+}
+trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup; init_cleanup; fan_cleanup; bid_cleanup; shape_cleanup; where_cleanup; join_cleanup; union_cleanup; events_cleanup; pipe_cleanup; append_cleanup; routing_cleanup; reindex_cleanup; rate_cleanup; through_cleanup; ra_cleanup; pseudo_cleanup; rl_cleanup; otel_cleanup; agg_cleanup; element_cleanup; flatten_cleanup; add_cleanup' EXIT
+
+pg "DROP TABLE IF EXISTS add_anchor, add_late, add_lines;" > /dev/null 2>&1
+pg "CREATE TABLE add_anchor(id bigint primary key, v text);" > /dev/null
+pg "CREATE TABLE add_late(id bigint primary key, v text);" > /dev/null
+pg "CREATE TABLE add_lines(id bigint primary key, late_id bigint);" > /dev/null
+pg "INSERT INTO add_anchor VALUES (1,'anchor');" > /dev/null
+# rows that were already there when the section was written: the load's half
+pg "INSERT INTO add_late SELECT g, 'before-' || g FROM generate_series(1, 500) g;" > /dev/null
+pg "DROP PUBLICATION IF EXISTS ${ADSLOT}_pub; CREATE PUBLICATION ${ADSLOT}_pub FOR TABLE add_anchor;" > /dev/null 2>&1
+curl -s -XDELETE "$OS/e2e_add_anchor,e2e_add_late?ignore_unavailable=true" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/postgres-$ADSLOT" > /dev/null
+# a finished load record from a previous run would skip the read this
+# section is about
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/load-postgres-${ADSLOT}-public_add_late" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/load-postgres-${ADSLOT}-public_add_anchor" > /dev/null
+
+ad_write_config ""
+sync_spawn "$ADCONFIG" "$ADLOG"
+ADPID=$SYNC_PID
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_count e2e_add_anchor)" = "1" ] && break
+  sleep 1
+done
+check "the pipeline is streaming one table" "$(os_count e2e_add_anchor)" "1"
+check "and the table about to join is not in the publication yet" \
+  "$(pg "SELECT count(*) FROM pg_publication_tables WHERE pubname='${ADSLOT}_pub' AND tablename='add_late';")" "0"
+ad_reconnects_before=$(ad_metric '^pg2osync_reconnects_total\{')
+
+# The ordering proof. Writes run continuously from before the SIGHUP until
+# after the load has finished, so some of them land in every phase there is:
+# before the ALTER, between the ALTER and the filter swap, and during the load.
+rm -f "/tmp/pg2osync-e2e-addstop-$TAG"
+( id=100000
+  while [ ! -f "/tmp/pg2osync-e2e-addstop-$TAG" ]; do
+    pg "INSERT INTO add_late VALUES ($id, 'during-$id');" > /dev/null 2>&1
+    id=$((id + 1))
+  done ) &
+AD_WRITER=$!
+sleep 1
+
+ad_write_config '
+[sync.late]
+table = "public.add_late"
+index = "e2e_add_late"'
+kill -HUP "$ADPID"
+for _ in $(seq 1 120); do
+  grep -q "public.add_late is synced" "$ADLOG" && break
+  sleep 1
+done
+if grep -q "public.add_late is synced" "$ADLOG"; then
+  ok "the reload read the added table beside the stream and said so"
+else
+  bad "the table never joined: $(grep -i 'sync.late' "$ADLOG" | tail -3)"
+fi
+# keep writing for a moment past the load, so the stream half is exercised too
+sleep 2
+touch "/tmp/pg2osync-e2e-addstop-$TAG"
+wait "$AD_WRITER" 2> /dev/null || true
+
+check "the table is in the publication now" \
+  "$(pg "SELECT count(*) FROM pg_publication_tables WHERE pubname='${ADSLOT}_pub' AND tablename='add_late';")" "1"
+check "the process is the same process" "$(kill -0 "$ADPID" 2> /dev/null && echo alive)" "alive"
+check "and nothing reconnected to do it" \
+  "$(ad_metric '^pg2osync_reconnects_total\{')" "$ad_reconnects_before"
+check "the reload is counted as applied" \
+  "$(ad_metric '^pg2osync_config_reloads_total\{source="[^"]*",result="applied"\}')" "1"
+
+ad_rows=$(pg "SELECT count(*) FROM add_late;")
+for _ in $(seq 1 120); do
+  refresh
+  [ "$(os_count e2e_add_late)" = "$ad_rows" ] && break
+  sleep 1
+done
+check "the rows that were already there arrived" "$(os_field e2e_add_late 1 v)" "before-1"
+# the assertion the whole section exists for
+check "and so did every row written while the reload was running" \
+  "$(os_count e2e_add_late)" "$ad_rows"
+if [ -n "$(curl -s "$OS/e2e_add_late/_mapping" | jqf "list(d.values())[0]['mappings']['properties'].get('v','')")" ]; then
+  ok "the index was created with a mapping for the table's columns"
+else
+  bad "the added index has no mapping: $(curl -s "$OS/e2e_add_late/_mapping")"
+fi
+
+# A change after the reload is ordinary streaming, which is what proves the
+# stream is admitting the table rather than the load having caught everything.
+pg "UPDATE add_late SET v = 'streamed' WHERE id = 1;" > /dev/null
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_field e2e_add_late 1 v)" = "streamed" ] && break
+  sleep 1
+done
+check "the added table is streaming, not just loaded" "$(os_field e2e_add_late 1 v)" "streamed"
+
+# Removing it stops the routing and leaves the index exactly as it is.
+ad_write_config ""
+kill -HUP "$ADPID"
+for _ in $(seq 1 60); do
+  grep -q "public.add_late is no longer synced" "$ADLOG" && break
+  sleep 1
+done
+if grep -qF 'index "e2e_add_late" is left exactly as it is' "$ADLOG"; then
+  ok "the removal names the index it is leaving behind"
+else
+  bad "the removal did not say what happens to the index: $(grep -i 'no longer synced' "$ADLOG" | tail -2)"
+fi
+check "and the table left the publication" \
+  "$(pg "SELECT count(*) FROM pg_publication_tables WHERE pubname='${ADSLOT}_pub' AND tablename='add_late';")" "0"
+# Written first, so a row of the anchor table arriving is proof the stream got
+# this far: a straggler is then absent because it was dropped, not because
+# nothing has been read yet.
+pg "INSERT INTO add_late VALUES (900001,'after-the-removal');" > /dev/null
+pg "INSERT INTO add_anchor VALUES (2,'still-streaming');" > /dev/null
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_count e2e_add_anchor)" = "2" ] && break
+  sleep 1
+done
+check "the anchor table is still streaming" "$(os_count e2e_add_anchor)" "2"
+check "a row written after the removal is not indexed" "$(os_status e2e_add_late 900001)" "404"
+check "its index is left exactly as it was" "$(os_status e2e_add_late 1)" "200"
+check "the process is still the same process" "$(kill -0 "$ADPID" 2> /dev/null && echo alive)" "alive"
+
+# A section whose shape the stream was built with is still a restart, and says so.
+ad_write_config '
+[sync.withkids]
+table = "public.add_late"
+index = "e2e_add_late"
+
+[[sync.withkids.children]]
+table = "public.add_lines"
+field = "lines"
+foreign_key = "late_id"'
+kill -HUP "$ADPID"
+for _ in $(seq 1 30); do
+  grep -q "Add it and restart" "$ADLOG" && break
+  sleep 1
+done
+if grep -qF "Add it and restart" "$ADLOG"; then
+  ok "a new section declaring children is refused with the restart it needs"
+else
+  bad "the unswappable section was not refused: $(grep -i 'sync.withkids' "$ADLOG" | tail -2)"
+fi
+check "and it is counted as refused" \
+  "$(ad_metric '^pg2osync_config_reloads_total\{source="[^"]*",result="refused"\}')" "1"
+check "the process survived that too" "$(kill -0 "$ADPID" 2> /dev/null && echo alive)" "alive"
+stop_sync
+
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

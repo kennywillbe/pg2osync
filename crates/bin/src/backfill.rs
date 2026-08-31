@@ -370,9 +370,10 @@ pub async fn run(
         tracing::info!(target: "pg2osync::backfill",
             "reading the load with {} connections", readers.len());
     }
-    // One counter for the whole load: a mark only has to be increasing, and a
-    // single sequence keeps the wait condition a comparison.
-    let mut mark: u64 = 0;
+    // One sequence for the whole load, and for anything else reading down the
+    // same channel: a mark only has to be increasing, and a single sequence
+    // keeps the wait condition a comparison.
+    let marks = &scope.marks;
     let mut progress_keys: Vec<String> = Vec::new();
 
     for tbl in cfg.sync.values() {
@@ -529,7 +530,7 @@ pub async fn run(
             // crash anywhere in it can only lose the wave and redo it, which an
             // idempotent write makes free — the reverse order would claim a
             // range that was never written.
-            mark += 1;
+            let mark = marks.next();
             tx.send(ChangeEvent::LoadMark(mark))
                 .await
                 .map_err(|_| anyhow::anyhow!("engine closed during backfill"))?;

@@ -1934,7 +1934,10 @@ What a reload does with each option:
 | `[sync.<key>] table`, `index`, `id`, `primary_key`, `append_only`, `routing`, `fan_out`, `join`, `children` | **Rebuild** — see below |
 | `[sync.<key>] columns`, `exclude_columns`, `transform`, `fields`, `constants`, `where`, `pipeline`, `soft_delete`, `mapping_file` | **Re-snapshot** — see below |
 | `[sync.<key>] poll_column` | **Restart** — the poll query is built when an attempt starts |
-| a `[sync.<key>]` added or removed | **Restart** |
+| a plain `[sync.<key>]` added | **Applied** — the table joins the publication, the stream, and then its rows are read beside it; see below |
+| a `[sync.<key>]` removed | **Applied** — its rows stop being routed and it leaves the publication. The index is left as it is |
+| a `[sync.<key>]` added with `children`, `join`, `fan_out`, `aggregates` or a per-row index | **Restart** — the source is built watching those tables, and the endpoints are told the index pattern once |
+| a `[sync.<key>]` added or removed under `mode = "poll"` | **Restart** — the poll query names the tables it reads when the attempt is built |
 
 Anything not applied is refused *in place*: the section keeps running exactly as
 it was, and one `ERROR` line names the field, both values and what it would
@@ -1947,10 +1950,28 @@ the old way — the fix is a re-index into a new name with the alias moved onto
 it ([Zero-downtime re-index](operations.md#zero-downtime-re-index)). The second
 only changes the **shape** of the document, so the index would end up holding a
 mixture with nothing recording which is which — the fix is `pg2osync resnapshot
---table …` after the restart. Adding or removing a section is a restart: a table
-joins a running pipeline only once its rows have been loaded beside the stream
-and, on PostgreSQL, its name is in the publication. Removing one leaves its
-index exactly as it is; nothing here deletes documents.
+--table …` after the restart.
+
+Adding a plain section happens while the pipeline runs, in this order and no
+other. On PostgreSQL the table is put into the publication — the same statement
+`bootstrap` would have run, and only where the role owns both the publication
+and the table; where it does not, the reload is refused and prints the exact
+`ALTER PUBLICATION … ADD TABLE` for a DBA to run. The reload then waits until
+the pipeline has acknowledged a position past that statement, because a
+walsender picks up the new membership at a transaction boundary. The startup
+checks for that table run next, then its index is created, then the stream
+begins admitting it, and only then are its existing rows read — on the same
+channel the initial load uses, at the same rate ceiling, recording progress so
+a crash halfway through finishes the job on the next start rather than leaving
+the table half indexed. The per-index bulk-load settings are *not* relaxed:
+those indices are serving searches. A row written during any of this arrives
+exactly once, which is what the ordering above buys.
+
+Removing a section stops its rows being routed and takes the table out of the
+publication; where the role may not, one `WARN` names the statement to run
+before the next restart, or the publication and the file will disagree. The
+index is left exactly as it is and named in the log — nothing here deletes
+documents — and so is its load-progress record.
 
 Every reload is counted as `pg2osync_config_reloads_total{result}`, with
 `result` one of `applied`, `refused`, `invalid` (the file did not load, so

@@ -387,6 +387,98 @@ pub async fn ensure_publication(
     Ok(())
 }
 
+/// Put a table into the publication this pipeline streams, or say what the
+/// operator has to run instead.
+///
+/// Not drift being applied: drift is the publication and the configuration
+/// disagreeing about a table nobody asked to change, and it stays an error.
+/// This is the configuration asking for a table, which is the same act
+/// `CREATE PUBLICATION` performs at bootstrap — the only difference is that
+/// the pipeline is already running. PostgreSQL requires ownership of both the
+/// publication and the table to do it, and grants cannot substitute, so where
+/// the role lacks either the statement is printed rather than attempted: the
+/// same shape the setup script uses, for the same reason.
+pub async fn add_table_to_publication(
+    client: &Client,
+    publication: &str,
+    qualified_table: &str,
+) -> Result<()> {
+    let already: bool = client
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_publication_tables t \
+             WHERE t.pubname = $1 AND format('%I.%I', t.schemaname, t.tablename)::regclass \
+                 = ($2::text)::regclass)",
+            &[&publication, &qualified_table],
+        )
+        .await
+        .catalog_ctx(|| format!("cannot read the tables of publication {publication}"))?
+        .get(0);
+    // Idempotent for the same reason bootstrap is: a first attempt that added
+    // the table and then failed further on must be one the next attempt can
+    // get past, and PostgreSQL refuses to add a member twice.
+    if already {
+        return Ok(());
+    }
+    let sql = format!("ALTER PUBLICATION {publication} ADD TABLE {qualified_table};");
+    let owns_publication: bool = client
+        .query_one(
+            "SELECT pg_has_role(p.pubowner, 'USAGE') FROM pg_publication p WHERE p.pubname = $1",
+            &[&publication],
+        )
+        .await
+        .catalog_ctx(|| format!("cannot read publication {publication}"))?
+        .get(0);
+    let owns_table: bool = client
+        .query_one(
+            "SELECT pg_has_role(c.relowner, 'USAGE') FROM pg_class c \
+             WHERE c.oid = ($1::text)::regclass",
+            &[&qualified_table],
+        )
+        .await
+        .catalog_ctx(|| format!("cannot inspect table {qualified_table}"))?
+        .get(0);
+    if !owns_publication || !owns_table {
+        let missing = match (owns_publication, owns_table) {
+            (false, false) => format!("publication {publication} nor table {qualified_table}"),
+            (false, true) => format!("publication {publication}"),
+            _ => format!("table {qualified_table}"),
+        };
+        return Err(SourceError::Config(format!(
+            "{qualified_table} has to be in publication {publication} before its rows can be \
+             streamed, and this role owns neither {missing}. Run as the owner or a superuser: \
+             {sql}"
+        )));
+    }
+    client
+        .execute(&sql, &[])
+        .await
+        .catalog_ctx(|| format!("{sql} failed"))?;
+    tracing::info!(target: "pg2osync::catalog",
+        "added {qualified_table} to publication {publication}");
+    Ok(())
+}
+
+/// Take a table out of the publication, or say what to run instead.
+///
+/// A failure here is a warning rather than an error: the section is gone from
+/// the configuration either way, so nothing is being indexed from the table.
+/// What is left is a publication that names one table more than the file does,
+/// which the next start reads as drift — hence the statement to run before it.
+pub async fn drop_table_from_publication(
+    client: &Client,
+    publication: &str,
+    qualified_table: &str,
+) -> Result<()> {
+    let sql = format!("ALTER PUBLICATION {publication} DROP TABLE {qualified_table};");
+    client
+        .execute(&sql, &[])
+        .await
+        .catalog_ctx(|| format!("{sql} failed"))?;
+    tracing::info!(target: "pg2osync::catalog",
+        "removed {qualified_table} from publication {publication}");
+    Ok(())
+}
+
 /// One replication slot as the server sees it.
 #[derive(Debug, Clone)]
 pub struct SlotInfo {
