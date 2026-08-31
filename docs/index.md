@@ -31,6 +31,12 @@ feature matrix are in the
   reconciled into the deployment the page above describes.
 - **[Operations](operations.md)** — metrics, every failure mode, and the
   recovery for each.
+- **Guides** — the tasks rather than the subsystems:
+  [migrating from Logstash](guides/migrating-from-logstash.md), [setting up a
+  managed PostgreSQL](guides/managed-postgres.md), [adding a source table
+  without a restart](guides/add-a-source-table-without-a-restart.md),
+  [choosing a rebuild](guides/choosing-a-rebuild.md) and [rotating a pseudonym
+  key](guides/rotating-a-pseudonym-key.md).
 - **[What it costs your database](database-impact.md)** — connections,
   privileges, and the measured load on a busy source.
 - **[Architecture](architecture.md)** and

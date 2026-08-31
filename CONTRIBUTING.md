@@ -51,6 +51,16 @@ The Meilisearch cell is advisory — `compat.yml` marks it `continue-on-error`
 while [#122](https://github.com/kennywillbe/pg2osync/issues/122) is open — so a
 failure there prints `!` and does not make your run red.
 
+Two other failures are known to be timing rather than breakage, and the
+etiquette for both is the same: **re-run the job once before you start
+triaging**, and if it fails twice it is real. The first is the junction-DELETE
+assertion in `e2e MySQL to OpenSearch` — step 22, "a junction DELETE takes them
+away again" — which reads the index before the re-fetch it triggered has
+landed. The second is the Supabase compatibility cell, whose image occasionally
+restarts while the cell is seeding it; that one says `the database system is
+shutting down` in the log, which is the tell. A failure that reproduces on the
+second run is a bug and wants an issue, not a third run.
+
 The script starts the dev stack and the `mysql-test` container if they are
 down and seeds both. Those are shared, and so are the table and index names the
 suites use, so the e2e jobs queue on one machine-wide lock: a second run waits
