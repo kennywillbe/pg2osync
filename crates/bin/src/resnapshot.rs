@@ -213,12 +213,14 @@ async fn postgres(
         .context("cannot connect to source PostgreSQL")?;
     let mut children = run::child_specs_for(cfg)?;
     run::resolve_child_order(&mut children, &admin).await?;
+    let aggregates = run::aggregate_specs_for(cfg)?;
     crate::backfill::run(
         cfg,
         source_url,
         &tls,
         &admin,
         &children,
+        &aggregates,
         copy_tx.clone(),
         sink,
         stream_id,
@@ -241,6 +243,7 @@ async fn mysql(
     let src_cfg = run::mysql_config_for(cfg, source_url)?;
     let tables = src_cfg.tables.clone();
     let mut children = src_cfg.children.clone();
+    let src_aggregates = src_cfg.aggregates.clone();
     let append_only = src_cfg.append_only.clone();
     let source = pg2osync_source_mysql::runner::MySqlSource::new(src_cfg);
     let mut conn = source.admin_connection().await?;
@@ -264,6 +267,7 @@ async fn mysql(
         load_done,
         scope,
         &children,
+        &src_aggregates,
         version_base,
         &append_only,
         cfg.engine.load_max_rows_per_sec,

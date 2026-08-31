@@ -338,7 +338,7 @@ pub async fn parents_through(
 /// The values come from the source itself, and are emitted through the same
 /// literal rules the chunked load uses so a number stays a number and anything
 /// else is quoted and escaped.
-fn key_list(keys: &[Value]) -> String {
+pub(crate) fn key_list(keys: &[Value]) -> String {
     keys.iter()
         .map(|k| match k {
             Value::Number(n) => n.to_string(),

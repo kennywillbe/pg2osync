@@ -162,6 +162,19 @@ impl Incoming {
             Incoming::Insert(t) | Incoming::Update(_, t) | Incoming::Delete(t) => t,
         }
     }
+
+    /// Every tuple that can carry the foreign key locating what this row
+    /// belongs to: the image above first, and behind it an update's old one.
+    ///
+    /// A row whose foreign key moved belongs to two parents in one change, and
+    /// the old image is the only place the one it left is named.
+    pub fn tuples(&self) -> Vec<&Tuple> {
+        match self {
+            Incoming::Insert(t) | Incoming::Delete(t) => vec![t],
+            Incoming::Update(None, t) => vec![t],
+            Incoming::Update(Some(old), t) => vec![t, old],
+        }
+    }
 }
 
 /// `append_only` declares the table keyless: an insert carries no key (the
@@ -274,6 +287,24 @@ pub fn convert_column_at(rel: &Relation, idx: usize, tuple: &Tuple) -> Result<Va
 mod tests {
     use super::*;
     use crate::pgoutput;
+
+    #[test]
+    fn an_update_carries_the_image_it_had_as_well_as_the_one_it_has() {
+        // A row whose foreign key moved belongs to two parents in one change,
+        // and the parent it left is named nowhere but the before-image.
+        let new = tuple(vec![TupleValue::Text(b"2".to_vec())]);
+        let old = tuple(vec![TupleValue::Text(b"1".to_vec())]);
+        let moved = Incoming::Update(Some(old.clone()), new.clone());
+        assert_eq!(moved.tuples(), vec![&new, &old]);
+        assert_eq!(
+            Incoming::Update(None, new.clone()).tuples(),
+            vec![&new],
+            "a replica identity that carries no before-image names one parent"
+        );
+        assert_eq!(Incoming::Insert(new.clone()).tuples(), vec![&new]);
+        assert_eq!(Incoming::Delete(old.clone()).tuples(), vec![&old]);
+        assert_eq!(moved.tuple(), &new, "the image above is still the row");
+    }
 
     fn users_relation(replica_identity: pgoutput::ReplicaIdentity) -> Relation {
         Relation {

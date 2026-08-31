@@ -2,6 +2,7 @@
 //! management, type mapping and document construction.
 //! Everything PostgreSQL-specific lives here and nowhere else.
 
+pub mod aggregate;
 pub mod catalog;
 pub mod children;
 pub mod docbuild;

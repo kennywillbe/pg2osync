@@ -193,7 +193,7 @@ fn fk_ref(spec: &ChildSpec) -> String {
     format!("{alias}.{}", pg_quote_ident(&spec.foreign_key))
 }
 
-fn any_predicate(
+pub(crate) fn any_predicate(
     quoted_column: &str,
     keys: &[Value],
 ) -> (String, Box<dyn tokio_postgres::types::ToSql + Sync + Send>) {
@@ -223,11 +223,11 @@ fn any_predicate(
     }
 }
 
-fn pg_quote_ident(name: &str) -> String {
+pub(crate) fn pg_quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-fn pg_quote_literal(value: &str) -> String {
+pub(crate) fn pg_quote_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 

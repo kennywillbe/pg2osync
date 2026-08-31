@@ -90,21 +90,23 @@ pub async fn run_pipeline(
 pub fn embedded_children_with_own_section(cfg: &AppConfig) -> Vec<String> {
     let mut notes = Vec::new();
     for (owner, tbl) in &cfg.sync {
-        for child in &tbl.children {
-            // the junction is read as somebody's child in exactly the same way
-            for watched in [Some(&child.table), child.through.as_ref()]
-                .into_iter()
-                .flatten()
-            {
-                if let Some((key, own)) = cfg.sync.iter().find(|(_, t)| &t.table == watched) {
-                    notes.push(format!(
-                        "[sync.{key}] {watched} is also an embedded child of [sync.{owner}]: \
-                         the replication runner reads its rows only as a re-fetch of {}, so \
-                         index {:?} receives the initial load and no streamed change",
-                        tbl.table,
-                        own.index_name(key)
-                    ));
-                }
+        // the junction of a many-to-many collection and the table an aggregate
+        // counts are read as somebody's child in exactly the same way
+        let watched_tables = tbl
+            .children
+            .iter()
+            .flat_map(|child| [Some(&child.table), child.through.as_ref()])
+            .flatten()
+            .chain(tbl.aggregates.iter().map(|agg| &agg.table));
+        for watched in watched_tables {
+            if let Some((key, own)) = cfg.sync.iter().find(|(_, t)| &t.table == watched) {
+                notes.push(format!(
+                    "[sync.{key}] {watched} is also an embedded child of [sync.{owner}]: \
+                     the replication runner reads its rows only as a re-fetch of {}, so \
+                     index {:?} receives the initial load and no streamed change",
+                    tbl.table,
+                    own.index_name(key)
+                ));
             }
         }
     }
@@ -999,6 +1001,7 @@ async fn run_postgres(
 
     let mut children = child_specs_for(&cfg)?;
     resolve_child_order(&mut children, &admin).await?;
+    let aggregates = aggregate_specs_for(&cfg)?;
     let mut tables: Vec<String> = cfg.sync.values().map(|t| t.table.clone()).collect();
     // Child tables must join the publication or their changes never reach us,
     // and so must a junction: each of the two carries half of what a
@@ -1016,12 +1019,21 @@ async fn run_postgres(
         }
     }
 
+    // an aggregated table must join the publication or its changes never reach
+    // us, exactly as a child table must
+    for table in aggregated_tables(&cfg) {
+        if !tables.contains(&table) {
+            tables.push(table);
+        }
+    }
+
     let src_cfg: WalSourceConfig = wal_config(
         &cfg,
         &source_url,
         &admin_url,
         &tables,
         &children,
+        &aggregates,
         &durable,
         &tls,
     )?;
@@ -1306,6 +1318,7 @@ async fn attempt_postgres(
                     tls,
                     admin,
                     children,
+                    &src_cfg.aggregates,
                     copy_tx,
                     load_sink.as_ref(),
                     &load_stream_id,
@@ -1391,12 +1404,14 @@ async fn read_current_lsn(tls: &pg2osync_source::tls::TlsSettings, admin_url: &s
     row.get::<_, String>(0).parse::<Lsn>().ok().map(|lsn| lsn.0)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn wal_config(
     cfg: &AppConfig,
     source_url: &str,
     admin_url: &str,
     tables: &[String],
     children: &HashMap<(String, String), Vec<pg2osync_source::children::ChildSpec>>,
+    aggregates: &HashMap<(String, String), Vec<pg2osync_core::aggregate::AggregateSpec>>,
     durable: &DurableLsn,
     tls: &pg2osync_source::tls::TlsSettings,
 ) -> Result<pg2osync_source::runner::WalSourceConfig> {
@@ -1423,6 +1438,15 @@ fn wal_config(
                 );
             }
         }
+        // An aggregated table takes the same route: its rows are not documents
+        // either, and they resolve to this parent.
+        for agg in &tbl.aggregates {
+            let (cs, ct) = split_qualified(&agg.table);
+            child_parents.insert(
+                (cs.to_string(), ct.to_string()),
+                (ps.to_string(), pt.to_string()),
+            );
+        }
     }
     Ok(pg2osync_source::runner::WalSourceConfig {
         host: url.host_str().unwrap_or("localhost").into(),
@@ -1441,6 +1465,7 @@ fn wal_config(
         admin_url: Some(admin_url.to_string()),
         tls: tls.clone(),
         children: children.clone(),
+        aggregates: aggregates.clone(),
         child_parents,
         parent_pk_columns,
         key_columns: HashMap::new(),
@@ -1540,6 +1565,53 @@ pub fn child_specs_for(
     Ok(map)
 }
 
+/// Every configured aggregate, keyed by the parent whose document carries it.
+///
+/// The `where` predicate is parsed here rather than in the reader: `validate`
+/// already refused a bad one, but `run` does not go through `validate`, so the
+/// error is mapped rather than assumed away.
+pub fn aggregate_specs_for(
+    cfg: &AppConfig,
+) -> Result<HashMap<(String, String), Vec<pg2osync_core::aggregate::AggregateSpec>>> {
+    let mut map: HashMap<_, Vec<_>> = HashMap::new();
+    for (key, tbl) in &cfg.sync {
+        let (schema, table) = split_qualified(&tbl.table);
+        for agg in &tbl.aggregates {
+            let mut spec = pg2osync_core::aggregate::AggregateSpec::new(
+                &agg.table,
+                &agg.field,
+                &agg.foreign_key,
+                &tbl.primary_key.clone().unwrap_or_else(|| "id".into()),
+            )?;
+            if let Some(predicate) = &agg.filter {
+                spec.filter = Some(pg2osync_core::filter::Filter::parse(predicate).map_err(
+                    |e| {
+                        anyhow::anyhow!(
+                            "[sync.{key}.aggregates({})] where {predicate:?}: {e}",
+                            agg.table
+                        )
+                    },
+                )?);
+            }
+            map.entry((schema.to_string(), table.to_string()))
+                .or_default()
+                .push(spec);
+        }
+    }
+    Ok(map)
+}
+
+/// Every table read as somebody's aggregate.
+///
+/// Watched the way a child table is: its rows are not documents, they name a
+/// parent whose number has to be counted again.
+fn aggregated_tables(cfg: &AppConfig) -> Vec<String> {
+    cfg.sync
+        .values()
+        .flat_map(|tbl| tbl.aggregates.iter().map(|agg| agg.table.clone()))
+        .collect()
+}
+
 /// Deletes carry only the replica identity, so a table whose delete has to name
 /// something else cannot locate the parent. Warn before it happens.
 ///
@@ -1571,6 +1643,24 @@ async fn warn_on_child_replica_identity(
                      primary key: DELETEs on it cannot refresh the parent document. \
                      Run: ALTER TABLE {qualified} REPLICA IDENTITY FULL",
                     info.relreplident);
+            }
+        }
+        // An aggregated table is located by its foreign key on every path a
+        // child table is, and by the *old* one as well: a row that moves
+        // between parents leaves a number behind that only the before-image
+        // can name.
+        for agg in &tbl.aggregates {
+            let (schema, table) = split_qualified(&agg.table);
+            let info = pg2osync_source::catalog::table_info(admin, schema, table)
+                .await
+                .with_context(|| format!("cannot inspect aggregated table {}", agg.table))?;
+            if info.relreplident != 'f' && !info.pk_columns.contains(&agg.foreign_key) {
+                tracing::warn!(target: "pg2osync::run",
+                    "{} has REPLICA IDENTITY '{}' and {} is not in its primary key: a \
+                     DELETE cannot say which parent's {} to count again, and an UPDATE \
+                     that moves a row between parents leaves the old one stale. \
+                     Run: ALTER TABLE {} REPLICA IDENTITY FULL",
+                    agg.table, info.relreplident, agg.foreign_key, agg.field, agg.table);
             }
         }
     }
@@ -1998,6 +2088,7 @@ async fn attempt_mysql(
                     load_done_rx,
                     &scope,
                     &load_children,
+                    &src_cfg.aggregates,
                     base,
                     &src_cfg.append_only,
                     cfg.engine.load_max_rows_per_sec,
@@ -2072,6 +2163,7 @@ pub fn mysql_config_for(
 ) -> Result<pg2osync_source_mysql::runner::MySqlSourceConfig> {
     let url = url::Url::parse(source_url).context("source url is not a valid URL")?;
     let children = child_specs_for(cfg)?;
+    let aggregates = aggregate_specs_for(cfg)?;
     let mut child_parents = HashMap::new();
     let mut tables: Vec<(String, String)> = cfg
         .sync
@@ -2101,6 +2193,17 @@ pub fn mysql_config_for(
             }
         }
     }
+    // an aggregated table is streamed for the same reason a child table is: its
+    // rows resolve to a parent instead of becoming documents
+    for (parent, specs) in &aggregates {
+        for spec in specs {
+            let watched = (spec.schema.clone(), spec.table.clone());
+            if !tables.contains(&watched) {
+                tables.push(watched.clone());
+            }
+            child_parents.insert(watched, parent.clone());
+        }
+    }
     Ok(pg2osync_source_mysql::runner::MySqlSourceConfig {
         host: url.host_str().unwrap_or("localhost").into(),
         port: url.port().unwrap_or(3306),
@@ -2112,6 +2215,7 @@ pub fn mysql_config_for(
         start_pos: 0,
         tls: cfg.tls_settings(source_url)?,
         children,
+        aggregates,
         child_parents,
         gtid: None,
         gtid_resume: None,

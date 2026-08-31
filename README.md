@@ -79,6 +79,7 @@ not expressions) — if you need those, you want Kafka.
 | Crash recovery with no data loss (`kill -9` safe) | ✅ verified by the e2e suite |
 | Nested child collections (one level) | ✅ PostgreSQL and MySQL/MariaDB; the parent document embeds child arrays, resolved once per collection per transaction, with their own `columns` / `exclude_columns` projection, or `single = true` to embed a 1:1 relation as an object |
 | Many-to-many children (`through`) | ✅ PostgreSQL and MySQL/MariaDB; a junction table is joined inside the same aggregation, and both the junction and the child are streamed |
+| Aggregate children (`aggregates`) | ✅ PostgreSQL and MySQL/MariaDB; a count from a child table lands on the parent document and is kept live by the same machinery, one grouped query per aggregate per transaction |
 | Parent-child as a join field (`join`) | ✅ OpenSearch and Elasticsearch; shared index, per-document routing, parent delete cascades to its children |
 | Per-document routing from a column (`routing = "tenant_id"`) | ✅ OpenSearch and Elasticsearch; co-locates a tenant on one shard; a changed value moves the document; non-key columns need `REPLICA IDENTITY FULL` |
 | One index fed by several tables | ✅ each section declares an explicit id; reconcile refuses it, a TRUNCATE is skipped and counted |

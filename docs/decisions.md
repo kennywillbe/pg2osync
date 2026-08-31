@@ -797,6 +797,39 @@ unchanged, so one parent read and one aggregation per collection per transaction
 still hold; folding that lookup into the parent re-fetch instead would read a
 parent twice whenever a junction row and one of its child rows changed together.
 
+**An aggregate is one more shape of child, not a computation.** `children`
+embeds a child table's rows; `[[sync.x.aggregates]]` embeds a single number
+derived from them. That is the whole claim, and it is what decides where the
+feature lives: the aggregated table is watched exactly as a child table is,
+added to the publication or the streamed set the same way, a changed row of it
+names the parents to read again rather than becoming a document, and the read is
+one grouped query per aggregate per transaction — the same cost model, through
+the same `Pending` group, merged into the same parent re-fetch. Nothing new
+reaches the engine: a number arrives on the document beside the arrays.
+
+What keeps it a shape of child rather than a query language is what it refuses.
+The operation is a fixed name — `count`, with `sum`, `min` and `max` left until
+somebody asks — over exactly one foreign key, and the only thing an operator may
+write is the bounded `where` a section already takes, parsed by
+`core::filter` and rendered by `Filter::to_sql` for both dialects. There is no
+second SQL renderer and no place to put an expression in. The alternative, a
+computed field with an arbitrary expression, is a different product: it would
+need its own grammar, its own type rules and its own answer for what a value
+means when the expression cannot be pushed down, and none of that is a
+replication concern.
+
+A parent no row matched carries zero rather than nothing. The load's `COALESCE`
+and the streamed read's missing key both mean "no row matched", and a field that
+is absent in that case makes `open_deals = 0` a query nobody can write.
+
+The old image counts as much as the new one. A row whose foreign key moves
+belongs to two parents in one change, and the parent it left goes stale unless
+that change names it too — so an update names both, the before-image being the
+only place the old parent appears. On MySQL `binlog_row_image = FULL` is already
+required and carries it; on PostgreSQL it is the replica identity, and an
+aggregated table without `REPLICA IDENTITY FULL` is warned about at startup with
+the `ALTER` to run, exactly as a child table is.
+
 ## Checkpoints
 
 **State lives in the target.** A hidden `.pg2osync_meta` index holds one
@@ -1012,9 +1045,10 @@ classes and the difference is what it costs to put right: changing `table`,
 `index`, `id`, `primary_key`, `append_only`, `routing`, `fan_out`, `join` or
 `children` changes what a row *is filed as*, so every document already written
 is filed the old way and the answer is a re-index behind an alias; changing
-`columns`, `transform`, `fields`, `constants`, `where`, `pipeline`,
-`soft_delete` or `mapping_file` only reshapes the document, so the index would
-hold a mixture with nothing recording which, and the answer is a re-snapshot.
+`columns`, `transform`, `fields`, `constants`, `aggregates`, `where`,
+`pipeline`, `soft_delete` or `mapping_file` only reshapes the document, so the
+index would hold a mixture with nothing recording which, and the answer is a
+re-snapshot.
 `poll_column` is a third class of one: it decides which rows the poll query
 reads rather than what a document is or how it is shaped, so neither answer
 applies and the fix is a plain restart.

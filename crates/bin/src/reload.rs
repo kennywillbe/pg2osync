@@ -435,6 +435,7 @@ fn section_refusals(
             (transform, "transform"),
             (fields, "fields"),
             (constants, "constants"),
+            (aggregates, "aggregates"),
             (filter, "where"),
             (pipeline, "pipeline"),
             (soft_delete, "soft_delete"),

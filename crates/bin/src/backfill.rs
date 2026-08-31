@@ -21,6 +21,7 @@
 //! physical order.
 
 use anyhow::{Context as _, Result, bail};
+use pg2osync_core::aggregate::AggregateSpec;
 use pg2osync_core::checkpoint::StreamId;
 use pg2osync_core::event::{ChangeEvent, RowKind, TransactionBoundary};
 use pg2osync_core::load::{LoadCursor, LoadProgress, LoadScope, load_progress_key};
@@ -98,6 +99,7 @@ fn copy_statement(
     qualified_table: &str,
     cols: &[ColMeta],
     children: &[ChildSpec],
+    aggregates: &[AggregateSpec],
     soft_delete: Option<&str>,
     range: &KeyRange,
     pk_column: Option<&str>,
@@ -129,6 +131,20 @@ fn copy_statement(
             " LEFT JOIN ({agg}) {alias} ON {alias}.k = p.{parent_key}",
             agg = pg2osync_source::children::agg_subquery(child, None),
             parent_key = quote_ident(&child.parent_column),
+        ));
+    }
+
+    // An aggregate joins the same way, one column wide: the grouped read comes
+    // from the source crate, so the number the load writes is the one a
+    // streamed re-read writes. A parent no row matched has no row here either,
+    // which COALESCE turns into the zero the document has to carry.
+    for (i, agg) in aggregates.iter().enumerate() {
+        let alias = format!("a{i}");
+        selected.push(format!("COALESCE({alias}.n, 0)::text"));
+        joins.push_str(&format!(
+            " LEFT JOIN ({count}) {alias} ON {alias}.k = p.{parent_key}",
+            count = pg2osync_source::aggregate::count_subquery(agg, None),
+            parent_key = quote_ident(&agg.parent_column),
         ));
     }
 
@@ -307,6 +323,19 @@ fn child_column(child: &ChildSpec) -> ColMeta {
     }
 }
 
+/// The aggregate's number as an ordinary column of the row.
+///
+/// `int8` because that is what `count(*)` returns, so the value goes through
+/// the same type mapping every other column does and lands as a JSON number.
+fn aggregate_column(agg: &AggregateSpec) -> ColMeta {
+    const INT8_OID: u32 = 20;
+    ColMeta {
+        name: agg.field.clone(),
+        type_oid: INT8_OID,
+        is_pk: false,
+    }
+}
+
 /// Stream every configured table into the engine channel.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -315,6 +344,7 @@ pub async fn run(
     tls: &pg2osync_source::tls::TlsSettings,
     admin: &tokio_postgres::Client,
     children: &HashMap<(String, String), Vec<ChildSpec>>,
+    aggregates: &HashMap<(String, String), Vec<AggregateSpec>>,
     tx: Sender<ChangeEvent>,
     sink: &dyn pg2osync_core::sink::Sink,
     stream: &StreamId,
@@ -355,6 +385,10 @@ pub async fn run(
             .get(&(schema.to_string(), table.to_string()))
             .map(Vec::as_slice)
             .unwrap_or_default();
+        let agg_specs: &[AggregateSpec] = aggregates
+            .get(&(schema.to_string(), table.to_string()))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
 
         for child in child_specs {
             // shadowing a real column would produce a document that quietly
@@ -376,11 +410,24 @@ pub async fn run(
             }
             cols.push(child_column(child));
         }
+        for agg in agg_specs {
+            // shadowing a real column would produce a document that quietly
+            // disagrees with the row it came from
+            if cols.iter().any(|c| c.name == agg.field) {
+                bail!(
+                    "[sync] aggregate field {:?} collides with a column of {}; \
+                     choose another field name",
+                    agg.field,
+                    tbl.table
+                );
+            }
+            cols.push(aggregate_column(agg));
+        }
         // The column list is pinned here and reused for every range. A column
         // added mid-load would otherwise leave earlier ranges shaped one way
         // and later ranges another, and no WAL event repairs that: ADD COLUMN
         // with a constant default does not rewrite existing rows.
-        let data_cols = &cols[..cols.len() - child_specs.len()];
+        let data_cols = &cols[..cols.len() - child_specs.len() - agg_specs.len()];
         let pk_column = cols
             .iter()
             .filter(|c| c.is_pk)
@@ -448,6 +495,7 @@ pub async fn run(
             cols: &cols,
             data_cols,
             child_specs,
+            agg_specs,
             soft_delete: tbl.soft_delete.as_deref(),
             pk_column: pk_column.as_deref(),
             append_only: tbl.append_only,
@@ -528,6 +576,7 @@ struct RangePlan<'a> {
     cols: &'a [ColMeta],
     data_cols: &'a [ColMeta],
     child_specs: &'a [ChildSpec],
+    agg_specs: &'a [AggregateSpec],
     soft_delete: Option<&'a str>,
     pk_column: Option<&'a str>,
     /// Declared keyless: its rows go out with no key, and the engine files
@@ -560,6 +609,7 @@ async fn read_range(
         plan.qualified,
         plan.data_cols,
         plan.child_specs,
+        plan.agg_specs,
         plan.soft_delete,
         range,
         plan.pk_column,
@@ -934,6 +984,7 @@ mod tests {
             "public.users",
             &[col("id")],
             &[],
+            &[],
             Some("deleted_at IS NOT NULL"),
             &KeyRange {
                 from: Some("'1'".into()),
@@ -956,7 +1007,17 @@ mod tests {
         let mut b = col("b");
         a.is_pk = true;
         b.is_pk = true;
-        let sql = copy_statement("public.t", &[a, b], &[], None, &whole(), None, None, None);
+        let sql = copy_statement(
+            "public.t",
+            &[a, b],
+            &[],
+            &[],
+            None,
+            &whole(),
+            None,
+            None,
+            None,
+        );
         assert!(!sql.contains("WHERE"), "{sql}");
     }
 
@@ -975,6 +1036,7 @@ mod tests {
         let sql = copy_statement(
             "public.t",
             &[col("id")],
+            &[],
             &[],
             Some("deleted_at IS NOT NULL"),
             &KeyRange {
@@ -1000,6 +1062,7 @@ mod tests {
             "public.users",
             &[col("id")],
             &[],
+            &[],
             Some("deleted_at IS NOT NULL"),
             &whole(),
             None,
@@ -1014,6 +1077,7 @@ mod tests {
         let sql = copy_statement(
             "public.users",
             &[col("id")],
+            &[],
             &[],
             Some("deleted_at IS NOT NULL"),
             &whole(),
@@ -1041,6 +1105,66 @@ mod tests {
         ChildSpec::new(table, field, fk, parent_key).expect("qualified")
     }
 
+    fn aggregate(field: &str, table: &str, fk: &str, parent_key: &str) -> AggregateSpec {
+        AggregateSpec::new(table, field, fk, parent_key).expect("qualified")
+    }
+
+    #[test]
+    fn an_aggregate_joins_one_column_and_a_parent_with_no_rows_gets_a_zero() {
+        let mut spec = aggregate("open_orders", "public.orders", "customer_id", "id");
+        spec.filter = Some(pg2osync_core::filter::Filter::parse("status = 1").expect("valid"));
+        let sql = copy_statement(
+            "public.customers",
+            &[col("id")],
+            &[],
+            std::slice::from_ref(&spec),
+            None,
+            &whole(),
+            None,
+            None,
+            None,
+        );
+        assert!(
+            sql.contains(&pg2osync_source::aggregate::count_subquery(&spec, None)),
+            "the load embeds the source crate's own grouped read verbatim: {sql}"
+        );
+        assert!(
+            sql.contains("COALESCE(a0.n, 0)::text"),
+            "a parent no row matched carries a zero, not a null: {sql}"
+        );
+        assert!(
+            sql.contains("a0.k = p.\"id\""),
+            "the key is compared in its own type, or the index goes unused: {sql}"
+        );
+        assert!(
+            sql.contains("WHERE (t.\"status\" = 1) GROUP BY"),
+            "the where subset narrows what is counted: {sql}"
+        );
+    }
+
+    #[test]
+    fn a_collection_and_an_aggregate_each_get_their_own_join() {
+        let sql = copy_statement(
+            "public.customers",
+            &[col("id")],
+            &[child("orders", "public.orders", "customer_id", "id")],
+            &[aggregate(
+                "open_orders",
+                "public.orders",
+                "customer_id",
+                "id",
+            )],
+            None,
+            &whole(),
+            None,
+            None,
+            None,
+        );
+        assert!(sql.contains("c0.k = p.\"id\""), "{sql}");
+        assert!(sql.contains("a0.k = p.\"id\""), "{sql}");
+        assert_eq!(sql.matches("LEFT JOIN").count(), 2);
+    }
+
     fn col(name: &str) -> ColMeta {
         ColMeta {
             name: name.into(),
@@ -1054,6 +1178,7 @@ mod tests {
         let sql = copy_statement(
             "public.users",
             &[col("id"), col("name")],
+            &[],
             &[],
             None,
             &whole(),
@@ -1076,6 +1201,7 @@ mod tests {
             "public.customers",
             &[col("id")],
             &[child("orders", "public.orders", "customer_id", "id")],
+            &[],
             None,
             &whole(),
             None,
@@ -1116,6 +1242,7 @@ mod tests {
             "public.books",
             &[col("id")],
             std::slice::from_ref(&spec),
+            &[],
             None,
             &whole(),
             None,
@@ -1144,6 +1271,7 @@ mod tests {
             "public.customers",
             &[col("id")],
             std::slice::from_ref(&spec),
+            &[],
             None,
             &whole(),
             None,
@@ -1163,6 +1291,7 @@ mod tests {
             "public.customers",
             &[col("id")],
             std::slice::from_ref(&spec),
+            &[],
             None,
             &whole(),
             None,
@@ -1185,6 +1314,7 @@ mod tests {
                 child("orders", "public.orders", "customer_id", "id"),
                 child("tickets", "support.tickets", "cust", "id"),
             ],
+            &[],
             None,
             &whole(),
             None,
@@ -1203,6 +1333,7 @@ mod tests {
             "public.we\"ird",
             &[col("od\"d")],
             &[child("kids", "public.ch\"ild", "fk\"y", "pk\"y")],
+            &[],
             None,
             &whole(),
             None,

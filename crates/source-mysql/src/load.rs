@@ -43,6 +43,13 @@ pub async fn run(
     mut load_done: watch::Receiver<u64>,
     scope: &LoadScope,
     children: &std::collections::HashMap<(String, String), Vec<ChildSpec>>,
+    // Aggregates keyed by parent, read once per aggregate per chunk — the same
+    // grouped query the stream runs, so the number a load writes and the one a
+    // re-fetch writes come from one place.
+    aggregates: &std::collections::HashMap<
+        (String, String),
+        Vec<pg2osync_core::aggregate::AggregateSpec>,
+    >,
     // Added to every coordinate to make a version, so a load that runs after a
     // failover writes in the same generation the stream does. Without it these
     // rows would carry versions from the previous server's numbering and the
@@ -86,6 +93,11 @@ pub async fn run(
             .get(&(schema.clone(), table.clone()))
             .cloned()
             .unwrap_or_default();
+        let agg_specs = aggregates
+            .get(&(schema.clone(), table.clone()))
+            .cloned()
+            .unwrap_or_default();
+        let held_back = !specs.is_empty() || !agg_specs.is_empty();
 
         let stored = if scope.resumable {
             progress_keys.push(progress_key.clone());
@@ -187,7 +199,7 @@ pub async fn run(
                     kind: RowKind::Insert { pk, doc },
                     version,
                 };
-                if specs.is_empty() {
+                if !held_back {
                     tx.send(ChangeEvent::Row(change)).await.map_err(|_| {
                         MySqlError::LoadInterrupted("engine closed during the initial load".into())
                     })?;
@@ -200,8 +212,9 @@ pub async fn run(
             }
             // The cursor's borrow of the connection ends with the loop above,
             // which is what leaves the connection free to read the collections.
-            if !specs.is_empty() {
+            if held_back {
                 attach_to_chunk(conn, &specs, &mut held).await?;
+                crate::aggregate::attach_aggregates(conn, &agg_specs, &mut held).await?;
                 for (nth, change) in held.into_iter().enumerate() {
                     tx.send(ChangeEvent::Row(change)).await.map_err(|_| {
                         MySqlError::LoadInterrupted("engine closed during the initial load".into())

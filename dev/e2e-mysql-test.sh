@@ -1552,5 +1552,118 @@ check "the stream is still advancing after the bad file" \
   "$(os_field e2e_mysql_reload 2002 v)" "still-streaming"
 stop_sync
 
+say "25. a count from a child table, kept live"
+# The PostgreSQL suite's section 37 (#179) on the binlog path. The aggregate is
+# one more shape of child, so what this proves is that the binlog side names the
+# same parents: a child change moves the number without the parent changing, a
+# row crossing the `where` boundary is counted or not, and a row moved to
+# another parent is counted where it now belongs — the before-image the binlog
+# always carries being what says where it was.
+AGCONFIG=$(mktemp /tmp/pg2osync-mysql-agg.XXXXXX)
+AGSID=$((RANDOM + 7700))
+cat > "$AGCONFIG" <<TOML
+[source]
+flavor = "mysql"
+url_env = "PG2OSYNC_MYSQL_URL"
+server_id = $AGSID
+
+[target]
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
+
+[metrics]
+bind = "127.0.0.1:$((PORT_BASE + 25))"
+
+[sync.contacts]
+table = "sourcedb.agg_contact"
+index = "e2e_mysql_agg"
+
+[[sync.contacts.aggregates]]
+field = "open_deals"
+table = "sourcedb.agg_deal"
+foreign_key = "contact_id"
+op = "count"
+where = "status_type = 1"
+TOML
+agg_cleanup() {
+  sync_kill
+  my "DROP TABLE IF EXISTS agg_deal, agg_contact;" > /dev/null 2>&1 || true
+  curl -s -XDELETE "$OS/e2e_mysql_agg?ignore_unavailable=true" > /dev/null 2>&1 || true
+  rm -f "$AGCONFIG"
+}
+trap 'cleanup; resume_cleanup; types_cleanup; child_cleanup; where_cleanup; events_cleanup; pipe_cleanup; append_cleanup; routing_cleanup; through_cleanup; pseudo_cleanup; rl_cleanup; agg_cleanup' EXIT
+
+my "DROP TABLE IF EXISTS agg_deal, agg_contact;"
+my "CREATE TABLE agg_contact(id bigint primary key, name varchar(40));"
+my "CREATE TABLE agg_deal(id bigint primary key, contact_id bigint, status_type int, INDEX(contact_id));"
+my "INSERT INTO agg_contact VALUES (1,'acme'),(2,'globex'),(3,'initech');"
+# contact 1 has two open deals and one the filter leaves out, contact 2 one
+# closed deal, contact 3 nothing at all
+my "INSERT INTO agg_deal VALUES (1,1,1),(2,1,1),(3,1,2),(4,2,2);"
+curl -s -XDELETE "$OS/e2e_mysql_agg?ignore_unavailable=true" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/mysql-$AGSID" > /dev/null
+
+# captured first: a `grep -q` that matches mid-output closes the pipe, and under
+# pipefail the signalled validate would fail the whole test
+out=$($BIN validate -c "$AGCONFIG" 2>&1 || true)
+if grep -q "aggregate open_deals counts sourcedb.agg_deal" <<< "$out"; then
+  ok "validate runs the aggregate against the table"
+else
+  bad "validate did not report the aggregate it checked: $out"
+fi
+
+sync_spawn "$AGCONFIG"
+await_count e2e_mysql_agg 3
+check "the load counts what the filter matches" "$(os_field e2e_mysql_agg 1 open_deals)" "2"
+check "a parent whose rows the filter leaves out counts none" \
+  "$(os_field e2e_mysql_agg 2 open_deals)" "0"
+check "and a parent with no rows at all still carries the field" \
+  "$(os_field e2e_mysql_agg 3 open_deals)" "0"
+
+# every assertion below changes only the child table: the parent row is never
+# touched, and the number still moves
+my "INSERT INTO agg_deal VALUES (5,2,1);"
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_field e2e_mysql_agg 2 open_deals)" = "1" ] && break
+  sleep 1
+done
+check "an inserted child row bumps the parent's count" "$(os_field e2e_mysql_agg 2 open_deals)" "1"
+
+my "DELETE FROM agg_deal WHERE id = 1;"
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_field e2e_mysql_agg 1 open_deals)" = "1" ] && break
+  sleep 1
+done
+check "a deleted child row drops it" "$(os_field e2e_mysql_agg 1 open_deals)" "1"
+
+# the row was always there; it only just started matching `where`
+my "UPDATE agg_deal SET status_type = 1 WHERE id = 3;"
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_field e2e_mysql_agg 1 open_deals)" = "2" ] && break
+  sleep 1
+done
+check "a row crossing into the filter is counted" "$(os_field e2e_mysql_agg 1 open_deals)" "2"
+my "UPDATE agg_deal SET status_type = 2 WHERE id = 3;"
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_field e2e_mysql_agg 1 open_deals)" = "1" ] && break
+  sleep 1
+done
+check "and one crossing back out is not" "$(os_field e2e_mysql_agg 1 open_deals)" "1"
+
+# the acceptance test: the parent it left is as wrong as the one it joined
+my "UPDATE agg_deal SET contact_id = 3 WHERE id = 5;"
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_field e2e_mysql_agg 3 open_deals)" = "1" ] && [ "$(os_field e2e_mysql_agg 2 open_deals)" = "0" ] && break
+  sleep 1
+done
+check "a row moved to another parent counts there" "$(os_field e2e_mysql_agg 3 open_deals)" "1"
+check "and no longer where it was" "$(os_field e2e_mysql_agg 2 open_deals)" "0"
+stop_sync
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]
