@@ -46,9 +46,8 @@ throwaway containers on ports of their own (PostgreSQL 15433, OpenSearch 9201,
 Elasticsearch 9202, Meilisearch 7701, Qdrant 6334, MySQL/MariaDB 13307), so the
 dev stack keeps running beside them.
 
-The Elasticsearch and Meilisearch cells are advisory — `compat.yml` marks them
-`continue-on-error` while [#118](https://github.com/kennywillbe/pg2osync/issues/118)
-and [#122](https://github.com/kennywillbe/pg2osync/issues/122) are open — so a
+The Meilisearch cell is advisory — `compat.yml` marks it `continue-on-error`
+while [#122](https://github.com/kennywillbe/pg2osync/issues/122) is open — so a
 failure there prints `!` and does not make your run red.
 
 The script starts the dev stack and the `mysql-test` container if they are

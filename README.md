@@ -73,7 +73,7 @@ not expressions) — if you need those, you want Kafka.
 | | Status |
 |---|---|
 | **PostgreSQL → OpenSearch** (logical replication) | ✅ full suite on every pull request (PostgreSQL 17, OpenSearch 2.19) |
-| PostgreSQL → Elasticsearch 8.x | ✅ full suite nightly, [one known gap](docs/compatibility.md) |
+| PostgreSQL → Elasticsearch 8.x | ✅ full suite nightly |
 | PostgreSQL → Meilisearch 1.x | ✅ smoke suite nightly (file-based checkpoint), [one known gap](docs/compatibility.md) |
 | PostgreSQL → PostgreSQL with pgvector | ✅ full suite on every pull request (pgvector pg17); a table per section, bring-your-own-embedding |
 | PostgreSQL → Qdrant 1.x | ✅ suite of its own nightly (Qdrant v1.15); a collection per section, bring-your-own-embedding, the checkpoint in a state collection |

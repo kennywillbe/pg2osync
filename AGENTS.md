@@ -93,8 +93,8 @@ What it covers, job by job:
 | `dependencies have no known advisories` | `audit.yml`, when a Cargo file moved |
 | the nine compatibility cells and `sink conformance kit` | `compat.yml`, when it, `dev/e2e-*.sh`, a sink crate or the `Sink` contract changed |
 
-The two cells `compat.yml` marks `continue-on-error` are reported as advisory
-(`!`) here too: a known gap being tracked does not make the run red.
+The cell `compat.yml` marks `continue-on-error` is reported as advisory (`!`)
+here too: a known gap being tracked does not make the run red.
 
 It brings the dev stack up if it is down and seeds it. The e2e suites share
 that stack, so they queue on one machine-wide lock (`dev/e2e-lock.sh`); a
