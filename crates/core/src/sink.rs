@@ -336,6 +336,18 @@ pub trait Sink: Send + Sync {
         true
     }
 
+    /// Whether a truncate at a position clears what was written before it and
+    /// keeps what was written after.
+    ///
+    /// Deliberately a different question from `orders_by_version`: recording
+    /// the position of every document it holds is enough to clear at one, and
+    /// that is a comparison against what is stored rather than a race between
+    /// two writes in flight. A target that can do the first and not the second
+    /// answers yes here and no there.
+    fn truncates_at_a_position(&self) -> bool {
+        true
+    }
+
     /// Whether this target can durably record a rejected document.
     ///
     /// Checked at startup so a pipeline configured to quarantine against a

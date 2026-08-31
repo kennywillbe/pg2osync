@@ -176,6 +176,7 @@ pub struct TargetConfig {
     /// in the URL worth hiding.
     pub url_env: Option<String>,
     /// "opensearch" (default) | "elasticsearch" | "meilisearch" | "postgres"
+    /// | "qdrant"
     #[serde(default = "default_target_flavor")]
     pub flavor: String,
     pub username: Option<String>,
@@ -979,6 +980,7 @@ impl AppConfig {
         match self.target.flavor.as_str() {
             "meilisearch" => Some("Meilisearch"),
             "postgres" => Some("PostgreSQL"),
+            "qdrant" => Some("Qdrant"),
             _ => None,
         }
     }
@@ -987,8 +989,13 @@ impl AppConfig {
     /// this function never touches the network.
     pub fn validate(&self) -> Result<()> {
         const SOURCE_FLAVORS: [&str; 3] = ["postgres", "postgresql", "mysql"];
-        const TARGET_FLAVORS: [&str; 4] =
-            ["opensearch", "elasticsearch", "meilisearch", "postgres"];
+        const TARGET_FLAVORS: [&str; 5] = [
+            "opensearch",
+            "elasticsearch",
+            "meilisearch",
+            "postgres",
+            "qdrant",
+        ];
         const SOURCE_MODES: [&str; 2] = ["wal", "poll"];
 
         if let Some(name) = &self.source.name {
@@ -1009,13 +1016,13 @@ impl AppConfig {
         if self.target.url.is_empty() && self.target.url_env.is_none() {
             anyhow::bail!("either [target] url or [target] url_env is required");
         }
-        if self.target.flavor == "postgres" {
-            // This target creates nothing on its own — it has no dynamic
-            // mapping to infer a shape from the first document, and inventing a
-            // table from the source's columns would be the schema mirroring
-            // this sink deliberately is not. So the DDL is required, once per
-            // table rather than once per section, because two sections feeding
-            // one table still describe one table.
+        // Neither of these targets creates an index on its own: PostgreSQL has
+        // no dynamic mapping to infer a table from the first document that
+        // arrives, and Qdrant cannot create a collection without being told the
+        // vectors it holds. So the file is required, once per index rather than
+        // once per section, because two sections feeding one index still
+        // describe one index.
+        if matches!(self.target.flavor.as_str(), "postgres" | "qdrant") {
             let described: std::collections::HashSet<String> = self
                 .sync
                 .iter()
@@ -1027,12 +1034,19 @@ impl AppConfig {
                 .iter()
                 .find(|(key, tbl)| !described.contains(&tbl.index_name(key)))
             {
-                anyhow::bail!(
-                    "[sync.{key}] needs mapping_file: a PostgreSQL target writes table {} and \
-                     creates nothing on its own, so the section has to name the .sql file that \
-                     creates it",
-                    tbl.index_name(key)
-                );
+                let index = tbl.index_name(key);
+                anyhow::bail!(match self.target.flavor.as_str() {
+                    "qdrant" => format!(
+                        "[sync.{key}] needs mapping_file: a Qdrant target writes collection \
+                         {index} and cannot create one without being told the vectors it \
+                         holds, so the section has to name the .json file that creates it"
+                    ),
+                    _ => format!(
+                        "[sync.{key}] needs mapping_file: a PostgreSQL target writes table \
+                         {index} and creates nothing on its own, so the section has to name \
+                         the .sql file that creates it"
+                    ),
+                });
             }
         }
         if self.target.require_alias && self.target.flavor == "meilisearch" {
@@ -1047,6 +1061,13 @@ impl AppConfig {
                 "[target] require_alias is an OpenSearch and Elasticsearch flag; PostgreSQL \
                  has no alias namespace — the name a section writes to is a table — so there \
                  is nothing for it to require"
+            );
+        }
+        if self.target.require_alias && self.target.flavor == "qdrant" {
+            anyhow::bail!(
+                "[target] require_alias refuses every write to a name that is not an alias, \
+                 and an alias is what a rebuild leaves behind — which this target has no \
+                 reindex to produce, so the flag could only ever refuse every write"
             );
         }
         if !SOURCE_MODES.contains(&self.source.mode.as_str()) {
@@ -2192,6 +2213,59 @@ mapping_file = "users.sql"
         .expect_err("require_alias against a table")
         .to_string();
         assert!(why.contains("no alias namespace"), "{why}");
+    }
+
+    /// A Qdrant target, which needs the configuration of the collection it
+    /// writes.
+    const QDRANT_TARGET: &str = r#"
+[source]
+url = "postgres://u:p@localhost/db"
+[target]
+flavor = "qdrant"
+url = "http://localhost:6333"
+[sync.users]
+table = "public.users"
+mapping_file = "users.json"
+"#;
+
+    #[test]
+    fn a_qdrant_target_needs_the_configuration_of_the_collection_it_writes() {
+        let no_collection = QDRANT_TARGET.replace("mapping_file = \"users.json\"\n", "");
+        let why = parse(&no_collection)
+            .expect_err("a section with no collection configuration")
+            .to_string();
+        assert!(why.contains("mapping_file"), "{why}");
+        assert!(why.contains(".json"), "{why}");
+        assert!(why.contains("vectors"), "{why}");
+    }
+
+    #[test]
+    fn the_search_engine_features_are_refused_for_a_qdrant_target_by_name() {
+        for (option, line) in [
+            ("routing", "routing = \"tenant_id\"\n"),
+            ("pipeline", "pipeline = \"enrich\"\n"),
+            (
+                "join",
+                "[sync.users.join]\nfield = \"rel\"\nname = \"user\"\n",
+            ),
+        ] {
+            let why = parse(&format!("{QDRANT_TARGET}{line}"))
+                .expect_err("an OpenSearch-only option")
+                .to_string();
+            assert!(why.contains(option), "{option}: {why}");
+            assert!(why.contains("Qdrant"), "{option}: {why}");
+        }
+    }
+
+    #[test]
+    fn require_alias_is_refused_for_a_target_with_no_rebuild_to_produce_one() {
+        let why = parse(&QDRANT_TARGET.replace(
+            "flavor = \"qdrant\"",
+            "flavor = \"qdrant\"\nrequire_alias = true",
+        ))
+        .expect_err("require_alias against a collection")
+        .to_string();
+        assert!(why.contains("require_alias"), "{why}");
     }
 
     #[test]

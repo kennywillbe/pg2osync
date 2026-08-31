@@ -197,6 +197,12 @@ impl Sink for MeilisearchSink {
         false
     }
 
+    /// And it stores no position either, so a truncate here clears the index
+    /// whole rather than up to a point in the stream.
+    fn truncates_at_a_position(&self) -> bool {
+        false
+    }
+
     async fn ensure_ready(&self, tables: &[IndexSpec]) -> Result<(), CoreError> {
         for spec in tables {
             // refused by config before it gets here; kept so a new caller

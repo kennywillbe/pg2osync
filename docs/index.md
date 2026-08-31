@@ -3,7 +3,7 @@
 pg2osync keeps a search index in sync with a database, in real time, from one
 binary. It reads changes straight from the database's replication stream —
 PostgreSQL's WAL or MySQL's binlog — and writes them to OpenSearch,
-Elasticsearch, Meilisearch or a pgvector table within milliseconds. No
+Elasticsearch, Meilisearch, a pgvector table or Qdrant within milliseconds. No
 Logstash, no Kafka, no Redis, no JVM.
 
 ```sh
@@ -22,9 +22,10 @@ feature matrix are in the
   [MySQL/MariaDB](sources/mysql.md) each need switched on, and how much of the
   server's behaviour leaks into the pipeline.
 - **Sinks** — [OpenSearch](sinks/opensearch.md),
-  [Elasticsearch](sinks/elasticsearch.md), [Meilisearch](sinks/meilisearch.md)
-  and [PostgreSQL with pgvector](sinks/postgresql.md), including where they
-  differ in what they can guarantee.
+  [Elasticsearch](sinks/elasticsearch.md), [Meilisearch](sinks/meilisearch.md),
+  [PostgreSQL with pgvector](sinks/postgresql.md) and
+  [Qdrant](sinks/qdrant.md), including where they differ in what they can
+  guarantee.
 - **[Deployment](deployment.md)** — Docker, Kubernetes, systemd, probes.
 - **[Operations](operations.md)** — metrics, every failure mode, and the
   recovery for each.

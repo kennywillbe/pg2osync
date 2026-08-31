@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "OpenSearch, Elasticsearch, Meilisearch and PostgreSQL sinks for pg2osync"
+description = "OpenSearch, Elasticsearch, Meilisearch, PostgreSQL and Qdrant sinks for pg2osync"
 
 [dependencies]
 pg2osync-core = { path = "../core" }
@@ -15,6 +15,9 @@ tokio-postgres-rustls = "0.14.0"
 opensearch.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
+# a document id becomes a point id as a UUIDv5, which is a SHA-1 over a fixed
+# namespace
+sha1.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 anyhow.workspace = true

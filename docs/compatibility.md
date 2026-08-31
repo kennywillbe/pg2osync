@@ -24,6 +24,8 @@ so a regression there would ship unnoticed.
 | pgvector | pg17 (PostgreSQL 17) | every pull request |
 | pgvector | other PostgreSQL majors | not tested |
 | Meilisearch | v1.53.1 | nightly, smoke suite only — advisory until [#122](https://github.com/kennywillbe/pg2osync/issues/122) |
+| Qdrant | v1.15.1 | nightly, suite of its own |
+| Qdrant | other 1.x | not tested |
 
 ## What the nightly suite runs
 
@@ -41,7 +43,16 @@ every cell. Three scripts do the work:
   INSERT/UPDATE/DELETE, the file-based checkpoint resuming after a restart,
   and a `reindex` swapping a rebuilt index into the live name.
 
-A fourth script, `dev/e2e-postgres-sink.sh`, runs on every pull request rather
+- `dev/e2e-qdrant.sh` — Qdrant, for the same reason: no mappings, no joins, no
+  per-row collections. It covers the initial load, live INSERT/UPDATE/DELETE, an
+  embedding the source produced answering a similarity search, a fanned list
+  that really deletes the elements it drops, a `kill -9` resuming from the state
+  collection, `TRUNCATE` at a position, the refusal of an OpenSearch-only
+  option, and the sink conformance kit with no check skipped. That last section
+  is a `cargo test`, which is why this cell needs a toolchain where the others
+  need only the binary.
+
+A fifth script, `dev/e2e-postgres-sink.sh`, runs on every pull request rather
 than nightly: the PostgreSQL target is exercised by the `e2e PostgreSQL to
 pgvector` job in `ci.yml`, so it has no cell here.
 
@@ -56,11 +67,12 @@ cells are kept red rather than trimmed: the gap is the finding.
 The matrix also runs on a pull request that touches the workflow or those
 scripts, so a change to the matrix is tested before the night it would break.
 
-`./dev/ci-local.sh` runs the same eight cells on your machine, and runs them
+`./dev/ci-local.sh` runs the same nine cells on your machine, and runs them
 automatically for exactly the changes a pull request would; `--matrix` forces
 them. Each cell is a throwaway container on a port of its own — PostgreSQL
-15433, OpenSearch 9201, Elasticsearch 9202, Meilisearch 7701, MySQL/MariaDB
-13307 — so the dev stack on 15432/9200/13306 keeps running beside it, and the
+15433, OpenSearch 9201, Elasticsearch 9202, Meilisearch 7701, Qdrant 6334,
+MySQL/MariaDB 13307 — so the dev stack on 15432/9200/13306 keeps running beside
+it, and the
 containers are removed however the cell ends. Those ports are one set, so the
 cells go one at a time. `--isolated` gives every cell containers and ports of
 its own instead, which lets the run take two at a time and lets it run beside

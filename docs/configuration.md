@@ -129,11 +129,11 @@ It re-reads rows whose timestamp column advanced since the last cycle.
 
 | Option | Default | Description |
 |---|---|---|
-| `flavor` | `"opensearch"` | `"opensearch"`, `"elasticsearch"`, `"meilisearch"` or `"postgres"` |
+| `flavor` | `"opensearch"` | `"opensearch"`, `"elasticsearch"`, `"meilisearch"`, `"postgres"` or `"qdrant"` |
 | `url` / `url_env` | *(one required)* | Base URL, e.g. `http://localhost:9200`; for `postgres` a connection string, which carries a password and therefore belongs in `url_env` |
 | `username` | — | Basic-auth user |
 | `password` / `password_env` | — | Basic-auth password |
-| `api_key_env` | — | Elasticsearch API key, or Meilisearch master key |
+| `api_key_env` | — | Elasticsearch API key, Meilisearch master key, or Qdrant API key |
 | `tls_verify` | `true` | Only disable for self-signed development certificates |
 | `state_dir` | `./.pg2osync-state` | Meilisearch only: directory for the checkpoint file |
 | `require_alias` | `false` | Refuse any write whose target is an index rather than an alias — see [Rebuilding an index](#rebuilding-an-index) |
@@ -149,6 +149,15 @@ database. It is not database replication — no schema is mirrored and no DDL is
 propagated. Everything it refuses, and why, is in
 [the PostgreSQL sink page](sinks/postgresql.md). TLS follows `sslmode` in the
 connection string, the way `[source]` reads it.
+
+A `qdrant` target is a vector database used the same way: each section writes
+one collection, the operator declares that collection through `mapping_file` —
+the JSON of `PUT /collections/<name>` — and the checkpoint lives in a state
+collection of the target. A document field named after one of the collection's
+*named vectors* becomes that vector; everything else becomes payload. Point ids
+are `u64` or UUID only, so a document id becomes a UUIDv5 and the id itself is
+kept in the `_pg2osync_id` payload field. Everything it refuses, and why, is in
+[the Qdrant sink page](sinks/qdrant.md).
 
 ## `[sync.<key>]`
 
@@ -357,8 +366,8 @@ and the document is then in the old index.
   Reconcile pages one index by its key column, and the table's documents are
   spread over every index the template renders; an alias points at one index,
   and so does a rebuild. `resnapshot` works.
-- **Meilisearch refuses a template** at startup: it has no mappings to
-  create an index with.
+- **Meilisearch, PostgreSQL and Qdrant refuse a template** at startup: none of
+  them can say what a name a row renders should be created with.
 - **Bulk-load settings are not relaxed** for a templated index. An index
   created during the initial load takes the target's defaults.
 
@@ -1046,6 +1055,10 @@ For a `postgres` target the file is SQL rather than JSON, and it is required:
 what an index mapping is to OpenSearch, the `CREATE TABLE` is there. See
 [the PostgreSQL sink page](sinks/postgresql.md).
 
+For a `qdrant` target it is required too, and it is the JSON body of
+`PUT /collections/<name>` — the named vectors, their size and their distance.
+See [the Qdrant sink page](sinks/qdrant.md).
+
 ### Ingest pipelines
 
 A vector field is the one thing a mapping can declare that no row can fill:
@@ -1605,7 +1618,7 @@ Defaults are production-sane; tune only against measurements.
 |---|---|---|
 | `batch_size` | `500` | Rows per sink request |
 | `batch_max_bytes` | `10485760` | Approximate byte ceiling per request; whichever limit hits first splits the batch |
-| `write_concurrency` | `1` | Write requests open against the target at once. One at a time is what the initial load is limited by, not the source read; raising it multiplies the load on the target, and it needs a target that orders by document version, so Meilisearch refuses anything above 1 |
+| `write_concurrency` | `1` | Write requests open against the target at once. One at a time is what the initial load is limited by, not the source read; raising it multiplies the load on the target, and it needs a target that orders by document version, so Meilisearch and Qdrant refuse anything above 1 |
 | `load_max_rows_per_sec` | unset | Ceiling on how many rows a second the initial load, a re-snapshot and a rebuild take in. Unset means unlimited; `0` is refused. Load rows only — the stream is never held back |
 | `txn_buffer_cap_mb` | `256` | Warning threshold for one open transaction |
 | `retry_max` | `10` | Attempts per request before the pipeline stops |
@@ -1648,9 +1661,10 @@ data loss. `on_permanent_rejection = "quarantine"` trades that for availability:
 the document is recorded with its position before the position is acknowledged,
 so nothing is lost, but the transaction it belonged to is applied without it.
 `pg2osync rejects --replay` puts it back once the mapping is fixed. The
-OpenSearch, Elasticsearch and PostgreSQL targets can quarantine — the last in a
-`pg2osync_rejects` table of the target database; configuring it against
-Meilisearch, which has nowhere to keep a refused document, fails at startup.
+OpenSearch, Elasticsearch, PostgreSQL and Qdrant targets can quarantine — the
+last two in a `pg2osync_rejects` table and collection of the target;
+configuring it against Meilisearch, which has nowhere to keep a refused
+document, fails at startup.
 
 ## `[api]`
 
