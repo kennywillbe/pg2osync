@@ -45,7 +45,9 @@ The full `dev/e2e-test.sh` suite runs nightly against Elasticsearch 8.19.20
 with security disabled (see [compatibility](../compatibility.md)). The sink
 speaks raw REST (`_bulk`, `_mget`, `_delete_by_query`, `_refresh`, `_doc`)
 rather than using the official client, which keeps a second HTTP stack out of
-the binary.
+the binary. The `sink conformance kit` job runs the kit against the same
+version, with no check skipped: this target versions its documents and refuses
+a value of the wrong type, so it answers all five.
 
 7.x is untested. If you hit a bulk or mapping incompatibility there, open an
 issue — the fix is usually small.
