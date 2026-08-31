@@ -153,7 +153,7 @@ One section per table. `<key>` is the index name when `index` is omitted.
 | `primary_key` | Overrides key detection; also the join column for nested children; contradicts `append_only` |
 | `append_only` | The table has no key and only ever gains rows; documents are filed under a content hash, see [Append-only tables](#append-only-tables) |
 | `id` | Derived document id, e.g. `tenant-{tenant_id}-{id}`; see [Document ids](#document-ids) |
-| `fan_out` | One row becomes one document per element of an array column; see [Fan-out](#fan-out) |
+| `fan_out` | One row becomes one document per element of an array column, or of a delimited string with `by`; see [Fan-out](#fan-out) |
 | `join` | This table's place in a join field shared with another section: its relation name and, on the child, the parent column; see [Join fields](#join-fields) |
 | `columns` | Only these columns are indexed |
 | `exclude_columns` | All columns except these; mutually exclusive with `columns` |
@@ -597,7 +597,22 @@ Each element document is the parent document **minus the array**, merged with
 the element: an object element's fields are merged in and win on collision, a
 scalar element lands under the array's own field name. The element `id`
 renders from that merged document, so its placeholders can name parent columns
-and element fields alike.
+and element fields alike — a scalar element is named by the fan-out field, as
+`{tags}` above.
+
+`by` fans out a **delimited string column** instead: with `by = ","` a
+`member_ids` of `"7, 12 ,31"` is three elements, trimmed, with empty pieces
+dropped — the [`split`](#transforms) transform's semantics, applied to the raw
+row where fan-out reads. The column has to be text: `by` on an array column is
+refused at startup by type, and at write time by value, because a column that
+already holds an array needs no separator.
+
+```toml
+[sync.links.fan_out]
+field = "member_ids"      # text: "7,12,31"
+by    = ","
+id    = "note-{id}-{member_ids}"
+```
 
 - A row with an **empty or missing** array emits nothing; a row whose array is
   **NULL** keeps one parent document under the plain `id`.
@@ -617,6 +632,44 @@ and element fields alike.
 
 Two tables may map to the same index once each declares its `id`; see
 [Sharing an index](#sharing-an-index).
+
+#### Fanned elements as join parents
+
+`fan_out` and [`join`](#join-fields) are refused together — every element of a
+fanned row would need its own routing, and they would all be filed under one
+parent — with one exception: `parent = "{element}"`, where each element *is*
+its parent.
+
+```toml
+[sync.links]
+table   = "public.link_table"
+index   = "notes"
+id      = "note-{id}"
+fan_out = { field = "member_ids", by = ",", id = "note-{id}-{member_ids}" }
+
+[sync.links.join]
+name   = "member"
+field  = "relation"
+parent = "{element}"      # the literal, not a column and not a placeholder
+```
+
+Every element document then routes to and files under its own value: the
+element `"7"` becomes a child of the parent document `7`, on that document's
+shard.
+
+- **The parent's ids have to be the element values.** The element is rendered
+  through the parent section's own id rule — its `id` template, or the
+  primary key when it has none — exactly as a parent column would be, so a
+  `member_ids` of `"7,12"` finds the documents the parent section files under
+  `7` and `12`. The parent `id` may name only its key, which is the rule
+  [join fields](#join-fields) already state, and a list value that matches no
+  parent document indexes a child no parent has, like any other dangling
+  foreign key.
+- **A member dropped from the list loses its document.** The update diff runs
+  per element and per shard, so a `"7,12,31"` that becomes `"7,31"` deletes
+  exactly `note-{id}-12`, on the shard it was on — no rebuild.
+- `parent = "{element}"` on a section without `fan_out` is refused, as is
+  `fan_out` with a column parent, and `join` against Meilisearch.
 
 ### Transforms
 
@@ -690,7 +743,10 @@ document.
 - Transforms name the **source** column and run after projection, before
   `fields` renames and `constants`.
 - `split` cannot feed `fan_out`: fan-out reads the raw row, before any
-  transform, so it needs a real array column.
+  transform. A delimited column is fanned out with
+  [`fan_out.by`](#fan-out), which does the same cut in the same place
+  identity is derived; the transform stays what shapes a column that is
+  indexed as an array.
 
 Refused at load: an unknown op, a parameter the op does not take, `split`
 without a non-empty `by`, `date` without a non-empty `from`, `lookup` without a
@@ -1352,7 +1408,9 @@ parent = "customer_id"       # column on THIS table holding the parent's key
 
 `parent` is what makes a section the child: it names the column whose value,
 rendered through the parent section's `id`, is the parent document's id — and
-the child's routing. The parent omits it. Each document carries the join field
+the child's routing. The parent omits it. On a fanned section it may instead
+be the literal `"{element}"`, which files every element document under itself;
+see [Fanned elements as join parents](#fanned-elements-as-join-parents). Each document carries the join field
 in the shape the target expects, `"customer"` on a parent and
 `{"name": "order", "parent": "customer-1"}` on a child. It is written after
 projection and renames, like a constant, so nothing can strip it or move a
@@ -1411,7 +1469,9 @@ of them and without an `id` on every one of them (see
 different join fields; an index with no
 parent, or with two; two sections sharing a relation name; a child that only
 names a parent no other section provides; a child with `mapping_file`;
-`fan_out` together with `join`; a parent `id` naming a column outside its key;
+`fan_out` together with `join` other than as an
+[element parent](#fanned-elements-as-join-parents); a `parent = "{element}"`
+on a section that does not fan out; a parent `id` naming a column outside its key;
 `join` against Meilisearch, which has no parent-child model; a `fields`
 rename, a constant, a `columns` entry or a `[[children]]` field that collides
 with the join field. `[[children]]` on a join child is allowed: embedding an

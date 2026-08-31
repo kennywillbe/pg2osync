@@ -1665,5 +1665,101 @@ check "a row moved to another parent counts there" "$(os_field e2e_mysql_agg 3 o
 check "and no longer where it was" "$(os_field e2e_mysql_agg 2 open_deals)" "0"
 stop_sync
 
+say "26. a delimited column fanned out, each element its own join parent"
+# The PostgreSQL suite's section 38 (#180) on the binlog path: `by` cuts a
+# varchar into elements and `parent = "{element}"` files each of them under the
+# note it names, so a member dropped from the list has to lose its document
+# here too. binlog_row_image = FULL already gives the diff the old row.
+stop_sync
+ELCONFIG=$(mktemp /tmp/pg2osync-mysql-element.XXXXXX)
+ELMAPPING=$(dirname "$ELCONFIG")/pg2osync-mysql-element-mapping-$TAG.json
+ELSID=990012
+cat > "$ELCONFIG" <<TOML
+[source]
+flavor = "mysql"
+url_env = "PG2OSYNC_MYSQL_URL"
+server_id = $ELSID
+
+[target]
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
+
+[metrics]
+bind = "127.0.0.1:$((PORT_BASE + 26))"
+
+[sync.enote]
+table = "sourcedb.enotes"
+index = "e2e_mysql_element"
+id = "note-{id}"
+mapping_file = "pg2osync-mysql-element-mapping-$TAG.json"
+
+[sync.enote.join]
+field = "relation"
+name = "note"
+
+[sync.elink]
+table = "sourcedb.elinks"
+index = "e2e_mysql_element"
+id = "link-{id}"
+
+[sync.elink.fan_out]
+field = "member_ids"
+by = ","
+id = "link-{id}-{member_ids}"
+
+[sync.elink.join]
+field = "relation"
+name = "member"
+parent = "{element}"
+TOML
+# three shards, so a routed read proves the routing; see section 21
+cat > "$ELMAPPING" <<'JSON'
+{"settings":{"number_of_shards":3},"mappings":{"properties":{"relation":{"type":"join","relations":{"note":["member"]}}}}}
+JSON
+element_cleanup() {
+  sync_kill
+  my "DROP TABLE IF EXISTS elinks, enotes;" > /dev/null 2>&1 || true
+  curl -s -XDELETE "$OS/e2e_mysql_element?ignore_unavailable=true" > /dev/null 2>&1 || true
+  rm -f "$ELCONFIG" "$ELMAPPING"
+}
+trap 'cleanup; resume_cleanup; types_cleanup; child_cleanup; where_cleanup; events_cleanup; pipe_cleanup; append_cleanup; routing_cleanup; through_cleanup; pseudo_cleanup; rl_cleanup; agg_cleanup; element_cleanup' EXIT
+
+my "DROP TABLE IF EXISTS elinks, enotes;"
+my "CREATE TABLE enotes(id bigint primary key, title varchar(40));"
+my "CREATE TABLE elinks(id bigint primary key, member_ids varchar(80));"
+my "INSERT INTO enotes VALUES (1,'first'),(2,'second'),(3,'third');"
+# spaces on purpose: fan-out trims each piece
+my "INSERT INTO elinks VALUES (9,'1, 2');"
+curl -s -XDELETE "$OS/e2e_mysql_element?ignore_unavailable=true" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/mysql-$ELSID" > /dev/null
+if $BIN validate -c "$ELCONFIG" 2>&1 | grep -q "all checks passed"; then
+  ok "validate accepts a fanned section whose elements are the parents"
+else
+  bad "validate refused the element-parent pair"
+fi
+sync_spawn "$ELCONFIG"
+await_count e2e_mysql_element 5
+check "the load writes three notes and one document per member" "$(os_count e2e_mysql_element)" "5"
+check "an element document is found under the note it names" "$(os_rstatus e2e_mysql_element link-9-1 note-1)" "200"
+check "the element is the trimmed piece, and it names its own parent" \
+  "$(curl -s "$OS/e2e_mysql_element/_doc/link-9-2?routing=note-2" \
+      | jqf "d['_source']['member_ids'] + ' ' + d['_source']['relation']['parent']")" \
+  "2 note-2"
+
+# the acceptance test: the list shrinks and exactly that document goes
+my "UPDATE elinks SET member_ids='1,3' WHERE id=9;"
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_rstatus e2e_mysql_element link-9-3 note-3)" = "200" ] && break
+  sleep 1
+done
+check "a member added to the list gains a document" "$(os_rstatus e2e_mysql_element link-9-3 note-3)" "200"
+synced 2> /dev/null || { sleep 2; refresh; }
+check "the member dropped from the list loses its document" "$(os_rstatus e2e_mysql_element link-9-2 note-2)" "404"
+check "and the member that stayed is untouched" "$(os_rstatus e2e_mysql_element link-9-1 note-1)" "200"
+refresh
+check "one document per member, and no orphan" "$(os_count e2e_mysql_element)" "5"
+stop_sync
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

@@ -418,6 +418,7 @@ fn fan_outs(cfg: &AppConfig) -> Result<pg2osync_engine::mapping::FanOuts> {
             (schema.to_string(), table.to_string()),
             pg2osync_engine::mapping::FanOut {
                 field: fan.field.clone(),
+                by: fan.by.clone(),
                 id,
             },
         ));
@@ -444,7 +445,7 @@ fn joins(cfg: &AppConfig) -> Result<Joins> {
         });
         for (key, tbl) in members {
             let Some(join) = &tbl.join else { continue };
-            let parent = match &join.parent {
+            let parent = match join.parent_column(tbl.fan_out.as_ref()) {
                 None => None,
                 Some(column) => {
                     let Some((parent_key, parent_tbl, parent_join)) = parent else {
@@ -468,10 +469,14 @@ fn joins(cfg: &AppConfig) -> Result<Joins> {
                         ),
                     };
                     Some(JoinParent {
-                        column: column.clone(),
+                        column: column.to_string(),
                         name: parent_join.name.clone(),
                         id,
-                        key_column: pk_columns_for(tbl).contains(column),
+                        // the fan-out field is an array or a delimited
+                        // string, which no key is
+                        key_column: !join.is_element_parent()
+                            && pk_columns_for(tbl).iter().any(|c| c == column),
+                        element: join.is_element_parent(),
                     })
                 }
             };
@@ -752,6 +757,9 @@ async fn check_derived_identity_requirements(
                         .join(",")
                 ),
                 None => {}
+                // an element parent is read from the element document, and
+                // fan-out below already requires the whole old row
+                Some(column) if column == crate::config::ELEMENT_PARENT => {}
                 // the same two-key rule as an id: a bare key value is bound to
                 // the parent column only when both views agree it is the key
                 Some(column) if !in_both_keys(column) && info.relreplident != 'f' => bail!(
@@ -802,7 +810,8 @@ async fn check_derived_identity_requirements(
 }
 
 /// A `fan_out` field must hold an array: a PostgreSQL array column, or a
-/// jsonb/json whose value is one. Anything else fails per row at write time
+/// jsonb/json whose value is one — or, with `by`, the delimited string that
+/// fan-out cuts itself. Anything else fails per row at write time
 /// with a permanent rejection, which is a slow way of saying what the
 /// catalog can say at startup.
 async fn check_fan_out_column(
@@ -823,21 +832,35 @@ async fn check_fan_out_column(
         )
         .await?
         .map(|r| r.get(0));
-    match dtype.as_deref() {
-        None => bail!(
+    match (dtype.as_deref(), fan.by.as_deref()) {
+        (None, _) => bail!(
             "[sync.{key}.fan_out] table {} has no column {:?}",
             tbl.table,
             fan.field
         ),
+        // a delimited list is text, and an array column with a separator is
+        // two answers to the same question
+        (Some(t), Some(_)) if is_text_type(t) => Ok(()),
+        (Some(t), Some(by)) => bail!(
+            "[sync.{key}.fan_out] column {} is of type {t:?}, but by {by:?} splits a \
+             delimited string; remove by, or fan out a text column",
+            fan.field
+        ),
         // json/jsonb is accepted on the promise that the *value* is an array,
         // which is enforced per row when the documents are expanded
-        Some(t) if t.ends_with("[]") || t == "json" || t == "jsonb" => Ok(()),
-        Some(t) => bail!(
+        (Some(t), None) if t.ends_with("[]") || t == "json" || t == "jsonb" => Ok(()),
+        (Some(t), None) => bail!(
             "[sync.{key}.fan_out] column {} is of type {t:?}; fan-out needs a PostgreSQL \
-             array column or a jsonb column holding a JSON array",
+             array column or a jsonb column holding a JSON array, or a by that says how to \
+             split a delimited string",
             fan.field
         ),
     }
+}
+
+/// Whether a PostgreSQL type name is one a delimited list arrives in.
+fn is_text_type(t: &str) -> bool {
+    t == "text" || t.starts_with("character varying") || t.starts_with("character")
 }
 
 /// Tell the read-your-writes endpoint what this source answers with.
@@ -2572,6 +2595,67 @@ table = "public.users"
                 .expect("the parent has a rule")
                 .parent
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn an_element_parent_resolves_to_the_fan_out_field() {
+        let cfg: AppConfig = toml::from_str(
+            r#"
+[source]
+url = "postgres://u:p@localhost/db"
+[target]
+url = "http://localhost:9200"
+[sync.customers]
+table = "public.customers"
+index = "shop"
+id = "customer-{id}"
+[sync.customers.join]
+field = "relation"
+name = "customer"
+[sync.links]
+table = "public.links"
+index = "shop"
+id = "link-{id}"
+[sync.links.fan_out]
+field = "customer_ids"
+by = ","
+id = "link-{id}-{customer_ids}"
+[sync.links.join]
+field = "relation"
+name = "link"
+parent = "{element}"
+"#,
+        )
+        .expect("parses");
+        let joins = joins(&cfg).expect("resolves");
+        let parent = joins
+            .for_table("public", "links")
+            .expect("the child has a rule")
+            .parent
+            .as_ref()
+            .expect("it names its parent");
+        assert!(parent.element);
+        assert_eq!(
+            parent.column, "customer_ids",
+            "the element arrives under the fan-out field's name"
+        );
+        assert!(
+            !parent.key_column,
+            "a delimited list is not part of any key"
+        );
+        assert!(
+            matches!(&parent.id, ParentId::Template(t) if t.render_from_pk(&serde_json::json!("7"))
+                .expect("renders") == "customer-7"),
+            "the element is rendered with the parent section's own id rule"
+        );
+        let fan = fan_outs(&cfg).expect("resolves");
+        assert_eq!(
+            fan.for_table("public", "links")
+                .expect("the section fans")
+                .by
+                .as_deref(),
+            Some(",")
         );
     }
 

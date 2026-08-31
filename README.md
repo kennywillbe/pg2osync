@@ -86,7 +86,7 @@ not expressions) — if you need those, you want Kafka.
 | A row chooses its index (`index = "events-{tenant}"`) | ✅ created on demand with your mapping; TRUNCATE clears the pattern; reconcile refuses; old buckets expire through [ILM or ISM](docs/configuration.md#retention) |
 | Column projection (`columns` / `exclude_columns`) | ✅ |
 | Derived document ids (`id = "tenant-{tenant_id}-{id}"`) | ✅ default stays the primary key; non-key columns need `REPLICA IDENTITY FULL` |
-| One row to many documents (`fan_out` over a JSON-array column) | ✅ elements added, moved and removed as versioned writes |
+| One row to many documents (`fan_out` over a JSON-array column, or a delimited string with `by = ","`) | ✅ elements added, moved and removed as versioned writes; with `join.parent = "{element}"` each element is filed under itself |
 | Append-only tables without a primary key (`append_only`) | ✅ content-hash ids; an UPDATE or DELETE halts |
 | Column transforms (`hash`, `redact`, `pseudonym`, `json`, `split`, `number`, `date`, `lookup`) | ✅ eight named ops, no expression language; `pseudonym` is keyed AES-SIV, so joins survive; a value that will not convert is indexed as it is and counted (a pseudonym is redacted) |
 | Row filters (`where`) | ✅ a SQL subset the load pushes down and the stream evaluates; a row that leaves the filter is deleted |

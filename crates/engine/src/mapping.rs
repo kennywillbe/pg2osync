@@ -1044,6 +1044,9 @@ pub struct FanOuts {
 #[derive(Debug, Clone)]
 pub struct FanOut {
     pub field: String,
+    /// The separator a delimited string column is cut on. Unset means the
+    /// column already holds an array.
+    pub by: Option<String>,
     pub id: IdTemplate,
 }
 
@@ -1072,6 +1075,11 @@ impl FanOuts {
 /// Ids render from the merged RAW docs, like every other id: identity is a
 /// property of the row (and now of its element), not of the projected
 /// document.
+///
+/// With `by` set the column is a delimited string and fan-out cuts it here,
+/// on the raw row, with the same trimming and empty-dropping the `split`
+/// transform documents — the column type is what the two rules differ on, so
+/// each is refused where the other applies.
 pub fn fan_out_docs(
     rule: &FanOut,
     base_id: &str,
@@ -1080,11 +1088,34 @@ pub fn fan_out_docs(
     let parent = doc
         .as_object()
         .ok_or("fan-out needs a row document, not a bare value")?;
-    let items = match parent.get(&rule.field) {
-        None => return Ok(Vec::new()),
-        Some(serde_json::Value::Null) => return Ok(vec![(base_id.to_string(), doc.clone())]),
-        Some(serde_json::Value::Array(items)) => items,
-        Some(_) => {
+    let items: std::borrow::Cow<'_, [serde_json::Value]> = match (parent.get(&rule.field), &rule.by)
+    {
+        (None, _) => return Ok(Vec::new()),
+        (Some(serde_json::Value::Null), _) => {
+            return Ok(vec![(base_id.to_string(), doc.clone())]);
+        }
+        (Some(serde_json::Value::Array(items)), None) => std::borrow::Cow::Borrowed(items),
+        (Some(serde_json::Value::String(s)), Some(by)) => std::borrow::Cow::Owned(
+            s.split(by.as_str())
+                .map(str::trim)
+                .filter(|piece| !piece.is_empty())
+                .map(|piece| serde_json::Value::String(piece.to_string()))
+                .collect(),
+        ),
+        (Some(serde_json::Value::Array(_)), Some(by)) => {
+            return Err(format!(
+                "fan_out column {} holds an array, but by {by:?} splits a delimited string; \
+                 remove by",
+                rule.field
+            ));
+        }
+        (Some(_), Some(_)) => {
+            return Err(format!(
+                "fan_out column {} is neither a string nor NULL, and by splits a string",
+                rule.field
+            ));
+        }
+        (Some(_), None) => {
             return Err(format!(
                 "fan_out column {} is neither an array nor NULL",
                 rule.field
@@ -1092,7 +1123,7 @@ pub fn fan_out_docs(
         }
     };
     let mut out = Vec::with_capacity(items.len());
-    for item in items {
+    for item in items.iter() {
         let mut child = parent.clone();
         child.remove(&rule.field);
         match item {
@@ -1145,6 +1176,10 @@ pub struct JoinParent {
     /// readable from a key-only delete event. The same declaration
     /// `IdTemplate::pk_only` makes, and the same startup check makes it true.
     pub key_column: bool,
+    /// Whether the parent is the fanned element rather than a column of the
+    /// row. `column` is then the fan-out field, which every element document
+    /// carries in the array's place, so the parent is read per element.
+    pub element: bool,
 }
 
 /// How a foreign-key value becomes the parent's document id.
@@ -1185,7 +1220,9 @@ impl JoinRule {
     /// the parent's shard.
     ///
     /// Reads the RAW row, like identity does: a projection must not be able
-    /// to move a document to another shard.
+    /// to move a document to another shard. A fanned row's element document
+    /// is that same raw row with the element in the array's place, which is
+    /// what an element parent reads its value from.
     pub fn routing_for_doc(
         &self,
         raw: &serde_json::Value,
@@ -1225,6 +1262,15 @@ impl JoinRule {
         let Some(parent) = &self.parent else {
             return Ok(None);
         };
+        // An element parent gives one row as many parents as it has elements,
+        // and a key names none of them: the fanned paths route each element
+        // document from the element itself instead.
+        if parent.element {
+            return Err(format!(
+                "the parent of {} is the fanned element, which a key alone does not carry",
+                self.name
+            ));
+        }
         if let Some(before) = before {
             return self.routing_for_doc(before).map(|(_, routing)| routing);
         }
@@ -2049,6 +2095,7 @@ mod tests {
     fn fan_out_merges_elements_into_the_parent_minus_the_array() {
         let rule = FanOut {
             field: "tags".into(),
+            by: None,
             id: pk("t-{id}-{tags}", &[]),
         };
         let doc = json!({"id": 1, "title": "x", "tags": ["a", "b"]});
@@ -2072,6 +2119,7 @@ mod tests {
     fn fan_out_object_elements_win_their_names_and_the_array_is_gone() {
         let rule = FanOut {
             field: "items".into(),
+            by: None,
             id: pk("o-{order_id}-{sku}", &[]),
         };
         let doc = json!({"order_id": 9, "items": [{"sku": "A", "qty": 2}, {"sku": "B", "qty": 1}], "title": "t"});
@@ -2088,6 +2136,7 @@ mod tests {
     fn fan_out_null_keeps_one_parent_and_empty_or_missing_emits_nothing() {
         let rule = FanOut {
             field: "tags".into(),
+            by: None,
             id: pk("t-{id}-{tags}", &[]),
         };
         let docs = fan_out_docs(&rule, "t-1", &json!({"id": 1, "tags": null})).expect("null");
@@ -2111,10 +2160,104 @@ mod tests {
     fn fan_out_refuses_a_column_that_holds_anything_else() {
         let rule = FanOut {
             field: "tags".into(),
+            by: None,
             id: pk("t-{id}", &[]),
         };
         let err = fan_out_docs(&rule, "t-1", &json!({"id": 1, "tags": "a,b"})).unwrap_err();
         assert!(err.contains("tags"), "{err}");
+    }
+
+    #[test]
+    fn a_delimited_column_is_split_with_the_transforms_semantics() {
+        let rule = FanOut {
+            field: "member_ids".into(),
+            by: Some(",".into()),
+            id: pk("n-{id}-{member_ids}", &[]),
+        };
+        let docs = fan_out_docs(&rule, "n-1", &json!({"id": 1, "member_ids": "7, 12 ,31"}))
+            .expect("splits");
+        assert_eq!(
+            docs.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec!["n-1-7", "n-1-12", "n-1-31"],
+            "pieces are trimmed, and each is an element of its own"
+        );
+        assert_eq!(docs[0].1, json!({"id": 1, "member_ids": "7"}));
+        assert_eq!(
+            fan_out_docs(&rule, "n-2", &json!({"id": 2, "member_ids": "9"}))
+                .expect("one piece")
+                .len(),
+            1,
+            "a list of one is one element, not a special case"
+        );
+        for empty in ["", " ", ",", " , "] {
+            assert!(
+                fan_out_docs(&rule, "n-3", &json!({"id": 3, "member_ids": empty}))
+                    .expect("empty")
+                    .is_empty(),
+                "{empty:?} names no member"
+            );
+        }
+        assert_eq!(
+            fan_out_docs(&rule, "n-4", &json!({"id": 4, "member_ids": null})).expect("null"),
+            vec![("n-4".to_string(), json!({"id": 4, "member_ids": null}))],
+            "a NULL list is still a row with no members"
+        );
+    }
+
+    #[test]
+    fn by_and_an_array_column_are_two_answers_to_one_question() {
+        let rule = FanOut {
+            field: "tags".into(),
+            by: Some(",".into()),
+            id: pk("t-{id}-{tags}", &[]),
+        };
+        let err = fan_out_docs(&rule, "t-1", &json!({"id": 1, "tags": ["a", "b"]})).unwrap_err();
+        assert!(err.contains("tags") && err.contains("by"), "{err}");
+        let err = fan_out_docs(&rule, "t-1", &json!({"id": 1, "tags": 7})).unwrap_err();
+        assert!(err.contains("tags"), "{err}");
+    }
+
+    #[test]
+    fn an_element_parent_files_every_element_under_itself() {
+        let fan = FanOut {
+            field: "member_ids".into(),
+            by: Some(",".into()),
+            id: pk("n-{id}-{member_ids}", &[]),
+        };
+        let rule = JoinRule {
+            field: "relation".into(),
+            name: "member".into(),
+            parent: Some(JoinParent {
+                column: "member_ids".into(),
+                element: true,
+                name: "note".into(),
+                id: ParentId::Template(pk("note-{id}", &["id"])),
+                key_column: false,
+            }),
+        };
+        let docs =
+            fan_out_docs(&fan, "n-1", &json!({"id": 1, "member_ids": "7,12"})).expect("fans out");
+        let placed: Vec<(serde_json::Value, Option<String>)> = docs
+            .iter()
+            .map(|(_, doc)| rule.routing_for_doc(doc).expect("element parent"))
+            .collect();
+        assert_eq!(
+            placed,
+            vec![
+                (
+                    json!({"name": "member", "parent": "note-7"}),
+                    Some("note-7".to_string())
+                ),
+                (
+                    json!({"name": "member", "parent": "note-12"}),
+                    Some("note-12".to_string())
+                ),
+            ],
+            "each element document names and routes to its own parent"
+        );
+        // a key names none of the parents a fanned row has
+        let err = rule.routing_for_key(None, &json!(1)).unwrap_err();
+        assert!(err.contains("element"), "{err}");
     }
 
     fn parent_rule() -> JoinRule {
@@ -2131,6 +2274,7 @@ mod tests {
             name: "order".into(),
             parent: Some(JoinParent {
                 column: "customer_id".into(),
+                element: false,
                 name: "customer".into(),
                 id,
                 key_column,
