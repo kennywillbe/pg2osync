@@ -10,6 +10,87 @@ pub struct TableCatalogInfo {
     pub pk_columns: Vec<String>,
 }
 
+/// A managed PostgreSQL, recognised so an error can name the switch that
+/// service calls logical replication instead of the one `postgresql.conf` has.
+///
+/// Detection is fail-open on purpose: an unrecognised server gets the plain
+/// message, never a guess about a service it is not running on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedService {
+    Rds,
+    Aurora,
+    Supabase,
+}
+
+impl ManagedService {
+    /// Aurora exposes the RDS parameter too, so it is decided first: naming
+    /// the instance parameter group on a cluster sends the reader to a screen
+    /// where the change has no effect.
+    fn from_probe(rds_guc: bool, aurora_version: bool, supabase_admin: bool) -> Option<Self> {
+        if aurora_version {
+            Some(Self::Aurora)
+        } else if rds_guc {
+            Some(Self::Rds)
+        } else if supabase_admin {
+            Some(Self::Supabase)
+        } else {
+            None
+        }
+    }
+
+    /// How this service turns logical decoding on.
+    pub fn wal_level_remedy(self) -> &'static str {
+        match self {
+            Self::Rds => {
+                "on Amazon RDS the server takes no postgresql.conf: set \
+                 `rds.logical_replication = 1` in the instance's parameter group \
+                 and reboot the instance"
+            }
+            Self::Aurora => {
+                "on Aurora PostgreSQL set `rds.logical_replication = 1` in the DB \
+                 *cluster* parameter group — the instance parameter group ignores \
+                 it — and reboot the writer"
+            }
+            Self::Supabase => {
+                "Supabase ships `wal_level = logical`, so a server reporting \
+                 anything else has it overridden in the project's database settings"
+            }
+        }
+    }
+
+    /// How this service hands out the right to create a replication slot.
+    pub fn replication_role_remedy(self) -> &'static str {
+        match self {
+            Self::Rds | Self::Aurora => {
+                "a managed instance grants no REPLICATION attribute directly: \
+                 `GRANT rds_replication TO <role>` as the master user instead"
+            }
+            Self::Supabase => {
+                "on Supabase the built-in `postgres` role already has REPLICATION; \
+                 connect as it, or have `supabase_admin` grant a role of your own"
+            }
+        }
+    }
+}
+
+/// Which managed service this server is, if it is recognisably one.
+///
+/// One query over catalogs, and every failure — including a catalog a service
+/// restricts — reads as "not recognised", so this can never turn a diagnosable
+/// problem into a connection error.
+pub async fn detect_managed_service(client: &Client) -> Option<ManagedService> {
+    let row = client
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_settings WHERE name = 'rds.logical_replication'),
+                    to_regprocedure('aurora_version()') IS NOT NULL,
+                    EXISTS(SELECT 1 FROM pg_roles WHERE rolname = 'supabase_admin')",
+            &[],
+        )
+        .await
+        .ok()?;
+    ManagedService::from_probe(row.get(0), row.get(1), row.get(2))
+}
+
 pub async fn check_wal_level(client: &Client) -> Result<()> {
     let level: String = client
         .query_one(
@@ -20,9 +101,13 @@ pub async fn check_wal_level(client: &Client) -> Result<()> {
         .catalog_ctx(|| "cannot read wal_level".into())?
         .get(0);
     if level != "logical" {
+        let service = match detect_managed_service(client).await {
+            Some(service) => format!("; {}", service.wal_level_remedy()),
+            None => String::new(),
+        };
         return Err(SourceError::Config(format!(
             "wal_level is '{level}' but must be 'logical'; \
-             set `wal_level = logical` in postgresql.conf and restart PostgreSQL"
+             set `wal_level = logical` in postgresql.conf and restart PostgreSQL{service}"
         )));
     }
     Ok(())
@@ -76,6 +161,9 @@ pub struct Preflight {
     pub tables_not_owned: Vec<String>,
     /// Tables the role cannot read, which breaks the initial load.
     pub tables_not_readable: Vec<String>,
+    /// The managed service this server is, when it is recognisably one, so a
+    /// refusal can name the switch that service actually has.
+    pub service: Option<ManagedService>,
 }
 
 impl Preflight {
@@ -193,7 +281,10 @@ pub async fn preflight(
             "SELECT (r.rolreplication OR r.rolsuper) AS can_replicate,
                     has_database_privilege(current_database(), 'CREATE') AS can_create,
                     EXISTS(SELECT 1 FROM pg_publication WHERE pubname = $1) AS pub_exists,
-                    EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $2) AS slot_exists
+                    EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $2) AS slot_exists,
+                    EXISTS(SELECT 1 FROM pg_settings WHERE name = 'rds.logical_replication') AS rds,
+                    to_regprocedure('aurora_version()') IS NOT NULL AS aurora,
+                    EXISTS(SELECT 1 FROM pg_roles WHERE rolname = 'supabase_admin') AS supabase
              FROM pg_roles r WHERE r.rolname = current_user",
             &[&publication, &slot_name],
         )
@@ -229,6 +320,7 @@ pub async fn preflight(
         can_create_in_database: row.get("can_create"),
         tables_not_owned,
         tables_not_readable,
+        service: ManagedService::from_probe(row.get("rds"), row.get("aurora"), row.get("supabase")),
     })
 }
 
@@ -600,6 +692,51 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn aurora_is_recognised_before_the_rds_parameter_it_also_has() {
+        assert_eq!(
+            ManagedService::from_probe(true, true, false),
+            Some(ManagedService::Aurora)
+        );
+        assert!(
+            ManagedService::Aurora
+                .wal_level_remedy()
+                .contains("cluster")
+        );
+    }
+
+    #[test]
+    fn each_service_names_its_own_switch() {
+        assert_eq!(
+            ManagedService::from_probe(true, false, false),
+            Some(ManagedService::Rds)
+        );
+        assert_eq!(
+            ManagedService::from_probe(false, false, true),
+            Some(ManagedService::Supabase)
+        );
+        assert!(
+            ManagedService::Rds
+                .wal_level_remedy()
+                .contains("rds.logical_replication")
+        );
+        assert!(
+            ManagedService::Rds
+                .replication_role_remedy()
+                .contains("rds_replication")
+        );
+        assert!(
+            ManagedService::Supabase
+                .replication_role_remedy()
+                .contains("postgres")
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_server_keeps_the_plain_message() {
+        assert_eq!(ManagedService::from_probe(false, false, false), None);
+    }
 
     #[test]
     fn retention_is_reported_in_units_an_operator_reads() {

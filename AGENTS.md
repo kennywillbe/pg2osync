@@ -84,7 +84,7 @@ What it covers, job by job:
 | `the book builds` | `docs.yml` |
 | `the title is a conventional commit` | `pr-title.yml` |
 | `dependencies have no known advisories` | `audit.yml`, when a Cargo file moved |
-| the six compatibility cells | `compat.yml`, when it or `dev/e2e-*.sh` changed |
+| the eight compatibility cells | `compat.yml`, when it or `dev/e2e-*.sh` changed |
 
 The two cells `compat.yml` marks `continue-on-error` are reported as advisory
 (`!`) here too: a known gap being tracked does not make the run red.
@@ -95,7 +95,7 @@ second run waits. `--isolated` instead gives the run throwaway containers of
 its own, `pg2osync-ci-<run id>-*`, on ports Docker assigns — it takes no lock,
 never touches the dev stack, and is how you run beside someone else's run. An
 8 GB Docker VM fits about two isolated runs next to the dev stack. Because each
-cell there is a namespace of its own, an isolated run also takes the six
+cell there is a namespace of its own, an isolated run also takes the eight
 compatibility cells two at a time (`--jobs <n>`), which halves the matrix.
 Every run prints its mode and run id first, and logs land in
 `/tmp/pg2osync-ci-local/<run id>`, one file per job plus the pipeline log of
