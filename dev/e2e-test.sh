@@ -992,8 +992,12 @@ echo -e "\n\033[1m== 19. init writes a config that runs ==\033[0m"
 # other one takes a `-c FILE` that has to exist first. Measured before this
 # existed, the first hand-written config failed on an unqualified table name.
 #
-# Nothing is edited after `init` here, deliberately: the out-of-the-box path is
-# what is being tested, down to the default config name and target url.
+# The out-of-the-box path is what is being tested, down to the default config
+# name and target url — the default is asserted below rather than passed to
+# `init`. The one edit is the one an operator makes first, pointing the target
+# at their own cluster: without it a run with a stack of its own (ci-local
+# --isolated) would validate against whatever listens on the default port,
+# which is the dev stack and not this run.
 ABIN="$(pwd)/$BIN"
 INITDIR=$(mktemp -d /tmp/pg2osync-e2e-init.XXXXXX)
 pg "DROP TABLE IF EXISTS init_probe, init_no_pk;" > /dev/null 2>&1
@@ -1030,9 +1034,13 @@ if (cd "$INITDIR" && "$ABIN" init --table init_probe > /dev/null 2>&1); then
 else
   ok "init refuses to overwrite without --force"
 fi
-# The whole point: what it writes validates, unedited and with no -c flag.
+check "and wrote the default target url" \
+  "$(grep -c '^url = "http://localhost:9200"$' "$INITDIR/pg2osync.toml" 2> /dev/null || echo 0)" "1"
+sed "s|^url = \"http://localhost:9200\"$|url = \"$OS\"|" "$INITDIR/pg2osync.toml" \
+  > "$INITDIR/retargeted.toml" && mv "$INITDIR/retargeted.toml" "$INITDIR/pg2osync.toml"
+# The whole point: what it writes validates, with no -c flag.
 if (cd "$INITDIR" && "$ABIN" validate > /dev/null 2>&1); then
-  ok "validate passes on the generated config, unedited"
+  ok "validate passes on the generated config"
 else
   bad "the generated config does not validate"
 fi
