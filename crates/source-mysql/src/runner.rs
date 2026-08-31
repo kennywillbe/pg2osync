@@ -385,6 +385,13 @@ impl MySqlSource {
                 binlog::T_TABLE_MAP => {
                     let (tid, meta, opt) = binlog::parse_table_map(body)?;
                     if !self.is_configured(&meta.schema, &meta.name) {
+                        // A registration outlives the TABLE_MAP that made it,
+                        // because the rows that follow are addressed by id
+                        // alone. A table that stops being configured under the
+                        // running stream — a reload dropping its section —
+                        // would otherwise keep being decoded through the entry
+                        // it left behind, so the entry goes with it.
+                        registered.remove(&tid);
                         tracing::trace!(target: "pg2osync::source",
                             "ignoring unconfigured table {}.{}", meta.schema, meta.name);
                         continue;
