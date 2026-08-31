@@ -1716,6 +1716,16 @@ fn completion_key(
         .map(|id| ((index, id), routing))
 }
 
+/// One document a row expands to, before the projections and transforms:
+/// where it is filed and, when the section joins, what its join field holds.
+struct Placed {
+    id: String,
+    doc: Value,
+    /// The join field's value and the routing it implies, unset without a join.
+    filed: Option<(Value, Option<String>)>,
+    routing: Option<String>,
+}
+
 /// Convert one row change into document operations, completing unchanged-TOAST
 /// columns from the previously indexed document when needed.
 ///
@@ -1793,21 +1803,37 @@ fn materialize(
             Some(rule) => crate::mapping::fan_out_docs(rule, base, doc).map_err(halt),
         }
     };
-    // The join field's value and the routing, from the RAW row for the same
-    // reason identity is: a projection must not be able to move a document to
-    // another shard.
-    let file = |raw: &Value| -> Result<Option<(Value, Option<String>)>, CoreError> {
-        join.map(|rule| rule.routing_for_doc(raw))
-            .transpose()
-            .map_err(halt)
-    };
     // A configured routing column is refused together with `join`, so at most
     // one of the two ever decides where a document lives.
     let routed = rules.routings.for_table(table.0, table.1);
-    let route = |raw: &Value, filed: &Option<(Value, Option<String>)>| match (filed, routed) {
-        (Some((_, routing)), _) => Ok(routing.clone()),
-        (None, Some(rule)) => rule.render(raw).map(Some).map_err(halt),
-        (None, None) => Ok(None),
+    // The documents one row becomes, each with the join field's value and the
+    // routing it is written under. Both are read from the document rather
+    // than the row so that an element parent files every element under its
+    // own value; without fan-out the two are the same object, and fan-out is
+    // combined with `join` only for an element parent. Raw either way, for
+    // the same reason identity is: a projection must not be able to move a
+    // document to another shard.
+    let place = |base: &str, raw: &Value| -> Result<Vec<Placed>, CoreError> {
+        shape(base, raw)?
+            .into_iter()
+            .map(|(id, doc)| {
+                let filed = join
+                    .map(|rule| rule.routing_for_doc(&doc))
+                    .transpose()
+                    .map_err(halt)?;
+                let routing = match (&filed, routed) {
+                    (Some((_, routing)), _) => routing.clone(),
+                    (None, Some(rule)) => Some(rule.render(raw).map_err(halt)?),
+                    (None, None) => None,
+                };
+                Ok(Placed {
+                    id,
+                    doc,
+                    filed,
+                    routing,
+                })
+            })
+            .collect()
     };
     // The routing of the document the row already owns, for the events that
     // carry a key and, at best, a before-image.
@@ -1819,14 +1845,15 @@ fn materialize(
     // `shaped` names the columns completed from the stored document: they
     // went through the transforms when they were first written, so they must
     // not go through them again
-    let finish = |index: &str,
-                  docs: Vec<(String, Value)>,
-                  filed: Option<(Value, Option<String>)>,
-                  routing: Option<String>,
-                  shaped: &[String],
-                  left: &mut Vec<String>| {
+    let finish = |index: &str, docs: Vec<Placed>, shaped: &[String], left: &mut Vec<String>| {
         docs.into_iter()
-            .map(|(id, mut doc)| {
+            .map(|placed| {
+                let Placed {
+                    id,
+                    mut doc,
+                    filed,
+                    routing,
+                } = placed;
                 rules.projections.apply(table.0, table.1, &mut doc);
                 // owned only on the failure path, which is the rare one
                 left.extend(
@@ -1848,7 +1875,7 @@ fn materialize(
                 {
                     map.insert(rule.field.clone(), value.clone());
                 }
-                upsert(index, id, routing.clone(), doc)
+                upsert(index, id, routing, doc)
             })
             .collect()
     };
@@ -1878,16 +1905,7 @@ fn materialize(
         RowKind::Insert { pk, doc } => {
             let base = derived_id(table, pk, Some(doc), None, rules)?;
             let index = rendered_index(target, table, pk, Some(doc), None)?;
-            let filed = file(doc)?;
-            let routing = route(doc, &filed)?;
-            Ok(finish(
-                &index,
-                shape(&base, doc)?,
-                filed,
-                routing,
-                &[],
-                left_as_is,
-            ))
+            Ok(finish(&index, place(&base, doc)?, &[], left_as_is))
         }
         RowKind::Update {
             pk,
@@ -1906,22 +1924,26 @@ fn materialize(
             // index sees the same row and the two cannot disagree
             let base = derived_id(table, pk, Some(&doc), before, rules)?;
             let index = rendered_index(target, table, pk, Some(&doc), before)?;
-            let filed = file(&doc)?;
-            let routing = route(&doc, &filed)?;
-            let old_routing = key_routing(before, old_pk)?;
-            let new_docs = shape(&base, &doc)?;
-            let mut ops = finish(
-                &index,
-                new_docs.clone(),
-                filed,
-                routing.clone(),
-                &completed,
-                left_as_is,
-            );
+            let new_docs = place(&base, &doc)?;
+            // Where the row's new state lives: one (id, shard) per document,
+            // which the diff below subtracts the before-image from. Only a
+            // fanned row can hold more than one, and only it needs the set.
+            let held: std::collections::HashSet<(String, Option<String>)> =
+                match (fan, before.is_some()) {
+                    (Some(_), true) => new_docs
+                        .iter()
+                        .map(|placed| (placed.id.clone(), placed.routing.clone()))
+                        .collect(),
+                    _ => std::collections::HashSet::new(),
+                };
+            // a row that is not fanned is one document, and its shard is what
+            // the move below compares the old one against
+            let routing = new_docs.first().and_then(|placed| placed.routing.clone());
+            let mut ops = finish(&index, new_docs, &completed, left_as_is);
             // write first, delete second: a crash between them leaves a
             // duplicate that the replay repairs, where the reverse order would
             // leave a gap that nothing repairs
-            if let Some(rule) = fan {
+            if fan.is_some() {
                 // the diff against the before-image: every document the row
                 // owned that its new state no longer produces is removed. The
                 // startup check required a before-image for fanned tables, so
@@ -1931,25 +1953,22 @@ fn materialize(
                 if let Some(before) = before {
                     let old_base = derived_id(table, old_pk, None, Some(before), rules)?;
                     let old_index = rendered_index(target, table, old_pk, None, Some(before))?;
-                    // One row, one index and one shard: every element
-                    // document went where the row did, so when the row moved
-                    // index or routing nothing it left behind is held any
-                    // more, whatever its id.
-                    let held: std::collections::HashSet<&str> =
-                        if old_index == index && old_routing == routing {
-                            new_docs.iter().map(|(id, _)| id.as_str()).collect()
-                        } else {
-                            std::collections::HashSet::new()
-                        };
-                    for (id, _) in crate::mapping::fan_out_docs(rule, &old_base, before)
-                        .map_err(|e| halt(format!("before-image of a fanned row: {e}")))?
-                    {
-                        if !held.contains(id.as_str()) {
-                            ops.push(delete(&old_index, id, old_routing.clone()));
+                    // A document is still the row's own only where its id and
+                    // its shard both stayed: a row that moved index or shard
+                    // holds nothing it left behind, and an element parent
+                    // moves one element document at a time.
+                    for placed in place(&old_base, before).map_err(|e| {
+                        CoreError::Other(format!("{e} (the before-image of a fanned row)"))
+                    })? {
+                        if old_index != index
+                            || !held.contains(&(placed.id.clone(), placed.routing.clone()))
+                        {
+                            ops.push(delete(&old_index, placed.id, placed.routing));
                         }
                     }
                 }
             } else {
+                let old_routing = key_routing(before, old_pk)?;
                 // A changed key means the row moved to a different document,
                 // a changed index column that it moved to a different index,
                 // and a changed parent that it moved to a different shard;
@@ -1984,9 +2003,9 @@ fn materialize(
             // the before-image names the index the document is in; a
             // template it cannot satisfy halts, as the startup check promised
             let index = rendered_index(target, table, pk, None, before)?;
-            let routing = key_routing(before, pk)?;
             match fan {
                 None => {
+                    let routing = key_routing(before, pk)?;
                     let mut ops = vec![delete(&index, base.clone(), routing)];
                     // A parent's children live on its shard and know nothing
                     // of its deletion; they go after the parent, at the same
@@ -2004,7 +2023,7 @@ fn materialize(
                     }
                     Ok(ops)
                 }
-                Some(rule) => {
+                Some(_) => {
                     let row = before.ok_or_else(|| {
                         halt(
                             "a fanned row's delete needs its before-image, which this event \
@@ -2012,10 +2031,11 @@ fn materialize(
                                 .into(),
                         )
                     })?;
-                    Ok(crate::mapping::fan_out_docs(rule, &base, row)
-                        .map_err(halt)?
+                    // each element document on the shard it was written to,
+                    // which for an element parent is the element's own
+                    Ok(place(&base, row)?
                         .into_iter()
-                        .map(|(id, _)| delete(&index, id, routing.clone()))
+                        .map(|placed| delete(&index, placed.id, placed.routing))
                         .collect())
                 }
             }
@@ -3549,6 +3569,7 @@ mod pipeline_tests {
             ("public".to_string(), "users".to_string()),
             crate::mapping::FanOut {
                 field: field.into(),
+                by: None,
                 id: crate::mapping::IdTemplate::parse(spec, &[]).expect("valid template"),
             },
         )])
@@ -4764,6 +4785,23 @@ mod pipeline_tests {
                     name: "order".into(),
                     parent: Some(crate::mapping::JoinParent {
                         column: "customer_id".into(),
+                        element: false,
+                        name: "customer".into(),
+                        id: crate::mapping::ParentId::Template(customer_id.clone()),
+                        key_column: false,
+                    }),
+                },
+            ),
+            // one row of `links` holds a delimited list of customers, and
+            // each element document is filed under the customer it names
+            (
+                ("public".to_string(), "links".to_string()),
+                crate::mapping::JoinRule {
+                    field: "relation".into(),
+                    name: "link".into(),
+                    parent: Some(crate::mapping::JoinParent {
+                        column: "customer_ids".into(),
+                        element: true,
                         name: "customer".into(),
                         id: crate::mapping::ParentId::Template(customer_id),
                         key_column: false,
@@ -4771,6 +4809,18 @@ mod pipeline_tests {
                 },
             ),
         ])
+    }
+
+    fn links_fan() -> crate::mapping::FanOuts {
+        crate::mapping::FanOuts::from_pairs([(
+            ("public".to_string(), "links".to_string()),
+            crate::mapping::FanOut {
+                field: "customer_ids".into(),
+                by: Some(",".into()),
+                id: crate::mapping::IdTemplate::parse("link-{id}-{customer_ids}", &[])
+                    .expect("valid template"),
+            },
+        )])
     }
 
     fn shop_row(table: &str, kind: RowKind, version: u64) -> ChangeEvent {
@@ -4787,6 +4837,16 @@ mod pipeline_tests {
     async fn drive_join_result(
         script: Vec<ChangeEvent>,
         sink: Arc<RecordingSink>,
+    ) -> (Arc<crate::metrics::Metrics>, Result<(), CoreError>) {
+        drive_join_fanned(script, sink, crate::mapping::FanOuts::default()).await
+    }
+
+    /// The same pair, with whatever fan-out rules the test needs: the links
+    /// section is the one that fans, so a run without it is unchanged.
+    async fn drive_join_fanned(
+        script: Vec<ChangeEvent>,
+        sink: Arc<RecordingSink>,
+        fan_outs: crate::mapping::FanOuts,
     ) -> (Arc<crate::metrics::Metrics>, Result<(), CoreError>) {
         let (events_tx, events_rx) = mpsc::channel(1024);
         let (copy_tx, copy_rx) = mpsc::channel(1024);
@@ -4814,6 +4874,10 @@ mod pipeline_tests {
                     ("public".to_string(), "orders".to_string()),
                     "shop".to_string(),
                 ),
+                (
+                    ("public".to_string(), "links".to_string()),
+                    "shop".to_string(),
+                ),
             ]),
             projections: crate::mapping::Projections::default(),
             transforms: crate::mapping::Transforms::default(),
@@ -4828,8 +4892,12 @@ mod pipeline_tests {
                     ("public".to_string(), "orders".to_string()),
                     ids("order-{id}"),
                 ),
+                (
+                    ("public".to_string(), "links".to_string()),
+                    ids("link-{id}"),
+                ),
             ]),
-            fan_outs: crate::mapping::FanOuts::default(),
+            fan_outs,
             joins: shop_joins(),
             filters: crate::mapping::Filters::default(),
             pipelines: crate::mapping::Pipelines::default(),
@@ -4868,6 +4936,91 @@ mod pipeline_tests {
         let (_, outcome) = drive_join_result(script, sink.clone()).await;
         outcome.expect("engine ran");
         sink
+    }
+
+    async fn drive_fanned_join(script: Vec<ChangeEvent>) -> Arc<RecordingSink> {
+        let sink = Arc::new(RecordingSink::default());
+        let (_, outcome) = drive_join_fanned(script, sink.clone(), links_fan()).await;
+        outcome.expect("engine ran");
+        sink
+    }
+
+    #[tokio::test]
+    async fn every_fanned_element_is_filed_under_the_parent_it_names() {
+        let sink = drive_fanned_join(vec![
+            shop_row(
+                "links",
+                RowKind::Insert {
+                    pk: json!(5),
+                    doc: json!({"id": 5, "customer_ids": "1, 2"}),
+                },
+                0x100,
+            ),
+            commit(0x100),
+        ])
+        .await;
+        assert_eq!(
+            sink.events(),
+            vec!["write[upsert:link-5-1->customer-1@256 upsert:link-5-2->customer-2@256]"],
+            "one element, one document, each on its own parent's shard"
+        );
+        assert_eq!(
+            sink.doc("link-5-1"),
+            Some(json!({
+                "id": 5,
+                "customer_ids": "1",
+                "relation": {"name": "link", "parent": "customer-1"}
+            })),
+            "the parent is named with the parent section's own id rule"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_member_dropped_from_the_list_loses_its_document_where_it_was() {
+        let sink = drive_fanned_join(vec![
+            shop_row(
+                "links",
+                RowKind::Update {
+                    pk: json!(5),
+                    previous_pk: None,
+                    doc: json!({"id": 5, "customer_ids": "1,3"}),
+                    unchanged_toast_columns: Vec::new(),
+                    before: Some(json!({"id": 5, "customer_ids": "1,2"})),
+                },
+                0x200,
+            ),
+            commit(0x200),
+        ])
+        .await;
+        assert_eq!(
+            sink.events(),
+            vec![
+                "write[upsert:link-5-1->customer-1@512 upsert:link-5-3->customer-3@512 \
+                 delete:link-5-2->customer-2]"
+            ],
+            "the kept and the new element are written, and the dropped one is \
+             removed from the shard it was on"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fanned_join_row_deletes_every_element_on_its_own_shard() {
+        let sink = drive_fanned_join(vec![
+            shop_row(
+                "links",
+                RowKind::Delete {
+                    pk: json!(5),
+                    before: Some(json!({"id": 5, "customer_ids": "1,2"})),
+                },
+                0x300,
+            ),
+            commit(0x300),
+        ])
+        .await;
+        assert_eq!(
+            sink.events(),
+            vec!["write[delete:link-5-1->customer-1 delete:link-5-2->customer-2]"]
+        );
     }
 
     #[tokio::test]
@@ -5245,6 +5398,7 @@ mod pipeline_tests {
             ("public".to_string(), "docs".to_string()),
             crate::mapping::FanOut {
                 field: "tags".into(),
+                by: None,
                 id: crate::mapping::IdTemplate::parse("doc-{id}-{tags}", &["id".to_string()])
                     .expect("valid template"),
             },

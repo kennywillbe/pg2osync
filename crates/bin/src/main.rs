@@ -1490,7 +1490,11 @@ fn check_configured_columns(
     // the parent column is where a child's routing comes from, so like an id
     // placeholder a missing one could never render and a nullable one is a
     // halt waiting to happen
-    if let Some(column) = table.join.as_ref().and_then(|join| join.parent.as_deref()) {
+    if let Some(column) = table
+        .join
+        .as_ref()
+        .and_then(|join| join.parent_column(table.fan_out.as_ref()))
+    {
         if !live.iter().any(|c| c.eq_ignore_ascii_case(column)) {
             bail!(
                 "table {} has no column {column} to find its join parent by",

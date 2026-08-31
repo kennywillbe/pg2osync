@@ -80,6 +80,15 @@ external version and would have to act as a barrier, breaking
 refuse fanned tables for now — both page by key, and one row is no longer one
 document.
 
+`by` (#180) extends this to the column that holds `"7,12,31"` rather than an
+array. It is the `split` transform's cut, moved to where fan-out reads: the
+raw row. That keeps the raw-row contract rather than bending it — a transform
+still cannot feed fan-out, and now does not need to — and the column type is
+what tells the two rules apart, so `by` on an array column is refused at
+startup and at write time. The alternative, splitting in an external pipeline,
+handles rows arriving and never rows shrinking: the removal path is exactly
+what fan-out's before-image diff already computes.
+
 **Parent-child can be a join field, not only an embedded array.** (`join`, #60.)
 An embedded array is one document and one write, and the right answer nearly
 always; a join field is for children that are many, change far more often than
@@ -91,16 +100,34 @@ deletes, a quarantined document's replay — and a parent delete cascades throug
 a search, refreshed first, rather than an id list the engine could have built,
 because the engine does not know which children the target holds. A join child
 needs `REPLICA IDENTITY FULL` unless its parent column is part of its key:
-routing comes from the same place identity does. Exactly one parent, one shared
-field, no fan-out on a join table, and a parent id naming anything outside its
-key is refused at config load — the child holds one column and computes the
-parent's id from it alone. Ids must be unique across the shared index, which
+routing comes from the same place identity does. Exactly one parent, one
+shared field, and a parent id naming anything outside its key is refused at
+config load — the child holds one column and computes the parent's id from it
+alone. Ids must be unique across the shared index, which
 config cannot see, and `TRUNCATE` on either table clears its relation only —
 the join field is what tells the halves apart. A table that is both an embedded child
 and a section of its own is warned about at startup rather than refused — a
 load-once index is a legitimate thing to want — because the runner reads its
 rows only as a re-fetch of the owner, so its own index receives the initial
 load and no streamed change.
+
+**A fanned element can be the join parent.** (`join.parent = "{element}"`,
+#180.) Fan-out on a join table stayed refused for one reason: every element of
+a fanned row would need its own routing, and they would all be filed under one
+parent. The exception lifts it by answering it — let each element *be* its
+parent. `parent = "{element}"` is read from the element document rather than
+from the row, so the join field and the routing are derived per document
+instead of per row, on the same code path a column parent uses: the element
+arrives under the fan-out field's name, and the element document is the raw
+row with the element in the array's place, so nothing new renders identity or
+chooses a shard. Every other combination of `fan_out` and `join` stays
+refused, and so does `parent = "{element}"` without `fan_out`. The element is
+rendered through the parent section's own id rule, byte for byte as a parent
+column would be, which is why the parent's ids have to be the element values.
+What it buys is the removal path: a member dropped from the list deletes that
+one element document, on the shard it was on, with no rebuild — a key alone
+names none of a fanned row's parents, so the diff comes from the before-image
+like every other fan-out delete.
 
 **A column can route a document; the rule is the id rule.** (`routing`, #109.)
 Shard co-location arrived as a by-product of `join`, where a child has to live
@@ -232,7 +259,9 @@ keeps the rest visible. A *protective* op is the exception: `pseudonym` writes
 worse than losing it. A value already in the target shape is not a failure,
 so every op is idempotent under at-least-once replay. `split` cannot feed
 `fan_out`, because fan-out reads the raw row — identity is a property of the
-row, as the id paragraph says. `chrono`, already in the build through the
+row, as the id paragraph says; a delimited column that should become documents
+is cut by `fan_out.by` (#180) on that raw row instead, which is the same rule
+kept rather than an exception to it. `chrono`, already in the build through the
 OpenSearch client, parses the dates: a strptime calendar is not protocol code.
 
 A seventh op, `lookup` (#142), maps a status code to the label it is searched

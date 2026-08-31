@@ -3074,5 +3074,132 @@ check "a row moved to another parent counts there" "$(os_field e2e_agg 3 open_de
 check "and no longer where it was" "$(os_field e2e_agg 2 open_deals)" "0"
 stop_sync
 
+echo -e "\n\033[1m== 38. a delimited column fanned out, each element its own join parent ==\033[0m"
+# The two lifts of #180 in one shape: fan_out cuts a text column on `by`, and
+# `parent = "{element}"` files every element document under the parent the
+# element names. The selling point is the removal path — a member dropped from
+# the list loses its document without a rebuild — so that is what is asserted.
+drop_idle_probe_slots
+ECONFIG=$(mktemp /tmp/pg2osync-e2e-element.XXXXXX)
+EMAPPING=$(dirname "$ECONFIG")/pg2osync-e2e-element-mapping-$TAG.json
+ESLOT=pg2osync_e2e_element
+cat > "$ECONFIG" <<TOML
+[source]
+url_env = "PG2OSYNC_SOURCE_URL"
+slot_name = "$ESLOT"
+publication = "${ESLOT}_pub"
+
+[target]
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
+
+[metrics]
+bind = "127.0.0.1:$((PORT_BASE + 39))"
+
+[sync.enote]
+table = "public.enotes"
+index = "e2e_element"
+id = "note-{id}"
+mapping_file = "pg2osync-e2e-element-mapping-$TAG.json"
+
+[sync.enote.join]
+field = "relation"
+name = "note"
+
+[sync.elink]
+table = "public.elinks"
+index = "e2e_element"
+id = "link-{id}"
+
+[sync.elink.fan_out]
+field = "member_ids"
+by = ","
+id = "link-{id}-{member_ids}"
+
+[sync.elink.join]
+field = "relation"
+name = "member"
+parent = "{element}"
+TOML
+# Three shards, for the reason section 24 gives: on one shard every document
+# is reachable unrouted, and a routing assertion would prove nothing.
+cat > "$EMAPPING" <<'JSON'
+{"settings":{"number_of_shards":3},"mappings":{"properties":{"relation":{"type":"join","relations":{"note":["member"]}}}}}
+JSON
+element_cleanup() {
+  sync_kill
+  pg "SELECT pg_drop_replication_slot('$ESLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$ESLOT');" > /dev/null 2>&1 || true
+  pg "DROP PUBLICATION IF EXISTS ${ESLOT}_pub; DROP TABLE IF EXISTS elinks, enotes;" > /dev/null 2>&1 || true
+  rm -f "$ECONFIG" "$EMAPPING"
+}
+trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup; init_cleanup; fan_cleanup; bid_cleanup; shape_cleanup; where_cleanup; join_cleanup; union_cleanup; events_cleanup; pipe_cleanup; append_cleanup; routing_cleanup; reindex_cleanup; rate_cleanup; through_cleanup; ra_cleanup; pseudo_cleanup; rl_cleanup; otel_cleanup; agg_cleanup; element_cleanup' EXIT
+
+pg "DROP TABLE IF EXISTS elinks, enotes;" > /dev/null 2>&1
+pg "CREATE TABLE enotes(id bigint primary key, title text);" > /dev/null
+pg "CREATE TABLE elinks(id bigint primary key, member_ids text);" > /dev/null
+# the diff that removes a dropped member comes from the old row
+pg "ALTER TABLE elinks REPLICA IDENTITY FULL;" > /dev/null 2>&1
+pg "INSERT INTO enotes VALUES (1,'first'),(2,'second'),(3,'third');" > /dev/null
+# spaces on purpose: fan-out trims each piece, as the split transform does
+pg "INSERT INTO elinks VALUES (9,'1, 2');" > /dev/null
+pg "DROP PUBLICATION IF EXISTS ${ESLOT}_pub; CREATE PUBLICATION ${ESLOT}_pub FOR TABLE enotes, elinks;" > /dev/null 2>&1
+curl -s -XDELETE "$OS/e2e_element?ignore_unavailable=true" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/postgres-$ESLOT" > /dev/null
+# the element parent is the only shape fan_out and join combine in: without
+# the fan_out block the same file has to be refused
+sed '/^\[sync\.elink\.fan_out\]/,/^$/d' "$ECONFIG" > "${ECONFIG}.bad"
+if $BIN validate -c "${ECONFIG}.bad" > /dev/null 2>&1; then
+  bad "validate accepted parent = \"{element}\" on a section that does not fan out"
+else
+  ok "validate refuses an element parent without fan_out"
+fi
+rm -f "${ECONFIG}.bad"
+if $BIN validate -c "$ECONFIG" 2>&1 | grep -q "all checks passed"; then
+  ok "validate accepts a fanned section whose elements are the parents"
+else
+  bad "validate refused the element-parent pair"
+fi
+sync_spawn "$ECONFIG"
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_count e2e_element)" = "5" ] && break
+  sleep 1
+done
+check "the load writes three notes and one document per member" "$(os_count e2e_element)" "5"
+check "an element document is found under the note it names" "$(os_rstatus e2e_element link-9-1 note-1)" "200"
+check "and so is the second one, on the other note's shard" "$(os_rstatus e2e_element link-9-2 note-2)" "200"
+check "the element is the trimmed piece, under the fan-out field" \
+  "$(os_routed e2e_element link-9-2 note-2 member_ids)" "2"
+check "and it names its own parent" \
+  "$(curl -s "$OS/e2e_element/_doc/link-9-2?routing=note-2" | jqf "json.dumps(d['_source']['relation'], sort_keys=True)")" \
+  '{"name": "member", "parent": "note-2"}'
+check "has_child finds exactly the notes a member document points at" \
+  "$(curl -s "$OS/e2e_element/_search" -H 'Content-Type: application/json' \
+      -d '{"query":{"has_child":{"type":"member","query":{"match_all":{}}}}}' | jqf "d['hits']['total']['value']")" "2"
+
+# the acceptance test for the feature: a member leaves the list and its
+# document goes with it, on the shard it was on, while the rest stay
+pg "UPDATE elinks SET member_ids='1,3' WHERE id=9;" > /dev/null
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_rstatus e2e_element link-9-3 note-3)" = "200" ] && break
+  sleep 1
+done
+check "a member added to the list gains a document" "$(os_rstatus e2e_element link-9-3 note-3)" "200"
+synced 2> /dev/null || { sleep 2; refresh; }
+check "the member dropped from the list loses its document" "$(os_rstatus e2e_element link-9-2 note-2)" "404"
+check "and the member that stayed is untouched" "$(os_rstatus e2e_element link-9-1 note-1)" "200"
+refresh
+check "one document per member, and no orphan" "$(os_count e2e_element)" "5"
+
+pg "DELETE FROM elinks WHERE id=9;" > /dev/null
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_count e2e_element)" = "3" ] && break
+  sleep 1
+done
+check "a deleted row takes every element document with it" "$(os_count e2e_element)" "3"
+stop_sync
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

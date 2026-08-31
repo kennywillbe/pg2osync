@@ -587,6 +587,11 @@ impl TransformSpec {
 #[serde(deny_unknown_fields)]
 pub struct FanOut {
     pub field: String,
+    /// The separator that cuts a delimited string column into elements, with
+    /// the `split` transform's semantics. Unset means the column already
+    /// holds an array, which is what fan-out started as.
+    #[serde(default)]
+    pub by: Option<String>,
     pub id: String,
 }
 
@@ -599,10 +604,31 @@ pub struct JoinSpec {
     pub field: String,
     /// This section's relation name inside that field.
     pub name: String,
-    /// Column on THIS table holding the parent's key. Its presence is what
-    /// makes this section a child; its absence makes it the parent.
+    /// Column on THIS table holding the parent's key, or [`ELEMENT_PARENT`]
+    /// on a fanned section. Its presence is what makes this section a child;
+    /// its absence makes it the parent.
     #[serde(default)]
     pub parent: Option<String>,
+}
+
+/// The `parent` that names the fanned element instead of a column: every
+/// element document files under and routes to its own value.
+pub const ELEMENT_PARENT: &str = "{element}";
+
+impl JoinSpec {
+    pub fn is_element_parent(&self) -> bool {
+        self.parent.as_deref() == Some(ELEMENT_PARENT)
+    }
+
+    /// The column the parent's key is read from. For an element parent that
+    /// is the fan-out field, which every element document carries in the
+    /// array's place, so one rule serves both shapes.
+    pub fn parent_column<'a>(&'a self, fan_out: Option<&'a FanOut>) -> Option<&'a str> {
+        match self.parent.as_deref()? {
+            ELEMENT_PARENT => fan_out.map(|fan| fan.field.as_str()),
+            column => Some(column),
+        }
+    }
 }
 
 /// A child table joined into the parent document.
@@ -974,11 +1000,21 @@ impl AppConfig {
                 if join.parent.as_deref() == Some("") {
                     anyhow::bail!("[sync.{key}.join] parent must not be empty");
                 }
-                if tbl.fan_out.is_some() {
+                // The one shape that answers the refusal below: the element is
+                // the parent, so each element document has a routing of its
+                // own and is filed under the value it carries.
+                if join.is_element_parent() && tbl.fan_out.is_none() {
+                    anyhow::bail!(
+                        "[sync.{key}.join] parent {ELEMENT_PARENT:?} names the element of a \
+                         fanned row, but this section has no fan_out"
+                    );
+                }
+                if tbl.fan_out.is_some() && !join.is_element_parent() {
                     anyhow::bail!(
                         "[sync.{key}] fan_out and join cannot be combined: every element of a \
                          fanned row would need its own routing, and they would all be filed \
-                         under one parent"
+                         under one parent. Set parent = {ELEMENT_PARENT:?} to file each \
+                         element under itself"
                     );
                 }
                 if join.parent.is_some() && tbl.mapping_file.is_some() {
@@ -1119,6 +1155,11 @@ impl AppConfig {
                 }
                 if fan.field.is_empty() {
                     anyhow::bail!("[sync.{key}.fan_out] field must not be empty");
+                }
+                // an empty separator would cut between every character, as
+                // the `split` transform refuses one for the same reason
+                if fan.by.as_deref() == Some("") {
+                    anyhow::bail!("[sync.{key}.fan_out] by must not be empty");
                 }
                 // every document a row fans out into goes to one index, so the
                 // template renders from the row, where the array is a value
@@ -1856,8 +1897,8 @@ fn check_shared_index(index: &str, members: &[(Label, &TableSync)]) -> Result<()
         {
             anyhow::bail!(
                 "{parent_label} id {spec:?} names a column outside the primary key, so a \
-                 join child cannot compute the parent's document id from its own {column} \
-                 column. Give the parent an id that names only its key"
+                 join child cannot compute the parent's document id from {column} alone. \
+                 Give the parent an id that names only its key"
             );
         }
     }
@@ -3123,6 +3164,68 @@ parent = "customer_id"
                 "[sync.users] routing is an OpenSearch and Elasticsearch feature, which \
                  Meilisearch has no equivalent for; remove routing for this target"
             ),
+            "{refusal}"
+        );
+    }
+
+    /// The pair with the child fanned over a delimited column, each element
+    /// filed under itself: the one shape `fan_out` and `join` combine in.
+    fn element_parent_pair() -> String {
+        PAIR.replace("parent = \"customer_id\"", "parent = \"{element}\"")
+            .replace(
+                "id = \"order-{id}\"",
+                "id = \"order-{id}\"\n[sync.orders.fan_out]\nfield = \"customer_ids\"\n\
+                 by = \",\"\nid = \"order-{id}-{customer_ids}\"",
+            )
+    }
+
+    #[test]
+    fn a_fanned_element_can_be_the_join_parent_and_nothing_else_can() {
+        let cfg = parse(&element_parent_pair()).expect("an element parent is a join child");
+        let orders = cfg.sync.get("orders").expect("the child section");
+        let join = orders.join.as_ref().expect("its join");
+        assert!(join.is_element_parent());
+        assert_eq!(
+            join.parent_column(orders.fan_out.as_ref()),
+            Some("customer_ids"),
+            "the parent's key is read from the element, which the fan-out field carries"
+        );
+
+        let refusal = refused(
+            &PAIR.replace("parent = \"customer_id\"", "parent = \"{element}\""),
+            "an element parent without elements",
+        );
+        assert!(
+            refusal.contains("[sync.orders.join] parent \"{element}\"")
+                && refusal.contains("no fan_out"),
+            "{refusal}"
+        );
+
+        let refusal = refused(
+            &element_parent_pair().replace("parent = \"{element}\"", "parent = \"customer_id\""),
+            "a fanned row filed under one column",
+        );
+        assert!(
+            refusal.contains("fan_out and join cannot be combined")
+                && refusal.contains("parent = \"{element}\""),
+            "the refusal points at the shape that works: {refusal}"
+        );
+
+        let refusal = refused(
+            &element_parent_pair().replace("[target]", "[target]\nflavor = \"meilisearch\""),
+            "a target with no parent-child model",
+        );
+        assert!(
+            refusal.contains("Meilisearch has no equivalent"),
+            "{refusal}"
+        );
+
+        let refusal = refused(
+            &element_parent_pair().replace("by = \",\"", "by = \"\""),
+            "a separator that cuts between every character",
+        );
+        assert!(
+            refusal.contains("[sync.orders.fan_out] by must not be empty"),
             "{refusal}"
         );
     }
