@@ -170,10 +170,6 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Advisory: the suite stops at reconcile, which the Elasticsearch sink
-    # cannot run (kennywillbe/pg2osync#118). The cell stays so the gap keeps
-    # being reported rather than forgotten.
-    continue-on-error: true
     services:
       # Its own job rather than a second row of compat-postgres: OpenSearch
       # refuses to start with an xpack setting it does not know, so one

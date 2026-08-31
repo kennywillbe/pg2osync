@@ -368,17 +368,27 @@ impl ElasticsearchSink {
         })
     }
 
-    /// Create `name` with `mapping` unless it exists; whether this call made it.
+    /// Create `name` with `mapping` unless it already resolves; whether this
+    /// call made it.
     ///
-    /// One PUT rather than an exists check first: Elasticsearch answers a
-    /// second create with `resource_already_exists_exception`, which is the
-    /// same end state as finding it — whoever won the race, the index is
-    /// there.
+    /// The HEAD comes first because a name that resolves is not always an
+    /// index: with `require_alias` the section names an alias, and a PUT on an
+    /// alias is `invalid_index_name_exception` — a 400 that no amount of
+    /// retrying turns into the index that is already there. HEAD resolves the
+    /// alias, so the answer is the one that matters: something is there to
+    /// write to.
+    ///
+    /// A create that loses a race to another writer still lands as
+    /// `resource_already_exists_exception`, which is the same end state as
+    /// finding it, so that is not an error either.
     async fn create_index_if_absent(
         &self,
         name: &str,
         mapping: Option<&Value>,
     ) -> Result<bool, CoreError> {
+        if self.index_exists(name).await? {
+            return Ok(false);
+        }
         // without a body the index takes whatever Elasticsearch infers, or
         // whatever index template the operator already manages
         let create = mapping.map(|m| crate::mapping::create_body(m).to_string());
@@ -387,7 +397,9 @@ impl ElasticsearchSink {
             .await?;
         let already = body["error"]["type"] == json!("resource_already_exists_exception");
         if !(status == 200 || already) {
-            return Err(CoreError::Sink(format!("create index {name}: {status}")));
+            return Err(CoreError::Sink(format!(
+                "create index {name}: {status} {body}"
+            )));
         }
         Ok(!already)
     }
@@ -1597,6 +1609,7 @@ mod tests {
     #[tokio::test]
     async fn a_rejects_index_that_cannot_be_created_fails_the_quarantine() {
         let target = FakeTarget::start(|line, _sent| match line {
+            "HEAD /.pg2osync_rejects" => (404, ""),
             "PUT /.pg2osync_rejects" => (500, r#"{"error":{"type":"illegal_state_exception"}}"#),
             _ => (201, "{}"),
         })
@@ -1606,12 +1619,21 @@ mod tests {
             matches!(result, Err(CoreError::Sink(_))),
             "an index that was never created took a document: {result:?}"
         );
-        assert_eq!(target.seen(), vec!["PUT /.pg2osync_rejects".to_string()]);
+        assert_eq!(
+            target.seen(),
+            vec![
+                "HEAD /.pg2osync_rejects".to_string(),
+                "PUT /.pg2osync_rejects".to_string()
+            ]
+        );
     }
 
     #[tokio::test]
     async fn a_rejects_index_that_already_exists_is_not_created_twice() {
+        // absent when probed and there by the time the create lands, which is
+        // the race a second writer wins: the end state is the one asked for
         let target = FakeTarget::start(|line, _sent| match line {
+            "HEAD /.pg2osync_rejects" => (404, ""),
             "PUT /.pg2osync_rejects" => (
                 400,
                 r#"{"error":{"type":"resource_already_exists_exception"}}"#,
@@ -1624,7 +1646,39 @@ mod tests {
             .quarantine(&[a_rejection()])
             .await
             .expect("the existing index takes the document");
-        assert_eq!(target.seen().len(), 2, "{:?}", target.seen());
+        assert_eq!(target.seen().len(), 3, "{:?}", target.seen());
+    }
+
+    #[tokio::test]
+    async fn a_section_that_names_an_alias_creates_nothing_and_starts() {
+        // The 400 is what Elasticsearch answers a PUT on an alias name, and it
+        // is not the already-exists it tolerates: sending the PUT at all
+        // halted every require_alias run before the first write
+        // (kennywillbe/pg2osync#178).
+        let target = FakeTarget::start(|line, _sent| match line {
+            "HEAD /live" => (200, ""),
+            "PUT /live" => (
+                400,
+                r#"{"error":{"type":"invalid_index_name_exception",
+                    "reason":"Invalid index name [live], already exists as alias"}}"#,
+            ),
+            _ => (200, r#"{"acknowledged":true}"#),
+        })
+        .await;
+        target
+            .sink_with(true)
+            .ensure_ready(&[IndexSpec {
+                name: "live".to_string(),
+                mapping: None,
+                pattern: false,
+            }])
+            .await
+            .expect("a section pointed at an alias starts");
+        assert!(
+            !target.seen().contains(&"PUT /live".to_string()),
+            "an alias that already resolves is never created: {:?}",
+            target.seen()
+        );
     }
 
     #[tokio::test]

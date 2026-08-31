@@ -19,7 +19,7 @@ so a regression there would ship unnoticed.
 | MariaDB | 11.8 LTS | nightly |
 | OpenSearch | 2.19.6 | every pull request |
 | OpenSearch | other 2.x | not tested |
-| Elasticsearch | 8.19.20 | nightly, full suite — advisory until [#118](https://github.com/kennywillbe/pg2osync/issues/118) |
+| Elasticsearch | 8.19.20 | nightly, full suite |
 | Elasticsearch | 7.x | not tested, known gaps |
 | pgvector | pg17 (PostgreSQL 17) | every pull request |
 | pgvector | other PostgreSQL majors | not tested |
@@ -65,13 +65,14 @@ compiles once here. With OpenSearch and pgvector answering it on every pull
 request and Qdrant inside its own cell, all five targets answer the same
 contract.
 
-Two cells are marked advisory, because the first nightly matrix found a bug
-in each of them. The Elasticsearch suite reaches `reconcile`, which that sink
-cannot run ([#118](https://github.com/kennywillbe/pg2osync/issues/118)), so
-everything after that section is unverified there. The Meilisearch smoke suite
-reaches the restart, which fails because that sink cannot start twice against
-one index ([#122](https://github.com/kennywillbe/pg2osync/issues/122)). Both
-cells are kept red rather than trimmed: the gap is the finding.
+One cell is marked advisory. The Meilisearch smoke suite reaches the restart,
+which fails because that sink cannot start twice against one index
+([#122](https://github.com/kennywillbe/pg2osync/issues/122)); the cell is kept
+red rather than trimmed, because the gap is the finding. The Elasticsearch cell
+was advisory for the same reason until the last write it could not make went
+green: a section pointed at an alias, which `require_alias` makes the normal
+shape, halted before its first write
+([#178](https://github.com/kennywillbe/pg2osync/issues/178)).
 
 The matrix also runs on a pull request that touches the workflow, those
 scripts, a sink crate or the `Sink` contract, so the change that would break it
