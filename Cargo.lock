@@ -1750,6 +1750,7 @@ dependencies = [
  "pg2osync-tls",
  "reqwest",
  "serde_json",
+ "sha1 0.11.0",
  "tokio",
  "tokio-postgres",
  "tokio-postgres-rustls",

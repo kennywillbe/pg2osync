@@ -38,13 +38,13 @@ OpenSearch`, `e2e MySQL to OpenSearch`, `e2e several sources in one process`
 health and isolation are proved), `e2e PostgreSQL to pgvector`, the container
 image build, the helm
 lints, the book (`docs.yml`), your pull request title (`pr-title.yml`),
-`cargo audit` when a Cargo file moved, and the eight compatibility cells when
+`cargo audit` when a Cargo file moved, and the nine compatibility cells when
 CI would run them — that is, when you touched `.github/workflows/compat.yml`
 or `dev/e2e-*.sh`. `--matrix` runs those cells anyway; `--no-matrix` skips
 them, which is worth it only when you know they cannot be affected. They are
 throwaway containers on ports of their own (PostgreSQL 15433, OpenSearch 9201,
-Elasticsearch 9202, Meilisearch 7701, MySQL/MariaDB 13307), so the dev stack
-keeps running beside them.
+Elasticsearch 9202, Meilisearch 7701, Qdrant 6334, MySQL/MariaDB 13307), so the
+dev stack keeps running beside them.
 
 The Elasticsearch and Meilisearch cells are advisory — `compat.yml` marks them
 `continue-on-error` while [#118](https://github.com/kennywillbe/pg2osync/issues/118)
@@ -71,7 +71,7 @@ CI seeds its service containers and removed when the job ends; the pipelines
 the suites start get a block of localhost ports of their own too, because they
 run on your machine rather than in a container. Such a run takes no lock and
 leaves the dev stack alone, so it can go beside a shared run or another
-isolated one. It also runs the eight compatibility cells two at a time
+isolated one. It also runs the nine compatibility cells two at a time
 rather than one after the other, because each of them now has containers and
 ports of its own; `--jobs <n>` sets how many, and more than two is what a
 larger Docker VM buys you. A cell measures about 1 GB — 0.9 of it OpenSearch
@@ -105,6 +105,12 @@ Deeper probes are not part of CI and stay manual:
 It is also where the sink conformance kit runs against that target; the same
 kit runs against OpenSearch as a step of the `e2e PostgreSQL to OpenSearch`
 job, so a change to `crates/core/src/testkit.rs` is answered by two targets.
+
+`e2e-qdrant.sh` is the suite to run when the Qdrant sink changes, and the third
+place the conformance kit runs. The full PostgreSQL suite cannot cover that
+target either — no mappings, no joins, no per-row collections — so this is
+where its load, its similarity search, its state collection and its versioned
+truncate are exercised.
 
 `e2e-meili-smoke.sh` is the suite to run when the Meilisearch sink changes.
 The full PostgreSQL suite cannot cover that target — it asserts over mappings,

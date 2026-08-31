@@ -124,8 +124,10 @@ pub fn embedded_children_with_own_section(cfg: &AppConfig) -> Vec<String> {
 /// mappings, where nothing could create the index a row chose with the shape
 /// it should have.
 pub fn check_rejection_policy(cfg: &AppConfig, sink: &dyn Sink) -> Result<()> {
-    if matches!(cfg.target.flavor.as_str(), "meilisearch" | "postgres")
-        && let Some((key, tbl)) = cfg.sync.iter().find(|(_, t)| t.is_templated())
+    if matches!(
+        cfg.target.flavor.as_str(),
+        "meilisearch" | "postgres" | "qdrant"
+    ) && let Some((key, tbl)) = cfg.sync.iter().find(|(_, t)| t.is_templated())
     {
         bail!(
             "[sync.{key}] index {:?} chooses an index per row, which needs a target that can \
@@ -206,9 +208,16 @@ pub fn build_sink(cfg: &AppConfig, target_password: Option<String>) -> Result<Ar
         "postgres" => Arc::new(pg2osync_sink::postgres::PostgresSink::new(
             pg2osync_sink::postgres::PostgresSinkConfig { url, retry },
         )?),
+        "qdrant" => Arc::new(pg2osync_sink::qdrant::QdrantSink::new(
+            pg2osync_sink::qdrant::QdrantSinkConfig {
+                url: url.clone(),
+                api_key: api_key.or(target_password),
+                retry,
+            },
+        )?),
         other => bail!(
             "unsupported target.flavor {other:?}; expected \"opensearch\", \
-             \"elasticsearch\", \"meilisearch\" or \"postgres\""
+             \"elasticsearch\", \"meilisearch\", \"postgres\" or \"qdrant\""
         ),
     };
     Ok(sink)

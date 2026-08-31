@@ -256,6 +256,56 @@ jobs:
         env:
           MEILI_MASTER_KEY: e2e-master-key
 
+  compat-qdrant:
+    name: PostgreSQL 17 to Qdrant v1.15.1
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      qdrant:
+        image: qdrant/qdrant:v1.15.1
+        env:
+          # a throwaway key, set so the sink's api-key path is the one tested
+          QDRANT__SERVICE__API_KEY: e2e-api-key
+        ports: ["6333:6333"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: pg2osync
+          path: target/release
+      - run: chmod +x target/release/pg2osync
+      # This suite ends in the sink conformance kit, which is a cargo test
+      # rather than a section of the script, so this cell needs a toolchain
+      # where the others need only the binary.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
+      - name: Start PostgreSQL
+        run: |
+          docker run -d --name dev-postgres-1 -p 15432:5432 \
+            -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_DB=sourcedb postgres:17 \
+            -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10
+          for _ in $(seq 1 60); do
+            docker exec dev-postgres-1 pg_isready -U postgres -d sourcedb && break
+            sleep 2
+          done
+      - run: docker exec -i dev-postgres-1 psql -U postgres -d sourcedb < dev/seed.sql
+      - name: Wait for Qdrant
+        run: |
+          for _ in $(seq 1 60); do
+            curl -s -H "api-key: e2e-api-key" http://localhost:6333/healthz | grep -q passed && exit 0
+            sleep 2
+          done
+          echo "Qdrant never became ready"; exit 1
+      # Qdrant has no mappings, no joins and no per-row collections, so the full
+      # suite cannot run against it; this is what it does support.
+      - run: ./dev/e2e-qdrant.sh
+        env:
+          QDRANT_API_KEY: e2e-api-key
+
   compat-mysql:
     name: MySQL 8.4 to OpenSearch 2.19.6
     needs: build
@@ -378,7 +428,7 @@ jobs:
     name: file a nightly failure
     needs:
       [build, compat-postgres, compat-derived, compat-elasticsearch,
-       compat-meilisearch, compat-mysql, compat-mariadb]
+       compat-meilisearch, compat-qdrant, compat-mysql, compat-mariadb]
     # A pull request already reports itself on the pull request; only the
     # scheduled run has nobody watching it.
     if: failure() && github.event_name == 'schedule'

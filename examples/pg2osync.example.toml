@@ -37,7 +37,7 @@ publication = "pg2osync_pub"
 # poll_interval_secs = 30
 
 [target]
-# "opensearch" (default), "elasticsearch" or "meilisearch"
+# "opensearch" (default), "elasticsearch", "meilisearch", "postgres" or "qdrant"
 flavor = "opensearch"
 url = "http://localhost:9200"
 username = "admin"

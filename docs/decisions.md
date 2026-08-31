@@ -624,8 +624,8 @@ every copy row before it is durable.
 It stays at one request by default. Raising it multiplies the load placed on
 someone's production target, which is not a default anyone should inherit
 unmeasured, and it needs a target that decides between two writes by their
-version: Meilisearch keeps whichever landed last, so it refuses the setting
-outright rather than reordering writes quietly.
+version: Meilisearch and Qdrant keep whichever landed last, so they refuse the
+setting outright rather than reordering writes quietly.
 
 **A re-snapshot is a subcommand, not a signal table.** Debezium triggers an
 ad-hoc snapshot by writing to a table in the user's database. pg2osync will not
@@ -886,7 +886,10 @@ position — which is what a zero-downtime re-index runs, and what splitting
 tables across instances means. A local file breaks on ephemeral containers, and a table in
 the source database pollutes the user's schema and risks replicating itself.
 Meilisearch has nowhere to put an arbitrary document, so it uses a
-write-then-rename state file — the documented exception.
+write-then-rename state file — the documented exception. A PostgreSQL target
+keeps the same document in a `pg2osync_state` table and Qdrant in a
+`pg2osync_state` collection: different spellings of the one rule, that only the
+target is visible to both the process that stopped and the one that takes over.
 
 **One position format for every source.** The document stores an ordering token
 plus the source's own textual position. Documents written by earlier versions,
@@ -1243,6 +1246,68 @@ things stay the caller's — the documents its target accepts, and one it
 refuses — because only the caller knows them, and a target with no document it
 can refuse reports that check as skipped rather than faking it. Behind a
 feature flag, so a release binary carries none of it.
+
+**A document id becomes a Qdrant point id as a UUIDv5, and the id itself lives
+in the payload.** (#187.) A point id there is a `u64` or a UUID and nothing
+else, so the ids this pipeline files documents under — a primary key, a derived
+`tenant-{tenant_id}-{id}`, a content hash for an append-only table — cannot be
+one. The mapping has to be *deterministic*, because delivery is at-least-once:
+the same document arrives again after every restart, and a random or counted id
+would insert a second point instead of overwriting the first. A UUIDv5 over a
+fixed namespace is that function, and the namespace is a constant rather than a
+setting, since changing it would file every document under a new point and
+leave the old one behind.
+
+One rule for every id, including an id that reads as an integer. Mapping those
+onto `u64` points would have been free, and it would have meant `7` and `"7"`
+landing on different points depending on which spelling the source produced.
+The original id is kept in the reserved `_pg2osync_id` payload field, which is
+what lets a read-back, a filter and a quarantined document name the document
+rather than a hash of it.
+
+**Qdrant is last-write-wins, and the sink says so rather than pretending
+otherwise.** Its upsert overwrites whatever the point held; there is no
+external version to compare against, and the only honest alternative — reading
+each point's stored position before writing it — is not atomic under
+concurrency either, just slower. So `orders_by_version` is false here, which is
+what refuses `write_concurrency` above 1: with one write in flight the engine
+delivers the operations of one document in order, and a full-document upsert
+replayed after a restart is the same document again.
+
+That is a different question from whether a truncate can happen *at* a
+position, and the two used to be one flag. Every point still carries a
+`_version` payload field, and a source-side `TRUNCATE` is a delete-by-filter
+over it — `_version <= the truncate's position`, plus the points that carry
+none — with a payload index created at `ensure_ready` so the filter is an index
+lookup rather than a scan. A target can record what it holds and clear up to a
+point without being able to arbitrate two writes in flight, so `Sink` asks the
+two questions separately (`orders_by_version`, `truncates_at_a_position`) and
+the conformance kit gates the truncate check on the second.
+
+**Qdrant's vectors are bring-your-own-embedding, and the collection's *named
+vectors* are the mapping.** The section's `mapping_file` is the JSON of
+`PUT /collections/<name>`, so the operator declares the dimensions and the
+distance the way they declare a mapping today; a document field whose name
+matches one of the declared vectors is written as that vector, and every other
+field becomes payload. One rule, no second configuration block, and — as on
+pgvector — the sink calls no model and computes nothing. A row whose embedding
+has not been computed yet is stored as a point without that vector: it is found
+by id and by filter, and it joins the similarity search the moment the vector
+arrives, which is better than quarantining every row an embedding worker has
+not reached. A value that is present but is not an array of the declared length
+is a permanent rejection naming the field.
+
+A write is `PUT /collections/<name>/points?wait=true`: with `wait=false` Qdrant
+answers `acknowledged` before the operation is applied, and acknowledging a
+source position on that would lose data on a crash. Batch upserts are
+all-or-nothing rather than per item, so a request the target refuses is retried
+one point at a time — this target's savepoint — and each refusal is attributed
+to the document that caused it while the rest of the batch still lands. What
+Qdrant does not have is refused by name: `join`, `routing`, `pipeline`, a
+per-row collection, `reconcile`, and `reindex` with `require_alias` — Qdrant
+does have collection aliases, so that last one is a gap in this sink rather
+than in the target, and a rebuild there is the same "build beside it and
+repoint your readers" recipe the PostgreSQL target gives.
 
 **Sinks are search targets, and nothing else.** pgstream and Conduit fan the
 same change stream out to webhooks, and the request here was a `webhook` sink

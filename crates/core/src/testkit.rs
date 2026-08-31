@@ -80,15 +80,14 @@ impl SinkTestHarness {
             .map_err(named("idempotent replay"))?;
         report.passed.push("idempotent replay".into());
 
-        if sink.orders_by_version() {
+        if sink.truncates_at_a_position() {
             self.versioned_truncate(sink)
                 .await
                 .map_err(named("versioned truncate"))?;
             report.passed.push("versioned truncate".into());
         } else {
-            // A target that keeps whichever write landed last has no ordering
-            // for a truncate to respect either, and `write_concurrency` is
-            // already refused against it.
+            // A target that records no position for the documents it holds has
+            // nothing for a truncate to compare against.
             report.skipped.push("versioned truncate".into());
         }
 

@@ -33,7 +33,7 @@
 #   docs                 the book builds                       (docs.yml)
 #   pr-title             the title is a conventional commit    (pr-title.yml)
 #   audit                dependencies have no known advisories (audit.yml)
-#   compat-*             the eight compatibility cells         (compat.yml)
+#   compat-*             the nine compatibility cells         (compat.yml)
 #
 # By default the e2e jobs use the shared dev stack (dev/docker-compose.yml plus
 # the mysql-test container): nothing to pull, nothing to start, and the suites
@@ -90,7 +90,11 @@ COMPAT_PGSINK_PORT=15435
 COMPAT_OS_PORT=9201
 COMPAT_ES_PORT=9202
 COMPAT_MEILI_PORT=7701
+COMPAT_QDRANT_PORT=6334
 COMPAT_MYSQL_PORT=13307
+# A throwaway key, as compat.yml sets on its cell, so the sink's api-key path is
+# the one exercised rather than an unauthenticated one.
+QDRANT_E2E_KEY=e2e-api-key
 
 ONLY=""
 SKIP=""
@@ -105,7 +109,8 @@ ALL_JOBS="lint msrv e2e-postgres e2e-mysql e2e-multi-source e2e-postgres-sink
 docker helm docs
 pr-title audit
 compat-postgres15 compat-timescaledb compat-supabase compat-elasticsearch
-compat-meilisearch compat-mysql84 compat-mariadb106 compat-mariadb118"
+compat-meilisearch compat-qdrant compat-mysql84 compat-mariadb106
+compat-mariadb118"
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 note() { printf '  %s\n' "$*"; }
@@ -155,6 +160,7 @@ COMPAT_SUPABASE_IMAGE=$(first_match 's|^ *pg_image: \(supabase/postgres:[^ ]*\)$
 COMPAT_OS_IMAGE=$(first_match 's|^ *image: \(opensearchproject/opensearch:[^ ]*\)$|\1|p' "$COMPAT_WF")
 COMPAT_ES_IMAGE=$(first_match 's|^ *image: \(docker.elastic.co/elasticsearch/elasticsearch:[^ ]*\)$|\1|p' "$COMPAT_WF")
 COMPAT_MEILI_IMAGE=$(first_match 's|^ *image: \(getmeili/meilisearch:[^ ]*\)$|\1|p' "$COMPAT_WF")
+COMPAT_QDRANT_IMAGE=$(first_match 's|^ *image: \(qdrant/qdrant:[^ ]*\)$|\1|p' "$COMPAT_WF")
 COMPAT_MYSQL_IMAGE=$(first_match 's|^ *image: \(mysql:[^ ]*\)$|\1|p' "$COMPAT_WF")
 COMPAT_MARIADB_1=$(sed -n 's|^ *image: \(mariadb:[^ ]*\)$|\1|p' "$COMPAT_WF" | sed -n 1p)
 COMPAT_MARIADB_2=$(sed -n 's|^ *image: \(mariadb:[^ ]*\)$|\1|p' "$COMPAT_WF" | sed -n 2p)
@@ -162,8 +168,8 @@ COMPAT_MARIADB_2=$(sed -n 's|^ *image: \(mariadb:[^ ]*\)$|\1|p' "$COMPAT_WF" | s
 for name in PG_IMAGE OS_IMAGE MYSQL_IMAGE PGVECTOR_IMAGE MSRV CARGO_MSRV MDBOOK_VERSION \
   TITLE_PATTERN AUDIT_CMD COMPAT_PG15_IMAGE COMPAT_PG_IMAGE \
   COMPAT_TIMESCALE_IMAGE COMPAT_SUPABASE_IMAGE COMPAT_OS_IMAGE \
-  COMPAT_ES_IMAGE COMPAT_MEILI_IMAGE COMPAT_MYSQL_IMAGE COMPAT_MARIADB_1 \
-  COMPAT_MARIADB_2; do
+  COMPAT_ES_IMAGE COMPAT_MEILI_IMAGE COMPAT_QDRANT_IMAGE COMPAT_MYSQL_IMAGE \
+  COMPAT_MARIADB_1 COMPAT_MARIADB_2; do
   eval "value=\${$name}"
   [ -n "$value" ] || { echo "could not read $name out of the workflow files" >&2; exit 2; }
 done
@@ -210,6 +216,7 @@ cell_use() {
     CELL_OS_PORT=0
     CELL_ES_PORT=0
     CELL_MEILI_PORT=0
+    CELL_QDRANT_PORT=0
     CELL_MYSQL_PORT=0
   else
     CELL=$CELL_BASE
@@ -218,6 +225,7 @@ cell_use() {
     CELL_OS_PORT=$COMPAT_OS_PORT
     CELL_ES_PORT=$COMPAT_ES_PORT
     CELL_MEILI_PORT=$COMPAT_MEILI_PORT
+    CELL_QDRANT_PORT=$COMPAT_QDRANT_PORT
     CELL_MYSQL_PORT=$COMPAT_MYSQL_PORT
   fi
   CELL_PG=$CELL-postgres
@@ -225,6 +233,7 @@ cell_use() {
   CELL_OS=$CELL-opensearch
   CELL_ES=$CELL-elasticsearch
   CELL_MEILI=$CELL-meilisearch
+  CELL_QDRANT=$CELL-qdrant
   CELL_MYSQL=$CELL-mysql
 }
 cell_use default
@@ -501,6 +510,7 @@ os_green() { curl -s "$1/_cluster/health" | grep -q green; }
 os_ready() { curl -s "$1/_cluster/health" | grep -q '"status":"\(green\|yellow\)"'; }
 es_yellow() { curl -sf "$1/_cluster/health?wait_for_status=yellow"; }
 meili_up() { curl -s "$1/health" | grep -q available; }
+qdrant_up() { curl -s -H "api-key: $QDRANT_E2E_KEY" "$1/healthz" | grep -q passed; }
 mysql_ready() { docker exec "$1" mysqladmin ping -h 127.0.0.1 -pmysqlpw; }
 maria_ready() { docker exec "$1" mariadb-admin ping -h 127.0.0.1 -uroot -pmysqlpw; }
 
@@ -880,6 +890,21 @@ job_compat_meilisearch() {
     E2E_LOG=$RUN_DIR/compat-meilisearch-pipeline.log ./dev/e2e-meili-smoke.sh || return 1
 }
 
+job_compat_qdrant() {
+  cell_start "$CELL_PG" "$CELL_QDRANT" || return 1
+  docker run -d --name "$CELL_QDRANT" -p "$CELL_QDRANT_PORT:6333" \
+    -e QDRANT__SERVICE__API_KEY="$QDRANT_E2E_KEY" \
+    "$COMPAT_QDRANT_IMAGE" > /dev/null || return 1
+  CELL_QDRANT_PORT=$(published_port "$CELL_QDRANT" 6333)
+  wait_for_container "$CELL_QDRANT" "Qdrant" 60 qdrant_up "http://localhost:$CELL_QDRANT_PORT" || return 1
+  cell_postgres "$COMPAT_PG_IMAGE" || return 1
+  # Qdrant has no mappings, no joins and no per-row collections, so the full
+  # suite cannot run against it; this is what it does support.
+  PG_CONTAINER=$CELL_PG PG_PORT=$CELL_PG_PORT \
+    QDRANT_URL="http://localhost:$CELL_QDRANT_PORT" QDRANT_API_KEY="$QDRANT_E2E_KEY" \
+    E2E_LOG=$RUN_DIR/compat-qdrant-pipeline.log ./dev/e2e-qdrant.sh || return 1
+}
+
 job_compat_mysql84() {
   cell_start "$CELL_MYSQL" "$CELL_OS" || return 1
   cell_opensearch "$COMPAT_OS_IMAGE" || return 1
@@ -945,12 +970,14 @@ note "matrix      $([ "$MATRIX_ON" = 1 ] && echo on || echo off) — $MATRIX_REA
 if [ "$MATRIX_ON" = 1 ]; then
   note "  images    $COMPAT_PG15_IMAGE, $COMPAT_PG_IMAGE, $COMPAT_TIMESCALE_IMAGE,"
   note "            $COMPAT_SUPABASE_IMAGE, $COMPAT_ES_IMAGE, $COMPAT_MEILI_IMAGE,"
-  note "            $COMPAT_MYSQL_IMAGE, $COMPAT_MARIADB_1, $COMPAT_MARIADB_2"
+  note "            $COMPAT_QDRANT_IMAGE, $COMPAT_MYSQL_IMAGE, $COMPAT_MARIADB_1,"
+  note "            $COMPAT_MARIADB_2"
   if [ "$ISOLATED" = 1 ]; then
     note "  ports     assigned by Docker"
   else
     note "  ports     postgres $COMPAT_PG_PORT, opensearch $COMPAT_OS_PORT, elasticsearch $COMPAT_ES_PORT,"
-    note "            meilisearch $COMPAT_MEILI_PORT, mysql/mariadb $COMPAT_MYSQL_PORT"
+    note "            meilisearch $COMPAT_MEILI_PORT, qdrant $COMPAT_QDRANT_PORT,"
+    note "            mysql/mariadb $COMPAT_MYSQL_PORT"
   fi
 fi
 if [ "$FAST" = 1 ]; then
@@ -985,6 +1012,7 @@ compat-timescaledb|TimescaleDB to OpenSearch|compat-derived
 compat-supabase|Supabase PostgreSQL to OpenSearch|compat-derived
 compat-elasticsearch|PostgreSQL 17 to Elasticsearch|compat-elasticsearch
 compat-meilisearch|PostgreSQL 17 to Meilisearch|compat-meilisearch
+compat-qdrant|PostgreSQL 17 to Qdrant|compat-qdrant
 compat-mysql84|MySQL 8.4 to OpenSearch|compat-mysql
 compat-mariadb106|MariaDB 10.6 to OpenSearch|compat-mariadb
 compat-mariadb118|MariaDB 11.8 to OpenSearch|compat-mariadb

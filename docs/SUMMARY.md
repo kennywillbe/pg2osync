@@ -13,6 +13,7 @@
   - [Elasticsearch](sinks/elasticsearch.md)
   - [Meilisearch](sinks/meilisearch.md)
   - [PostgreSQL (pgvector)](sinks/postgresql.md)
+  - [Qdrant](sinks/qdrant.md)
 - [Compatibility](compatibility.md)
 - [Proxies and connection poolers](proxies.md)
 - [Deployment](deployment.md)
