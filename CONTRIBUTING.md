@@ -104,10 +104,15 @@ Deeper probes are not part of CI and stay manual:
 `e2e-postgres-sink.sh` is the suite to run when the PostgreSQL sink changes.
 It is also where the sink conformance kit runs against that target; the same
 kit runs against OpenSearch as a step of the `e2e PostgreSQL to OpenSearch`
-job, so a change to `crates/core/src/testkit.rs` is answered by two targets.
+job. Every target answers it, and answering it is what finishes a new sink:
+Elasticsearch and Meilisearch in the `sink conformance kit` job of
+`compat.yml` — one `cargo test` beside both containers, because their own
+cells run a prebuilt binary and would each have compiled the workspace for it
+— and Qdrant inside its own suite. So a change to `crates/core/src/testkit.rs`
+is answered by five targets, none of them the only witness.
 
-`e2e-qdrant.sh` is the suite to run when the Qdrant sink changes, and the third
-place the conformance kit runs. The full PostgreSQL suite cannot cover that
+`e2e-qdrant.sh` is the suite to run when the Qdrant sink changes, and where the
+kit answers for that target. The full PostgreSQL suite cannot cover that
 target either — no mappings, no joins, no per-row collections — so this is
 where its load, its similarity search, its state collection and its versioned
 truncate are exercised.

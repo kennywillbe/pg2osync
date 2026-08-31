@@ -1247,6 +1247,17 @@ refuses — because only the caller knows them, and a target with no document it
 can refuse reports that check as skipped rather than faking it. Behind a
 feature flag, so a release binary carries none of it.
 
+A kit two targets answer is a kit that describes those two. All five answer it
+now, each where a toolchain already is: pgvector and OpenSearch on every pull
+request, Qdrant inside its own cell, and Elasticsearch and Meilisearch in a
+`sink conformance kit` job that starts both containers and runs one
+`cargo test` across them. Their own cells could not have it — those run the
+prebuilt binary the matrix hands around and download no toolchain, so a
+section there would have compiled the whole workspace once per cell for a test
+that compiles once for both. The job is nightly like the rest of the matrix,
+and runs on a pull request that touches a sink crate or the contract itself,
+which is the change that would break it.
+
 **A document id becomes a Qdrant point id as a UUIDv5, and the id itself lives
 in the payload.** (#187.) A point id there is a `u64` or a UUID and nothing
 else, so the ids this pipeline files documents under — a primary key, a derived

@@ -13,6 +13,12 @@ on:
     paths:
       - ".github/workflows/compat.yml"
       - "dev/e2e-*.sh"
+      # The sinks these cells are the only witness of, and the contract they
+      # answer to: a change to one of them is exactly what this workflow
+      # exists to catch, so it is worth the cells rather than a night's wait.
+      - "crates/sink/**"
+      - "crates/core/src/sink.rs"
+      - "crates/core/src/testkit.rs"
 
 permissions:
   contents: read
@@ -306,6 +312,58 @@ jobs:
         env:
           QDRANT_API_KEY: e2e-api-key
 
+  # Elasticsearch and Meilisearch answer the sink conformance kit here rather
+  # than inside their own cells. The kit is a cargo test and those cells run a
+  # prebuilt binary, so a section there would compile the workspace once per
+  # cell; one job holding both containers compiles it once and runs both. The
+  # other three targets answer it where they already have a toolchain: pgvector
+  # and OpenSearch on every pull request, Qdrant inside its cell.
+  conformance-kit:
+    name: sink conformance kit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      elasticsearch:
+        image: docker.elastic.co/elasticsearch/elasticsearch:8.19.20
+        env:
+          discovery.type: single-node
+          xpack.security.enabled: "false"
+          xpack.security.enrollment.enabled: "false"
+          ES_JAVA_OPTS: -Xms512m -Xmx512m
+        ports: ["9200:9200"]
+        # Not "green": a single-node Elasticsearch leaves every replica
+        # unassigned, so the cluster never leaves yellow.
+        options: >-
+          --health-cmd "curl -sf http://localhost:9200/_cluster/health?wait_for_status=yellow"
+          --health-interval 10s --health-timeout 10s --health-retries 30
+      meilisearch:
+        image: getmeili/meilisearch:v1.53.1
+        env:
+          # a throwaway key, set so the sink's Bearer path is the one tested
+          MEILI_MASTER_KEY: e2e-master-key
+          MEILI_ENV: development
+        ports: ["7700:7700"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
+      - name: Wait for Meilisearch
+        run: |
+          for _ in $(seq 1 60); do
+            curl -s http://localhost:7700/health | grep -q available && exit 0
+            sleep 2
+          done
+          echo "Meilisearch never became available"; exit 1
+      # One invocation, two targets: each test skips itself when its variable
+      # is unset, so what is set here is what runs.
+      - run: cargo test --locked -p pg2osync-sink --test conformance
+        env:
+          PG2OSYNC_TEST_ES_URL: http://localhost:9200
+          PG2OSYNC_TEST_MEILI_URL: http://localhost:7700
+          PG2OSYNC_TEST_MEILI_KEY: e2e-master-key
+
   compat-mysql:
     name: MySQL 8.4 to OpenSearch 2.19.6
     needs: build
@@ -428,7 +486,8 @@ jobs:
     name: file a nightly failure
     needs:
       [build, compat-postgres, compat-derived, compat-elasticsearch,
-       compat-meilisearch, compat-qdrant, compat-mysql, compat-mariadb]
+       compat-meilisearch, compat-qdrant, conformance-kit, compat-mysql,
+       compat-mariadb]
     # A pull request already reports itself on the pull request; only the
     # scheduled run has nobody watching it.
     if: failure() && github.event_name == 'schedule'

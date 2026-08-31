@@ -25,7 +25,13 @@ Breaking one of these is a bug even if the tests pass:
   in `crates/engine`; source positions reach it as an opaque `u64` token.
 - Protocol decoding stays inside its source crate — pgoutput in
   `crates/source`, binlog in `crates/source-mysql`. No CDC framework.
-- New targets implement `Sink`. The engine never matches on a sink kind.
+- New targets implement `Sink`. The engine never matches on a sink kind, and a
+  new sink is not done until it answers `pg2osync_core::testkit` — the
+  conformance kit, `crates/sink/tests/conformance.rs` — against a live
+  instance of its target. A check it cannot answer is reported as skipped,
+  with the reason in the trait: the kit gates the truncate check on
+  `truncates_at_a_position`, and the partial-batch one on there being a
+  document the target refuses.
 - Delivery is at-least-once with idempotent writes: `_id` is the primary key,
   an id the configuration derives, or — for an `append_only` table — a content
   hash, so a replay overwrites rather than duplicates.
@@ -85,7 +91,7 @@ What it covers, job by job:
 | `the book builds` | `docs.yml` |
 | `the title is a conventional commit` | `pr-title.yml` |
 | `dependencies have no known advisories` | `audit.yml`, when a Cargo file moved |
-| the nine compatibility cells | `compat.yml`, when it or `dev/e2e-*.sh` changed |
+| the nine compatibility cells and `sink conformance kit` | `compat.yml`, when it, `dev/e2e-*.sh`, a sink crate or the `Sink` contract changed |
 
 The two cells `compat.yml` marks `continue-on-error` are reported as advisory
 (`!`) here too: a known gap being tracked does not make the run red.

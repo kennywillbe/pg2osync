@@ -81,3 +81,11 @@ and per-row indices — the three things this target does not have. What it does
 cover is the initial load, live INSERT/UPDATE/DELETE, the file checkpoint
 resuming after a restart, and a rebuild swapping a fresh index into the live
 name.
+
+The `sink conformance kit` job runs the shared kit against the same version.
+Three of its five checks pass here — read-back, idempotent replay and
+checkpoint durability, the last against the state file rather than a document
+in the target. The other two are reported as skipped rather than faked: this
+target keeps no document versions, so a truncate cannot happen *at* a
+position, and it has no schema, so there is no document it refuses for the
+partial-batch check to work with.

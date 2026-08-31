@@ -56,6 +56,15 @@ A fifth script, `dev/e2e-postgres-sink.sh`, runs on every pull request rather
 than nightly: the PostgreSQL target is exercised by the `e2e PostgreSQL to
 pgvector` job in `ci.yml`, so it has no cell here.
 
+Beside the cells there is one job that runs no script at all. `sink
+conformance kit` starts an Elasticsearch and a Meilisearch side by side and
+runs the kit against both in a single `cargo test`: the kit is a test rather
+than a section of a suite, and the two cells above run a prebuilt binary, so
+asking them for it would have compiled the workspace once per cell for what
+compiles once here. With OpenSearch and pgvector answering it on every pull
+request and Qdrant inside its own cell, all five targets answer the same
+contract.
+
 Two cells are marked advisory, because the first nightly matrix found a bug
 in each of them. The Elasticsearch suite reaches `reconcile`, which that sink
 cannot run ([#118](https://github.com/kennywillbe/pg2osync/issues/118)), so
@@ -64,19 +73,20 @@ reaches the restart, which fails because that sink cannot start twice against
 one index ([#122](https://github.com/kennywillbe/pg2osync/issues/122)). Both
 cells are kept red rather than trimmed: the gap is the finding.
 
-The matrix also runs on a pull request that touches the workflow or those
-scripts, so a change to the matrix is tested before the night it would break.
+The matrix also runs on a pull request that touches the workflow, those
+scripts, a sink crate or the `Sink` contract, so the change that would break it
+is tested before the night it would be reported — and a sink change is answered
+by the cells that are the only witness of that target.
 
-`./dev/ci-local.sh` runs the same nine cells on your machine, and runs them
-automatically for exactly the changes a pull request would; `--matrix` forces
-them. Each cell is a throwaway container on a port of its own — PostgreSQL
-15433, OpenSearch 9201, Elasticsearch 9202, Meilisearch 7701, Qdrant 6334,
-MySQL/MariaDB 13307 — so the dev stack on 15432/9200/13306 keeps running beside
-it, and the
-containers are removed however the cell ends. Those ports are one set, so the
-cells go one at a time. `--isolated` gives every cell containers and ports of
-its own instead, which lets the run take two at a time and lets it run beside
-another run on the same machine.
+`./dev/ci-local.sh` runs the same nine cells and that job on your machine, and
+runs them automatically for exactly the changes a pull request would;
+`--matrix` forces them. Each cell is a throwaway container on a port of its
+own — PostgreSQL 15433, OpenSearch 9201, Elasticsearch 9202, Meilisearch 7701,
+Qdrant 6334, MySQL/MariaDB 13307 — so the dev stack on 15432/9200/13306 keeps
+running beside it, and the containers are removed however the cell ends. Those
+ports are one set, so the cells go one at a time. `--isolated` gives every cell
+containers and ports of its own instead, which lets the run take two at a time
+and lets it run beside another run on the same machine.
 
 ## PostgreSQL-derived services
 

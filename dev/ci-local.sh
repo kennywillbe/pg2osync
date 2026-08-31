@@ -33,7 +33,8 @@
 #   docs                 the book builds                       (docs.yml)
 #   pr-title             the title is a conventional commit    (pr-title.yml)
 #   audit                dependencies have no known advisories (audit.yml)
-#   compat-*             the nine compatibility cells         (compat.yml)
+#   compat-*             the nine compatibility cells and the
+#                        sink conformance kit                  (compat.yml)
 #
 # By default the e2e jobs use the shared dev stack (dev/docker-compose.yml plus
 # the mysql-test container): nothing to pull, nothing to start, and the suites
@@ -92,9 +93,10 @@ COMPAT_ES_PORT=9202
 COMPAT_MEILI_PORT=7701
 COMPAT_QDRANT_PORT=6334
 COMPAT_MYSQL_PORT=13307
-# A throwaway key, as compat.yml sets on its cell, so the sink's api-key path is
-# the one exercised rather than an unauthenticated one.
+# Throwaway keys, as compat.yml sets on its cells, so the sink's api-key and
+# Bearer paths are the ones exercised rather than unauthenticated ones.
 QDRANT_E2E_KEY=e2e-api-key
+MEILI_E2E_KEY=e2e-master-key
 
 ONLY=""
 SKIP=""
@@ -109,8 +111,8 @@ ALL_JOBS="lint msrv e2e-postgres e2e-mysql e2e-multi-source e2e-postgres-sink
 docker helm docs
 pr-title audit
 compat-postgres15 compat-timescaledb compat-supabase compat-elasticsearch
-compat-meilisearch compat-qdrant compat-mysql84 compat-mariadb106
-compat-mariadb118"
+compat-meilisearch compat-qdrant compat-conformance-kit compat-mysql84
+compat-mariadb106 compat-mariadb118"
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 note() { printf '  %s\n' "$*"; }
@@ -249,10 +251,12 @@ case "$MATRIX" in
   force) MATRIX_ON=1; MATRIX_REASON="--matrix" ;;
   never) MATRIX_ON=0; MATRIX_REASON="--no-matrix" ;;
   *)
-    if changed_matches '^(\.github/workflows/compat\.yml|dev/e2e-.*\.sh)$'; then
-      MATRIX_ON=1; MATRIX_REASON="compat.yml or dev/e2e-*.sh changed, so a pull request runs it"
+    if changed_matches '^(\.github/workflows/compat\.yml|dev/e2e-.*\.sh|crates/sink/.*|crates/core/src/(sink|testkit)\.rs)$'; then
+      MATRIX_ON=1
+      MATRIX_REASON="compat.yml, dev/e2e-*.sh, a sink or the contract changed, so a pull request runs it"
     else
-      MATRIX_ON=0; MATRIX_REASON="compat.yml and dev/e2e-*.sh are unchanged, as on CI"
+      MATRIX_ON=0
+      MATRIX_REASON="compat.yml, dev/e2e-*.sh, the sinks and the contract are unchanged, as on CI"
     fi ;;
 esac
 
@@ -825,11 +829,38 @@ cell_mysql() {
 
 # A cell owns throwaway containers; naming them here has whatever runs the cell
 # remove them however it ends, and clears away what a killed run left first.
-cell_start() {
+cell_containers() {
   CLEANUP_CONTAINERS="$*"
   cleanup_containers
   CLEANUP_CONTAINERS="$*"
+}
+
+# And every cell that runs a suite runs it from the binary compat.yml's build
+# job hands around, so it builds that first. A cell whose whole job is a
+# `cargo test` names its containers and stops there.
+cell_start() {
+  cell_containers "$@"
   release_build || return 1
+}
+
+cell_elasticsearch() {
+  docker run -d --name "$CELL_ES" -p "$CELL_ES_PORT:9200" \
+    -e discovery.type=single-node -e xpack.security.enabled=false \
+    -e xpack.security.enrollment.enabled=false -e ES_JAVA_OPTS="-Xms512m -Xmx512m" \
+    "$1" > /dev/null || return 1
+  CELL_ES_PORT=$(published_port "$CELL_ES" 9200)
+  CELL_ES_URL="http://localhost:$CELL_ES_PORT"
+  # not "green": a single-node Elasticsearch leaves every replica unassigned
+  wait_for_container "$CELL_ES" "Elasticsearch" 90 es_yellow "$CELL_ES_URL" || return 1
+}
+
+cell_meilisearch() {
+  docker run -d --name "$CELL_MEILI" -p "$CELL_MEILI_PORT:7700" \
+    -e MEILI_MASTER_KEY="$MEILI_E2E_KEY" -e MEILI_ENV=development \
+    "$1" > /dev/null || return 1
+  CELL_MEILI_PORT=$(published_port "$CELL_MEILI" 7700)
+  CELL_MEILI_URL="http://localhost:$CELL_MEILI_PORT"
+  wait_for_container "$CELL_MEILI" "Meilisearch" 60 meili_up "$CELL_MEILI_URL" || return 1
 }
 
 job_compat_postgres15() {
@@ -862,32 +893,35 @@ job_compat_supabase() {
 
 job_compat_elasticsearch() {
   cell_start "$CELL_PG" "$CELL_ES" || return 1
-  docker run -d --name "$CELL_ES" -p "$CELL_ES_PORT:9200" \
-    -e discovery.type=single-node -e xpack.security.enabled=false \
-    -e xpack.security.enrollment.enabled=false -e ES_JAVA_OPTS="-Xms512m -Xmx512m" \
-    "$COMPAT_ES_IMAGE" > /dev/null || return 1
-  CELL_ES_PORT=$(published_port "$CELL_ES" 9200)
-  # not "green": a single-node Elasticsearch leaves every replica unassigned
-  wait_for_container "$CELL_ES" "Elasticsearch" 90 es_yellow "http://localhost:$CELL_ES_PORT" || return 1
+  cell_elasticsearch "$COMPAT_ES_IMAGE" || return 1
   cell_postgres "$COMPAT_PG_IMAGE" || return 1
   PG_CONTAINER=$CELL_PG PG_PORT=$CELL_PG_PORT \
-    OS_URL="http://localhost:$CELL_ES_PORT" TARGET_FLAVOR=elasticsearch \
+    OS_URL=$CELL_ES_URL TARGET_FLAVOR=elasticsearch \
     E2E_LOG=$RUN_DIR/compat-elasticsearch-pipeline.log ./dev/e2e-test.sh || return 1
 }
 
 job_compat_meilisearch() {
   cell_start "$CELL_PG" "$CELL_MEILI" || return 1
-  docker run -d --name "$CELL_MEILI" -p "$CELL_MEILI_PORT:7700" \
-    -e MEILI_MASTER_KEY=e2e-master-key -e MEILI_ENV=development \
-    "$COMPAT_MEILI_IMAGE" > /dev/null || return 1
-  CELL_MEILI_PORT=$(published_port "$CELL_MEILI" 7700)
-  wait_for_container "$CELL_MEILI" "Meilisearch" 60 meili_up "http://localhost:$CELL_MEILI_PORT" || return 1
+  cell_meilisearch "$COMPAT_MEILI_IMAGE" || return 1
   cell_postgres "$COMPAT_PG_IMAGE" || return 1
   # Meilisearch has no mappings, no joins and no per-row indices, so the full
   # suite cannot run against it; this is what it does support.
   PG_CONTAINER=$CELL_PG PG_PORT=$CELL_PG_PORT \
-    MEILI_URL="http://localhost:$CELL_MEILI_PORT" MEILI_MASTER_KEY=e2e-master-key \
+    MEILI_URL=$CELL_MEILI_URL MEILI_MASTER_KEY=$MEILI_E2E_KEY \
     E2E_LOG=$RUN_DIR/compat-meilisearch-pipeline.log ./dev/e2e-meili-smoke.sh || return 1
+}
+
+# The two targets whose cells run a prebuilt binary answer the conformance kit
+# here instead, in one `cargo test` beside both containers: a section inside
+# each cell would compile the workspace twice for what compiles once. No
+# source database and no binary — the kit talks to the sinks directly.
+job_compat_conformance_kit() {
+  cell_containers "$CELL_ES" "$CELL_MEILI"
+  cell_elasticsearch "$COMPAT_ES_IMAGE" || return 1
+  cell_meilisearch "$COMPAT_MEILI_IMAGE" || return 1
+  PG2OSYNC_TEST_ES_URL=$CELL_ES_URL \
+    PG2OSYNC_TEST_MEILI_URL=$CELL_MEILI_URL PG2OSYNC_TEST_MEILI_KEY=$MEILI_E2E_KEY \
+    cargo test --locked -p pg2osync-sink --test conformance || return 1
 }
 
 job_compat_qdrant() {
@@ -1013,6 +1047,7 @@ compat-supabase|Supabase PostgreSQL to OpenSearch|compat-derived
 compat-elasticsearch|PostgreSQL 17 to Elasticsearch|compat-elasticsearch
 compat-meilisearch|PostgreSQL 17 to Meilisearch|compat-meilisearch
 compat-qdrant|PostgreSQL 17 to Qdrant|compat-qdrant
+compat-conformance-kit|sink conformance kit|conformance-kit
 compat-mysql84|MySQL 8.4 to OpenSearch|compat-mysql
 compat-mariadb106|MariaDB 10.6 to OpenSearch|compat-mariadb
 compat-mariadb118|MariaDB 11.8 to OpenSearch|compat-mariadb
