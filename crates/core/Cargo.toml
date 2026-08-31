@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 description = "Shared types and trait boundaries for pg2osync"
 
+[features]
+# The sink conformance suite, which only a sink's own tests build.
+testkit = []
+
 [dependencies]
 async-trait.workspace = true
 serde_json.workspace = true

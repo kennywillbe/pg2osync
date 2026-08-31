@@ -1328,7 +1328,11 @@ async fn validate_source(cfg: config::AppConfig) -> Result<()> {
 
     let sink = run::build_sink(&cfg, secrets.target_password)?;
     match sink.health().await? {
-        Health::Up => println!("✓ {} reachable at {}", cfg.target.flavor, cfg.target.url),
+        Health::Up => println!(
+            "✓ {} reachable at {}",
+            cfg.target.flavor,
+            cfg.target.endpoint()
+        ),
         Health::Down(reason) => bail!("{} is reachable but unhealthy: {reason}", cfg.target.flavor),
     }
     // Checked here and not at startup: a pipeline that vanishes while the

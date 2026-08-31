@@ -21,6 +21,8 @@ so a regression there would ship unnoticed.
 | OpenSearch | other 2.x | not tested |
 | Elasticsearch | 8.19.20 | nightly, full suite — advisory until [#118](https://github.com/kennywillbe/pg2osync/issues/118) |
 | Elasticsearch | 7.x | not tested, known gaps |
+| pgvector | pg17 (PostgreSQL 17) | every pull request |
+| pgvector | other PostgreSQL majors | not tested |
 | Meilisearch | v1.53.1 | nightly, smoke suite only — advisory until [#122](https://github.com/kennywillbe/pg2osync/issues/122) |
 
 ## What the nightly suite runs
@@ -38,6 +40,10 @@ every cell. Three scripts do the work:
   Meilisearch has. The smoke suite covers the initial load, live
   INSERT/UPDATE/DELETE, the file-based checkpoint resuming after a restart,
   and a `reindex` swapping a rebuilt index into the live name.
+
+A fourth script, `dev/e2e-postgres-sink.sh`, runs on every pull request rather
+than nightly: the PostgreSQL target is exercised by the `e2e PostgreSQL to
+pgvector` job in `ci.yml`, so it has no cell here.
 
 Two cells are marked advisory, because the first nightly matrix found a bug
 in each of them. The Elasticsearch suite reaches `reconcile`, which that sink

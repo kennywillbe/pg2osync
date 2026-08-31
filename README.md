@@ -5,8 +5,8 @@ binary.** No Logstash, no Kafka, no Redis, no JVM.
 
 pg2osync reads changes straight from the database's replication stream —
 PostgreSQL's WAL or MySQL's binlog — and writes them to OpenSearch,
-Elasticsearch or Meilisearch within milliseconds. Inserts, updates, deletes and
-truncates included. One static Rust binary, one TOML file.
+Elasticsearch, Meilisearch or a pgvector table within milliseconds. Inserts,
+updates, deletes and truncates included. One static Rust binary, one TOML file.
 
 ```sh
 git clone https://github.com/kennywillbe/pg2osync && cd pg2osync
@@ -74,6 +74,7 @@ not expressions) — if you need those, you want Kafka.
 | **PostgreSQL → OpenSearch** (logical replication) | ✅ full suite on every pull request (PostgreSQL 17, OpenSearch 2.19) |
 | PostgreSQL → Elasticsearch 8.x | ✅ full suite nightly, [one known gap](docs/compatibility.md) |
 | PostgreSQL → Meilisearch 1.x | ✅ smoke suite nightly (file-based checkpoint), [one known gap](docs/compatibility.md) |
+| PostgreSQL → PostgreSQL with pgvector | ✅ full suite on every pull request (pgvector pg17); a table per section, bring-your-own-embedding |
 | PostgreSQL-derived services | ✅ TimescaleDB and Supabase's image run the full suite nightly (plain tables; hypertables are not published); RDS, Aurora and Neon speak the same pgoutput and `validate` names each one's switch — CockroachDB is wire-compatible, not replication-compatible: [what is proven and what is argued](docs/compatibility.md#postgresql-derived-services) |
 | **MySQL 8.0 / MariaDB 10.6+ → any of the above** | ✅ MySQL 8.0 on every pull request; MySQL 8.4 and MariaDB 10.6/11.8 nightly |
 | Consistent initial load, then live streaming | ✅ |
@@ -81,6 +82,7 @@ not expressions) — if you need those, you want Kafka.
 | Nested child collections (one level) | ✅ PostgreSQL and MySQL/MariaDB; the parent document embeds child arrays, resolved once per collection per transaction, with their own `columns` / `exclude_columns` projection, or `single = true` to embed a 1:1 relation as an object, or `flatten = true` with it to lift the element's columns onto the parent document |
 | Many-to-many children (`through`) | ✅ PostgreSQL and MySQL/MariaDB; a junction table is joined inside the same aggregation, and both the junction and the child are streamed |
 | Aggregate children (`aggregates`) | ✅ PostgreSQL and MySQL/MariaDB; a count from a child table lands on the parent document and is kept live by the same machinery, one grouped query per aggregate per transaction |
+| Vector columns on a pgvector target | ✅ bring-your-own-embedding: a vector the source database or the application produced is carried like any other column and orders a nearest-neighbour query in the target; the sink computes nothing |
 | Parent-child as a join field (`join`) | ✅ OpenSearch and Elasticsearch; shared index, per-document routing, parent delete cascades to its children |
 | Per-document routing from a column (`routing = "tenant_id"`) | ✅ OpenSearch and Elasticsearch; co-locates a tenant on one shard; a changed value moves the document; non-key columns need `REPLICA IDENTITY FULL` |
 | One index fed by several tables | ✅ each section declares an explicit id; reconcile refuses it, a TRUNCATE is skipped and counted |
@@ -163,7 +165,8 @@ and client certificates via `sslcert`/`sslkey`.
 proxy cannot carry a replication or binlog-dump connection. The SQL connection
 may be pooled but must reach the primary. See [docs/proxies.md](docs/proxies.md).
 
-**Target** — OpenSearch 2.x, Elasticsearch 8.x or Meilisearch 1.x.
+**Target** — OpenSearch 2.x, Elasticsearch 8.x, Meilisearch 1.x, or PostgreSQL
+with pgvector as a search backend.
 
 The exact versions CI runs are listed in
 [docs/compatibility.md](docs/compatibility.md); the rest of the range is
@@ -442,7 +445,7 @@ from `docs/` on every change.
 - [Operations](docs/operations.md) — metrics, failure modes, recovery
 - [Design decisions](docs/decisions.md) — why it is built this way
 - Sources: [PostgreSQL](docs/sources/postgresql.md) · [MySQL/MariaDB](docs/sources/mysql.md)
-- Sinks: [OpenSearch](docs/sinks/opensearch.md) · [Elasticsearch](docs/sinks/elasticsearch.md) · [Meilisearch](docs/sinks/meilisearch.md)
+- Sinks: [OpenSearch](docs/sinks/opensearch.md) · [Elasticsearch](docs/sinks/elasticsearch.md) · [Meilisearch](docs/sinks/meilisearch.md) · [PostgreSQL (pgvector)](docs/sinks/postgresql.md)
 
 ## Development
 
@@ -467,7 +470,7 @@ crates/
 ├── source/        PostgreSQL: pgoutput decoder, catalog, poll fallback
 ├── source-mysql/  MySQL/MariaDB: wire protocol, binlog decoder, catalog
 ├── engine/        transaction buffering, batching, projections, metrics
-├── sink/          OpenSearch / Elasticsearch / Meilisearch writers
+├── sink/          OpenSearch / Elasticsearch / Meilisearch / PostgreSQL writers
 └── bin/           CLI and pipeline wiring
 ```
 

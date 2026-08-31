@@ -27,6 +27,7 @@
 #   e2e-postgres         e2e PostgreSQL to OpenSearch          (ci.yml)
 #   e2e-mysql            e2e MySQL to OpenSearch               (ci.yml)
 #   e2e-multi-source     e2e several sources in one process    (ci.yml)
+#   e2e-postgres-sink    e2e PostgreSQL to pgvector            (ci.yml)
 #   docker               container image builds                (ci.yml)
 #   helm                 helm chart lints                      (ci.yml)
 #   docs                 the book builds                       (docs.yml)
@@ -85,6 +86,7 @@ export RUSTFLAGS=${RUSTFLAGS:--D warnings}
 # Under --isolated a second run would collide with the first on exactly these,
 # so there the ports are Docker's to pick and read back.
 COMPAT_PG_PORT=15433
+COMPAT_PGSINK_PORT=15435
 COMPAT_OS_PORT=9201
 COMPAT_ES_PORT=9202
 COMPAT_MEILI_PORT=7701
@@ -99,7 +101,8 @@ MATRIX=auto
 PR_TITLE=""
 PR_TITLE_GIVEN=0
 
-ALL_JOBS="lint msrv e2e-postgres e2e-mysql e2e-multi-source docker helm docs
+ALL_JOBS="lint msrv e2e-postgres e2e-mysql e2e-multi-source e2e-postgres-sink
+docker helm docs
 pr-title audit
 compat-postgres15 compat-timescaledb compat-supabase compat-elasticsearch
 compat-meilisearch compat-mysql84 compat-mariadb106 compat-mariadb118"
@@ -133,6 +136,7 @@ first_match() { sed -n "$1" "$2" | head -1; }
 PG_IMAGE=$(first_match 's|^ *image: \(postgres:[^ ]*\)$|\1|p' "$CI_WF")
 OS_IMAGE=$(first_match 's|^ *image: \(opensearchproject/opensearch:[^ ]*\)$|\1|p' "$CI_WF")
 MYSQL_IMAGE=$(first_match 's|^ *image: \(mysql:[^ ]*\)$|\1|p' "$CI_WF")
+PGVECTOR_IMAGE=$(first_match 's|^ *image: \(pgvector/pgvector:[^ ]*\)$|\1|p' "$CI_WF")
 MSRV=$(first_match 's|^ *toolchain: "\([0-9.]*\)"$|\1|p' "$CI_WF")
 CARGO_MSRV=$(first_match 's|^rust-version = "\([0-9.]*\)"$|\1|p' Cargo.toml)
 MDBOOK_VERSION=$(first_match 's|^ *MDBOOK_VERSION: "\([0-9.]*\)"$|\1|p' "$DOCS_WF")
@@ -155,7 +159,7 @@ COMPAT_MYSQL_IMAGE=$(first_match 's|^ *image: \(mysql:[^ ]*\)$|\1|p' "$COMPAT_WF
 COMPAT_MARIADB_1=$(sed -n 's|^ *image: \(mariadb:[^ ]*\)$|\1|p' "$COMPAT_WF" | sed -n 1p)
 COMPAT_MARIADB_2=$(sed -n 's|^ *image: \(mariadb:[^ ]*\)$|\1|p' "$COMPAT_WF" | sed -n 2p)
 
-for name in PG_IMAGE OS_IMAGE MYSQL_IMAGE MSRV CARGO_MSRV MDBOOK_VERSION \
+for name in PG_IMAGE OS_IMAGE MYSQL_IMAGE PGVECTOR_IMAGE MSRV CARGO_MSRV MDBOOK_VERSION \
   TITLE_PATTERN AUDIT_CMD COMPAT_PG15_IMAGE COMPAT_PG_IMAGE \
   COMPAT_TIMESCALE_IMAGE COMPAT_SUPABASE_IMAGE COMPAT_OS_IMAGE \
   COMPAT_ES_IMAGE COMPAT_MEILI_IMAGE COMPAT_MYSQL_IMAGE COMPAT_MARIADB_1 \
@@ -202,6 +206,7 @@ cell_use() {
     # 0 means "Docker, pick one": probing for a free port and then binding it
     # leaves a window in which the cell beside this one binds the same port.
     CELL_PG_PORT=0
+    CELL_PGSINK_PORT=0
     CELL_OS_PORT=0
     CELL_ES_PORT=0
     CELL_MEILI_PORT=0
@@ -209,12 +214,14 @@ cell_use() {
   else
     CELL=$CELL_BASE
     CELL_PG_PORT=$COMPAT_PG_PORT
+    CELL_PGSINK_PORT=$COMPAT_PGSINK_PORT
     CELL_OS_PORT=$COMPAT_OS_PORT
     CELL_ES_PORT=$COMPAT_ES_PORT
     CELL_MEILI_PORT=$COMPAT_MEILI_PORT
     CELL_MYSQL_PORT=$COMPAT_MYSQL_PORT
   fi
   CELL_PG=$CELL-postgres
+  CELL_PGSINK=$CELL-postgres-sink
   CELL_OS=$CELL-opensearch
   CELL_ES=$CELL-elasticsearch
   CELL_MEILI=$CELL-meilisearch
@@ -486,6 +493,7 @@ pick_port_base() {
 }
 
 pg_ready() { docker exec "$1" pg_isready -U postgres -d sourcedb; }
+pgsink_ready() { docker exec "$1" pg_isready -U postgres -d targetdb; }
 os_green() { curl -s "$1/_cluster/health" | grep -q green; }
 # The dev stack's OpenSearch is a single node that outlives one run, so an index
 # left behind with a replica keeps the cluster yellow for good. This is the
@@ -535,14 +543,18 @@ mysql_enable_gtid() {
 # CI gets PostgreSQL and OpenSearch as service containers; locally they are the
 # dev stack, brought up here when it is not already running.
 dev_stack_up() {
-  local pg_state os_state
+  local pg_state os_state sink_state
   pg_state=$(container_state dev-postgres-1)
   os_state=$(container_state dev-opensearch-1)
-  if [ "$pg_state" != "running" ] || [ "$os_state" != "running" ]; then
-    echo "bringing up dev/docker-compose.yml ($PG_IMAGE + $OS_IMAGE)"
+  sink_state=$(container_state dev-postgres-sink-1)
+  if [ "$pg_state" != "running" ] || [ "$os_state" != "running" ] ||
+    [ "$sink_state" != "running" ]; then
+    echo "bringing up dev/docker-compose.yml ($PG_IMAGE + $OS_IMAGE + $PGVECTOR_IMAGE)"
     docker compose -f dev/docker-compose.yml up -d || return 1
   fi
   wait_for_container dev-postgres-1 "PostgreSQL" 60 pg_ready dev-postgres-1 || return 1
+  wait_for_container dev-postgres-sink-1 "the PostgreSQL target" 60 \
+    pgsink_ready dev-postgres-sink-1 || return 1
   wait_for_container dev-opensearch-1 "OpenSearch" 60 os_ready http://localhost:9200 || return 1
   docker exec -i dev-postgres-1 psql -U postgres -d sourcedb < dev/seed.sql || return 1
 }
@@ -600,11 +612,22 @@ job_e2e_postgres() {
     cell_postgres "$PG_IMAGE" || return 1
     PG_CONTAINER=$CELL_PG PG_PORT=$CELL_PG_PORT OS_URL=$CELL_OS_URL \
       E2E_LOG=$RUN_DIR/e2e-postgres-pipeline.log ./dev/e2e-test.sh || return 1
+    conformance_kit "$CELL_OS_URL" || return 1
     return 0
   fi
   dev_stack_up || return 1
   release_build || return 1
   E2E_LOG=$RUN_DIR/e2e-postgres-pipeline.log ./dev/e2e-test.sh || return 1
+  conformance_kit http://localhost:9200 || return 1
+}
+
+# The reference target answering the same conformance suite the newest one
+# does. A step of the job rather than a section of the suite, because the
+# compatibility cells run that suite from a prebuilt binary and have no reason
+# to compile the workspace.
+conformance_kit() {
+  PG2OSYNC_TEST_OS_URL=$1 \
+    cargo test --release --locked -p pg2osync-sink --test conformance || return 1
 }
 
 job_e2e_mysql() {
@@ -639,6 +662,23 @@ job_e2e_multi_source() {
   mysql_stack_up || return 1
   release_build || return 1
   E2E_LOG=$RUN_DIR/e2e-multi-source-pipeline.log ./dev/e2e-multi-source.sh || return 1
+}
+
+# PostgreSQL on both ends: the dev stack's source, and the pgvector database
+# beside it that stands in for a PostgreSQL target.
+job_e2e_postgres_sink() {
+  if [ "$ISOLATED" = 1 ]; then
+    cell_start "$CELL_PG" "$CELL_PGSINK" || return 1
+    cell_postgres "$PG_IMAGE" || return 1
+    cell_postgres_sink "$PGVECTOR_IMAGE" || return 1
+    PG_CONTAINER=$CELL_PG PG_PORT=$CELL_PG_PORT \
+      SINK_CONTAINER=$CELL_PGSINK SINK_PORT=$CELL_PGSINK_PORT \
+      E2E_LOG=$RUN_DIR/e2e-postgres-sink-pipeline.log ./dev/e2e-postgres-sink.sh || return 1
+    return 0
+  fi
+  dev_stack_up || return 1
+  release_build || return 1
+  E2E_LOG=$RUN_DIR/e2e-postgres-sink-pipeline.log ./dev/e2e-postgres-sink.sh || return 1
 }
 
 job_docker() {
@@ -747,6 +787,17 @@ cell_postgres() {
       -c "ALTER DATABASE sourcedb OWNER TO postgres" > /dev/null || return 1
   fi
   docker exec -i "$CELL_PG" psql -U postgres -d sourcedb < dev/seed.sql || return 1
+}
+
+# A PostgreSQL in the *target* role: no replication settings, since nothing
+# streams out of it, and a database named for what it is.
+cell_postgres_sink() {
+  docker run -d --name "$CELL_PGSINK" -p "$CELL_PGSINK_PORT:5432" \
+    -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
+    -e POSTGRES_DB=targetdb "$1" > /dev/null || return 1
+  CELL_PGSINK_PORT=$(published_port "$CELL_PGSINK" 5432)
+  wait_for_container "$CELL_PGSINK" "the PostgreSQL target" 90 \
+    pgsink_ready "$CELL_PGSINK" || return 1
 }
 
 # Seeded the way ci.yml and compat.yml seed a service container: the user the
@@ -906,7 +957,7 @@ if [ "$FAST" = 1 ]; then
   warn "--fast: the e2e suites, the image build and the matrix are skipped."
   warn "It is a quick loop, not the definition of done. Run the whole script"
   warn "before you push, or CI finds what this one did not look at."
-  SKIP="$SKIP e2e-postgres e2e-mysql e2e-multi-source docker"
+  SKIP="$SKIP e2e-postgres e2e-mysql e2e-multi-source e2e-postgres-sink docker"
 fi
 if [ "$MATRIX" = never ]; then
   warn "--no-matrix: the compatibility cells are skipped. If they would have run,"
@@ -919,6 +970,7 @@ run_job msrv "minimum supported Rust version"
 run_job e2e-postgres "e2e PostgreSQL to OpenSearch"
 run_job e2e-mysql "e2e MySQL to OpenSearch"
 run_job e2e-multi-source "e2e several sources in one process"
+run_job e2e-postgres-sink "e2e PostgreSQL to pgvector"
 run_job docker "container image builds"
 run_job helm "helm chart lints"
 run_job docs "the book builds"

@@ -12,6 +12,12 @@ pub mod filter;
 pub mod load;
 pub mod lsn;
 pub mod sink;
+/// The conformance suite a sink implementation runs against a live target.
+///
+/// Behind a feature so it is a test dependency rather than something a release
+/// binary carries: nothing in the pipeline calls it.
+#[cfg(feature = "testkit")]
+pub mod testkit;
 
 pub use checkpoint::{Checkpoint, StreamId};
 pub use error::CoreError;

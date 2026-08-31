@@ -106,6 +106,14 @@ jobs:
       - run: docker exec -i dev-postgres-1 psql -U postgres -d sourcedb < dev/seed.sql
       - run: cargo build --release --locked -p pg2osync
       - run: ./dev/e2e-test.sh
+      # The reference target answering the same conformance suite the newest
+      # one does: a contract only one implementation is held to is a
+      # description of that implementation. Not inside the suite above, which
+      # the compatibility cells also run from a prebuilt binary.
+      - name: The sink conformance kit
+        run: cargo test --release --locked -p pg2osync-sink --test conformance
+        env:
+          PG2OSYNC_TEST_OS_URL: http://localhost:9200
 
   e2e-mysql:
     name: e2e MySQL to OpenSearch
@@ -235,6 +243,58 @@ jobs:
       - run: docker exec -i mysql-test mysql -uroot -pmysqlpw sourcedb < dev/mysql-seed.sql
       - run: cargo build --release --locked -p pg2osync
       - run: ./dev/e2e-multi-source.sh
+
+  # PostgreSQL on both ends: logical replication out of one database and into a
+  # pgvector table in another. The target is a second service container rather
+  # than a second database in the first, because a checkpoint that lives in the
+  # target must be somewhere the source going away cannot take with it.
+  e2e-postgres-sink:
+    name: e2e PostgreSQL to pgvector
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: sourcedb
+        ports: ["15432:5432"]
+        options: >-
+          --name dev-postgres-1
+          --health-cmd "pg_isready -U postgres -d sourcedb"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+      pgvector:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: targetdb
+        ports: ["15434:5432"]
+        options: >-
+          --name dev-postgres-sink-1
+          --health-cmd "pg_isready -U postgres -d targetdb"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # the service container needs logical replication, which the image's
+      # default command does not enable
+      - name: Enable logical replication
+        run: |
+          docker exec dev-postgres-1 bash -c "
+            echo 'wal_level = logical' >> /var/lib/postgresql/data/postgresql.conf
+            echo 'max_replication_slots = 10' >> /var/lib/postgresql/data/postgresql.conf
+            echo 'max_wal_senders = 10' >> /var/lib/postgresql/data/postgresql.conf"
+          docker restart dev-postgres-1
+          until docker exec dev-postgres-1 pg_isready -U postgres -d sourcedb; do sleep 2; done
+      - run: docker exec -i dev-postgres-1 psql -U postgres -d sourcedb < dev/seed.sql
+      - run: cargo build --release --locked -p pg2osync
+      - run: ./dev/e2e-postgres-sink.sh
 
   docker:
     name: container image builds

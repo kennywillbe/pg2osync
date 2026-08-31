@@ -5,10 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "OpenSearch, Elasticsearch and Meilisearch sinks for pg2osync"
+description = "OpenSearch, Elasticsearch, Meilisearch and PostgreSQL sinks for pg2osync"
 
 [dependencies]
 pg2osync-core = { path = "../core" }
+pg2osync-tls = { path = "../tls" }
+tokio-postgres = { workspace = true, features = ["with-serde_json-1"] }
+tokio-postgres-rustls = "0.14.0"
 opensearch.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
@@ -22,3 +25,6 @@ reqwest = { version = "0.13.4", default-features = false, features = ["rustls", 
 # The retry loop is tested against a virtual clock rather than by waiting out
 # its backoffs.
 tokio = { workspace = true, features = ["test-util"] }
+# The conformance suite every sink here answers to; a test dependency, so a
+# release binary carries none of it.
+pg2osync-core = { path = "../core", features = ["testkit"] }
