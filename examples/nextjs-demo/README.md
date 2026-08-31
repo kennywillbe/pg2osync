@@ -38,10 +38,15 @@ a single number.
   ```
   This provides PostgreSQL on `localhost:15432` and OpenSearch on
   `localhost:9200`.
-- `pg2osync` built:
+- `pg2osync` on your machine. Either take the binary from a release — no
+  toolchain needed, four targets, see the
+  [install section](../../README.md#install) — or build it:
   ```sh
   cargo build --release
   ```
+  The container image is the awkward one here: this demo's config names
+  `localhost` at both ends, so a container would need host networking to reach
+  them.
 - Node.js 20+.
 
 ## Run it
@@ -55,7 +60,7 @@ docker exec -i dev-postgres-1 psql -U postgres -d sourcedb < schema.sql
 # 2. Start pg2osync against the demo config (from the repo root, in another shell)
 cd ../..
 export PG2OSYNC_SOURCE_URL="postgres://postgres:postgres@localhost:15432/sourcedb"
-./target/release/pg2osync run -c examples/nextjs-demo/pg2osync.demo.toml
+pg2osync run -c examples/nextjs-demo/pg2osync.demo.toml    # ./target/release/pg2osync from a build
 
 # 3. Install deps and start the app (back in examples/nextjs-demo/)
 npm install

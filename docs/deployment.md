@@ -56,27 +56,35 @@ directory is an option, not a migration.
 
 ## Container image
 
+<!-- x-release-please-start-version -->
 ```sh
 docker run --rm \
   -e PG2OSYNC_SOURCE_URL="postgres://user:pass@db:5432/appdb" \
   -e PG2OSYNC_TARGET_PASSWORD="…" \
   -v "$PWD/pg2osync.toml:/etc/pg2osync/pg2osync.toml:ro" \
   -p 9100:9100 \
-  ghcr.io/kennywillbe/pg2osync:1.3.0
+  ghcr.io/kennywillbe/pg2osync:1.5.0
 ```
+<!-- x-release-please-end -->
 
 The image runs as UID 10001 with a read-only root filesystem and no
 capabilities. The default command is `run -c /etc/pg2osync/pg2osync.toml`;
 override it to use another subcommand:
 
+<!-- x-release-please-start-version -->
 ```sh
-docker run --rm … ghcr.io/kennywillbe/pg2osync:1.3.0 \
+docker run --rm … ghcr.io/kennywillbe/pg2osync:1.5.0 \
   validate -c /etc/pg2osync/pg2osync.toml
 ```
+<!-- x-release-please-end -->
 
 Build it yourself with `docker build -t pg2osync:local .`.
 
-A compose example lives in [deploy/docker-compose.yml](https://github.com/kennywillbe/pg2osync/blob/main/deploy/docker-compose.yml).
+A compose example lives in [deploy/docker-compose.yml](https://github.com/kennywillbe/pg2osync/blob/main/deploy/docker-compose.yml),
+which brings up the tool alone against databases you already run. For a stack
+that needs nothing of yours — PostgreSQL, OpenSearch and pg2osync together,
+seeded, with a searchable row at the end of it — start from
+[examples/docker-compose.yml](https://github.com/kennywillbe/pg2osync/blob/main/examples/docker-compose.yml).
 
 ## Kubernetes with Helm
 

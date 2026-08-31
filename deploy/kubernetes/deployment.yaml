@@ -33,7 +33,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: pg2osync
-          image: ghcr.io/kennywillbe/pg2osync:1.0.0
+          image: ghcr.io/kennywillbe/pg2osync:1.5.0 # x-release-please-version
           # one file, one source. With several *.toml in the ConfigMap:
           #   args: ["run", "--config-dir", "/etc/pg2osync"]
           args: ["run", "-c", "/etc/pg2osync/pg2osync.toml"]

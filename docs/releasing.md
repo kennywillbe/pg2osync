@@ -26,6 +26,19 @@ released sit together. The library crates are internal to the workspace and are
 not published, so their versions are not tracked at all: one package, one tag,
 one release, one changelog.
 
+Every version that appears anywhere else — the image tags in `deploy/`, the
+Helm chart's `version` and `appVersion`, the quickstart compose file, the
+`docker run` and download lines in the README and in
+[deployment](deployment.md) — is bumped by the same pull request, through
+release-please's generic updater. Each of those files is listed in
+`extra-files`, and each pinned line carries the annotation the updater looks
+for: `# x-release-please-version` at the end of the line in YAML and TOML, or a
+`<!-- x-release-please-start-version -->` / `<!-- x-release-please-end -->`
+pair around a fenced block in Markdown, where a comment cannot sit on the line
+itself. To add a file, annotate the line and add the path with
+`"type": "generic"`; nothing else pins a version by hand, and a pin that goes
+stale means one of those two steps was missed.
+
 ```
 merge a feature PR   →  release PR updated. Nothing released.
 merge a feature PR   →  release PR updated. Nothing released.
