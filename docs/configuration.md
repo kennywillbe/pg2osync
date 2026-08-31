@@ -1249,6 +1249,76 @@ reason the array form has a cap — does not apply.
   them. Fix the data, or drop `single`, and the next change to those parents
   rewrites them.
 
+### Aggregates
+
+When only the *number* of related rows matters, embedding every row to count it
+client-side is waste and leaving it out forces a second query at search time.
+An aggregate embeds the number itself, kept live by the same machinery the
+embedded children use:
+
+```toml
+[sync.contacts]
+table = "public.contacts"
+index = "contacts"
+primary_key = "id"
+
+[[sync.contacts.aggregates]]
+field       = "open_deals"       # field on the parent document
+table       = "public.deals"     # the table whose rows are counted
+foreign_key = "contact_id"       # column on THAT table naming the parent
+op          = "count"            # the only operation; the default
+where       = "status_type = 1"  # optional: which rows count
+```
+
+```json
+{ "id": 42, "name": "…", "open_deals": 3 }
+```
+
+An aggregate is one more shape of child, not a computation: `children` embeds a
+child table's rows, an aggregate embeds a single number derived from them. There
+is no expression language — a fixed operation over one foreign key, narrowed by
+the [row-filter subset](#row-filters), the same predicate `[sync.x] where`
+takes and rendered through the same parser for both dialects.
+
+- PostgreSQL and MySQL/MariaDB alike.
+- `count` is the only operation. `sum`, `min` and `max` are a change of their
+  own, when somebody asks for one; an `op` that is not `count` is refused at
+  startup, naming what is supported.
+- **A parent no row matched carries `0`, never a missing field**, on every path
+  — otherwise `open_deals: 0` could not be queried for at all.
+- The initial load joins one grouped read per aggregate, so it costs one query
+  per table however many parents there are.
+- **Streamed changes cost one grouped query per aggregate per transaction.**
+  The aggregated table is watched exactly as a child table is — added to the
+  publication (PostgreSQL) or the streamed set (MySQL/MariaDB) automatically —
+  and a changed row names the parent to count again rather than becoming a
+  document. **Index the foreign key on that table.**
+- An INSERT, a DELETE and an UPDATE all name the parent, so a row entering or
+  leaving `where` moves the number. An UPDATE that moves a row to another
+  parent names **both**: the parent it left is as wrong as the one it joined.
+- PostgreSQL: **give the aggregated table `REPLICA IDENTITY FULL`**
+  (`ALTER TABLE public.deals REPLICA IDENTITY FULL`) unless `foreign_key` is
+  part of its primary key. Without it a DELETE carries no foreign key and an
+  UPDATE carries no before-image, so the parent — or the parent the row left —
+  cannot be located; pg2osync warns at startup with the `ALTER` to run.
+  MySQL/MariaDB need nothing: `binlog_row_image = FULL` is already required and
+  carries both images.
+- The field name must not collide with another aggregate, a child's `field`, a
+  constant, a rename target or the join field; each is refused when the config
+  is read. A collision with a *column* of the parent is refused by the initial
+  load, which is where the catalogue is known — as for a child's `field`.
+- An `append_only` parent is refused — a changed row of the aggregated table
+  names the parent to count again *by its key*, which such a table has none of
+  — and so is a `fan_out` parent, whose row is not one document to count for.
+- The table an aggregate counts may have a `[sync]` section of its own, exactly
+  as a child table may — with the same caveat, which pg2osync says at startup:
+  its rows are read as a re-count of the parent, so its own index receives the
+  initial load and no streamed change.
+- Map the field as a `long`. Nothing else about the target changes: it is one
+  more number on the document.
+- A `TRUNCATE` of the aggregated table is not applied to the parents, exactly as
+  for a child table; `pg2osync resnapshot --table public.contacts` rebuilds them.
+
 ### Join fields
 
 The embedded array above is one document and one write, and it is the right

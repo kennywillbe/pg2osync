@@ -317,6 +317,10 @@ pub struct TableSync {
     /// One-to-many children embedded as JSON arrays (single level, 0.3).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<ChildJoin>,
+    /// Numbers derived from a child table: one field per entry, kept live by
+    /// the same machinery the embedded children use.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aggregates: Vec<AggregateJoin>,
     /// JSON file holding the mapping to create this index with, resolved
     /// relative to the config file. Applied only when the index does not
     /// exist; an existing index is compared against it, never altered.
@@ -651,6 +655,37 @@ pub struct ChildJoin {
     #[serde(default)]
     pub single: bool,
 }
+
+/// A number derived from a child table, carried on the parent document.
+///
+/// One more shape of child rather than a computation: a fixed operation over
+/// one foreign key, narrowed by the same restricted `where` a section takes.
+/// There is no expression language here and there is not meant to be one.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AggregateJoin {
+    /// Schema-qualified table to aggregate, e.g. "public.deals".
+    pub table: String,
+    /// Field name on the parent document holding the number.
+    pub field: String,
+    /// Column on the aggregated table holding the parent's key.
+    pub foreign_key: String,
+    /// What to derive. `count` is the only one: `sum`, `min` and `max` are a
+    /// change of their own, when somebody asks for one.
+    #[serde(default = "default_aggregate_op")]
+    pub op: String,
+    /// Restricted SQL predicate deciding which rows count, e.g.
+    /// `status_type = 1`. The same subset `[sync.x] where` takes.
+    #[serde(default, rename = "where")]
+    pub filter: Option<String>,
+}
+
+fn default_aggregate_op() -> String {
+    AGGREGATE_OPS[0].to_string()
+}
+
+/// Every operation an aggregate may name, in the order a refusal lists them.
+const AGGREGATE_OPS: [&str; 1] = ["count"];
 
 impl ChildJoin {
     /// Every name this child writes on the parent document: the array, and
@@ -1038,6 +1073,13 @@ impl AppConfig {
                          document to re-read by its key, which an append-only table does not have"
                     );
                 }
+                if !tbl.aggregates.is_empty() {
+                    anyhow::bail!(
+                        "[sync.{key}] [[aggregates]] needs a key: a changed row of the \
+                         aggregated table names the parent document to count again by its \
+                         key, which an append-only table does not have"
+                    );
+                }
                 if tbl.soft_delete.is_some() {
                     anyhow::bail!(
                         "[sync.{key}] soft_delete needs a key to delete by, which an append-only \
@@ -1066,6 +1108,13 @@ impl AppConfig {
                     anyhow::bail!(
                         "[sync.{key}] fan_out and [[children]] both decide what a row's \
                          array becomes; configuring them together has no coherent meaning"
+                    );
+                }
+                if !tbl.aggregates.is_empty() {
+                    anyhow::bail!(
+                        "[sync.{key}] fan_out and [[aggregates]] cannot be combined: a changed \
+                         row of the aggregated table names one parent document to count \
+                         again, and a fanned row is not one document"
                     );
                 }
                 if fan.field.is_empty() {
@@ -1255,6 +1304,84 @@ impl AppConfig {
                              {target}"
                         );
                     }
+                }
+            }
+            for agg in &tbl.aggregates {
+                if !is_qualified_table(&agg.table) {
+                    anyhow::bail!(
+                        "[sync.{key}] aggregate table {:?} must be schema-qualified",
+                        agg.table
+                    );
+                }
+                let agg_key = format!("sync.{key}.aggregates({})", agg.table);
+                if agg.field.is_empty() {
+                    anyhow::bail!("[{agg_key}] field must not be empty");
+                }
+                if agg.foreign_key.is_empty() {
+                    anyhow::bail!("[{agg_key}] foreign_key must not be empty");
+                }
+                if !AGGREGATE_OPS.contains(&agg.op.as_str()) {
+                    anyhow::bail!(
+                        "[{agg_key}] op {:?} is not an operation; supported: {}",
+                        agg.op,
+                        AGGREGATE_OPS.join(", ")
+                    );
+                }
+                if let Some(spec) = &agg.filter {
+                    pg2osync_core::filter::Filter::parse(spec).map_err(|e| {
+                        anyhow::anyhow!(
+                            "[{agg_key}] where {spec:?}: {e}\n{}",
+                            pg2osync_core::filter::SUPPORTED
+                        )
+                    })?;
+                }
+                // The number is a field of the parent document like any other,
+                // so anything else claiming that name would bury it or be
+                // buried by it, depending on which is written last. Whether it
+                // collides with a real column only the catalogue knows, and the
+                // load refuses that as it does for a child's field.
+                if tbl.fields.contains_key(&agg.field)
+                    || tbl.fields.values().any(|t| t == &agg.field)
+                {
+                    anyhow::bail!(
+                        "[{agg_key}] field {:?} is also named in fields; the aggregate is \
+                         written last and would bury the renamed column",
+                        agg.field
+                    );
+                }
+                if tbl.constants.contains_key(&agg.field) {
+                    anyhow::bail!("[{agg_key}] field {:?} is also a constant", agg.field);
+                }
+                if let Some(child) = tbl
+                    .children
+                    .iter()
+                    .find(|child| child.claimed_fields().contains(&agg.field))
+                {
+                    anyhow::bail!(
+                        "[{agg_key}] field {:?} is the field of child {}",
+                        agg.field,
+                        child.table
+                    );
+                }
+                if tbl
+                    .aggregates
+                    .iter()
+                    .filter(|other| other.field == agg.field)
+                    .count()
+                    > 1
+                {
+                    anyhow::bail!(
+                        "[{agg_key}] field {:?} is claimed by two aggregates; one field \
+                         holds one number",
+                        agg.field
+                    );
+                }
+                if tbl
+                    .join
+                    .as_ref()
+                    .is_some_and(|join| join.field == agg.field)
+                {
+                    anyhow::bail!("[{agg_key}] field {:?} is the join field", agg.field);
                 }
             }
             // qualification was checked at the top of this loop
@@ -2343,6 +2470,100 @@ id = "user-{id}"
             )
         ))
         .expect("where and soft_delete compose in poll mode");
+    }
+
+    #[test]
+    fn an_aggregate_is_a_field_a_table_a_key_and_one_operation() {
+        const AGG: &str = "[[sync.users.aggregates]]\ntable = \"public.orders\"\n\
+                           field = \"open_orders\"\nforeign_key = \"user_id\"\n";
+        let cfg = parse(&format!("{MINIMAL}{AGG}where = \"status = 1\"\n")).expect("valid");
+        let agg = &cfg.sync["users"].aggregates[0];
+        assert_eq!(agg.field, "open_orders");
+        assert_eq!(
+            agg.op, "count",
+            "count is what an aggregate is unless it says"
+        );
+        assert_eq!(agg.filter.as_deref(), Some("status = 1"));
+
+        let refused = [
+            (
+                format!("{MINIMAL}{}", AGG.replace("public.orders", "orders")),
+                "an unqualified table",
+            ),
+            (
+                format!("{MINIMAL}{}", AGG.replace("open_orders", "")),
+                "an empty field",
+            ),
+            (
+                format!("{MINIMAL}{}", AGG.replace("user_id", "")),
+                "an empty foreign_key",
+            ),
+            (
+                format!("{MINIMAL}{AGG}op = \"sum\"\n"),
+                "an operation that does not exist",
+            ),
+            (
+                format!("{MINIMAL}{AGG}where = \"status LIKE 'a%'\"\n"),
+                "a predicate outside the subset",
+            ),
+        ];
+        for (toml, why) in refused {
+            assert!(parse(&toml).is_err(), "{why} must be refused");
+        }
+        let op = parse(&format!("{MINIMAL}{AGG}op = \"sum\"\n"))
+            .expect_err("sum is not an operation")
+            .to_string();
+        assert!(op.contains("supported: count"), "{op}");
+        let predicate = parse(&format!("{MINIMAL}{AGG}where = \"status LIKE 'a%'\"\n"))
+            .expect_err("LIKE is outside the subset")
+            .to_string();
+        assert!(predicate.contains("supported:"), "{predicate}");
+    }
+
+    #[test]
+    fn an_aggregate_field_is_a_name_nothing_else_may_claim() {
+        const AGG: &str = "[[sync.users.aggregates]]\ntable = \"public.orders\"\n\
+                           field = \"open_orders\"\nforeign_key = \"user_id\"\n";
+        let refused = [
+            (
+                format!("{MINIMAL}{AGG}[sync.users.fields]\nname = \"open_orders\"\n"),
+                "the target of a rename",
+            ),
+            (
+                format!("{MINIMAL}{AGG}[sync.users.constants]\nopen_orders = 1\n"),
+                "a constant",
+            ),
+            (
+                format!(
+                    "{MINIMAL}{AGG}[[sync.users.children]]\ntable = \"public.orders\"\n\
+                     field = \"open_orders\"\nforeign_key = \"user_id\"\n"
+                ),
+                "the field of a child",
+            ),
+            (format!("{MINIMAL}{AGG}{AGG}"), "another aggregate's field"),
+        ];
+        for (toml, what) in refused {
+            assert!(
+                parse(&toml).is_err(),
+                "an aggregate field must not collide with {what}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_aggregate_needs_a_parent_that_is_one_document_with_a_key() {
+        const AGG: &str = "[[sync.users.aggregates]]\ntable = \"public.orders\"\n\
+                           field = \"open_orders\"\nforeign_key = \"user_id\"\n";
+        let keyless = parse(&format!("{MINIMAL}append_only = true\n{AGG}"))
+            .expect_err("an append-only parent has no key to count against")
+            .to_string();
+        assert!(keyless.contains("[[aggregates]] needs a key"), "{keyless}");
+        let fanned = parse(&format!(
+            "{MINIMAL}{AGG}[sync.users.fan_out]\nfield = \"tags\"\nid = \"user-{{id}}\"\n"
+        ))
+        .expect_err("a fanned row is not one document")
+        .to_string();
+        assert!(fanned.contains("fan_out and [[aggregates]]"), "{fanned}");
     }
 
     #[test]

@@ -962,14 +962,16 @@ fn setup_sql(cfg: config::AppConfig) -> Result<()> {
     // child tables are read by the initial load too, and a junction is read by
     // every aggregation over the collection it joins, so both need the grant
     for table in cfg.sync.values() {
-        for child in &table.children {
-            for name in [Some(&child.table), child.through.as_ref()]
-                .into_iter()
-                .flatten()
-            {
-                if !tables.contains(name) {
-                    tables.push(name.clone());
-                }
+        for name in table
+            .children
+            .iter()
+            .flat_map(|child| [Some(&child.table), child.through.as_ref()])
+            .flatten()
+            // an aggregated table is read by the load and by every re-count
+            .chain(table.aggregates.iter().map(|agg| &agg.table))
+        {
+            if !tables.contains(name) {
+                tables.push(name.clone());
             }
         }
     }
@@ -1969,6 +1971,41 @@ async fn validate_postgres(cfg: &config::AppConfig, source_url: &str) -> Result<
                 tables.push(through.clone());
             }
         }
+        for agg in &table.aggregates {
+            // The grouped read itself, with LIMIT 0: it parses, plans and
+            // type-checks the foreign key and the `where` against the real
+            // table, which the grammar cannot do — and reads nothing.
+            let spec = pg2osync_core::aggregate::AggregateSpec::new(
+                &agg.table,
+                &agg.field,
+                &agg.foreign_key,
+                &table.primary_key.clone().unwrap_or_else(|| "id".into()),
+            )?;
+            let mut spec = spec;
+            if let Some(predicate) = &agg.filter {
+                spec.filter = Some(
+                    pg2osync_core::filter::Filter::parse(predicate).map_err(|e| {
+                        anyhow::anyhow!("where {predicate:?} of {}: {e}", agg.table)
+                    })?,
+                );
+            }
+            let probe = format!(
+                "SELECT 1 FROM ({}) c LIMIT 0",
+                pg2osync_source::aggregate::count_subquery(&spec, None)
+            );
+            client.query(&probe, &[]).await.with_context(|| {
+                format!(
+                    "the aggregate {} of {} does not run against {}: check foreign_key and \
+                     where",
+                    agg.field, table.table, agg.table
+                )
+            })?;
+            println!(
+                "✓ aggregate {} counts {} by {}",
+                agg.field, agg.table, agg.foreign_key
+            );
+            tables.push(agg.table.clone());
+        }
     }
 
     if cfg.source.mode == "wal" {
@@ -2147,6 +2184,38 @@ async fn validate_mysql(cfg: &config::AppConfig, source_url: &str) -> Result<()>
                     .await?;
             let junction = mysql_junction(&mut admin, table, child, &child_live).await?;
             check_child_columns(child, &child_live.column_names(), junction.as_ref())?;
+        }
+        for agg in &table.aggregates {
+            // the grouped read itself, bounded to nothing: it checks the
+            // foreign key and the `where` against the real table
+            let mut spec = pg2osync_core::aggregate::AggregateSpec::new(
+                &agg.table,
+                &agg.field,
+                &agg.foreign_key,
+                &table.primary_key.clone().unwrap_or_else(|| "id".into()),
+            )?;
+            if let Some(predicate) = &agg.filter {
+                spec.filter = Some(
+                    pg2osync_core::filter::Filter::parse(predicate).map_err(|e| {
+                        anyhow::anyhow!("where {predicate:?} of {}: {e}", agg.table)
+                    })?,
+                );
+            }
+            let probe = format!(
+                "SELECT 1 FROM ({}) c LIMIT 0",
+                pg2osync_source_mysql::aggregate::count_statement(&spec, &[])
+            );
+            admin.query_text_rows(&probe).await.with_context(|| {
+                format!(
+                    "the aggregate {} of {} does not run against {}: check foreign_key and \
+                     where",
+                    agg.field, table.table, agg.table
+                )
+            })?;
+            println!(
+                "✓ aggregate {} counts {} by {}",
+                agg.field, agg.table, agg.foreign_key
+            );
         }
         if table.append_only {
             println!(
@@ -2404,6 +2473,7 @@ fn mysql_source(
             start_file: None,
             start_pos: 0,
             children: Default::default(),
+            aggregates: Default::default(),
             child_parents: Default::default(),
             // this source is built for one-off catalog work, not for streaming,
             // so it records nothing and resumes from nowhere

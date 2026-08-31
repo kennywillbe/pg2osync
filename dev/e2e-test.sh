@@ -2930,5 +2930,149 @@ case "$refusal" in
   *) bad "a bad sampling ratio was accepted: $refusal" ;;
 esac
 
+echo -e "\n\033[1m== 37. a count from a child table, kept live ==\033[0m"
+# An aggregate is one more shape of child (#179): the parent document carries a
+# number derived from a child table, and the same machinery keeps it fresh. What
+# has to hold is that the load counts correctly including the zero, that a child
+# change moves the number without the parent changing, and that a row crossing
+# the `where` boundary or moving to another parent is counted where it now
+# belongs — and no longer where it was.
+AGCONFIG=$(mktemp /tmp/pg2osync-e2e-agg.XXXXXX)
+AGSLOT=pg2osync_e2e_agg
+AGLOG=/tmp/pg2osync-e2e-agg-$TAG.log
+drop_idle_probe_slots
+cat > "$AGCONFIG" <<TOML
+[source]
+url_env = "PG2OSYNC_SOURCE_URL"
+slot_name = "$AGSLOT"
+publication = "${AGSLOT}_pub"
+
+[target]
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
+
+[metrics]
+bind = "127.0.0.1:$((PORT_BASE + 38))"
+
+[sync.contacts]
+table = "public.agg_contact"
+index = "e2e_agg"
+
+[[sync.contacts.aggregates]]
+field = "open_deals"
+table = "public.agg_deal"
+foreign_key = "contact_id"
+op = "count"
+where = "status_type = 1"
+TOML
+agg_cleanup() {
+  sync_kill
+  pg "SELECT pg_drop_replication_slot('$AGSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$AGSLOT');" > /dev/null 2>&1 || true
+  pg "DROP PUBLICATION IF EXISTS ${AGSLOT}_pub; DROP TABLE IF EXISTS agg_deal, agg_contact;" > /dev/null 2>&1 || true
+  curl -s -XDELETE "$OS/e2e_agg?ignore_unavailable=true" > /dev/null 2>&1 || true
+  rm -f "$AGCONFIG" "$AGLOG"
+}
+trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup; init_cleanup; fan_cleanup; bid_cleanup; shape_cleanup; where_cleanup; join_cleanup; union_cleanup; events_cleanup; pipe_cleanup; append_cleanup; routing_cleanup; reindex_cleanup; rate_cleanup; through_cleanup; ra_cleanup; pseudo_cleanup; rl_cleanup; otel_cleanup; agg_cleanup' EXIT
+
+pg "DROP TABLE IF EXISTS agg_deal, agg_contact;" > /dev/null 2>&1
+pg "CREATE TABLE agg_contact(id bigint primary key, name text);" > /dev/null 2>&1
+pg "CREATE TABLE agg_deal(id bigint primary key, contact_id bigint, status_type int);" > /dev/null 2>&1
+pg "INSERT INTO agg_contact VALUES (1,'acme'),(2,'globex'),(3,'initech');" > /dev/null
+# contact 1 has two open deals and one that the filter leaves out, contact 2 one
+# closed deal, contact 3 nothing at all
+pg "INSERT INTO agg_deal VALUES (1,1,1),(2,1,1),(3,1,2),(4,2,2);" > /dev/null
+pg "DROP PUBLICATION IF EXISTS ${AGSLOT}_pub; CREATE PUBLICATION ${AGSLOT}_pub FOR TABLE agg_contact, agg_deal;" > /dev/null 2>&1
+curl -s -XDELETE "$OS/e2e_agg?ignore_unavailable=true" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/postgres-$AGSLOT" > /dev/null
+
+# captured first: a failure exits non-zero, which under pipefail would hide a
+# grep that matched
+out=$($BIN validate -c "$AGCONFIG" 2>&1 || true)
+if grep -q "aggregate open_deals counts public.agg_deal" <<< "$out"; then
+  ok "validate runs the aggregate against the table"
+else
+  bad "validate did not report the aggregate it checked: $out"
+fi
+# an operation that does not exist is refused where it can still be fixed.
+# Captured first: a refusal exits non-zero, which under pipefail would hide a
+# grep that matched.
+sed 's/^op = "count"$/op = "sum"/' "$AGCONFIG" > "${AGCONFIG}.bad"
+out=$($BIN validate -c "${AGCONFIG}.bad" 2>&1 || true)
+if grep -q "supported: count" <<< "$out"; then
+  ok "validate refuses an operation that does not exist, naming what there is"
+else
+  bad "validate accepted an unknown aggregate op: $out"
+fi
+rm -f "${AGCONFIG}.bad"
+
+# the foreign key is not the deal's own key, so a DELETE carries it only under
+# FULL: the warning has to name the ALTER before anything goes stale
+: > "$AGLOG"
+sync_spawn "$AGCONFIG" "$AGLOG"
+sleep 3
+sync_stop
+if grep -q "ALTER TABLE public.agg_deal REPLICA IDENTITY FULL" "$AGLOG"; then
+  ok "an aggregated table without FULL is warned about, with the ALTER to run"
+else
+  bad "nothing warned that a delete could not name the parent to count again"
+fi
+pg "ALTER TABLE agg_deal REPLICA IDENTITY FULL;" > /dev/null 2>&1
+
+sync_spawn "$AGCONFIG"
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_count e2e_agg)" = "3" ] && break
+  sleep 1
+done
+check "the load counts what the filter matches" "$(os_field e2e_agg 1 open_deals)" "2"
+check "a parent whose rows the filter leaves out counts none" "$(os_field e2e_agg 2 open_deals)" "0"
+check "and a parent with no rows at all still carries the field" \
+  "$(os_field e2e_agg 3 open_deals)" "0"
+
+# every assertion below changes only the child table: the parent row is never
+# touched, and the number still moves
+pg "INSERT INTO agg_deal VALUES (5,2,1);" > /dev/null
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_field e2e_agg 2 open_deals)" = "1" ] && break
+  sleep 1
+done
+check "an inserted child row bumps the parent's count" "$(os_field e2e_agg 2 open_deals)" "1"
+
+pg "DELETE FROM agg_deal WHERE id = 1;" > /dev/null
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_field e2e_agg 1 open_deals)" = "1" ] && break
+  sleep 1
+done
+check "a deleted child row drops it" "$(os_field e2e_agg 1 open_deals)" "1"
+
+# the row was always there; it only just started matching `where`
+pg "UPDATE agg_deal SET status_type = 1 WHERE id = 3;" > /dev/null
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_field e2e_agg 1 open_deals)" = "2" ] && break
+  sleep 1
+done
+check "a row crossing into the filter is counted" "$(os_field e2e_agg 1 open_deals)" "2"
+pg "UPDATE agg_deal SET status_type = 2 WHERE id = 3;" > /dev/null
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_field e2e_agg 1 open_deals)" = "1" ] && break
+  sleep 1
+done
+check "and one crossing back out is not" "$(os_field e2e_agg 1 open_deals)" "1"
+
+# the acceptance test: the parent it left is as wrong as the one it joined
+pg "UPDATE agg_deal SET contact_id = 3 WHERE id = 5;" > /dev/null
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_field e2e_agg 3 open_deals)" = "1" ] && [ "$(os_field e2e_agg 2 open_deals)" = "0" ] && break
+  sleep 1
+done
+check "a row moved to another parent counts there" "$(os_field e2e_agg 3 open_deals)" "1"
+check "and no longer where it was" "$(os_field e2e_agg 2 open_deals)" "0"
+stop_sync
+
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

@@ -30,6 +30,10 @@ pub struct MySqlSourceConfig {
     pub tls: pg2osync_tls::TlsSettings,
     /// Child collections keyed by PARENT (schema, table).
     pub children: HashMap<(String, String), Vec<pg2osync_core::children::ChildSpec>>,
+    /// Aggregates over a child table, keyed by PARENT (schema, table). An
+    /// aggregate's table is watched exactly as a child's is, and reaches this
+    /// runner through the same reverse routing.
+    pub aggregates: HashMap<(String, String), Vec<pg2osync_core::aggregate::AggregateSpec>>,
     /// Reverse routing: CHILD (schema, table) -> parent (schema, table).
     pub child_parents: HashMap<(String, String), (String, String)>,
     /// Which transactions have been consumed, so a checkpoint can resume on a
@@ -475,26 +479,48 @@ impl MySqlSource {
                     // Naming it rather than emitting it is what lets a thousand
                     // children of one parent cost one query and one document.
                     if let Some(parent) = self.cfg.child_parents.get(&table).cloned() {
-                        let spec = child_spec(&self.cfg, &parent, &table)?.clone();
-                        // Which half of a many-to-many relation this row is: the
-                        // junction carries the parent's key, the child only its
-                        // own, and the junction is asked for the rest at commit.
-                        let through = spec
-                            .through
-                            .as_ref()
-                            .filter(|_| spec.schema == table.0 && spec.table == table.1);
-                        for row in &set.rows {
-                            let column = match through {
-                                Some(through) => &through.child_key,
-                                None => &spec.foreign_key,
-                            };
-                            let key = row_column(rt, &table, row, column)?;
-                            match through {
-                                Some(_) => pending.name_through(parent.clone(), &spec.field, key),
-                                None => pending.name_parent(parent.clone(), key),
+                        match child_spec(&self.cfg, &parent, &table) {
+                            Some(spec) => {
+                                let spec = spec.clone();
+                                // Which half of a many-to-many relation this row is: the
+                                // junction carries the parent's key, the child only its
+                                // own, and the junction is asked for the rest at commit.
+                                let through = spec
+                                    .through
+                                    .as_ref()
+                                    .filter(|_| spec.schema == table.0 && spec.table == table.1);
+                                for row in &set.rows {
+                                    let column = match through {
+                                        Some(through) => &through.child_key,
+                                        None => &spec.foreign_key,
+                                    };
+                                    let key = row_column(rt, &table, row, column)?;
+                                    match through {
+                                        Some(_) => {
+                                            pending.name_through(parent.clone(), &spec.field, key)
+                                        }
+                                        None => pending.name_parent(parent.clone(), key),
+                                    }
+                                }
+                            }
+                            // A row of a table an aggregate counts names the
+                            // parents to count again — both of them where the
+                            // foreign key moved, since the parent the row left
+                            // is as wrong as the one it joined.
+                            None => {
+                                let spec = aggregate_spec(&self.cfg, &parent, &table)?.clone();
+                                for row in &set.rows {
+                                    for image in [&row.after, &row.before].into_iter().flatten() {
+                                        let key =
+                                            image_column(rt, &table, image, &spec.foreign_key)?;
+                                        pending.name_parent(parent.clone(), key);
+                                    }
+                                }
                             }
                         }
-                    } else if self.cfg.children.contains_key(&table) {
+                    } else if self.cfg.children.contains_key(&table)
+                        || self.cfg.aggregates.contains_key(&table)
+                    {
                         // a parent row: its document is here, only the arrays are
                         // missing, so it waits for the group's read
                         for row in &set.rows {
@@ -590,8 +616,19 @@ fn child_spec<'a>(
     cfg: &'a MySqlSourceConfig,
     parent: &(String, String),
     table: &(String, String),
-) -> Result<&'a pg2osync_core::children::ChildSpec> {
+) -> Option<&'a pg2osync_core::children::ChildSpec> {
     cfg.children
+        .get(parent)
+        .and_then(|specs| specs.iter().find(|s| s.reads(&table.0, &table.1)))
+}
+
+/// The aggregate a streamed row counts towards.
+fn aggregate_spec<'a>(
+    cfg: &'a MySqlSourceConfig,
+    parent: &(String, String),
+    table: &(String, String),
+) -> Result<&'a pg2osync_core::aggregate::AggregateSpec> {
+    cfg.aggregates
         .get(parent)
         .and_then(|specs| specs.iter().find(|s| s.reads(&table.0, &table.1)))
         .ok_or_else(|| {
@@ -618,6 +655,17 @@ fn row_column(
         .as_ref()
         .or(row.before.as_ref())
         .ok_or_else(|| MySqlError::protocol("child row carries no image"))?;
+    image_column(rt, table, values, column)
+}
+
+/// The same column read out of one named image, so a row that moved between
+/// parents can be read twice: once as it is, once as it was.
+fn image_column(
+    rt: &RegisteredTable,
+    table: &(String, String),
+    values: &[Option<serde_json::Value>],
+    column: &str,
+) -> Result<serde_json::Value> {
     let idx = rt.columns.iter().position(|c| c == column).ok_or_else(|| {
         MySqlError::protocol(format!(
             "column {column} missing on {}.{}",
@@ -727,6 +775,8 @@ async fn flush_pending(
                     spec.qualified(), spec.truncated_field(), spec.total_field());
             }
         }
+        let aggregates = cfg.aggregates.get(&table).cloned().unwrap_or_default();
+        crate::aggregate::attach_aggregates(conn, &aggregates, &mut emitted).await?;
         for mut change in emitted {
             change.version = version;
             tx.send(ChangeEvent::Row(change))

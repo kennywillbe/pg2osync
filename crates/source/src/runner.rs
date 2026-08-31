@@ -36,6 +36,10 @@ pub struct WalSourceConfig {
     pub tls: crate::tls::TlsSettings,
     /// Child collections keyed by PARENT (schema, table).
     pub children: HashMap<(String, String), Vec<crate::children::ChildSpec>>,
+    /// Aggregates over a child table, keyed by PARENT (schema, table). An
+    /// aggregate's table is watched exactly as a child's is, and reaches this
+    /// runner through the same reverse routing.
+    pub aggregates: HashMap<(String, String), Vec<crate::aggregate::AggregateSpec>>,
     /// Reverse routing: CHILD (schema, table) -> parent (schema, table).
     pub child_parents: HashMap<(String, String), (String, String)>,
     /// Parent PK columns for refetch queries, keyed by parent (schema, table).
@@ -85,6 +89,7 @@ impl WalSource {
     fn is_configured(&self, schema: &str, table: &str) -> bool {
         let key = (schema.to_string(), table.to_string());
         self.cfg.children.contains_key(&key)
+            || self.cfg.aggregates.contains_key(&key)
             || self.cfg.child_parents.contains_key(&key)
             || self
                 .cfg
@@ -157,7 +162,9 @@ impl WalSource {
         let mut txn_version: Option<u64> = None;
         // Only child re-fetch needs SQL, so without children the connection the
         // caller passed is left alone.
-        let needs_admin = !self.cfg.children.is_empty() || !self.cfg.child_parents.is_empty();
+        let needs_admin = !self.cfg.children.is_empty()
+            || !self.cfg.aggregates.is_empty()
+            || !self.cfg.child_parents.is_empty();
         let admin_client = needs_admin.then_some(admin).flatten();
         if needs_admin && admin_client.is_none() {
             return Err(SourceError::Config(
@@ -280,8 +287,10 @@ impl WalSource {
                                 Classified::ParentRow(table, change) => {
                                     pending.hold_parent(table, change)
                                 }
-                                Classified::NamesParent { parent, key } => {
-                                    pending.name_parent(parent, key)
+                                Classified::NamesParent { parent, keys } => {
+                                    for key in keys {
+                                        pending.name_parent(parent.clone(), key);
+                                    }
                                 }
                                 Classified::NamesThrough {
                                     parent,
@@ -405,15 +414,9 @@ impl WalSource {
         // CHILD table: it names a parent to re-read, and carries nothing else
         if let Some(parent) = self.cfg.child_parents.get(&table) {
             let specs = self.cfg.children.get(parent).cloned().unwrap_or_default();
-            let cspec = specs
-                .iter()
-                .find(|s| s.reads(&rel.schema, &rel.name))
-                .ok_or_else(|| {
-                    SourceError::protocol(format!(
-                        "child {}.{} has no matching children entry",
-                        rel.schema, rel.name
-                    ))
-                })?;
+            let Some(cspec) = specs.iter().find(|s| s.reads(&rel.schema, &rel.name)) else {
+                return self.names_aggregate_parent(rel, parent, &incoming);
+            };
             // Which half of a many-to-many relation this row is. The junction
             // carries the parent's key and takes the direct path; the child
             // carries only its own, and the junction is asked at commit.
@@ -450,7 +453,7 @@ impl WalSource {
                 },
                 None => Classified::NamesParent {
                     parent: parent.clone(),
-                    key: value,
+                    keys: vec![value],
                 },
             });
         }
@@ -479,11 +482,65 @@ impl WalSource {
             self.cfg.key_columns.get(&table).map(Vec::as_slice),
             self.cfg.append_only.contains(&table),
         )?;
-        if self.cfg.children.contains_key(&table) {
+        if self.cfg.children.contains_key(&table) || self.cfg.aggregates.contains_key(&table) {
             Ok(Classified::ParentRow(table, change))
         } else {
             Ok(Classified::Row(change))
         }
+    }
+
+    /// A row of a table an aggregate counts: it is no document either, and what
+    /// it carries is the parents whose number has to be counted again.
+    ///
+    /// Both of them where the foreign key moved. The new image is required —
+    /// a row that cannot say which parent it belongs to leaves a number wrong
+    /// with nothing to notice it — while the old image is taken when the
+    /// replica identity carries it, which is the same story a child table's
+    /// deletes already have.
+    fn names_aggregate_parent(
+        &self,
+        rel: &crate::pgoutput::Relation,
+        parent: &(String, String),
+        incoming: &crate::docbuild::Incoming,
+    ) -> Result<Classified> {
+        let specs = self.cfg.aggregates.get(parent).cloned().unwrap_or_default();
+        let spec = specs
+            .iter()
+            .find(|s| s.reads(&rel.schema, &rel.name))
+            .ok_or_else(|| {
+                SourceError::protocol(format!(
+                    "child {}.{} has no matching children entry",
+                    rel.schema, rel.name
+                ))
+            })?;
+        let idx = super::docbuild::column_index(rel, &spec.foreign_key).ok_or_else(|| {
+            SourceError::protocol(format!(
+                "column {} missing on {}.{}",
+                spec.foreign_key, rel.schema, rel.name
+            ))
+        })?;
+        let mut keys: Vec<serde_json::Value> = Vec::new();
+        for (nth, tuple) in incoming.tuples().into_iter().enumerate() {
+            let value = super::docbuild::convert_column_at(rel, idx, tuple)
+                .protocol_ctx(|| "aggregate key decode".into())?;
+            if value.is_null() {
+                if nth == 0 {
+                    return Err(SourceError::protocol(format!(
+                        "row of {}.{} carries NULL {}; cannot locate the parent whose {} \
+                         it counts towards. Consider ALTER TABLE {}.{} REPLICA IDENTITY FULL",
+                        rel.schema, rel.name, spec.foreign_key, spec.field, rel.schema, rel.name
+                    )));
+                }
+                continue;
+            }
+            if !keys.contains(&value) {
+                keys.push(value);
+            }
+        }
+        Ok(Classified::NamesParent {
+            parent: parent.clone(),
+            keys,
+        })
     }
 }
 
@@ -493,10 +550,12 @@ enum Classified {
     Row(pg2osync_core::event::RowChange),
     /// A document missing only its child arrays.
     ParentRow((String, String), pg2osync_core::event::RowChange),
-    /// Not a document: the parent it names has to be re-read.
+    /// Not a document: the parents it names have to be re-read. A changed row
+    /// names two of them where its `foreign_key` moved — the parent it left
+    /// has to be re-counted as much as the one it joined.
     NamesParent {
         parent: (String, String),
-        key: serde_json::Value,
+        keys: Vec<serde_json::Value>,
     },
     /// Not a document either, and it names no parent: a row of a many-to-many
     /// child, whose parents the junction knows and the commit asks for.
@@ -559,6 +618,7 @@ async fn flush_pending(
             }
         }
 
+        let aggregates = cfg.aggregates.get(&table).cloned().unwrap_or_default();
         let mut docs: Vec<(serde_json::Value, &mut serde_json::Value)> = emitted
             .iter_mut()
             .filter_map(|r| {
@@ -567,6 +627,7 @@ async fn flush_pending(
             })
             .collect();
         crate::children::attach_children_batch(&mut docs, &specs, admin).await?;
+        crate::aggregate::attach_aggregates_batch(&mut docs, &aggregates, admin).await?;
         drop(docs);
 
         for mut change in emitted {
@@ -643,6 +704,7 @@ mod tests {
             admin_url: None,
             tls: Default::default(),
             children: HashMap::new(),
+            aggregates: HashMap::new(),
             child_parents: HashMap::new(),
             parent_pk_columns: HashMap::new(),
             key_columns: HashMap::new(),

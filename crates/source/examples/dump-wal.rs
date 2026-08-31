@@ -51,6 +51,7 @@ async fn main() -> Result<()> {
         durable: None,
         admin_url: Some(url.clone()),
         children: Default::default(),
+        aggregates: Default::default(),
         child_parents: Default::default(),
         parent_pk_columns: Default::default(),
         key_columns: Default::default(),

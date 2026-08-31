@@ -3,6 +3,7 @@
 //! Every other crate depends on this one; this crate depends on none of them.
 //! The `Sink` trait lives here so the engine never imports the sink crate.
 
+pub mod aggregate;
 pub mod checkpoint;
 pub mod children;
 pub mod error;
