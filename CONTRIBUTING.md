@@ -109,6 +109,7 @@ Deeper probes are not part of CI and stay manual:
 ./dev/db-load-impact.sh              # what the source database pays while busy
 ./dev/many-tables.sh                 # what a table costs, apart from its rows
 ./dev/resource-limits.sh             # how many cores it needs (needs the container image)
+./dev/soak.sh 4h                     # hours of sustained load with scheduled chaos, sampled and asserted
 ```
 
 `e2e-postgres-sink.sh` is the suite to run when the PostgreSQL sink changes.
