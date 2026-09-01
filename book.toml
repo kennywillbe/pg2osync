@@ -18,6 +18,9 @@ git-repository-url = "https://github.com/kennywillbe/pg2osync"
 edit-url-template = "https://github.com/kennywillbe/pg2osync/edit/main/{path}"
 site-url = "/pg2osync/"
 default-theme = "rust"
+# Without this, an OS in dark mode gets mdBook's factory navy instead of the
+# one theme the picker decision (#54) kept.
+preferred-dark-theme = "rust"
 additional-css = ["theme/custom.css"]
 additional-js = ["theme/force-rust.js"]
 
