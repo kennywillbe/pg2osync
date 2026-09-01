@@ -39,6 +39,17 @@ itself. To add a file, annotate the line and add the path with
 `"type": "generic"`; nothing else pins a version by hand, and a pin that goes
 stale means one of those two steps was missed.
 
+Dependency bumps follow the same conventional-commit logic, split by where the
+dependency ends up. A cargo dependency ships inside the binary, so Dependabot
+titles those PRs `fix(deps):` — each one makes the release PR propose a patch
+version, because a user cannot get the fixed dependency any other way. GitHub
+Actions and Docker base-image bumps never reach a user, so they stay
+`build(deps):` — they bump nothing, but they are no longer invisible either:
+`changelog-sections` lists the `build` type as a **Dependencies** section, so
+the next release's changelog names them. The release PR still merges by hand,
+so a run of dependency bumps becomes one deliberate patch release, not a
+stream of them.
+
 ```
 merge a feature PR   →  release PR updated. Nothing released.
 merge a feature PR   →  release PR updated. Nothing released.

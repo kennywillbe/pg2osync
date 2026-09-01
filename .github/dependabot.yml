@@ -5,6 +5,11 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    # cargo dependencies ship inside the binary, so a bump is a user-visible
+    # fix: it must cut a patch release, not vanish as a hidden build commit
+    commit-message:
+      prefix: fix
+      include: scope
     groups:
       # one PR for patch bumps keeps review focused on real upgrades
       patch-updates:
@@ -13,7 +18,14 @@ updates:
     directory: /
     schedule:
       interval: monthly
+    # CI-only: never reaches a user, so it must not bump a version
+    commit-message:
+      prefix: build
+      include: scope
   - package-ecosystem: docker
     directory: /
     schedule:
       interval: monthly
+    commit-message:
+      prefix: build
+      include: scope
