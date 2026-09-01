@@ -50,7 +50,7 @@ services:
       retries: 30
 
   pg2osync:
-    image: ghcr.io/kennywillbe/pg2osync:1.5.0 # x-release-please-version
+    image: ghcr.io/kennywillbe/pg2osync:1.5.1 # x-release-please-version
     environment:
       RUST_LOG: pg2osync=info
       PG2OSYNC_SOURCE_URL: postgres://postgres:postgres@postgres:5432/shop
