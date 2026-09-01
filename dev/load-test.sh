@@ -31,7 +31,20 @@ export PG2OSYNC_SOURCE_URL="postgres://postgres:postgres@localhost:15432/sourced
 pg()      { docker exec "$PG_CONTAINER" psql -U postgres -d sourcedb -qtAc "$1"; }
 # a series with no samples yet is absent from the exposition, and every caller
 # here wants to do arithmetic on the answer
-metric()  { local v; v=$(curl -s http://127.0.0.1:9115/metrics | awk -v k="$1" '$1 == k {print $2}'); echo "${v:-0}"; }
+# Every family carries a source="..." label since multi-source landed, so an
+# exact series match would read 0. Match the family plus any label fragment the
+# caller names, and sum across sources.
+metric()  {
+  local fam frag
+  fam=${1%%\{*}
+  frag=""
+  case $1 in *\{*) frag=${1#*\{}; frag=${frag%\}};; esac
+  curl -s http://127.0.0.1:9115/metrics | awk -v fam="$fam" -v frag="$frag" '
+    index($1, fam "{") == 1 || $1 == fam {
+      if (frag == "" || index($1, frag) > 0) { s += $2; found = 1 }
+    }
+    END { printf "%.0f", (found ? s : 0) }'
+}
 count()   { curl -s "$OS/load_test/_count" | python3 -c "import sys,json;print(json.load(sys.stdin).get('count',0))"; }
 refresh() { curl -s -XPOST "$OS/load_test/_refresh" > /dev/null; }
 now()     { python3 -c "import time;print(time.time())"; }
