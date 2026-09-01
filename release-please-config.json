@@ -20,7 +20,16 @@
           "type": "toml",
           "path": "Cargo.lock",
           "jsonpath": "$.package[?(@.name.value=='pg2osync')].version"
-        }
+        },
+        { "type": "generic", "path": "README.md" },
+        { "type": "generic", "path": "docs/deployment.md" },
+        { "type": "generic", "path": "examples/docker-compose.yml" },
+        { "type": "generic", "path": "deploy/docker-compose.yml" },
+        { "type": "generic", "path": "deploy/helm/pg2osync/Chart.yaml" },
+        { "type": "generic", "path": "deploy/kubernetes/kustomization.yaml" },
+        { "type": "generic", "path": "deploy/kubernetes/deployment.yaml" },
+        { "type": "generic", "path": "deploy/operator/kustomization.yaml" },
+        { "type": "generic", "path": "deploy/operator/deployment.yaml" }
       ]
     }
   }

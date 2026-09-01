@@ -1,0 +1,17 @@
+# The whole configuration of the quickstart. The host names are compose
+# service names, so this file means something only inside that network.
+
+[source]
+url_env = "PG2OSYNC_SOURCE_URL"
+
+[target]
+url = "http://opensearch:9200"
+
+[metrics]
+enabled = true
+# 0.0.0.0 rather than loopback, so the container's healthcheck can reach it.
+bind = "0.0.0.0:9100"
+
+[sync.products]
+table = "public.products"
+index = "products"

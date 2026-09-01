@@ -17,6 +17,11 @@ Installing it, the comparison against Debezium and Logstash, and the current
 feature matrix are in the
 [README](https://github.com/kennywillbe/pg2osync#readme). This site is the rest:
 
+- **[The five-minute quickstart](https://github.com/kennywillbe/pg2osync/blob/main/examples/docker-compose.yml)**
+  — PostgreSQL, OpenSearch and pg2osync in one `docker compose up`, seeded, with
+  a searchable row at the end of it; and
+  [a browser demo](https://github.com/kennywillbe/pg2osync/tree/main/examples/nextjs-demo)
+  that times how long a write takes to become searchable.
 - **[Configuration](configuration.md)** — every option, with what each one costs.
 - **Sources** — what [PostgreSQL](sources/postgresql.md) and
   [MySQL/MariaDB](sources/mysql.md) each need switched on, and how much of the

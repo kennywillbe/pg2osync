@@ -9,14 +9,28 @@ Elasticsearch, Meilisearch, a pgvector table or Qdrant within milliseconds.
 Inserts, updates, deletes and truncates included. One static Rust binary, one
 TOML file.
 
-```sh
-git clone https://github.com/kennywillbe/pg2osync && cd pg2osync
-cargo build --release
+Every release ships the binary already built, so there is nothing to compile:
 
+<!-- x-release-please-start-version -->
+```sh
+v=v1.5.0 t=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl,
+                                       # x86_64-apple-darwin, aarch64-apple-darwin
+curl -fsSLO "https://github.com/kennywillbe/pg2osync/releases/download/$v/pg2osync-$v-$t.tar.gz"
+tar -xzf "pg2osync-$v-$t.tar.gz" && sudo install pg2osync /usr/local/bin/
+```
+<!-- x-release-please-end -->
+
+<!-- x-release-please-start-version -->
+Or run the image: `docker run ghcr.io/kennywillbe/pg2osync:1.5.0`.
+<!-- x-release-please-end -->
+Or build from source with Rust 1.90 or newer. All three, with checksums, tags
+and the Kubernetes manifests, are under [Install](#install).
+
+```sh
 export PG2OSYNC_SOURCE_URL="postgres://user:pass@db-host/mydb"
-./target/release/pg2osync init --table users   # writes pg2osync.toml, checks the table exists
-./target/release/pg2osync validate             # checks both ends and the server's settings
-./target/release/pg2osync run                  # initial load, then streaming
+pg2osync init --table users   # writes pg2osync.toml, checks the table exists
+pg2osync validate             # checks both ends and the server's settings
+pg2osync run                  # initial load, then streaming
 ```
 
 `init` reads your database to write the config, so an unqualified `users` comes
@@ -184,25 +198,29 @@ ships a static binary for Linux and macOS on x86-64 and arm64, each as
 `pg2osync-<tag>-<target>.tar.gz` with a `.sha256` beside it. The archive holds
 the one `pg2osync` executable and nothing else:
 
+<!-- x-release-please-start-version -->
 ```sh
-v=v1.3.0 t=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl,
+v=v1.5.0 t=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl,
                                        # x86_64-apple-darwin, aarch64-apple-darwin
 curl -fsSLO "https://github.com/kennywillbe/pg2osync/releases/download/$v/pg2osync-$v-$t.tar.gz"
 curl -fsSLO "https://github.com/kennywillbe/pg2osync/releases/download/$v/pg2osync-$v-$t.tar.gz.sha256"
 sha256sum -c "pg2osync-$v-$t.tar.gz.sha256"   # shasum -a 256 -c on macOS
 tar -xzf "pg2osync-$v-$t.tar.gz" && sudo install pg2osync /usr/local/bin/
 ```
+<!-- x-release-please-end -->
 
-The same release publishes a container image, tagged with the version and with
-`major.minor`:
+The same release publishes a multi-architecture container image, tagged with the
+version, with `major.minor` and with `latest`:
 
+<!-- x-release-please-start-version -->
 ```sh
 docker run --rm \
   -e PG2OSYNC_SOURCE_URL="postgres://user:pass@db:5432/appdb" \
   -v "$PWD/pg2osync.toml:/etc/pg2osync/pg2osync.toml:ro" \
   -p 9100:9100 \
-  ghcr.io/kennywillbe/pg2osync:1.3.0
+  ghcr.io/kennywillbe/pg2osync:1.5.0
 ```
+<!-- x-release-please-end -->
 
 **From source.**
 
@@ -213,8 +231,8 @@ cargo build --release          # ./target/release/pg2osync
 cargo install --path crates/bin
 ```
 
-Rust 1.98 or newer. The binary links no C libraries, so the build needs nothing
-but a toolchain.
+Rust 1.90 or newer — the version CI enforces. The binary links no C libraries,
+so the build needs nothing but a toolchain.
 
 Kubernetes manifests are in [deploy/kubernetes](deploy/kubernetes)
 (`kubectl apply -k deploy/kubernetes`); see
@@ -226,7 +244,28 @@ release of its own.
 
 ## Try it locally
 
-Both ends in containers and a seeded table, from a clone of this repository:
+Three commands, no database of your own and no toolchain: PostgreSQL,
+OpenSearch and pg2osync come up together, a seeded table is loaded, and the
+rows are searchable.
+
+```sh
+docker compose -f examples/docker-compose.yml up -d --wait   # --wait: until it is streaming
+curl -s 'localhost:19200/products/_search?q=espresso' | jq '.hits.hits[]._source'
+docker compose -f examples/docker-compose.yml down -v
+```
+
+```json
+{ "id": 1, "name": "espresso machine", "price": "249.00" }
+```
+
+Nothing indexed that document directly: pg2osync read it out of the WAL. Write
+another row and it is searchable before you can run the query again —
+`docker compose -f examples/docker-compose.yml exec postgres psql -U postgres -d shop`.
+The ports are unusual on purpose, so the stack comes up beside whatever you
+already run, and the whole of what configures it is
+[examples/quickstart/pg2osync.toml](examples/quickstart/pg2osync.toml).
+
+From a clone, with a toolchain, the same thing against the development stack:
 
 ```sh
 docker compose -f dev/docker-compose.yml up -d          # PostgreSQL :15432, OpenSearch :9200
@@ -246,6 +285,13 @@ docker exec dev-postgres-1 psql -U postgres -d sourcedb \
   -c "UPDATE users SET name = 'renamed' WHERE id = 1;"
 curl -s localhost:9200/users/_doc/1 | jq .
 ```
+
+**Watch it happen in a browser.** [examples/nextjs-demo](examples/nextjs-demo)
+is a small app with PostgreSQL on the left and OpenSearch on the right: you
+write a row, edit it, delete it or run a mixed transaction, and the change
+appears on the other side with the measured propagation time on screen. It
+writes only to PostgreSQL and reads only from OpenSearch — everything you see
+indexed got there through pg2osync.
 
 Against **your own** database the only difference is the URL: `init` finds the
 tables, and `validate` names anything the server still needs — `wal_level`, a
