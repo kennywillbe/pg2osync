@@ -13,7 +13,7 @@ Every release ships the binary already built, so there is nothing to compile:
 
 <!-- x-release-please-start-version -->
 ```sh
-v=v1.5.0 t=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl,
+v=v1.5.1 t=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl,
                                        # x86_64-apple-darwin, aarch64-apple-darwin
 curl -fsSLO "https://github.com/kennywillbe/pg2osync/releases/download/$v/pg2osync-$v-$t.tar.gz"
 tar -xzf "pg2osync-$v-$t.tar.gz" && sudo install pg2osync /usr/local/bin/
@@ -21,7 +21,7 @@ tar -xzf "pg2osync-$v-$t.tar.gz" && sudo install pg2osync /usr/local/bin/
 <!-- x-release-please-end -->
 
 <!-- x-release-please-start-version -->
-Or run the image: `docker run ghcr.io/kennywillbe/pg2osync:1.5.0`.
+Or run the image: `docker run ghcr.io/kennywillbe/pg2osync:1.5.1`.
 <!-- x-release-please-end -->
 Or build from source with Rust 1.90 or newer. All three, with checksums, tags
 and the Kubernetes manifests, are under [Install](#install).
@@ -200,7 +200,7 @@ the one `pg2osync` executable and nothing else:
 
 <!-- x-release-please-start-version -->
 ```sh
-v=v1.5.0 t=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl,
+v=v1.5.1 t=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl,
                                        # x86_64-apple-darwin, aarch64-apple-darwin
 curl -fsSLO "https://github.com/kennywillbe/pg2osync/releases/download/$v/pg2osync-$v-$t.tar.gz"
 curl -fsSLO "https://github.com/kennywillbe/pg2osync/releases/download/$v/pg2osync-$v-$t.tar.gz.sha256"
@@ -218,7 +218,7 @@ docker run --rm \
   -e PG2OSYNC_SOURCE_URL="postgres://user:pass@db:5432/appdb" \
   -v "$PWD/pg2osync.toml:/etc/pg2osync/pg2osync.toml:ro" \
   -p 9100:9100 \
-  ghcr.io/kennywillbe/pg2osync:1.5.0
+  ghcr.io/kennywillbe/pg2osync:1.5.1
 ```
 <!-- x-release-please-end -->
 

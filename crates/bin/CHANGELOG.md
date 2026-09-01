@@ -16,6 +16,15 @@ What a major version promises here: the **configuration file** and the
 make an existing `pg2osync.toml` stop loading, or make a running pipeline
 re-read a table from the start, is a major version.
 
+## [1.5.1](https://github.com/kennywillbe/pg2osync/compare/v1.5.0...v1.5.1) (2026-09-01)
+
+
+### Dependencies
+
+* **deps:** bump actions/upload-pages-artifact from 4 to 5 ([#209](https://github.com/kennywillbe/pg2osync/issues/209)) ([9dea1de](https://github.com/kennywillbe/pg2osync/commit/9dea1dedce17dac9c55b250eaa0afbbdb88e90fb))
+* **deps:** bump softprops/action-gh-release from 3.0.2 to 3.0.3 ([#208](https://github.com/kennywillbe/pg2osync/issues/208)) ([b02bc43](https://github.com/kennywillbe/pg2osync/commit/b02bc4309e2bbb1be27ffe2db23b3219c94053b4))
+* **deps:** bump taiki-e/install-action from 2.86.8 to 2.87.1 ([#207](https://github.com/kennywillbe/pg2osync/issues/207)) ([a0dc3dd](https://github.com/kennywillbe/pg2osync/commit/a0dc3dd24885f2054b6514fe0415e7baadc0f659))
+
 ## [1.5.0](https://github.com/kennywillbe/pg2osync/compare/v1.4.0...v1.5.0) (2026-08-31)
 
 

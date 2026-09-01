@@ -30,14 +30,14 @@ spec:
           type: RuntimeDefault
       containers:
         - name: operator
-          image: ghcr.io/kennywillbe/pg2osync-operator:1.5.0 # x-release-please-version
+          image: ghcr.io/kennywillbe/pg2osync-operator:1.5.1 # x-release-please-version
           args:
             - run
             # The version every pipeline pod runs. Pinned here rather than
             # defaulted in the binary, so upgrading the pipelines is an edit
             # somebody reviewed.
             - --pipeline-image
-            - ghcr.io/kennywillbe/pg2osync:1.5.0 # x-release-please-version
+            - ghcr.io/kennywillbe/pg2osync:1.5.1 # x-release-please-version
           env:
             - name: RUST_LOG
               value: pg2osync_operator=info,kube=warn
