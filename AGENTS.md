@@ -68,6 +68,7 @@ document in the same change and say why.
 ```sh
 ./dev/ci-local.sh          # before every push, no exceptions
 ./dev/failover-probe.sh    # when the MySQL checkpoint or version logic changed; not part of CI
+./dev/soak.sh              # hours of load with scheduled chaos; not part of CI
 ```
 
 That one script runs, locally, exactly what GitHub Actions runs on a pull
@@ -119,6 +120,16 @@ Tools it needs: Docker, `helm`, `kubectl`, `mdbook`, `rustup`/`cargo`, `curl`,
 `python3`, and `kind` for the operator cell. `gh` is optional (only to read
 the title of an existing pull request); `cargo-audit` and a missing MSRV
 toolchain are installed on demand.
+
+Both probes above stay manual, and should: one builds a MySQL primary and a
+replica and promotes it, the other holds a stack under load for as long as you
+ask it to. `soak.sh` is the one to run before a release and after anything that
+touches buffering, retries, checkpointing or the slot. It drives sustained
+writes against throwaway containers of its own, rotates through pausing the
+target, terminating the walsender, `kill -9`, schema drift, a 20k-row
+transaction and finally SIGTERM, samples memory, lag and retained WAL to a CSV
+throughout, and ends in a `RESULT` line of its own: the source and the index
+agree, memory stayed under a ceiling, the slot came back to nothing.
 
 Every bug fix ships with a regression test that fails without the fix. For
 protocol decoders, that means a byte-level test vector.
