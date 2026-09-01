@@ -58,8 +58,11 @@ assertion in `e2e MySQL to OpenSearch` — step 22, "a junction DELETE takes the
 away again" — which reads the index before the re-fetch it triggered has
 landed. The second is the Supabase compatibility cell, whose image occasionally
 restarts while the cell is seeding it; that one says `the database system is
-shutting down` in the log, which is the tell. A failure that reproduces on the
-second run is a bug and wants an issue, not a third run.
+shutting down` in the log, which is the tell. The third is another children
+timing window in the same MySQL suite — "one statement of 10 children lands
+whole", which polls the parent before one grouped re-fetch has been written.
+A failure that reproduces on the second run is a bug and wants an issue, not
+a third run.
 
 The script starts the dev stack and the `mysql-test` container if they are
 down and seeds both. Those are shared, and so are the table and index names the
