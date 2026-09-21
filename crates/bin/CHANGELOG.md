@@ -16,6 +16,14 @@ What a major version promises here: the **configuration file** and the
 make an existing `pg2osync.toml` stop loading, or make a running pipeline
 re-read a table from the start, is a major version.
 
+## [1.5.2](https://github.com/kennywillbe/pg2osync/compare/v1.5.1...v1.5.2) (2026-09-21)
+
+
+### Bug Fixes
+
+* **deps:** bump the patch-updates group across 1 directory with 6 updates ([#218](https://github.com/kennywillbe/pg2osync/issues/218)) ([73bfcbd](https://github.com/kennywillbe/pg2osync/commit/73bfcbd39e398a1ed87cee945481ccc0b56c67ee))
+* **deps:** bump toml from 1.1.4+spec-1.1.0 to 1.1.5+spec-1.1.0 in the patch-updates group ([#214](https://github.com/kennywillbe/pg2osync/issues/214)) ([61e73cb](https://github.com/kennywillbe/pg2osync/commit/61e73cb674813d4205e7ac02068b4e0b0fca552b))
+
 ## [1.5.1](https://github.com/kennywillbe/pg2osync/compare/v1.5.0...v1.5.1) (2026-09-01)
 
 
