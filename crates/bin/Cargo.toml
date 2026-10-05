@@ -36,7 +36,7 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter", "json"] }
 tracing-opentelemetry = { version = "0.33.0", default-features = false }
 opentelemetry = { version = "0.32.0", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.32.1", default-features = false, features = ["trace"] }
-opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["trace", "grpc-tonic"] }
+opentelemetry-otlp = { version = "0.33.0", default-features = false, features = ["trace", "grpc-tonic"] }
 futures = "0.3.34"
 bytes = "1.12.1"
 url = "2.5.8"
