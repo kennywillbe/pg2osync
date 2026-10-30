@@ -19,7 +19,7 @@ schemars = "1.2"
 rustls = { version = "0.23.43", features = ["ring"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde-saphyr = "1.2"
+serde-saphyr = "2.0"
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
