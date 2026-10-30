@@ -11,6 +11,11 @@ updates:
       prefix: fix
       include: scope
     groups:
+      # the otel crates require each other's exact minor version, so a bump of
+      # one alone cannot compile; listed first because a crate joins only the
+      # first group it matches
+      opentelemetry:
+        patterns: ["opentelemetry*", "tracing-opentelemetry"]
       # one PR for patch bumps keeps review focused on real upgrades
       patch-updates:
         update-types: ["patch"]

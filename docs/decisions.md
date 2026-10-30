@@ -1502,7 +1502,10 @@ to the config file that describes a pipeline. With no endpoint nothing is
 constructed — no exporter, no batch thread, no connection — so an operator with
 no tracing backend pays for none of it, and one whose collector is down loses
 spans and one log line rather than throughput: an export failure is reported
-once and never reaches the write path.
+once and never reaches the write path. Since opentelemetry-otlp 0.33 a failed
+gRPC export is retried with backoff (up to three retries) before the batch is
+dropped; the default stays, because the retries run on the batch thread too, so
+a down collector only delays that one log line and can lengthen shutdown.
 
 This does not change the metrics decision above. The two answer different
 questions, and a Prometheus endpoint is still six counters that need no client
