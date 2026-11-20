@@ -1,5 +1,5 @@
 [advisories]
-ignore = ["RUSTSEC-2023-0071"]
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0543"]
 
 # RUSTSEC-2023-0071 is the Marvin attack against the `rsa` crate: a timing
 # sidechannel in RSA *decryption* that can recover a private key. There is no
@@ -12,3 +12,15 @@ ignore = ["RUSTSEC-2023-0071"]
 # public key for `caching_sha2_password` over an unencrypted connection. No
 # private key exists in this process, so there is no key for the sidechannel to
 # leak. Revisit when rsa 0.10 ships a stable release.
+#
+# RUSTSEC-2026-0543 marks `chrono` as unmaintained. It is informational: no
+# vulnerability is reported and no version is patched, so `--deny warnings`
+# would stay red until chrono is gone.
+#
+# chrono is used in one place, the `date` transform
+# (crates/engine/src/mapping.rs), to parse a column with the user's `from`
+# format. That format string is configuration users have already written in
+# chrono's strftime syntax, so swapping the crate is a behaviour change for
+# them, not a dependency bump. Revisit by moving the transform to `jiff` (or
+# `time`) with a documented format migration, or sooner if an actual
+# vulnerability in chrono is published.
