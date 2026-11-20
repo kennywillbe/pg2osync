@@ -16,6 +16,31 @@ What a major version promises here: the **configuration file** and the
 make an existing `pg2osync.toml` stop loading, or make a running pipeline
 re-read a table from the start, is a major version.
 
+## [1.5.2](https://github.com/kennywillbe/pg2osync/compare/v1.5.1...v1.5.2) (2026-11-20)
+
+
+### Bug Fixes
+
+* **deps:** bump opentelemetry crates to 0.33 together ([#233](https://github.com/kennywillbe/pg2osync/issues/233)) ([07beb6f](https://github.com/kennywillbe/pg2osync/commit/07beb6f5112d58a9ffb627f3fc4bb65e3a0a8e76))
+* **deps:** bump pgwire-replication from 0.4.1 to 0.5.0 ([#237](https://github.com/kennywillbe/pg2osync/issues/237)) ([58f0c0e](https://github.com/kennywillbe/pg2osync/commit/58f0c0e179ae5db499c3e26267edf500be261e21))
+* **deps:** bump quinn-udp to 0.5.16 for RUSTSEC-2026-0538 ([#241](https://github.com/kennywillbe/pg2osync/issues/241)) ([c08b667](https://github.com/kennywillbe/pg2osync/commit/c08b6674e88cc79ceddfa411eb82b872a3c0773a))
+* **deps:** bump serde-saphyr from 1.2.0 to 1.3.0 ([#222](https://github.com/kennywillbe/pg2osync/issues/222)) ([9d8c554](https://github.com/kennywillbe/pg2osync/commit/9d8c554ffae7ecb54e3c848b14f5059feca2a792))
+* **deps:** bump serde-saphyr from 1.3.0 to 2.0.0 ([#238](https://github.com/kennywillbe/pg2osync/issues/238)) ([9e548f7](https://github.com/kennywillbe/pg2osync/commit/9e548f731906aaaac5452fb32350ab5faaa395f2))
+* **deps:** bump the patch-updates group across 1 directory with 2 updates ([#240](https://github.com/kennywillbe/pg2osync/issues/240)) ([9003f0c](https://github.com/kennywillbe/pg2osync/commit/9003f0c37695c16f87c6c576c4dfbdd2708ff1f6))
+* **deps:** bump the patch-updates group across 1 directory with 3 updates ([#226](https://github.com/kennywillbe/pg2osync/issues/226)) ([caf3392](https://github.com/kennywillbe/pg2osync/commit/caf33929853bfa82e85d9cf852b6ea7edd35c49a))
+* **deps:** bump the patch-updates group across 1 directory with 6 updates ([#218](https://github.com/kennywillbe/pg2osync/issues/218)) ([73bfcbd](https://github.com/kennywillbe/pg2osync/commit/73bfcbd39e398a1ed87cee945481ccc0b56c67ee))
+* **deps:** bump the patch-updates group across 1 directory with 8 updates ([#231](https://github.com/kennywillbe/pg2osync/issues/231)) ([ca18511](https://github.com/kennywillbe/pg2osync/commit/ca18511b0aadd3bc821b90046f54cad765cc6fd1))
+* **deps:** bump toml from 1.1.4+spec-1.1.0 to 1.1.5+spec-1.1.0 in the patch-updates group ([#214](https://github.com/kennywillbe/pg2osync/issues/214)) ([61e73cb](https://github.com/kennywillbe/pg2osync/commit/61e73cb674813d4205e7ac02068b4e0b0fca552b))
+* **deps:** update tokio, quinn-proto and rustls-webpki for RUSTSEC advisories ([#232](https://github.com/kennywillbe/pg2osync/issues/232)) ([ef8df23](https://github.com/kennywillbe/pg2osync/commit/ef8df232cdd23c2feecb7d4b7a3d78f510f57bda))
+
+
+### Dependencies
+
+* **deps:** bump docker/login-action from 4.6.0 to 4.7.0 ([#234](https://github.com/kennywillbe/pg2osync/issues/234)) ([4ce688a](https://github.com/kennywillbe/pg2osync/commit/4ce688add5711d34558c93a0a333a8e26f425345))
+* **deps:** bump docker/setup-qemu-action from 4.2.0 to 4.4.0 ([#225](https://github.com/kennywillbe/pg2osync/issues/225)) ([4449f26](https://github.com/kennywillbe/pg2osync/commit/4449f26dd0a756c66a42ed2544a673d3af2c2381))
+* **deps:** bump taiki-e/install-action from 2.87.1 to 2.87.21 ([#224](https://github.com/kennywillbe/pg2osync/issues/224)) ([88e207f](https://github.com/kennywillbe/pg2osync/commit/88e207f9fa1cdd50d8518c397ce362c146674ef9))
+* **deps:** bump taiki-e/install-action from 2.87.21 to 2.88.0 ([#239](https://github.com/kennywillbe/pg2osync/issues/239)) ([8bee225](https://github.com/kennywillbe/pg2osync/commit/8bee2257f9c24c1ec05aafef71b41ac31d70398a))
+
 ## [1.5.1](https://github.com/kennywillbe/pg2osync/compare/v1.5.0...v1.5.1) (2026-09-01)
 
 
