@@ -431,25 +431,31 @@ impl WalSource {
                     rel.schema, rel.name
                 ))
             })?;
-            let value = super::docbuild::convert_column_at(rel, idx, incoming.tuple())
-                .protocol_ctx(|| "child key decode".into())?;
-            if value.is_null() {
-                return Err(SourceError::protocol(format!(
+            let missing = || {
+                format!(
                     "child row carries NULL {column}; cannot locate parent. \
                      Consider ALTER TABLE {}.{} REPLICA IDENTITY FULL",
                     rel.schema, rel.name
-                )));
-            }
-            return Ok(match through_child {
-                Some(_) => Classified::NamesThrough {
+                )
+            };
+            // A many-to-many child's own key does not move it anywhere: the
+            // junction rows do, and they take the direct path. Being a key, it
+            // is never legitimately NULL either.
+            if through_child.is_some() {
+                let child_key = super::docbuild::convert_column_at(rel, idx, incoming.tuple())
+                    .protocol_ctx(|| "child key decode".into())?;
+                if child_key.is_null() {
+                    return Err(SourceError::protocol(missing()));
+                }
+                return Ok(Classified::NamesThrough {
                     parent: parent.clone(),
                     field: cspec.field.clone(),
-                    child_key: value,
-                },
-                None => Classified::NamesParent {
-                    parent: parent.clone(),
-                    keys: vec![value],
-                },
+                    child_key,
+                });
+            }
+            return Ok(Classified::NamesParent {
+                parent: parent.clone(),
+                keys: keys_in(rel, idx, &incoming, missing)?,
             });
         }
 
@@ -518,29 +524,54 @@ impl WalSource {
                 spec.foreign_key, rel.schema, rel.name
             ))
         })?;
-        let mut keys: Vec<serde_json::Value> = Vec::new();
-        for (nth, tuple) in incoming.tuples().into_iter().enumerate() {
-            let value = super::docbuild::convert_column_at(rel, idx, tuple)
-                .protocol_ctx(|| "aggregate key decode".into())?;
-            if value.is_null() {
-                if nth == 0 {
-                    return Err(SourceError::protocol(format!(
-                        "row of {}.{} carries NULL {}; cannot locate the parent whose {} \
-                         it counts towards. Consider ALTER TABLE {}.{} REPLICA IDENTITY FULL",
-                        rel.schema, rel.name, spec.foreign_key, spec.field, rel.schema, rel.name
-                    )));
-                }
-                continue;
-            }
-            if !keys.contains(&value) {
-                keys.push(value);
-            }
-        }
+        let keys = keys_in(rel, idx, incoming, || {
+            format!(
+                "row of {}.{} carries NULL {}; cannot locate the parent whose {} \
+                 it counts towards. Consider ALTER TABLE {}.{} REPLICA IDENTITY FULL",
+                rel.schema, rel.name, spec.foreign_key, spec.field, rel.schema, rel.name
+            )
+        })?;
         Ok(Classified::NamesParent {
             parent: parent.clone(),
             keys,
         })
     }
+}
+
+/// The distinct parents one foreign key names across a row's images, newest
+/// first.
+///
+/// A row that moved to another parent has left one array as surely as it
+/// joined another, so every image counts. A NULL the image carries is a row
+/// with no parent on that side and names nobody. A NULL standing in for a
+/// column the image does not carry — a key-only image outside the replica
+/// identity — is skipped behind an update's new image, which already says where
+/// the row went, but is an error on a delete, where it is the only image there
+/// is.
+fn keys_in(
+    rel: &crate::pgoutput::Relation,
+    idx: usize,
+    incoming: &super::docbuild::Incoming,
+    missing: impl FnOnce() -> String,
+) -> Result<Vec<serde_json::Value>> {
+    let carried_by_old = rel.replica_identity == crate::pgoutput::ReplicaIdentity::Full
+        || rel.columns[idx].in_replica_identity;
+    let only_old = matches!(incoming, super::docbuild::Incoming::Delete(_));
+    let mut keys: Vec<serde_json::Value> = Vec::new();
+    for (nth, tuple) in incoming.tuples().into_iter().enumerate() {
+        let value = super::docbuild::convert_column_at(rel, idx, tuple)
+            .protocol_ctx(|| "parent key decode".into())?;
+        if value.is_null() {
+            if nth == 0 && only_old && !carried_by_old {
+                return Err(SourceError::protocol(missing()));
+            }
+            continue;
+        }
+        if !keys.contains(&value) {
+            keys.push(value);
+        }
+    }
+    Ok(keys)
 }
 
 /// What a decoded row turned out to be.
@@ -688,6 +719,8 @@ impl WalSourceConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pgoutput::{Message, OldTuple, ReplicaIdentity};
+    use serde_json::json;
 
     fn source(tables: &[&str]) -> WalSource {
         WalSource::new(WalSourceConfig {
@@ -728,6 +761,194 @@ mod tests {
         // asking the engine for an index that does not exist.
         assert!(!src.is_configured("public", "users_old"));
         assert!(!src.is_configured("other", "users"));
+    }
+
+    /// A customers <- orders source, with the orders relation as PG describes it
+    /// under `identity`: FULL flags every column as part of the identity.
+    fn orders_child_source(
+        identity: crate::pgoutput::ReplicaIdentity,
+    ) -> (WalSource, HashMap<u32, crate::pgoutput::Relation>) {
+        let mut cfg = source(&["public.customers"]).cfg;
+        let customers = ("public".to_string(), "customers".to_string());
+        cfg.children.insert(
+            customers.clone(),
+            vec![
+                pg2osync_core::children::ChildSpec::new(
+                    "public.orders",
+                    "orders",
+                    "customer_id",
+                    "id",
+                )
+                .expect("a qualified child"),
+            ],
+        );
+        cfg.child_parents
+            .insert(("public".into(), "orders".into()), customers);
+        let column = |name: &str, key: bool| crate::pgoutput::RelationColumn {
+            name: name.into(),
+            type_oid: 20,
+            typmod: -1,
+            in_replica_identity: key,
+        };
+        let rel = crate::pgoutput::Relation {
+            rel_id: 7,
+            schema: "public".into(),
+            name: "orders".into(),
+            columns: vec![
+                column("id", true),
+                column(
+                    "customer_id",
+                    identity == crate::pgoutput::ReplicaIdentity::Full,
+                ),
+            ],
+            replica_identity: identity,
+        };
+        (WalSource::new(cfg), HashMap::from([(7, rel)]))
+    }
+
+    fn row(id: &str, customer: Option<&str>) -> crate::pgoutput::Tuple {
+        use crate::pgoutput::TupleValue;
+        crate::pgoutput::Tuple(vec![
+            TupleValue::Text(id.as_bytes().to_vec()),
+            customer.map_or(TupleValue::Null, |c| {
+                TupleValue::Text(c.as_bytes().to_vec())
+            }),
+        ])
+    }
+
+    fn update(old: Option<crate::pgoutput::OldTuple>, new: crate::pgoutput::Tuple) -> Message {
+        Message::Update(crate::pgoutput::Update {
+            rel_id: 7,
+            old_tuple: old,
+            new_tuple: new,
+        })
+    }
+
+    fn named_parents(classified: Classified) -> Vec<serde_json::Value> {
+        match classified {
+            Classified::NamesParent { keys, .. } => keys,
+            _ => panic!("a child row names its parents"),
+        }
+    }
+
+    #[test]
+    fn a_child_moved_to_another_parent_names_the_one_it_left_too() {
+        let (mut src, relations) = orders_child_source(ReplicaIdentity::Full);
+        let moved = update(
+            Some(OldTuple::Full(row("10", Some("1")))),
+            row("10", Some("2")),
+        );
+        assert_eq!(
+            named_parents(src.classify(&moved, &relations).expect("classified")),
+            vec![json!(2), json!(1)],
+            "the parent the order left still embeds it until it is re-read"
+        );
+    }
+
+    #[test]
+    fn a_child_update_without_the_old_foreign_key_names_the_new_parent_only() {
+        let (mut src, relations) = orders_child_source(ReplicaIdentity::Default);
+        // Default replica identity: the key image carries NULL for the rest.
+        let rekeyed = update(Some(OldTuple::Key(row("9", None))), row("10", Some("2")));
+        assert_eq!(
+            named_parents(src.classify(&rekeyed, &relations).expect("classified")),
+            vec![json!(2)]
+        );
+        let unmoved = update(
+            Some(OldTuple::Full(row("10", Some("2")))),
+            row("10", Some("2")),
+        );
+        assert_eq!(
+            named_parents(src.classify(&unmoved, &relations).expect("classified")),
+            vec![json!(2)],
+            "one parent is named once"
+        );
+    }
+
+    #[test]
+    fn a_child_detached_from_its_parent_names_the_one_it_left() {
+        let (mut src, relations) = orders_child_source(ReplicaIdentity::Full);
+        let detached = update(Some(OldTuple::Full(row("10", Some("1")))), row("10", None));
+        assert_eq!(
+            named_parents(src.classify(&detached, &relations).expect("classified")),
+            vec![json!(1)],
+            "a NULL foreign key is a row with no parent, and the one it left \
+             still embeds it until it is re-read"
+        );
+    }
+
+    #[test]
+    fn a_child_with_no_parent_names_nobody() {
+        let (mut src, relations) = orders_child_source(ReplicaIdentity::Full);
+        let inserted = Message::Insert(crate::pgoutput::Insert {
+            rel_id: 7,
+            new_tuple: row("10", None),
+        });
+        assert_eq!(
+            named_parents(src.classify(&inserted, &relations).expect("classified")),
+            Vec::<serde_json::Value>::new()
+        );
+        let deleted = Message::Delete(crate::pgoutput::Delete {
+            rel_id: 7,
+            key_tuple: OldTuple::Full(row("10", None)),
+        });
+        assert_eq!(
+            named_parents(src.classify(&deleted, &relations).expect("classified")),
+            Vec::<serde_json::Value>::new()
+        );
+    }
+
+    #[test]
+    fn a_counted_row_detached_from_its_parent_names_the_one_it_left() {
+        let (mut src, relations) = orders_child_source(ReplicaIdentity::Full);
+        let customers = ("public".to_string(), "customers".to_string());
+        src.cfg.children.clear();
+        src.cfg.aggregates.insert(
+            customers,
+            vec![
+                pg2osync_core::aggregate::AggregateSpec::new(
+                    "public.orders",
+                    "order_count",
+                    "customer_id",
+                    "id",
+                )
+                .expect("a qualified aggregate"),
+            ],
+        );
+        let detached = update(Some(OldTuple::Full(row("10", Some("1")))), row("10", None));
+        assert_eq!(
+            named_parents(src.classify(&detached, &relations).expect("classified")),
+            vec![json!(1)]
+        );
+    }
+
+    #[test]
+    fn a_child_delete_that_does_not_carry_the_foreign_key_is_an_error() {
+        // Default replica identity: the key image holds only the primary key,
+        // so the parent the row was deleted from is named nowhere.
+        let (mut src, relations) = orders_child_source(ReplicaIdentity::Default);
+        let deleted = Message::Delete(crate::pgoutput::Delete {
+            rel_id: 7,
+            key_tuple: OldTuple::Key(row("10", None)),
+        });
+        assert!(src.classify(&deleted, &relations).is_err());
+    }
+
+    #[test]
+    fn a_many_to_many_child_without_its_own_key_is_an_error() {
+        let (mut src, relations) = orders_child_source(ReplicaIdentity::Full);
+        let customers = ("public".to_string(), "customers".to_string());
+        let spec = &mut src.cfg.children.get_mut(&customers).expect("orders")[0];
+        let mut through =
+            pg2osync_core::children::Through::new("public.customer_orders", "order_id")
+                .expect("a qualified junction");
+        through.child_key = "customer_id".into();
+        spec.through = Some(through);
+        let inserted = Message::Insert(crate::pgoutput::Insert {
+            rel_id: 7,
+            new_tuple: row("10", None),
+        });
+        assert!(src.classify(&inserted, &relations).is_err());
     }
 
     #[test]

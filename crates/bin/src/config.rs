@@ -1294,6 +1294,20 @@ impl AppConfig {
                     anyhow::anyhow!("[sync.{key}] id {spec:?} is not a usable id: {e}")
                 })?;
             }
+            if self.source.mode == "poll" && !tbl.children.is_empty() {
+                anyhow::bail!(
+                    "[sync.{key}] [[children]] needs the replication log: a polled row is \
+                     written as the whole document, which would drop the arrays the initial \
+                     load embedded, and no poll cycle reads the child tables to put them back"
+                );
+            }
+            if self.source.mode == "poll" && !tbl.aggregates.is_empty() {
+                anyhow::bail!(
+                    "[sync.{key}] [[aggregates]] needs the replication log: a polled row is \
+                     written as the whole document, which would drop the numbers the initial \
+                     load counted, and no poll cycle reads the counted tables to count again"
+                );
+            }
             if let Some(fan) = &tbl.fan_out {
                 if self.source.mode == "poll" {
                     anyhow::bail!(
@@ -1689,6 +1703,7 @@ impl AppConfig {
             sections.push((Label::section(key), tbl));
         }
         check_junctions(self)?;
+        check_child_tables(self)?;
         check_index_overlap(&sections)?;
         for (key, table) in &self.sync {
             // the predicate is evaluated by the database inside the poll query;
@@ -1844,12 +1859,65 @@ fn check_junctions(cfg: &AppConfig) -> Result<()> {
                     if (*table, *foreign_key) != (entry.0, entry.1) =>
                 {
                     anyhow::bail!(
-                        "[sync.{key}] junction {through} is already used by [sync.{first}]                          for {table} through {foreign_key}; one junction table names one                          parent, or a streamed junction row cannot say which"
+                        "[sync.{key}] junction {through} is already used by [sync.{first}] \
+                         for {table} through {foreign_key}; one junction table names one \
+                         parent, or a streamed junction row cannot say which"
                     );
                 }
                 Some(_) => {}
                 None => {
                     seen.insert(through.as_str(), entry);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A streamed row of a child, junction or aggregated table finds its parent
+/// through one mapping from its table to that parent, and reads one thing out
+/// of the row to say which: the `foreign_key`, or for a many-to-many child its
+/// junction. A table resolving two ways is something that mapping cannot hold —
+/// one use would win and the other's documents would go stale without a word.
+/// The same table resolving the same way, as a child and an aggregate of one
+/// parent, re-reads that parent whole and is no conflict.
+fn check_child_tables(cfg: &AppConfig) -> Result<()> {
+    // watched table -> (parent table, how a row locates it, where it was named)
+    let mut seen: std::collections::HashMap<&str, (&str, String, String)> =
+        std::collections::HashMap::new();
+    for (key, tbl) in &cfg.sync {
+        let mut uses: Vec<(&str, String, String)> = Vec::new();
+        for child in &tbl.children {
+            let place = format!("[sync.{key}.children] {}", child.field);
+            let by_key = format!("foreign_key {}", child.foreign_key);
+            match &child.through {
+                Some(junction) => {
+                    uses.push((&child.table, format!("junction {junction}"), place.clone()));
+                    uses.push((junction, by_key, place));
+                }
+                None => uses.push((&child.table, by_key, place)),
+            }
+        }
+        for agg in &tbl.aggregates {
+            uses.push((
+                &agg.table,
+                format!("foreign_key {}", agg.foreign_key),
+                format!("[sync.{key}.aggregates] {}", agg.field),
+            ));
+        }
+        for (watched, how, place) in uses {
+            match seen.get(watched) {
+                Some((parent, first_how, first)) if (*parent, first_how) != (&tbl.table, &how) => {
+                    anyhow::bail!(
+                        "{place} reads {watched} for {} by {how}, but {first} already reads \
+                         it for {parent} by {first_how}; a streamed row of one table resolves \
+                         to one parent through one key, so one of the two would go stale",
+                        tbl.table
+                    );
+                }
+                Some(_) => {}
+                None => {
+                    seen.insert(watched, (&tbl.table, how, place));
                 }
             }
         }
@@ -3095,6 +3163,138 @@ id = "user-{id}"
              through_key = \"tag_id\"\nsingle = true\n"
         ))
         .expect("a one-to-one relation may still be recorded in a junction");
+    }
+
+    #[test]
+    fn a_watched_table_locates_one_parent() {
+        const POSTS: &str = "[sync.posts]\ntable = \"public.posts\"\n";
+        let child = |section: &str, table: &str, field: &str, fk: &str| {
+            format!(
+                "[[sync.{section}.children]]\ntable = \"{table}\"\nfield = \"{field}\"\n\
+                 foreign_key = \"{fk}\"\n"
+            )
+        };
+        let aggregate = |section: &str, table: &str, field: &str, fk: &str| {
+            format!(
+                "[[sync.{section}.aggregates]]\ntable = \"{table}\"\nfield = \"{field}\"\n\
+                 foreign_key = \"{fk}\"\n"
+            )
+        };
+        let through = |section: &str, junction: &str| {
+            format!(
+                "[[sync.{section}.children]]\ntable = \"public.tags\"\nfield = \"tags\"\n\
+                 foreign_key = \"owner_id\"\nthrough = \"{junction}\"\n\
+                 through_key = \"tag_id\"\n"
+            )
+        };
+        let refused = [
+            (
+                format!(
+                    "{}{POSTS}{}",
+                    child("users", "public.comments", "comments", "user_id"),
+                    child("posts", "public.comments", "comments", "post_id")
+                ),
+                "one child table under two parents",
+            ),
+            (
+                format!(
+                    "{}{POSTS}{}",
+                    aggregate("users", "public.comments", "n", "user_id"),
+                    aggregate("posts", "public.comments", "n", "post_id")
+                ),
+                "one aggregated table under two parents",
+            ),
+            (
+                format!(
+                    "{}{POSTS}{}",
+                    child("users", "public.comments", "comments", "user_id"),
+                    aggregate("posts", "public.comments", "n", "post_id")
+                ),
+                "a child of one parent counted for another",
+            ),
+            (
+                format!(
+                    "{}{}",
+                    child("users", "public.orders", "bought", "buyer_id"),
+                    child("users", "public.orders", "sold", "seller_id")
+                ),
+                "one table under one parent through two foreign keys",
+            ),
+            (
+                format!(
+                    "{}{POSTS}{}",
+                    through("users", "public.user_tag"),
+                    through("posts", "public.post_tag")
+                ),
+                "one many-to-many child under two parents",
+            ),
+            (
+                format!(
+                    "{}{POSTS}{}",
+                    child("users", "public.user_tag", "links", "owner_id"),
+                    through("posts", "public.user_tag")
+                ),
+                "a junction of one parent embedded as a child of another",
+            ),
+        ];
+        for (extra, why) in refused {
+            let err = parse(&format!("{MINIMAL}{extra}")).expect_err(why);
+            assert!(
+                err.to_string().contains("already"),
+                "{why}: the refusal names the first use: {err}"
+            );
+        }
+
+        parse(&format!(
+            "{MINIMAL}{}{}{}",
+            child("users", "public.orders", "orders", "user_id"),
+            aggregate("users", "public.orders", "order_count", "user_id"),
+            aggregate("users", "public.orders", "open_orders", "user_id"),
+        ))
+        .expect("one table read the same way for one parent is one route");
+    }
+
+    #[test]
+    fn embedded_children_are_refused_under_a_polling_source() {
+        let polling = MINIMAL.replace("[source]", "[source]\nmode = \"poll\"");
+        let err = parse(&format!(
+            "{polling}[[sync.users.children]]\ntable = \"public.orders\"\nfield = \"orders\"\n\
+             foreign_key = \"user_id\"\n"
+        ))
+        .expect_err("a polled parent row would replace the document without its arrays");
+        assert!(err.to_string().contains("[[children]]"), "{err}");
+        parse(&format!(
+            "{MINIMAL}[[sync.users.children]]\ntable = \"public.orders\"\nfield = \"orders\"\n\
+             foreign_key = \"user_id\"\n"
+        ))
+        .expect("the replication log re-reads the arrays");
+    }
+
+    #[test]
+    fn aggregates_are_refused_under_a_polling_source() {
+        let polling = MINIMAL.replace("[source]", "[source]\nmode = \"poll\"");
+        let aggregate = "[[sync.users.aggregates]]\ntable = \"public.orders\"\n\
+                         field = \"order_count\"\nforeign_key = \"user_id\"\n";
+        let err = parse(&format!("{polling}{aggregate}"))
+            .expect_err("a polled parent row would replace the document without its count");
+        assert!(err.to_string().contains("[[aggregates]]"), "{err}");
+        parse(&format!("{MINIMAL}{aggregate}"))
+            .expect("the replication log counts the parent again");
+    }
+
+    #[test]
+    fn a_junction_refusal_reads_as_one_sentence() {
+        let err = parse(&format!(
+            "{MINIMAL}[[sync.users.children]]\ntable = \"public.tags\"\nfield = \"tags\"\n\
+             foreign_key = \"user_id\"\nthrough = \"public.user_tag\"\nthrough_key = \"tag_id\"\n\
+             [sync.posts]\ntable = \"public.posts\"\n\
+             [[sync.posts.children]]\ntable = \"public.tags\"\nfield = \"tags\"\n\
+             foreign_key = \"post_id\"\nthrough = \"public.user_tag\"\nthrough_key = \"tag_id\"\n"
+        ))
+        .expect_err("one junction naming two parents")
+        .to_string();
+        assert!(!err.contains("  "), "no runs of spaces: {err:?}");
+        assert!(err.contains("junction public.user_tag"), "{err}");
     }
 
     #[test]

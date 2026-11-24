@@ -917,6 +917,45 @@ required and carries it; on PostgreSQL it is the replica identity, and an
 aggregated table without `REPLICA IDENTITY FULL` is warned about at startup with
 the `ALTER` to run, exactly as a child table is.
 
+The same holds for an embedded child and for a junction row: a re-parented
+order has left one array as surely as it joined another. Both sources read the
+foreign key out of the before-image as well as the after-image and name both
+parents.
+
+A NULL the source sent is a row with no parent on that side, and it names
+nobody: a child inserted without a parent, one detached from its parent, one
+deleted while it had none. The load embeds such a row nowhere, so the stream
+does the same; halting on it would retry the same row forever, and a NULL in a
+nullable foreign key is data, not a protocol fault. What stays an error is a
+delete whose image does not carry the column at all — a PostgreSQL key-only
+image outside the replica identity — since that image is the only one that can
+say where the row was, and skipping it would leave the parent stale without a
+word. An update's before-image without the column is skipped instead: the new
+image already names where the row went. That makes `REPLICA IDENTITY FULL` on a
+child table what keeps the parent a row left up to date, which is no new
+requirement: the same setting is already what lets a child delete name its
+parent. A many-to-many child's own key is not a foreign key and is never
+legitimately NULL, so it stays required.
+
+**One watched table locates one parent.** A streamed row of a child, junction
+or aggregated table reaches its parent through one mapping, table to parent, and
+reads one column out of the row to say which parent. A table under two parents,
+or under one parent through two different foreign keys, describes something that
+mapping cannot hold: one of the two would win and the other's documents would go
+stale without a word. So the config is refused when it is read, naming both
+places. Repeating a table that resolves the same way is not refused — an
+aggregate over the table a child embeds, or two aggregates over one table with
+different `where`, read the same column and re-read the same parent, and every
+collection of that parent is read again with it.
+
+**Embedded children, aggregates and poll mode do not mix.** A polled row is the
+parent's own row and nothing else, and a document is written whole — an upsert
+is an `index` action, which replaces it — so the first polled update of a parent
+would drop the arrays and counts the initial load embedded, and nothing polls the
+child or counted tables to put them back. Doing it properly means polling every
+child table and re-reading its parents, a second implementation of the streaming
+re-fetch for a fallback mode; both are refused instead.
+
 ## Checkpoints
 
 **State lives in the target.** A hidden `.pg2osync_meta` index holds one
