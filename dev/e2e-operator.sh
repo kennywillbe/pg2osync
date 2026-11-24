@@ -177,7 +177,7 @@ spec:
           ports: [{ containerPort: 5432 }]
           readinessProbe:
             exec:
-              command: ["pg_isready", "-U", "postgres", "-d", "sourcedb"]
+              command: ["pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "sourcedb"]
             periodSeconds: 5
 ---
 apiVersion: v1

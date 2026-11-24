@@ -93,10 +93,10 @@ docker run -d --name "$PG" -p "$PORT:5432" \
       -c wal_level=logical -c max_replication_slots=8 -c max_wal_senders=8' > /dev/null
 
 for _ in $(seq 1 60); do
-  if docker exec "$PG" pg_isready -U postgres > /dev/null 2>&1; then break; fi
+  if docker exec "$PG" pg_isready -h 127.0.0.1 -U postgres > /dev/null 2>&1; then break; fi
   sleep 1
 done
-docker exec "$PG" pg_isready -U postgres > /dev/null 2>&1 \
+docker exec "$PG" pg_isready -h 127.0.0.1 -U postgres > /dev/null 2>&1 \
   || { bad "postgres never came up"; docker logs "$PG" | tail -20; exit 1; }
 ok "postgres:17 on $PORT with ssl=on and clientcert=verify-full"
 
