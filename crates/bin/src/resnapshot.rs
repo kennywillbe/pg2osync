@@ -156,6 +156,7 @@ pub(crate) async fn load_one(
         ctx,
         stream_id.clone(),
         Arc::new(|token| token.to_string()),
+        Arc::new(|token| token.to_string()),
         pg2osync_engine::mapping::DurableLsn::default(),
         shutdown_rx,
     );

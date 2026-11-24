@@ -1178,8 +1178,6 @@ pub fn rejections(
                 index, parent_id, ..
             } => (index.clone(), parent_id.clone()),
         };
-        tracing::error!(target: "pg2osync::sink",
-            "PERMANENT rejection {index}/{doc_id} at {}: {reason}", op.lsn);
         out.push(Rejection {
             index,
             doc_id,

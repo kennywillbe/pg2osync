@@ -150,7 +150,13 @@ pub async fn table(
         },
         delete,
         |ops| async move {
-            sink.write(ops).await.context("deleting orphans failed")?;
+            let ack = sink.write(ops).await.context("deleting orphans failed")?;
+            // The engine logs the pipeline's refusals; this pass writes past it.
+            for rejection in &ack.rejected {
+                tracing::error!(target: "pg2osync::sink",
+                    "PERMANENT rejection {}/{} while deleting an orphan: {}",
+                    rejection.index, rejection.doc_id, rejection.reason);
+            }
             Ok(())
         },
     )
