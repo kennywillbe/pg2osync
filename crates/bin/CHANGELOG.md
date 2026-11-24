@@ -16,6 +16,46 @@ What a major version promises here: the **configuration file** and the
 make an existing `pg2osync.toml` stop loading, or make a running pipeline
 re-read a table from the start, is a major version.
 
+## [2.0.0](https://github.com/kennywillbe/pg2osync/compare/v1.5.2...v2.0.0) (2026-11-24)
+
+
+### ⚠ BREAKING CHANGES
+
+* checkpoints are stored as schema v3 (ordering bytes as hex plus the textual position). Checkpoints written by 1.x are refused, so a pipeline upgraded from 1.x starts with a fresh initial load. On MySQL the version base is read from the 1.x checkpoint so the reloaded documents are not versioned below what is already indexed; resnapshot and reindex refuse such a stream until the first run has written a v3 checkpoint. Rolling back to 1.x is only safe on PostgreSQL, or on MySQL when the checkpoint has no base yet.
+
+### refactor
+
+* make the source position opaque ordered bytes ([#261](https://github.com/kennywillbe/pg2osync/issues/261)) ([eacf114](https://github.com/kennywillbe/pg2osync/commit/eacf114cfbce5b6d52c5473d39701936cdf891f3))
+
+
+### Features
+
+* aliases, reindex and switch-alias for per-row index templates ([#260](https://github.com/kennywillbe/pg2osync/issues/260)) ([9d25b5c](https://github.com/kennywillbe/pg2osync/commit/9d25b5c0927269a074142c1aa7b45c239cff0ed3))
+* nested children two levels deep ([#263](https://github.com/kennywillbe/pg2osync/issues/263)) ([4fb583d](https://github.com/kennywillbe/pg2osync/commit/4fb583d8b71137f6e2d917497f82ed5e761db0fd))
+* reconcile tables with a per-row index template ([#257](https://github.com/kennywillbe/pg2osync/issues/257)) ([8d64268](https://github.com/kennywillbe/pg2osync/commit/8d642682b87f45dffcd5a4444e6bd65b5d21bb5e))
+* refuse reindex beside a running pipeline ([#265](https://github.com/kennywillbe/pg2osync/issues/265)) ([2b0725e](https://github.com/kennywillbe/pg2osync/commit/2b0725edc97c5c3016d59e0b5bb7d617755d7ba4))
+
+
+### Bug Fixes
+
+* **deps:** bump serde-saphyr from 2.0.0 to 2.2.0 ([#244](https://github.com/kennywillbe/pg2osync/issues/244)) ([81ce579](https://github.com/kennywillbe/pg2osync/commit/81ce5791233f93f19add6070d364ad0667a6e041))
+* **deps:** bump the patch-updates group across 1 directory with 5 updates ([#243](https://github.com/kennywillbe/pg2osync/issues/243)) ([da7bd33](https://github.com/kennywillbe/pg2osync/commit/da7bd33b4527f5bb356042f04b7280978179f4f7))
+* **deps:** bump toml from 1.1.8+spec-1.1.0 to 1.2.1+spec-1.1.0 ([#245](https://github.com/kennywillbe/pg2osync/issues/245)) ([4a89473](https://github.com/kennywillbe/pg2osync/commit/4a894735982c0446fb7b317788ba56ffb38dd4d2))
+* **deps:** bump url to 2.5.9 for RUSTSEC-2026-0592 ([#247](https://github.com/kennywillbe/pg2osync/issues/247)) ([efd85d3](https://github.com/kennywillbe/pg2osync/commit/efd85d37b515026024e0ddd09ea692cb4758778c))
+* keep batch order when writing to Meilisearch ([#259](https://github.com/kennywillbe/pg2osync/issues/259)) ([2c7991f](https://github.com/kennywillbe/pg2osync/commit/2c7991f481a34419c51f8cb973c2bc4f9fd9540f))
+* read MySQL positions in their own format ([#258](https://github.com/kennywillbe/pg2osync/issues/258)) ([82d4646](https://github.com/kennywillbe/pg2osync/commit/82d464624bf89bdfbecc61a0c9764910a28f7a89))
+* refresh the old parent when an embedded child moves ([#256](https://github.com/kennywillbe/pg2osync/issues/256)) ([0ef2f8b](https://github.com/kennywillbe/pg2osync/commit/0ef2f8bed017a7fbf4733fac985194cbdc2ff835))
+* warn MySQL upgrades from 1.x about the deletes the reload misses ([#264](https://github.com/kennywillbe/pg2osync/issues/264)) ([94b6c3b](https://github.com/kennywillbe/pg2osync/commit/94b6c3bd37c6591221db6fa14c779c519976b153))
+
+
+### Dependencies
+
+* **deps:** bump docker/login-action from 4.7.0 to 4.8.0 ([#254](https://github.com/kennywillbe/pg2osync/issues/254)) ([c123f98](https://github.com/kennywillbe/pg2osync/commit/c123f9864cb75b18f8d651b1cc7d3c15ce8d568b))
+* **deps:** bump rust from 1.98-alpine to 1.100-alpine ([#252](https://github.com/kennywillbe/pg2osync/issues/252)) ([d98f60b](https://github.com/kennywillbe/pg2osync/commit/d98f60b54fa1d761b9b912e9ba51330688663b4e))
+* **deps:** bump softprops/action-gh-release from 3.0.3 to 3.0.4 ([#253](https://github.com/kennywillbe/pg2osync/issues/253)) ([02084c4](https://github.com/kennywillbe/pg2osync/commit/02084c4af3c2a62526afb4bdbb0fc7c88b5a5e2b))
+* **deps:** bump taiki-e/install-action from 2.88.0 to 2.90.6 ([#255](https://github.com/kennywillbe/pg2osync/issues/255)) ([2af8e71](https://github.com/kennywillbe/pg2osync/commit/2af8e71aae3d912bd6cf4eae3ccfbef69a38a58b))
+* **deps:** hold kube below 5.1 ([#251](https://github.com/kennywillbe/pg2osync/issues/251)) ([846ab67](https://github.com/kennywillbe/pg2osync/commit/846ab670c08c3447a971e32608d912cb39bd7bd1))
+
 ## [1.5.2](https://github.com/kennywillbe/pg2osync/compare/v1.5.1...v1.5.2) (2026-11-20)
 
 
