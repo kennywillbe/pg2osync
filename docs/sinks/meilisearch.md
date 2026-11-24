@@ -65,7 +65,9 @@ pg2osync reindex -c pg2osync.toml --table public.users --alias users
   back to undo the rebuild — and `--drop-old` deletes it instead.
 - **No config edit follows,** unlike the other targets: the section's `index`
   never changed, so the only step left is starting the pipeline again.
-- **Stop the pipeline first;** the command refuses to run beside it. The
+- **Stop the pipeline first;** the command refuses when it sees one running,
+  but not every running pipeline shows (see
+  [Rebuilding an index](../configuration.md#rebuilding-an-index)). The
   checkpoint file in `state_dir` does not move, so the restart replays
   everything committed since the rebuild started, which is what proves the
   contents — the count only proves how many.

@@ -468,14 +468,17 @@ points the alias at the new index in one atomic request. `--drop-old` deletes
 the index the alias came off; by default it is kept, because it is the
 rollback — one alias flip away.
 
-- **Stop the pipeline first; the command refuses to run beside it.** A
-  re-snapshot is safe beside the stream because a copied row and a streamed
-  change meet in the same index and the higher position wins. A fresh index the
-  stream is not writing to has no second document to compare against, so a row
-  that changed during the rebuild would be wrong there for good — and the count
-  would still add up. The refusal is evidence, not a flag: an active
-  replication slot on PostgreSQL, and on either source a checkpoint seen
-  moving. There is no `--force`.
+- **Stop the pipeline first.** A re-snapshot is safe beside the stream because
+  a copied row and a streamed change meet in the same index and the higher
+  position wins. A fresh index the stream is not writing to has no second
+  document to compare against, so a row that changed during the rebuild would
+  be wrong there for good — and the count would still add up. The command
+  refuses on evidence, not a flag: an active replication slot on PostgreSQL,
+  and on either source a checkpoint that moves, watched for two seconds before
+  the load and compared again before the alias moves. A running pipeline with
+  nothing to stream shows neither on MySQL, so one that stays idle through the
+  whole rebuild is not detected; if it streams after the switch, the changes go
+  to the old index and the restart does not replay them. There is no `--force`.
 - **The checkpoint does not move,** by construction: the rows carry position
   `0`, exactly as a re-snapshot's do. So everything committed while the
   pipeline was stopped is still in the log, and the restart replays it into the
