@@ -1,3 +1,4 @@
+use pg2osync_core::Position;
 use std::fmt;
 use std::str::FromStr;
 
@@ -31,9 +32,55 @@ impl fmt::Display for Lsn {
     }
 }
 
+impl Lsn {
+    /// Big-endian, so the bytes the engine compares order the way the WAL does.
+    pub fn to_position(self) -> Position {
+        Position::from_bytes(self.0.to_be_bytes())
+    }
+
+    /// `None` for anything that is not eight bytes: a position from another
+    /// source's space, which no LSN can stand for.
+    pub fn from_position(position: &Position) -> Option<Self> {
+        let bytes: [u8; 8] = position.as_bytes().try_into().ok()?;
+        Some(Lsn(u64::from_be_bytes(bytes)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn position_bytes_order_like_the_wal() {
+        let ordered = [
+            "0/0",
+            "0/1B4F2A8",
+            "0/FFFFFFFF",
+            "1/0",
+            "1/1",
+            "FFFFFFFF/FFFFFFFF",
+        ];
+        for pair in ordered.windows(2) {
+            let (a, b): (Lsn, Lsn) = (pair[0].parse().unwrap(), pair[1].parse().unwrap());
+            assert!(a.to_position() < b.to_position(), "{a} < {b}");
+        }
+    }
+
+    #[test]
+    fn position_round_trips() {
+        let lsn: Lsn = "16/B374D848".parse().unwrap();
+        assert_eq!(lsn.to_position().as_bytes().len(), 8);
+        assert_eq!(Lsn::from_position(&lsn.to_position()), Some(lsn));
+    }
+
+    #[test]
+    fn a_position_of_another_width_is_not_an_lsn() {
+        assert_eq!(
+            Lsn::from_position(&Position::from_bytes(vec![1, 2, 3])),
+            None
+        );
+        assert_eq!(Lsn::from_position(&Position::from_bytes(vec![0; 9])), None);
+    }
 
     #[test]
     fn roundtrips() {

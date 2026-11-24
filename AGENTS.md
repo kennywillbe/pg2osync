@@ -22,7 +22,8 @@ Breaking one of these is a bug even if the tests pass:
 - `core` depends on no other workspace crate. `ChangeEvent` and the `Sink`
   trait are the only things crossing module boundaries.
 - The engine is source-agnostic. Nothing PostgreSQL- or MySQL-specific belongs
-  in `crates/engine`; source positions reach it as an opaque `u64` token.
+  in `crates/engine`; source positions reach it as an opaque `Position`, bytes
+  whose order is the stream order, which it only ever compares.
 - Protocol decoding stays inside its source crate — pgoutput in
   `crates/source`, binlog in `crates/source-mysql`. No CDC framework.
 - New targets implement `Sink`. The engine never matches on a sink kind, and a

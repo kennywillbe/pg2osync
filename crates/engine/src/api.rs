@@ -8,7 +8,7 @@
 
 use crate::PositionParser;
 use crate::http::{authorized, request_target, split_target};
-use pg2osync_core::lsn::Lsn;
+use pg2osync_core::position::Position;
 use pg2osync_core::sink::Sink;
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -41,7 +41,7 @@ pub type StreamNudge = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> 
 /// an application account should not hold, and pg2osync already has a
 /// connection that may.
 pub type CurrentPosition =
-    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Option<u64>> + Send>> + Send + Sync>;
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Option<Position>> + Send>> + Send + Sync>;
 
 /// Continues a caller's trace inside the wait, given the span and the W3C
 /// `traceparent` header the request carried.
@@ -66,7 +66,7 @@ pub struct ApiConfig {
 /// from registering.
 #[derive(Clone)]
 pub struct SourceEndpoints {
-    pub acked: watch::Receiver<Option<Lsn>>,
+    pub acked: watch::Receiver<Option<Position>>,
     pub parse_position: PositionParser,
     pub render_position: crate::PositionRenderer,
     pub sink: Arc<dyn Sink>,
@@ -226,7 +226,7 @@ async fn handle(state: &ApiState, request: &str) -> (&'static str, String) {
     // the privilege to read it nor any knowledge of LSN or binlog syntax.
     let (requested, raw_position) = match query_param(query, "position") {
         Some(raw) => match (source.parse_position)(&raw) {
-            Some(token) => (token, raw),
+            Some(position) => (position, raw),
             None => {
                 return (
                     "400 Bad Request",
@@ -236,7 +236,10 @@ async fn handle(state: &ApiState, request: &str) -> (&'static str, String) {
         },
         None => match &source.current_position {
             Some(read) => match read().await {
-                Some(token) => (token, (source.render_position)(token)),
+                Some(position) => {
+                    let text = (source.render_position)(&position);
+                    (position, text)
+                }
                 None => {
                     return (
                         "503 Service Unavailable",
@@ -271,7 +274,7 @@ async fn handle(state: &ApiState, request: &str) -> (&'static str, String) {
     }
 
     let started = Instant::now();
-    let reached = wait_for_position(&source, requested, timeout)
+    let reached = wait_for_position(&source, &requested, timeout)
         .instrument(wait.clone())
         .await;
     wait.record("synced", reached);
@@ -288,7 +291,11 @@ async fn handle(state: &ApiState, request: &str) -> (&'static str, String) {
         }
     }
 
-    let confirmed = (*source.acked.borrow()).map(|lsn| (source.render_position)(lsn.0));
+    let confirmed = source
+        .acked
+        .borrow()
+        .as_ref()
+        .map(|position| (source.render_position)(position));
     let body = format!(
         r#"{{"source":{},"synced":{reached},"requested":{},"confirmed":{},"waited_ms":{}}}"#,
         json_string(&name),
@@ -312,7 +319,11 @@ async fn handle(state: &ApiState, request: &str) -> (&'static str, String) {
 /// Under traffic the position moves by itself and the grace period is all that
 /// is spent. On a quiet database nothing would ever close the gap, so a marker
 /// is written once and the wait resumes.
-async fn wait_for_position(source: &SourceEndpoints, requested: u64, timeout: Duration) -> bool {
+async fn wait_for_position(
+    source: &SourceEndpoints,
+    requested: &Position,
+    timeout: Duration,
+) -> bool {
     let grace = GRACE_BEFORE_NUDGE.min(timeout);
     if wait_for(source.acked.clone(), requested, grace).await {
         return true;
@@ -332,15 +343,16 @@ async fn wait_for_position(source: &SourceEndpoints, requested: u64, timeout: Du
 /// Driven by the watch channel the sink task updates, so a caller is woken by
 /// the write itself rather than by a polling interval.
 async fn wait_for(
-    mut acked: watch::Receiver<Option<Lsn>>,
-    requested: u64,
+    mut acked: watch::Receiver<Option<Position>>,
+    requested: &Position,
     timeout: Duration,
 ) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
         if acked
             .borrow_and_update()
-            .is_some_and(|lsn| lsn.0 >= requested)
+            .as_ref()
+            .is_some_and(|position| position >= requested)
         {
             return true;
         }
@@ -469,21 +481,31 @@ mod tests {
         let (tx, rx) = watch::channel(None);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            tx.send_replace(Some(Lsn(500)));
+            tx.send_replace(Some(at(500)));
         });
-        assert!(wait_for(rx, 400, Duration::from_secs(2)).await);
+        assert!(wait_for(rx, &at(400), Duration::from_secs(2)).await);
     }
 
     #[tokio::test]
     async fn an_already_passed_position_returns_immediately() {
-        let (_tx, rx) = watch::channel(Some(Lsn(900)));
-        assert!(wait_for(rx, 900, Duration::from_millis(1)).await);
+        let (_tx, rx) = watch::channel(Some(at(900)));
+        assert!(wait_for(rx, &at(900), Duration::from_millis(1)).await);
     }
 
     #[tokio::test]
     async fn a_position_that_never_arrives_times_out() {
-        let (_tx, rx) = watch::channel(Some(Lsn(10)));
-        assert!(!wait_for(rx, u64::MAX, Duration::from_millis(30)).await);
+        let (_tx, rx) = watch::channel(Some(at(10)));
+        assert!(!wait_for(rx, &at(u64::MAX), Duration::from_millis(30)).await);
+    }
+
+    #[tokio::test]
+    async fn waiting_with_nothing_acknowledged_times_out() {
+        let (_tx, rx) = watch::channel(None);
+        assert!(!wait_for(rx, &at(0), Duration::from_millis(30)).await);
+    }
+
+    fn at(n: u64) -> Position {
+        Position::from_bytes(n.to_be_bytes())
     }
 
     /// A state with `names` configured and `connected` registered.
@@ -527,7 +549,7 @@ mod tests {
             &self,
             _batch: Vec<pg2osync_core::sink::LsnOp>,
         ) -> Result<pg2osync_core::sink::SinkAck, pg2osync_core::error::CoreError> {
-            Ok(pg2osync_core::sink::SinkAck::written(Lsn(0)))
+            Ok(pg2osync_core::sink::SinkAck::written(None))
         }
         async fn truncate_index(
             &self,
@@ -564,11 +586,13 @@ mod tests {
     }
 
     fn endpoints() -> SourceEndpoints {
-        let (_tx, acked) = watch::channel(Some(Lsn(10)));
+        let (_tx, acked) = watch::channel(Some(at(10)));
         SourceEndpoints {
             acked,
-            parse_position: Arc::new(|text| text.parse::<u64>().ok()),
-            render_position: Arc::new(|token| token.to_string()),
+            parse_position: Arc::new(|text| text.parse::<u64>().ok().map(at)),
+            render_position: Arc::new(|position| {
+                u64::from_be_bytes(position.as_bytes().try_into().unwrap()).to_string()
+            }),
             sink: Arc::new(UnusedSink),
             nudge: None,
             current_position: None,

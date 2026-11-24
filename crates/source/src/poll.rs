@@ -10,7 +10,6 @@
 
 use crate::error::{Context as _, Result, SourceError};
 use pg2osync_core::event::{ChangeEvent, RowKind, TransactionBoundary};
-use pg2osync_core::lsn::Lsn;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -120,10 +119,10 @@ impl PollSource {
                 }
             }
             if sent_any {
-                // Lsn(0) marks a positionless boundary: it flushes the batch
-                // without advancing any checkpoint, which poll mode has none of
+                // a positionless boundary: it flushes the batch without
+                // advancing any checkpoint, which poll mode has none of
                 tx.send(ChangeEvent::Transaction(TransactionBoundary::Commit {
-                    lsn: Lsn(0),
+                    position: None,
                     commit_ts_micros: 0,
                 }))
                 .await

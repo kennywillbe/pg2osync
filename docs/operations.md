@@ -31,9 +31,9 @@ for what it does and does not answer for.
 | `pg2osync_source_connected{source}` | gauge | 1 while streaming, 0 while reconnecting |
 | `pg2osync_source_state{source,state}` | gauge | Exactly one `1` per source, on the state it is in: `starting`, `loading`, `streaming`, `reconnecting`, `halted`, `stopped` |
 | `pg2osync_latency_ms{source,quantile}` | summary | Source commit to indexed |
-| `pg2osync_position_current{source}` | gauge | Highest source position received |
-| `pg2osync_position_confirmed{source}` | gauge | Highest position durably checkpointed |
-| `pg2osync_position_lag{source}` | gauge | Difference between the two |
+| `pg2osync_position_current{source}` | gauge | Highest source position received, as a number: the WAL LSN on PostgreSQL, `(binlog file index << 32) \| offset` on MySQL |
+| `pg2osync_position_confirmed{source}` | gauge | Highest position durably checkpointed, as the same number |
+| `pg2osync_position_lag{source}` | gauge | Difference between the two: WAL bytes on PostgreSQL; on MySQL bytes within one binlog file, and `2^32` more per rotation in between. The three position gauges are absent in `mode = "poll"`, which has no source position |
 | `pg2osync_slot_retained_bytes{source,slot}` | gauge | WAL a slot forbids the source from recycling — the number that fills a disk |
 | `pg2osync_slot_safe_wal_size_bytes{source,slot}` | gauge | WAL that may still be written before the slot is lost; **absent** when `max_slot_wal_keep_size` is unlimited |
 | `pg2osync_slot_wal_status{source,slot,status}` | gauge | 1 for the server's own verdict: `reserved`, `extended`, `unreserved`, `lost` |
@@ -365,7 +365,9 @@ pg2osync.batch   rows=120 bytes=48213 position=42
 └─ write         docs=120 status=ok   the bulk request against the target
 ```
 
-`checkpoint` is a trace of its own, with the position it persisted: it runs on
+`position` on a batch is the number the position gauges show for its last
+commit. `checkpoint` is a trace of its own, with the position it persisted in
+the source's own text: it runs on
 its own interval and belongs to no single batch. `status` on a write is `ok`,
 `rejected` when the target refused documents, or `error`.
 
@@ -444,8 +446,9 @@ pg2osync rejects -c pg2osync.toml            # what was refused, where, and why
 pg2osync rejects -c pg2osync.toml --replay   # after fixing the mapping
 ```
 
-A replay submits each document again with its original position as its version, so
-a row the source has changed since loses to the newer value, and a record is
+A replay submits each document again with the version it was refused with, which
+the record keeps beside its position, so a row the source has changed since loses
+to the newer value, and a record is
 cleared only once the target has accepted it. Anything still refused is reported
 and left in place.
 
@@ -554,8 +557,8 @@ pg2osync resnapshot -c pg2osync.toml --table public.users --where "tenant_id = 4
 ```
 
 Safe to run while the pipeline is streaming, and it never moves the checkpoint —
-its rows carry the position they were read at, so a change committed after that
-wins as it always does. Use it after a mapping change, or after fixing something
+its rows carry the version of the position they were read at, so a change
+committed after that wins as it always does. Use it after a mapping change, or after fixing something
 that wrote a wrong value.
 
 Three things it does not do:
@@ -565,13 +568,13 @@ Three things it does not do:
 - **It does not resume.** An interruption means running it again, which costs the
   read and nothing else. Recording progress would leave bookkeeping the next
   pipeline start would read as an unfinished initial load.
-- **It does not overwrite a document whose version is above the position it read
+- **It does not overwrite a document whose version is above the one it read
   at.** That is the same rule that lets it run beside the stream. Documents the
-  pipeline wrote are always at or below the current position, so this only bites
-  if you have edited the index by hand: a plain `PUT` or `DELETE` through the
-  target's own API uses internal versioning, which leaves a version one past the
-  source's current position, and the re-snapshot declines it until the source
-  moves on. One write to the table is enough — or reach for the zero-downtime
+  pipeline wrote are always at or below the current position's version, so this
+  only bites if you have edited the index by hand: a plain `PUT` or `DELETE`
+  through the target's own API uses internal versioning, which leaves a version
+  one past the source's current one, and the re-snapshot declines it until the
+  source moves on. One write to the table is enough — or reach for the zero-downtime
   re-index below, which builds a fresh index and has nothing to argue with.
 
 ## Zero-downtime re-index
@@ -649,9 +652,23 @@ Two instances must never share a slot — each needs its own `slot_name` (or
 
 ## Upgrades
 
-Checkpoints are forward-compatible: a newer binary reads what an older one
-wrote. Rolling back across a format change makes the older binary ignore the
-checkpoint and re-run the initial load, which is safe but expensive.
+A newer binary resumes from checkpoints in the current layout (schema v3). One
+1.x wrote is in an earlier layout and is not resumed from, so the first start
+after an upgrade from 1.x re-runs the initial load. On MySQL the 1.x checkpoint
+is still read for its version generation, so no document is written with a
+version below what 1.x indexed; the log says which generation it carried over.
+Until that first start has written its checkpoint, `resnapshot` and `reindex`
+refuse to run on a MySQL stream, because the generation is not settled yet.
+On PostgreSQL an unfinished 1.x load carries on from its progress and the
+stream resumes from the slot.
+
+Rolling back to 1.x is not supported. On PostgreSQL 1.x resumes from the
+current checkpoint's LSN. On MySQL it re-runs the initial load in version
+generation 0, which only costs time while the checkpoint's `position` has no
+`;base=` part. With one, every write 1.x makes is versioned below what the
+target holds and refused without an error, so the index goes stale; going back
+then needs fresh index names under `[sync]`. See
+[Upgrades and rollbacks](deployment.md#upgrades-and-rollbacks).
 
 ## Performance
 

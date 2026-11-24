@@ -7,6 +7,7 @@ pub mod catalog;
 pub mod children;
 pub mod docbuild;
 pub mod error;
+pub mod lsn;
 pub mod pgoutput;
 pub mod poll;
 pub mod reconnect;
@@ -16,3 +17,4 @@ pub mod transport;
 pub mod typemap;
 
 pub use error::SourceError;
+pub use lsn::Lsn;

@@ -183,7 +183,7 @@ impl MeilisearchSink {
         format!("{}/{key}.json", self.state_dir)
     }
 
-    /// Where checkpoints lived before they were kept per stream.
+    /// Where 1.x kept every stream's checkpoint before they were per stream.
     fn legacy_checkpoint_path(&self) -> String {
         format!("{}/checkpoint.json", self.state_dir)
     }
@@ -340,7 +340,9 @@ impl Sink for MeilisearchSink {
                 self.wait_task(uid).await?;
             }
         }
-        Ok(SinkAck::written(batch.last().expect("nonempty").lsn))
+        Ok(SinkAck::written(
+            batch.last().expect("nonempty").position.clone(),
+        ))
     }
 
     async fn truncate_index(
@@ -485,19 +487,33 @@ impl Sink for MeilisearchSink {
         &self,
         stream: &pg2osync_core::checkpoint::StreamId,
     ) -> Result<Option<Checkpoint>, CoreError> {
-        let read = |path: String| match std::fs::read(path) {
+        match std::fs::read(self.checkpoint_path(stream)) {
             Ok(bytes) => serde_json::from_slice::<Value>(&bytes)
                 .map(|v| crate::checkpoint_from_doc(&v))
                 .map_err(|e| CoreError::Sink(e.to_string())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(CoreError::Sink(format!("checkpoint read: {e}"))),
-        };
-        match read(self.checkpoint_path(stream))? {
-            Some(checkpoint) => Ok(Some(checkpoint)),
-            // written before checkpoints were kept per stream; the caller
-            // still checks that it belongs to this one
-            None => read(self.legacy_checkpoint_path()),
         }
+    }
+
+    async fn read_legacy_position_text(
+        &self,
+        stream: &pg2osync_core::checkpoint::StreamId,
+    ) -> Result<Option<String>, CoreError> {
+        // 1.x read the shared file only when the stream's own was absent, so
+        // that is the order its checkpoints can be found in
+        for path in [self.checkpoint_path(stream), self.legacy_checkpoint_path()] {
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    let doc: Value = serde_json::from_slice(&bytes)
+                        .map_err(|e| CoreError::Sink(format!("1.x checkpoint {path}: {e}")))?;
+                    return Ok(crate::legacy_position_text(&doc, stream));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(CoreError::Sink(format!("1.x checkpoint {path}: {e}"))),
+            }
+        }
+        Ok(None)
     }
 
     async fn health(&self) -> Result<Health, CoreError> {
@@ -618,6 +634,86 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_checkpoint_file_round_trips_and_the_shared_file_is_not_read() {
+        use pg2osync_core::checkpoint::{SOURCE_MYSQL, StreamId};
+        let target = FakeTarget::start(|_| (200, "{}")).await;
+        let sink = target.sink();
+        let stream = StreamId {
+            source: SOURCE_MYSQL.into(),
+            stream: "424242".into(),
+            publication: String::new(),
+        };
+        // what checkpoints were kept in before they were per stream; nothing
+        // writes it any more, so nothing may resume from it either
+        std::fs::write(
+            format!("{}/checkpoint.json", target.state_dir),
+            serde_json::to_vec(&crate::checkpoint_doc(&Checkpoint {
+                stream: stream.clone(),
+                ordering: pg2osync_core::Position::from_bytes([0, 0, 0, 1, 0, 0, 0, 4]),
+                position: "binlog.000001:4".into(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sink.read_checkpoint(&stream).await.unwrap(), None);
+
+        let checkpoint = Checkpoint {
+            stream: stream.clone(),
+            ordering: pg2osync_core::Position::from_bytes([0, 0, 0, 4, 0, 0, 0x04, 0xD2]),
+            position: "binlog.000004:1234;base=4096".into(),
+        };
+        sink.write_checkpoint(&checkpoint).await.unwrap();
+        assert_eq!(
+            sink.read_checkpoint(&stream).await.unwrap(),
+            Some(checkpoint)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_1x_checkpoint_file_is_read_as_text_from_the_stream_file_then_the_shared_one() {
+        let target = FakeTarget::start(|_| (200, "{}")).await;
+        let sink = target.sink();
+        let stream = crate::tests::mysql_stream();
+        let legacy = serde_json::to_vec(&crate::tests::mysql_1x_doc()).unwrap();
+        assert_eq!(sink.read_legacy_position_text(&stream).await.unwrap(), None);
+
+        let shared = format!("{}/checkpoint.json", target.state_dir);
+        std::fs::write(&shared, &legacy).unwrap();
+        assert_eq!(
+            sink.read_legacy_position_text(&stream)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("binlog.000004:1234;base=1099511627776")
+        );
+        let other = pg2osync_core::checkpoint::StreamId {
+            stream: "7".into(),
+            ..stream.clone()
+        };
+        assert_eq!(sink.read_legacy_position_text(&other).await.unwrap(), None);
+        std::fs::remove_file(&shared).unwrap();
+
+        let own = sink.checkpoint_path(&stream);
+        std::fs::write(&own, &legacy).unwrap();
+        assert_eq!(
+            sink.read_legacy_position_text(&stream)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("binlog.000004:1234;base=1099511627776")
+        );
+        // the current layout replaces the 1.x one in the same file
+        sink.write_checkpoint(&Checkpoint {
+            stream: stream.clone(),
+            ordering: pg2osync_core::Position::from_bytes([0, 0, 0, 4, 0, 0, 0x04, 0xD2]),
+            position: "binlog.000004:1234;base=1099511627776".into(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(sink.read_legacy_position_text(&stream).await.unwrap(), None);
+    }
+
     fn users() -> Vec<IndexSpec> {
         vec![IndexSpec {
             name: "users".into(),
@@ -716,9 +812,9 @@ mod tests {
         assert!(message.contains("users-1756512345"), "{message}");
     }
 
-    fn op(lsn: u64, op: DocumentOp) -> LsnOp {
+    fn op(position: u64, op: DocumentOp) -> LsnOp {
         LsnOp {
-            lsn: pg2osync_core::lsn::Lsn(lsn),
+            position: crate::test_position(position),
             op,
         }
     }

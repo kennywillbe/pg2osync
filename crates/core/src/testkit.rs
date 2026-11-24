@@ -15,6 +15,7 @@
 //!   and reports the refusal rather than raising it
 //! - a checkpoint that was written reads back, and one belonging to another
 //!   stream does not
+//! - a current checkpoint is never taken for one 1.x left behind
 //! - the indices a pattern claims are listed, and a pattern that claims none
 //!   is an empty list
 //! - an index created for a row carries the alias the row names, even when a
@@ -23,21 +24,23 @@
 //!
 //! Behind the `testkit` feature so nothing of it reaches a release binary.
 //!
-//! Four things are the caller's, because only the caller knows them: the
+//! Five things are the caller's, because only the caller knows them: the
 //! documents its target accepts, a document its target refuses, whether its
-//! target can list indices by pattern, and whether it can switch aliases. A
-//! target with no document it can refuse — a schema-less one — leaves the
-//! second out, and the partial-batch check is skipped rather than faked; one
-//! that keeps the trait's default for `list_indices` or `switch_aliases`
-//! leaves the third or fourth out, and that check is skipped. The default
-//! answers with an error, and an error is not something the kit can tell
-//! apart from a broken implementation, so the caller says which it is.
-//! Skipping is reported, so an opt-out is a line in the output rather than a
-//! silence.
+//! target can list indices by pattern, whether it can switch aliases, and
+//! whether 1.x kept checkpoints in it. A target with no document it can
+//! refuse — a schema-less one — leaves the second out, and the partial-batch
+//! check is skipped rather than faked; one that keeps the trait's default for
+//! `list_indices` or `switch_aliases` leaves the third or fourth out, and that
+//! check is skipped. The default answers with an error, and an error is not
+//! something the kit can tell apart from a broken implementation, so the
+//! caller says which it is. The default `read_legacy_position_text` answers
+//! `None`, which passes any check the kit could make, so a target that keeps
+//! it leaves the fifth out rather than passing for nothing. Skipping is
+//! reported, so an opt-out is a line in the output rather than a silence.
 
 use crate::checkpoint::{Checkpoint, StreamId};
 use crate::error::CoreError;
-use crate::lsn::Lsn;
+use crate::position::Position;
 use crate::sink::{DocumentOp, IndexSpec, LsnOp, Sink};
 use serde_json::Value;
 
@@ -48,6 +51,7 @@ pub struct SinkTestHarness {
     unacceptable: Option<Value>,
     lists_indices: bool,
     switches_aliases: bool,
+    reads_legacy_checkpoints: bool,
 }
 
 /// What ran, so a caller can print it and a reader can see what was skipped.
@@ -67,6 +71,7 @@ impl SinkTestHarness {
             unacceptable: None,
             lists_indices: false,
             switches_aliases: false,
+            reads_legacy_checkpoints: false,
         }
     }
 
@@ -93,6 +98,13 @@ impl SinkTestHarness {
     /// check is reported as skipped.
     pub fn with_alias_switching(mut self) -> Self {
         self.switches_aliases = true;
+        self
+    }
+
+    /// The target implements `read_legacy_position_text`. Without this the
+    /// 1.x checkpoint check is reported as skipped.
+    pub fn with_legacy_checkpoints(mut self) -> Self {
+        self.reads_legacy_checkpoints = true;
         self
     }
 
@@ -136,6 +148,15 @@ impl SinkTestHarness {
             .await
             .map_err(named("checkpoint durability"))?;
         report.passed.push("checkpoint durability".into());
+
+        if self.reads_legacy_checkpoints {
+            self.legacy_checkpoint(sink)
+                .await
+                .map_err(named("1.x checkpoint"))?;
+            report.passed.push("1.x checkpoint".into());
+        } else {
+            report.skipped.push("1.x checkpoint".into());
+        }
 
         if self.lists_indices {
             self.index_listing(sink)
@@ -205,7 +226,7 @@ impl SinkTestHarness {
             return fail("kit-2 was written but did not come back");
         };
         sink.write(vec![LsnOp {
-            lsn: Lsn(150),
+            position: at(150),
             op: DocumentOp::Upsert {
                 index: self.index.clone(),
                 id: "kit-2".into(),
@@ -234,10 +255,10 @@ impl SinkTestHarness {
         let ids = ["kit-1", "kit-2", "kit-3"];
         let first = sink.write(self.batch(&ids, 200)).await?;
         let again = sink.write(self.batch(&ids, 200)).await?;
-        if first.max_lsn != again.max_lsn {
+        if first.max_position != again.max_position {
             return fail(format!(
-                "a replay of one batch acknowledged {} the first time and {} the second",
-                first.max_lsn, again.max_lsn
+                "a replay of one batch acknowledged {:?} the first time and {:?} the second",
+                first.max_position, again.max_position
             ));
         }
         if !first.rejected.is_empty() || !again.rejected.is_empty() {
@@ -284,7 +305,7 @@ impl SinkTestHarness {
         let batch = vec![
             self.upsert("kit-before", 600),
             LsnOp {
-                lsn: Lsn(601),
+                position: at(601),
                 op: DocumentOp::Upsert {
                     index: self.index.clone(),
                     id: "kit-bad".into(),
@@ -310,10 +331,10 @@ impl SinkTestHarness {
                 ack.rejected[0].doc_id
             ));
         }
-        if ack.max_lsn != Lsn(602) {
+        if ack.max_position != at(602) {
             return fail(format!(
-                "a batch that was written reported {} rather than its highest position",
-                ack.max_lsn
+                "a batch that was written reported {:?} rather than its highest position",
+                ack.max_position
             ));
         }
         sink.refresh(std::slice::from_ref(&self.index)).await?;
@@ -354,7 +375,7 @@ impl SinkTestHarness {
         }
         let checkpoint = Checkpoint {
             stream: mine.clone(),
-            token: 0x1B4F2A8,
+            ordering: Position::from_bytes(0x1B4F2A8u64.to_be_bytes()),
             position: "0/1B4F2A8".into(),
         };
         sink.write_checkpoint(&checkpoint).await?;
@@ -369,6 +390,35 @@ impl SinkTestHarness {
         }
         if sink.read_checkpoint(&other).await?.is_some() {
             return fail("one stream's checkpoint was returned for another's");
+        }
+        Ok(())
+    }
+
+    /// The current checkpoint lives where 1.x kept its own, so reading it as a
+    /// 1.x one would carry a stale MySQL version generation over a live one.
+    /// Runs after `checkpoint_durability`, whose checkpoint it reads.
+    async fn legacy_checkpoint(&self, sink: &dyn Sink) -> Result<(), CoreError> {
+        let mine = StreamId {
+            source: crate::checkpoint::SOURCE_POSTGRES.into(),
+            stream: "pg2osync_testkit".into(),
+            publication: "pg2osync_testkit_pub".into(),
+        };
+        if sink.read_checkpoint(&mine).await?.is_none() {
+            return fail("there is no current checkpoint to tell apart from a 1.x one");
+        }
+        if let Some(text) = sink.read_legacy_position_text(&mine).await? {
+            return fail(format!(
+                "the current checkpoint was read as one 1.x left, at {text:?}"
+            ));
+        }
+        let nobody = StreamId {
+            stream: "pg2osync_testkit_never_written".into(),
+            ..mine
+        };
+        if let Some(text) = sink.read_legacy_position_text(&nobody).await? {
+            return fail(format!(
+                "a stream nothing ever wrote for has a 1.x checkpoint at {text:?}"
+            ));
         }
         Ok(())
     }
@@ -447,7 +497,7 @@ impl SinkTestHarness {
             ])
             .await?;
             sink.write(vec![LsnOp {
-                lsn: Lsn(1),
+                position: at(1),
                 op: DocumentOp::Upsert {
                     index: created.clone(),
                     id: "kit-alias".into(),
@@ -469,7 +519,7 @@ impl SinkTestHarness {
             // A versioned delete is the first write a recreated index sees
             // when a replay reaches it, and the target creates a missing index
             // for one; the upsert in the next batch then finds it there.
-            for (lsn, op) in [
+            for (position, op) in [
                 (
                     3,
                     DocumentOp::Delete {
@@ -493,7 +543,11 @@ impl SinkTestHarness {
                     },
                 ),
             ] {
-                sink.write(vec![LsnOp { lsn: Lsn(lsn), op }]).await?;
+                sink.write(vec![LsnOp {
+                    position: at(position),
+                    op,
+                }])
+                .await?;
             }
             sink.refresh(std::slice::from_ref(&deleted_first)).await?;
             if sink.count_documents(&deleted_alias).await? != Some(1) {
@@ -543,7 +597,7 @@ impl SinkTestHarness {
                 .await?;
             let through = sink
                 .write(vec![LsnOp {
-                    lsn: Lsn(2),
+                    position: at(2),
                     op: DocumentOp::Upsert {
                         index: taken.clone(),
                         id: "kit-alias-taken".into(),
@@ -591,7 +645,7 @@ impl SinkTestHarness {
 
     fn upsert(&self, id: &str, version: u64) -> LsnOp {
         LsnOp {
-            lsn: Lsn(version),
+            position: at(version),
             op: DocumentOp::Upsert {
                 index: self.index.clone(),
                 id: id.to_string(),
@@ -603,6 +657,12 @@ impl SinkTestHarness {
             },
         }
     }
+}
+
+/// The suite's positions are its versions, encoded the way a source would
+/// order them, so one number says both where a write came from and what it is.
+fn at(n: u64) -> Option<Position> {
+    Some(Position::from_bytes(n.to_be_bytes()))
 }
 
 fn fail(why: impl Into<String>) -> Result<(), CoreError> {

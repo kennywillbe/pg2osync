@@ -10,7 +10,7 @@ use crate::run::{self, Mode};
 use crate::workspace::{Source, Workspace};
 use anyhow::Result;
 use pg2osync_engine::api::SourceEndpoints;
-use pg2osync_engine::mapping::DurableLsn;
+use pg2osync_engine::mapping::DurablePosition;
 use pg2osync_engine::metrics::{Registry, SharedMetrics, SourceState};
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
@@ -30,7 +30,7 @@ pub struct SourceRuntime {
     /// be read again. The signal is the process's; which file it re-reads is
     /// the source's.
     pub reload: crate::reload::ReloadSource,
-    pub durable: DurableLsn,
+    pub durable: DurablePosition,
     pub mode: Mode,
 }
 
@@ -107,7 +107,7 @@ pub async fn run_all(ws: Workspace, shutdown: watch::Receiver<bool>, mode: Mode)
                 path: source.path.clone(),
                 generations: generations.clone(),
             },
-            durable: DurableLsn::default(),
+            durable: DurablePosition::default(),
             mode,
         };
         set.spawn(async move {

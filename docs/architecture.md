@@ -24,7 +24,7 @@ so the database retains its log instead of the process growing without limit.
 
 Owns one replication connection and turns the wire protocol into
 `core::ChangeEvent` values: `Row` (insert/update/delete), `TableTruncated`, and
-`Transaction(Commit)` boundaries carrying a position token.
+`Transaction(Commit)` boundaries carrying the source position.
 
 Everything protocol-specific stays here. PostgreSQL pgoutput decoding lives in
 `crates/source`, MySQL binlog decoding in `crates/source-mysql`.
@@ -117,18 +117,37 @@ behind a directory of files rather than one file of sources.
 
 ## Positions
 
-The engine treats a source position as an opaque, monotonically increasing
-`u64` token:
+The engine treats a source position as opaque bytes whose lexicographic order
+is the stream order. It compares them — for acknowledgement, the checkpoint and
+`/synced` — and never reads them as anything else:
 
-| Source | Token | Stored text |
+| Source | Ordering bytes | Stored text |
 |---|---|---|
-| PostgreSQL | WAL LSN as `u64` | `0/1B4F2A8` |
-| MySQL/MariaDB | `(binlog file index << 32) \| offset` | `binlog.000004:1234` |
+| PostgreSQL | WAL LSN, 8 bytes big-endian | `0/1B4F2A8` |
+| MySQL/MariaDB | binlog file index then offset, 4 + 4 bytes big-endian | `binlog.000004:1234`, plus `;gtid=…` and `;base=…` once they are set |
 
-Packing the file index into the high bits makes a rotation compare greater than
-any offset in the previous file, so ordering holds across rotations. The binary
-supplies a closure that renders the token into the source's own textual form,
-which is what a restart parses to resume.
+Putting the file index first makes a rotation compare greater than any offset in
+the previous file, so ordering holds across rotations. What has no byte order —
+the GTID set a failover resumes from, the version generation `base` — stays out
+of the bytes and rides in the stored text, which the source alone parses. The
+binary supplies closures that render a position into that text and parse it
+back, which is what a restart resumes from and what `/synced` takes and returns.
+
+The checkpoint (schema v3) keeps both: the bytes as a hex string, which sorts
+the way the bytes do, and the text. A row with no position of its own — an
+initial load, poll mode, a reconcile or reindex — carries none rather than a
+zero, and nothing acknowledges it.
+
+Two numbers come from the source's side, never from the engine:
+
+- **The document version** a target orders writes by, which travels beside the
+  position rather than inside it — the commit LSN on PostgreSQL, `base` plus the
+  packed coordinate `(file index << 32) | offset` on MySQL. A source that cannot
+  project a monotone integer runs unversioned.
+- **The gauge value** behind `pg2osync_position_*`, a projection the binary
+  supplies per source — the LSN, or the packed coordinate without `base`.
+  Without one the gauges are absent; what gates acknowledgement never depends
+  on it.
 
 ## Delivery semantics
 
@@ -138,9 +157,11 @@ which is what a restart parses to resume.
   row's raw values, and for a `fan_out` table one id per array element — so a
   replay overwrites to the same value.
 - **Never acknowledge early.** The position reported to the source is clamped to
-  the durable checkpoint. Acknowledging further would let the database recycle
-  history for rows that are not indexed yet — the classic way CDC pipelines
-  lose data on crash-restart.
+  the durable checkpoint, compared as bytes; a batch with no position — an
+  initial load range, poll mode — is written but acknowledges nothing.
+  Acknowledging further would let the database recycle history for rows that
+  are not indexed yet — the classic way CDC pipelines lose data on
+  crash-restart.
 - **Written or recorded, before acknowledged.** A document the target refuses
   permanently stops the pipeline by default. Where `on_permanent_rejection =
   "quarantine"` is set it is written to a hidden `.pg2osync_rejects` index
@@ -235,10 +256,10 @@ constructor, which MySQL plans without a usable key. A key column whose text
 form is not a faithful literal — binary, blob, bit, geometry, float — is read in
 one statement instead.
 
-Rows produced by an initial load carry position token `0`, which flushes batches
-without ever advancing the checkpoint — they have no position of their own. They
-do carry a document *version*: the source position read before their range or
-chunk, so a row that was already stale when it was copied cannot overwrite the
+Rows produced by an initial load carry no position, so their batches flush
+without ever advancing the checkpoint. They do carry a document *version*: the
+one the source projects from the position it read before their range or chunk,
+so a row that was already stale when it was copied cannot overwrite the
 streamed change that superseded it.
 
 ### Why the load and the stream overlap
@@ -363,8 +384,11 @@ zero-downtime re-index, or tables split across instances — otherwise overwrite
 each other's position, and either one restarting then finds a checkpoint
 belonging to the other and re-runs a full initial load.
 
-A checkpoint written before that change lives under `default`, and is still
-read when a stream has no document of its own, so an upgrade does not re-load.
+Only the per-stream document is resumed from. The shared `default` document 1.x
+wrote before that change, and any checkpoint in a layout before schema v3, is
+not, so a pipeline upgraded from 1.x starts with a fresh initial load. A MySQL
+pipeline still reads its 1.x checkpoint for the version generation it reached,
+so the load does not write versions below the ones already indexed.
 
 ## Row fidelity
 
@@ -397,7 +421,8 @@ Adding a target means implementing `Sink` (`ensure_ready`, `get_documents`,
 `write`, `truncate_index`, `write_checkpoint`, `read_checkpoint`, `health`). No
 engine code changes, and the engine never matches on a sink kind.
 
-Adding a source means producing `ChangeEvent`s with position tokens. The engine
-cannot tell the difference.
+Adding a source means producing `ChangeEvent`s with positions encoded as ordered
+bytes, plus the render and parse closures for its text. The engine cannot tell
+the difference.
 
 Rationale for these boundaries is in [decisions.md](decisions.md).

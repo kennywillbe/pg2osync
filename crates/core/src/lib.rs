@@ -10,7 +10,7 @@ pub mod error;
 pub mod event;
 pub mod filter;
 pub mod load;
-pub mod lsn;
+pub mod position;
 pub mod sink;
 pub mod tables;
 /// The conformance suite a sink implementation runs against a live target.
@@ -22,6 +22,6 @@ pub mod testkit;
 
 pub use checkpoint::{Checkpoint, StreamId};
 pub use error::CoreError;
-pub use lsn::Lsn;
+pub use position::Position;
 
 pub use event::{ChangeEvent, RowKind, TransactionBoundary};

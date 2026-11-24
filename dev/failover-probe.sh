@@ -10,15 +10,25 @@
 # Builds its own pair of containers, promotes the replica, and asserts both.
 #
 # Usage: ./dev/failover-probe.sh
+#   OS_URL  a target to use instead of the OpenSearch the probe starts for
+#           itself; only the probe's own index and checkpoint are touched there
+#   BIN     the binary to probe (default ./target/release/pg2osync)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-BIN=./target/release/pg2osync
-OS=${OS_URL:-http://localhost:9200}
-PRIMARY=pg2osync-fo-primary
-REPLICA=pg2osync-fo-replica
+BIN=${BIN:-./target/release/pg2osync}
+# Suffixed with this run's pid so that neither a second probe nor anything else
+# named alike is what gets removed.
+PRIMARY=pg2osync-fo-primary-$$
+REPLICA=pg2osync-fo-replica-$$
+OWN_OS=""
+SYNC_PID=""
 PW=mysqlpw
 INDEX=fo_probe
+# The checkpoint document of server_id 940401, named the way the sink names it.
+# Deleting it rather than the whole meta index leaves every other pipeline's
+# checkpoint on a shared target alone.
+CHECKPOINT_DOC=.pg2osync_meta/_doc/mysql-940401
 CONFIG=$(mktemp /tmp/pg2osync-failover.XXXXXX)
 LOG=/tmp/pg2osync-failover.log
 # The second run needs its own log: the first legitimately reports an initial
@@ -37,11 +47,29 @@ on_replica() { docker exec "$REPLICA" mysql -uroot -p$PW -N -B ${2:-sourcedb} -e
 refresh()    { curl -s -XPOST "$OS/$INDEX/_refresh" > /dev/null 2>&1 || true; }
 os_field()   { curl -s "$OS/$INDEX/_doc/$1" | python3 -c "import sys,json;print(json.load(sys.stdin).get('_source',{}).get('v','<missing>'))"; }
 os_count()   { curl -s "$OS/$INDEX/_count" | python3 -c "import sys,json;print(json.load(sys.stdin).get('count',0))"; }
-stop_sync()  { pkill -f "pg2osync run" 2> /dev/null || true; sleep 1; }
+published_port() { docker port "$1" "$2/tcp" | head -1 | sed 's/.*://'; }
+
+# Only the pipeline this probe started: matching by name would take down every
+# other `pg2osync run` on the machine. Waiting for the exit matters because the
+# checkpoint is read straight after, and the final one is written on the way out.
+stop_sync() {
+  [ -n "$SYNC_PID" ] || return 0
+  kill "$SYNC_PID" 2> /dev/null || true
+  for _ in $(seq 1 60); do
+    kill -0 "$SYNC_PID" 2> /dev/null || break
+    sleep 0.5
+  done
+  SYNC_PID=""
+}
+start_sync() {
+  nohup "$BIN" run -c "$CONFIG" > "$1" 2>&1 < /dev/null &
+  SYNC_PID=$!
+}
 
 cleanup() {
   stop_sync
-  docker rm -f "$PRIMARY" "$REPLICA" > /dev/null 2>&1 || true
+  # shellcheck disable=SC2086
+  docker rm -f "$PRIMARY" "$REPLICA" $OWN_OS > /dev/null 2>&1 || true
   rm -f "$CONFIG"
 }
 trap cleanup EXIT
@@ -52,15 +80,35 @@ mysqld_flags() {
 }
 
 say "0. a primary and a replica, both with GTIDs on"
-docker rm -f "$PRIMARY" "$REPLICA" > /dev/null 2>&1 || true
 # shellcheck disable=SC2046
-docker run -d --name "$PRIMARY" -p 13401:3306 \
+docker run -d --name "$PRIMARY" -p 127.0.0.1::3306 \
   -e MYSQL_ROOT_PASSWORD=$PW -e MYSQL_DATABASE=sourcedb mysql:8.0 \
   $(mysqld_flags) --server-id=401 > /dev/null
 # shellcheck disable=SC2046
-docker run -d --name "$REPLICA" -p 13402:3306 \
+docker run -d --name "$REPLICA" -p 127.0.0.1::3306 \
   -e MYSQL_ROOT_PASSWORD=$PW -e MYSQL_DATABASE=sourcedb mysql:8.0 \
   $(mysqld_flags) --server-id=402 > /dev/null
+PRIMARY_PORT=$(published_port "$PRIMARY" 3306)
+REPLICA_PORT=$(published_port "$REPLICA" 3306)
+if [ -z "${OS_URL:-}" ]; then
+  # Its own target, so that nothing a developer or another run keeps in the dev
+  # stack's OpenSearch is in reach. The image is the one CI tests against, and
+  # the heap is the dev stack's, without which OpenSearch sizes itself off the
+  # whole Docker VM.
+  OWN_OS=pg2osync-fo-opensearch-$$
+  os_image=$(sed -n 's|^ *image: \(opensearchproject/opensearch:[^ ]*\)$|\1|p' \
+    .github/workflows/ci.yml | head -1)
+  docker run -d --name "$OWN_OS" -p 127.0.0.1::9200 \
+    -e discovery.type=single-node -e DISABLE_SECURITY_PLUGIN=true \
+    -e OPENSEARCH_JAVA_OPTS="-Xms512m -Xmx512m" "$os_image" > /dev/null
+  OS="http://localhost:$(published_port "$OWN_OS" 9200)"
+  for _ in $(seq 1 90); do
+    curl -s "$OS/_cluster/health" | grep -q '"status":"green"' && break
+    sleep 2
+  done
+else
+  OS=$OS_URL
+fi
 for container in "$PRIMARY" "$REPLICA"; do
   for _ in $(seq 1 60); do
     docker exec "$container" mysqladmin ping -h 127.0.0.1 -p$PW > /dev/null 2>&1 && break
@@ -68,7 +116,7 @@ for container in "$PRIMARY" "$REPLICA"; do
   done
 done
 primary_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$PRIMARY")
-ok "both servers up, primary at $primary_ip"
+ok "both servers up, primary at $primary_ip, target at $OS"
 
 on_primary "CREATE TABLE fo(id int primary key, v varchar(40));" > /dev/null
 on_primary "INSERT INTO fo VALUES (1,'one'),(2,'two');" > /dev/null
@@ -109,9 +157,10 @@ enabled = false
 table = "sourcedb.fo"
 index = "$INDEX"
 TOML
-curl -s -XDELETE "$OS/$INDEX,.pg2osync_meta?ignore_unavailable=true" > /dev/null
-export PG2OSYNC_FO_URL="mysql://root:$PW@localhost:13401/sourcedb"
-nohup $BIN run -c "$CONFIG" > "$LOG" 2>&1 < /dev/null & disown
+curl -s -XDELETE "$OS/$INDEX?ignore_unavailable=true" > /dev/null
+curl -s -XDELETE "$OS/$CHECKPOINT_DOC?refresh=true" > /dev/null
+export PG2OSYNC_FO_URL="mysql://root:$PW@localhost:$PRIMARY_PORT/sourcedb"
+start_sync "$LOG"
 sleep 5
 on_primary "INSERT INTO fo VALUES (3,'before-failover');" > /dev/null
 for _ in $(seq 1 30); do
@@ -121,8 +170,8 @@ for _ in $(seq 1 30); do
 done
 check "everything the primary had is indexed" "$(os_count)" "3"
 stop_sync
-position=$(curl -s "$OS/.pg2osync_meta/_search?q=*:*&size=5" \
-  | python3 -c "import sys,json;print(next((h['_source'].get('position','') for h in json.load(sys.stdin)['hits']['hits'] if 'position' in h['_source']), ''))")
+position=$(curl -s "$OS/$CHECKPOINT_DOC" \
+  | python3 -c "import sys,json;print(json.load(sys.stdin).get('_source',{}).get('position',''))")
 if [[ "$position" == *";gtid="* ]]; then
   ok "the checkpoint carries a GTID position (${position#*;gtid=})"
 else
@@ -145,8 +194,8 @@ on_replica "INSERT INTO fo VALUES (4,'after-failover');" > /dev/null
 on_replica "UPDATE fo SET v='changed-after-failover' WHERE id = 1;" > /dev/null
 
 say "3. point the pipeline at the new primary"
-export PG2OSYNC_FO_URL="mysql://root:$PW@localhost:13402/sourcedb"
-nohup $BIN run -c "$CONFIG" > "$LOG2" 2>&1 < /dev/null & disown
+export PG2OSYNC_FO_URL="mysql://root:$PW@localhost:$REPLICA_PORT/sourcedb"
+start_sync "$LOG2"
 for _ in $(seq 1 40); do
   refresh
   [ "$(os_count)" = "4" ] && break

@@ -658,9 +658,12 @@ impl Sink for PostgresSink {
         let refusals: Vec<(usize, String)> =
             crate::retry_transient(&self.retry, || self.write_once(&batch, &shapes)).await?;
         // the batch is non-empty, checked above
-        let max_lsn = batch.last().expect("nonempty checked").lsn;
+        let max_position = batch.last().expect("nonempty checked").position.clone();
         let rejected = crate::rejections(&batch, refusals)?;
-        Ok(SinkAck { max_lsn, rejected })
+        Ok(SinkAck {
+            max_position,
+            rejected,
+        })
     }
 
     async fn truncate_index(
@@ -867,6 +870,18 @@ impl Sink for PostgresSink {
             .await?
             .as_ref()
             .and_then(crate::checkpoint_from_doc))
+    }
+
+    /// 1.x kept its checkpoint under the key the current one uses; no shared
+    /// key ever existed here, because this target is newer than that layout.
+    async fn read_legacy_position_text(
+        &self,
+        stream: &pg2osync_core::checkpoint::StreamId,
+    ) -> Result<Option<String>, CoreError> {
+        Ok(self
+            .state_doc(&checkpoint_key(stream))
+            .await?
+            .and_then(|doc| crate::legacy_position_text(&doc, stream)))
     }
 
     async fn health(&self) -> Result<Health, CoreError> {

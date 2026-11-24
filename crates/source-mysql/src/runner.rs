@@ -11,7 +11,6 @@ use crate::catalog::{self, SchemaCache, TableSchema};
 use crate::connection::{MySqlConfig, MySqlConnection};
 use crate::error::{Context as _, MySqlError, Result};
 use pg2osync_core::event::{ChangeEvent, RowChange, RowKind, TransactionBoundary};
-use pg2osync_core::lsn::Lsn;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 
@@ -45,10 +44,10 @@ pub struct MySqlSourceConfig {
     pub gtid: Option<std::sync::Arc<std::sync::Mutex<crate::gtid::GtidTracker>>>,
     /// The GTID position to ask the server to resume from, when there is one.
     pub gtid_resume: Option<crate::gtid::GtidPosition>,
-    /// Added to every coordinate to make the ordering token and the document
-    /// version. A failover moves to a different, often lower, coordinate space,
-    /// and versions may only go up — so the generation lives here rather than
-    /// being applied by whoever consumes the events.
+    /// Added to every coordinate to make the document version, and never to
+    /// the commit position. A failover moves to a different, often lower,
+    /// coordinate space, and versions may only go up — so the generation lives
+    /// here rather than being applied by whoever consumes the events.
     pub version_base: u64,
 }
 
@@ -146,14 +145,12 @@ impl MySqlSource {
         // tracking the position here is the honest side of that trade. MySQL has
         // no such setting and fills every event in.
         let mut current_pos = start_pos;
-        // Every token this stream emits — a version, a commit boundary, a
-        // checkpoint position — is the coordinate plus the generation. Built in
-        // one place because a coordinate that escaped without it would be a
-        // version from the previous server's numbering, which the target
-        // silently refuses.
+        // Every version this stream emits carries the generation, and no
+        // position does: a version without it would be one from the previous
+        // server's numbering, which the target silently refuses, while a
+        // position only ever compares within this server's binlog history.
         let version_base = self.cfg.version_base;
-        let token_at =
-            |file: &str, pos: u32| version_base.saturating_add(catalog::position_token(file, pos));
+        let version_at = |file: &str, pos: u32| catalog::version(version_base, file, pos);
 
         // Which command to ask with is the server's decision, not ours: MySQL
         // takes the set in a dump command of its own, MariaDB has no such
@@ -271,7 +268,7 @@ impl MySqlSource {
                                 tx.send(ChangeEvent::TableTruncated {
                                     schema,
                                     table,
-                                    version: Some(token_at(&current_file, end_pos)),
+                                    version: Some(version_at(&current_file, end_pos)),
                                 })
                                 .await
                                 .map_err(|_| MySqlError::ChannelClosed)?;
@@ -317,18 +314,18 @@ impl MySqlSource {
                     // this transaction. The group's own end position is not
                     // known yet; its opening one is enough, because a
                     // checkpoint at or past it means the group was written.
-                    let token = token_at(&current_file, end_pos);
+                    let at = catalog::position(&current_file, end_pos);
                     let tracker = self.cfg.gtid.as_ref().expect("checked");
                     let mut tracker = tracker.lock().expect("not poisoned");
                     if h.event_type == binlog::T_GTID {
                         match binlog::parse_mysql_gtid(body) {
-                            Some((uuid, gno)) => tracker.record_mysql(token, uuid, gno),
+                            Some((uuid, gno)) => tracker.record_mysql(&at, uuid, gno),
                             None => tracker.mark_incomplete("a GTID event could not be read"),
                         }
                     } else {
                         match binlog::parse_maria_gtid(body) {
                             Some((domain, seq_no)) => {
-                                tracker.record_mariadb(token, domain, h.server_id, seq_no)
+                                tracker.record_mariadb(&at, domain, h.server_id, seq_no)
                             }
                             None => tracker.mark_incomplete("a GTID event could not be read"),
                         }
@@ -355,7 +352,7 @@ impl MySqlSource {
                 binlog::T_HEARTBEAT => {
                     // carries no data; its value is the position it reports
                     tx.send(ChangeEvent::Transaction(TransactionBoundary::Commit {
-                        lsn: Lsn(token_at(&current_file, end_pos)),
+                        position: Some(catalog::position(&current_file, end_pos)),
                         commit_ts_micros: 0,
                     }))
                     .await
@@ -370,13 +367,13 @@ impl MySqlSource {
                         &mut pending,
                         &mut admin,
                         &tx,
-                        Some(token_at(&current_file, end_pos)),
+                        Some(version_at(&current_file, end_pos)),
                     )
                     .await?;
                     // XID closes a transaction: this is the only point where a
                     // position may be acknowledged
                     tx.send(ChangeEvent::Transaction(TransactionBoundary::Commit {
-                        lsn: Lsn(token_at(&current_file, end_pos)),
+                        position: Some(catalog::position(&current_file, end_pos)),
                         commit_ts_micros: i64::from(h.timestamp) * 1_000_000 - 946_684_800_000_000,
                     }))
                     .await
@@ -480,7 +477,7 @@ impl MySqlSource {
                         continue;
                     };
                     let set = binlog::parse_rows(h.event_type, body, &rt.meta)?;
-                    let version = token_at(&current_file, end_pos);
+                    let version = version_at(&current_file, end_pos);
                     let table = (rt.schema.clone(), rt.table.clone());
                     // A child row is not a document: it names a parent to re-read.
                     // Naming it rather than emitting it is what lets a thousand

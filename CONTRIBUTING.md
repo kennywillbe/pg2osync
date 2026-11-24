@@ -212,7 +212,8 @@ request that crosses them will be sent back:
 - `core` depends on nothing in the workspace. Everything flows through
   `core::ChangeEvent` and the `Sink` trait.
 - The engine is source-agnostic: nothing PostgreSQL- or MySQL-specific may
-  appear in `crates/engine`. Source positions reach it as an opaque `u64`.
+  appear in `crates/engine`. Source positions reach it as an opaque
+  `Position`: bytes whose order is the stream order, compared and never read.
 - Sources own their protocol. pgoutput decoding stays in `crates/source`,
   binlog decoding in `crates/source-mysql`. No CDC framework dependency.
 - New targets implement `Sink`. The engine must never match on a sink kind.

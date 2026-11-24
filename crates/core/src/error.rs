@@ -17,9 +17,6 @@ pub enum CoreError {
     #[error("transient sink error: {0}")]
     SinkTransient(String),
 
-    #[error(transparent)]
-    InvalidLsn(#[from] crate::lsn::InvalidLsn),
-
     #[error("{0}")]
     Other(String),
 }

@@ -1,20 +1,47 @@
-//! Logical table → index mapping and the shared durable-LSN cell.
+//! Logical table → index mapping and the shared durable-position cell.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+
+use pg2osync_core::Position;
+use tokio::sync::watch;
 
 use crate::pseudonym::PseudonymKey;
 
-#[derive(Clone, Default)]
-pub struct DurableLsn(pub Arc<std::sync::atomic::AtomicU64>);
+/// The highest position whose checkpoint is persisted, shared by the engine's
+/// checkpoint task and whatever acknowledges to the source.
+///
+/// A `watch` rather than a lock: the source reads it on its own schedule and
+/// only ever needs the latest value. Cloning shares the one cell, which is what
+/// lets it outlive a reconnect the way the stored checkpoint does.
+#[derive(Clone)]
+pub struct DurablePosition(watch::Sender<Option<Position>>);
 
-impl DurableLsn {
-    pub fn store(&self, lsn: pg2osync_core::Lsn) {
-        self.0.store(lsn.0, std::sync::atomic::Ordering::SeqCst);
+impl Default for DurablePosition {
+    fn default() -> Self {
+        Self(watch::Sender::new(None))
     }
-    pub fn load(&self) -> Option<pg2osync_core::Lsn> {
-        let v = self.0.load(std::sync::atomic::Ordering::SeqCst);
-        (v > 0).then_some(pg2osync_core::Lsn(v))
+}
+
+impl DurablePosition {
+    /// `send_replace`, because a source that acknowledges nothing never
+    /// subscribes, and the value has to be there for one that does later.
+    pub fn store(&self, position: Position) {
+        self.0.send_replace(Some(position));
+    }
+
+    /// Back to nothing persisted, for a source whose positions stop comparing
+    /// with the ones stored so far. `send_replace` for the same reason as
+    /// [`Self::store`].
+    pub fn clear(&self) {
+        self.0.send_replace(None);
+    }
+
+    pub fn get(&self) -> Option<Position> {
+        self.0.borrow().clone()
+    }
+
+    pub fn subscribe(&self) -> watch::Receiver<Option<Position>> {
+        self.0.subscribe()
     }
 }
 
@@ -2128,11 +2155,19 @@ mod tests {
     }
 
     #[test]
-    fn durable_lsn_reports_none_until_set() {
-        let d = DurableLsn::default();
-        assert!(d.load().is_none());
-        d.store(pg2osync_core::Lsn(42));
-        assert_eq!(d.load(), Some(pg2osync_core::Lsn(42)));
+    fn durable_position_reports_none_until_set_and_is_shared_by_clones() {
+        let d = DurablePosition::default();
+        let seen = d.subscribe();
+        assert!(d.get().is_none());
+        d.clone().store(Position::from_bytes([0, 42]));
+        assert_eq!(d.get(), Some(Position::from_bytes([0, 42])));
+        assert_eq!(*seen.borrow(), Some(Position::from_bytes([0, 42])));
+        d.clone().clear();
+        assert!(d.get().is_none());
+        assert!(
+            seen.borrow().is_none(),
+            "a subscriber sees the cell cleared"
+        );
     }
 
     #[test]

@@ -751,9 +751,12 @@ impl Sink for QdrantSink {
         }
         refusals.sort_by_key(|(nth, _)| *nth);
         // the batch is non-empty, checked above
-        let max_lsn = batch.last().expect("nonempty checked").lsn;
+        let max_position = batch.last().expect("nonempty checked").position.clone();
         let rejected = crate::rejections(&batch, refusals)?;
-        Ok(SinkAck { max_lsn, rejected })
+        Ok(SinkAck {
+            max_position,
+            rejected,
+        })
     }
 
     async fn truncate_index(
@@ -955,6 +958,18 @@ impl Sink for QdrantSink {
             .and_then(crate::checkpoint_from_doc))
     }
 
+    /// 1.x kept its checkpoint under the key the current one uses; no shared
+    /// key ever existed here, because this target is newer than that layout.
+    async fn read_legacy_position_text(
+        &self,
+        stream: &pg2osync_core::checkpoint::StreamId,
+    ) -> Result<Option<String>, CoreError> {
+        Ok(self
+            .state_doc(&checkpoint_key(stream))
+            .await?
+            .and_then(|doc| crate::legacy_position_text(&doc, stream)))
+    }
+
     async fn health(&self) -> Result<Health, CoreError> {
         match self.send(reqwest::Method::GET, "/healthz", None).await {
             Ok((200, _)) => Ok(Health::Up),
@@ -973,6 +988,116 @@ fn checkpoint_key(stream: &pg2osync_core::checkpoint::StreamId) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sink over a loopback listener that answers every request with
+    /// `status` and `body`, and the request bodies it was sent.
+    async fn loopback_sink(
+        status: u16,
+        body: &'static str,
+    ) -> (QdrantSink, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let url = format!("http://{}", listener.local_addr().expect("local address"));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = std::sync::Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let record = std::sync::Arc::clone(&record);
+                tokio::spawn(async move {
+                    // the whole request, body included, before answering, so
+                    // the reply never races the client's own write
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let sent = loop {
+                        let Ok(n) = stream.read(&mut chunk).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                            continue;
+                        };
+                        let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                        let announced = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if buf.len() - end - 4 >= announced {
+                            break serde_json::from_slice(&buf[end + 4..]).unwrap_or(Value::Null);
+                        }
+                    };
+                    crate::lock(&record).push(sent);
+                    let response = format!(
+                        "HTTP/1.1 {status} Fake\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        let sink = QdrantSink::new(QdrantSinkConfig {
+            url,
+            api_key: None,
+            retry: crate::RetryPolicy::default(),
+        })
+        .expect("a sink over plain http");
+        (sink, seen)
+    }
+
+    #[tokio::test]
+    async fn a_1x_checkpoint_point_is_read_as_text() {
+        // the point 1.5.2 filed the checkpoint of MySQL server 424242 under
+        let (sink, seen) = loopback_sink(
+            200,
+            r#"{"result":[{"id":"x","payload":{"key":"checkpoint-mysql-424242","doc":
+                {"source":"mysql","stream":"424242","slot_name":"424242","publication":"",
+                 "position":"binlog.000004:1234;base=1099511627776","token":1116691498194,
+                 "instance_id":"","updated_at_epoch":1700000000,"schema_version":2}}}]}"#,
+        )
+        .await;
+        assert_eq!(
+            sink.read_legacy_position_text(&crate::tests::mysql_stream())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("binlog.000004:1234;base=1099511627776")
+        );
+        assert_eq!(
+            crate::lock(&seen).clone(),
+            vec![json!({"ids": [point_id("checkpoint-mysql-424242")], "with_payload": true})]
+        );
+    }
+
+    #[tokio::test]
+    async fn no_1x_checkpoint_point_is_none_and_an_unreadable_one_is_an_error() {
+        let (sink, _) = loopback_sink(404, r#"{"status":{"error":"Not found"}}"#).await;
+        assert_eq!(
+            sink.read_legacy_position_text(&crate::tests::mysql_stream())
+                .await
+                .unwrap(),
+            None
+        );
+        let (sink, _) = loopback_sink(200, r#"{"result":[]}"#).await;
+        assert_eq!(
+            sink.read_legacy_position_text(&crate::tests::mysql_stream())
+                .await
+                .unwrap(),
+            None
+        );
+        let (sink, _) = loopback_sink(500, r#"{"status":{"error":"boom"}}"#).await;
+        assert!(
+            sink.read_legacy_position_text(&crate::tests::mysql_stream())
+                .await
+                .is_err()
+        );
+    }
 
     fn documents() -> CollectionShape {
         CollectionShape {

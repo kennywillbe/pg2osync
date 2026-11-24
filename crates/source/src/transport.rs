@@ -3,8 +3,8 @@
 //! The transport is swappable by design: nothing outside this module
 //! may name pgwire-replication types.
 
+use crate::lsn::Lsn;
 use crate::pgoutput;
-use pg2osync_core::Lsn;
 use std::collections::HashMap;
 
 /// Relation metadata resolved from RELATION messages, keyed by relid.
@@ -51,9 +51,18 @@ impl RelationRegistry {
     }
 }
 
-/// Convert a transport LSN into the shared core LSN.
+/// Convert a transport LSN into this source's own LSN.
 pub fn to_core_lsn(lsn: pgwire_replication::Lsn) -> Lsn {
     Lsn(lsn.0)
+}
+
+/// The position a stream boundary may acknowledge, or `None` for a zero LSN.
+///
+/// Zero names no WAL record; the engine used to skip it as its positionless
+/// sentinel, and as a real position it would sort below everything and move
+/// the acknowledged position backwards.
+pub fn stream_position(lsn: pgwire_replication::Lsn) -> Option<pg2osync_core::Position> {
+    (lsn.0 != 0).then(|| to_core_lsn(lsn).to_position())
 }
 
 #[cfg(test)]
@@ -90,6 +99,17 @@ mod tests {
         changed.columns[0].in_replica_identity = false;
         reg.observe(&changed);
         assert!(reg.get(16385).unwrap().pk_columns.is_empty());
+    }
+
+    #[test]
+    fn a_zero_lsn_is_no_position() {
+        // a zero used to be the positionless sentinel; acknowledging one would
+        // move the acknowledged position back to the start of the WAL
+        assert_eq!(stream_position(pgwire_replication::Lsn(0)), None);
+        assert_eq!(
+            stream_position(pgwire_replication::Lsn(0x1B4_F2A8)),
+            Some(Lsn(0x1B4_F2A8).to_position())
+        );
     }
 
     #[test]

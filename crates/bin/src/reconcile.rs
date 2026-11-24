@@ -205,7 +205,7 @@ fn doomed(report: &Report) -> impl Iterator<Item = LsnOp> + '_ {
     orphans.chain(strays).map(|(id, routing)| LsnOp {
         // reconciliation has no source position of its own, and must
         // never move the checkpoint
-        lsn: pg2osync_core::lsn::Lsn(0),
+        position: None,
         op: DocumentOp::Delete {
             // the index it was found in, never the template's pattern:
             // a stray's real document lives under the same id elsewhere

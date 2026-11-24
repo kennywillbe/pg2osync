@@ -1,9 +1,12 @@
 //! The pipeline checkpoint: where a sink records how far the source was read.
 //!
-//! The engine orders positions by an opaque `u64` token and never interprets
-//! it, so one checkpoint document serves every source kind. `position` is the
-//! source's own textual form of that token — the only value a source needs to
-//! resume — and `source` tells the resuming process how to parse it.
+//! The engine orders positions by their bytes and never interprets them, so
+//! one checkpoint document serves every source kind. `position` is the source's
+//! own textual form — the only value a source needs to resume, and the place for
+//! anything that has no byte order, like a GTID set — and `source` tells the
+//! resuming process how to parse it.
+
+use crate::position::Position;
 
 /// Source-kind discriminator stored in the checkpoint document.
 pub const SOURCE_POSTGRES: &str = "postgres";
@@ -27,9 +30,8 @@ pub struct StreamId {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Checkpoint {
     pub stream: StreamId,
-    /// Ordering token: WAL LSN as u64, or MySQL binlog file index and offset
-    /// packed as `(file_index << 32) | position`.
-    pub token: u64,
+    /// What the engine compares: the source's position as ordered bytes.
+    pub ordering: Position,
     /// Source-specific textual position (`"0/1B4F2A8"`, `"binlog.000004:1234"`).
     pub position: String,
 }

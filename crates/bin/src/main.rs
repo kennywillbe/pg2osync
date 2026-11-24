@@ -13,8 +13,9 @@ mod workspace;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use pg2osync_core::lsn::Lsn;
+use pg2osync_core::Position;
 use pg2osync_core::sink::Health;
+use pg2osync_source::Lsn;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -1211,33 +1212,62 @@ fn binlog_coordinate(position: &str) -> Option<(String, u32)> {
 
 /// Where a quarantined document came from, in the source's own terms.
 ///
-/// The record keeps only the version, so a MySQL coordinate is rebuilt from
-/// the checkpoint's file prefix and generation base. A version below that base
-/// was written against a server the stream has since failed over from, whose
-/// binlog names mean nothing here, so it is shown as the bare version. So is
-/// one a whole generation margin above the checkpoint: a failover opens its new
-/// base there and keeps it in memory until the next checkpoint, and nothing the
-/// stored generation wrote runs that far ahead of its own checkpoint.
-fn reject_position(flavor: &str, checkpoint: Option<&str>, token: u64) -> String {
+/// A MySQL coordinate is rendered from the record's position with the
+/// checkpoint's file prefix. Whether that coordinate names a file on this
+/// server is the version's to say, since the generation lives there and not in
+/// the position: a version below the checkpoint's base was written against a
+/// server the stream has since failed over from, whose binlog names mean
+/// nothing here, so it is shown as the bare version. So is one a whole
+/// generation margin above the checkpoint: a failover opens its new base there
+/// and keeps it in memory until the next checkpoint, and nothing the stored
+/// generation wrote runs that far ahead of its own checkpoint.
+fn reject_position(
+    flavor: &str,
+    checkpoint: Option<&str>,
+    position: Option<&Position>,
+    version: Option<u64>,
+) -> String {
     use pg2osync_source_mysql::catalog;
-    // the load's sentinel, worded as the engine's log line words it
-    if token == 0 {
-        return "no position".to_string();
-    }
+    // Worded as the engine's log line words a loaded row. The version is added
+    // because a record 1.x quarantined from the stream lands here too: its
+    // numeric position is not read back, and the version is all that places it.
+    let Some(position) = position else {
+        return version.map_or_else(
+            || "no position".to_string(),
+            |version| format!("no position, version {version}"),
+        );
+    };
     if flavor != "mysql" {
-        return Lsn(token).to_string();
+        return run::render_lsn(position);
     }
-    let current = checkpoint.and_then(catalog::parse_stored_position);
-    match current {
-        Some(stored)
-            if token >= stored.base
-                && token < stored.token().saturating_add(run::GENERATION_MARGIN) =>
-        {
+    let Some(coordinate) = catalog::coordinate(position) else {
+        return position.to_hex();
+    };
+    let stored = checkpoint.and_then(catalog::parse_stored_position);
+    let in_this_generation = |stored: &catalog::StoredPosition| {
+        version.is_none_or(|version| {
+            version >= stored.base
+                && version < stored.version().saturating_add(run::GENERATION_MARGIN)
+        })
+    };
+    match stored {
+        Some(stored) if in_this_generation(&stored) => {
             let prefix = catalog::split_binlog_file(&stored.file)
                 .map_or(stored.file.clone(), |(prefix, _)| prefix);
-            catalog::position_text(&prefix, token - stored.base)
+            catalog::position_text(&prefix, coordinate)
         }
-        _ => format!("version {token}"),
+        _ => version.map_or_else(|| position.to_hex(), |version| format!("version {version}")),
+    }
+}
+
+/// The version a quarantined operation was written with, which places it in a
+/// generation.
+fn op_version(op: &pg2osync_core::sink::DocumentOp) -> Option<u64> {
+    use pg2osync_core::sink::DocumentOp;
+    match op {
+        DocumentOp::Upsert { version, .. }
+        | DocumentOp::Delete { version, .. }
+        | DocumentOp::DeleteChildren { version, .. } => *version,
     }
 }
 
@@ -1335,8 +1365,8 @@ async fn reindex_cmd(
 
 /// Show what the target refused, and optionally offer it again.
 ///
-/// A replay reuses the ordinary write path with the document's original
-/// position as its version, so anything the source has since superseded is
+/// A replay reuses the ordinary write path with the version the document was
+/// refused at, so anything the source has since superseded is
 /// refused by the version rule and the newer value stands — which is what
 /// should happen, and costs no special handling here.
 async fn rejects_cmd(cfg: config::AppConfig, replay: bool, limit: usize) -> Result<()> {
@@ -1374,7 +1404,12 @@ async fn rejects_cmd(cfg: config::AppConfig, replay: bool, limit: usize) -> Resu
             "  {}/{} at {}: {}",
             r.index,
             r.doc_id,
-            reject_position(&cfg.source.flavor, checkpoint.as_deref(), r.lsn.0),
+            reject_position(
+                &cfg.source.flavor,
+                checkpoint.as_deref(),
+                r.position.as_ref(),
+                op_version(&r.op)
+            ),
             r.reason
         );
         if !replay {
@@ -1382,7 +1417,7 @@ async fn rejects_cmd(cfg: config::AppConfig, replay: bool, limit: usize) -> Resu
         }
         let ack = sink
             .write(vec![pg2osync_core::sink::LsnOp {
-                lsn: r.lsn,
+                position: r.position.clone(),
                 op: r.op.clone(),
             }])
             .await?;
@@ -2720,37 +2755,56 @@ mod tests {
         }
     }
 
+    /// A MySQL reject as the store holds it: the coordinate's position bytes,
+    /// and the version that coordinate had in generation `base`.
+    fn mysql_reject(checkpoint: Option<&str>, base: u64, coordinate: u64) -> String {
+        reject_position(
+            "mysql",
+            checkpoint,
+            Some(&Position::from_bytes(coordinate.to_be_bytes())),
+            Some(base + coordinate),
+        )
+    }
+
     #[test]
     fn a_mysql_reject_is_listed_at_its_binlog_coordinate() {
         let coordinate = (4u64 << 32) | 900;
         assert_eq!(
-            reject_position("mysql", Some("binlog.000007:12"), coordinate),
+            mysql_reject(Some("binlog.000007:12"), 0, coordinate),
             "binlog.000004:900"
         );
         assert_eq!(
-            reject_position(
-                "mysql",
-                Some("binlog.000007:12;base=4096"),
-                coordinate + 4096
-            ),
+            mysql_reject(Some("binlog.000007:12;base=4096"), 4096, coordinate),
             "binlog.000004:900",
             "the generation base is the version's, not the coordinate's"
         );
         assert_eq!(
-            reject_position("mysql", Some("binlog.000007:12;base=4096"), 7),
+            mysql_reject(Some("binlog.000007:12;base=4096"), 0, 7),
             "version 7",
             "a reject from an earlier generation names a server that is gone"
         );
-        assert_eq!(reject_position("mysql", None, 7), "version 7");
+        assert_eq!(mysql_reject(None, 0, 7), "version 7");
         for flavor in ["mysql", "postgres"] {
+            // a loaded row, or a record 1.x quarantined whose numeric position
+            // is not read back: either way the version is what places it
             assert_eq!(
-                reject_position(flavor, Some("binlog.000007:12"), 0),
+                reject_position(flavor, Some("binlog.000007:12"), None, Some(7)),
+                "no position, version 7",
+                "a reject without a position is still told apart by its version"
+            );
+            assert_eq!(
+                reject_position(flavor, Some("binlog.000007:12"), None, None),
                 "no position",
-                "a loaded row has no stream position, as its log line says"
+                "a row with no stream position says so, as its log line does"
             );
         }
         assert_eq!(
-            reject_position("postgres", Some("0/1B4F2A8"), 0x1B4F2A8),
+            reject_position(
+                "postgres",
+                Some("0/1B4F2A8"),
+                Some(&Lsn(0x1B4F2A8).to_position()),
+                Some(0x1B4F2A8)
+            ),
             "0/1B4F2A8"
         );
     }
@@ -2759,14 +2813,14 @@ mod tests {
     fn a_reject_from_a_generation_the_checkpoint_has_not_caught_up_with_is_a_bare_version() {
         let checkpoint = (7u64 << 32) | 12;
         let opened = checkpoint + run::GENERATION_MARGIN;
-        let token = opened + ((2u64 << 32) | 500);
+        let version = opened + ((2u64 << 32) | 500);
         assert_eq!(
-            reject_position("mysql", Some("binlog.000007:12"), token),
-            format!("version {token}"),
+            mysql_reject(Some("binlog.000007:12"), opened, (2u64 << 32) | 500),
+            format!("version {version}"),
             "the new base is only in memory until the next checkpoint"
         );
         assert_eq!(
-            reject_position("mysql", Some("binlog.000007:12"), (8u64 << 32) | 40),
+            mysql_reject(Some("binlog.000007:12"), 0, (8u64 << 32) | 40),
             "binlog.000008:40",
             "a reject written ahead of its own generation's checkpoint still has a coordinate"
         );

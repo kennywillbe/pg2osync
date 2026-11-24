@@ -160,16 +160,18 @@ MySQL has no server-side position tracking. pg2osync stores
 `(binlog file, position)` in the checkpoint and resumes from it; a replay after
 a crash is harmless because writes are idempotent.
 
-The engine orders positions as `(file index << 32) | offset`, so a rotation
-always compares greater than any offset in the previous file.
+A position is the file index then the offset, both big-endian, and the engine
+orders positions by those bytes, so a rotation always compares greater than any
+offset in the previous file.
 
 Consequence: the server must still hold the binlog you stopped at. Past
 `binlog_expire_logs_seconds` the position is gone and the next start runs a full
 initial load. Keep enough retention to cover your worst expected outage —
 MySQL's automatic purge does not spare files a consumer still needs.
 
-The same token is each document's version at the target, which is what lets the
-initial load run beside the stream. A version only ever goes up, so a binlog
+The same coordinate, packed as `(file index << 32) | offset`, is each
+document's version at the target, which is what lets the initial load run beside
+the stream. A version only ever goes up, so a binlog
 history that restarts under a running pipeline — `RESET BINARY LOGS AND GTIDS`,
 or the same address answered by a different server — leaves the target holding
 versions from a numbering that no longer exists. pg2osync refuses to start in
