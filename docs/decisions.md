@@ -77,14 +77,34 @@ on each other, so the compiler enforces the architecture instead of discipline.
 never import a sink implementation; the contract has to sit next to the shared
 types for that to hold.
 
-**The engine is source-agnostic.** It knows `ChangeEvent` and an opaque `u64`
-position token. Whether that token is a WAL LSN or a packed binlog coordinate is
-the source's business, and the binary injects a closure that renders it back to
-text for the checkpoint. This is what made adding MySQL a small change rather
-than a fork. Log lines get a second closure that renders only the coordinate:
-the checkpoint one may consume source state as it renders (MySQL folds GTIDs
-into the resume position up to the token), so a log of a position ahead of the
-acknowledgement must never call it.
+**The engine is source-agnostic.** It knows `ChangeEvent` and an opaque
+`Position`: a byte string whose lexicographic order is the stream order. Each
+source encodes its own position that way — PostgreSQL's LSN as 8 big-endian
+bytes, MySQL's binlog file index then offset the same way — and the
+engine only ever compares bytes, for acknowledgement, the checkpoint and
+`/synced`. The binary injects closures that render a position to the source's
+text and parse text back, so `/synced` stays text in and text out. This is what
+made adding MySQL a small change rather than a fork. (#184.) Log lines get a
+second renderer that names only the coordinate: the checkpoint one may consume
+source state as it renders (MySQL folds GTIDs into the resume position up to
+the position it is given), so a log of a position ahead of the acknowledgement
+must never call it.
+
+**`Lsn` belongs to the PostgreSQL source, not to `core`.** `core` owns
+`Position`; a `u64` with PostgreSQL's `X/Y` rendering in the shared vocabulary
+is what let MySQL coordinates be printed as LSNs.
+
+**A position is optional where there may be none.** Commit boundaries,
+operations and acknowledgements carry `Option<Position>`. The initial load,
+poll mode, reconcile and reindex write rows that have no position of their
+own, and they say so with `None` rather than a zero that every reader had to
+remember not to acknowledge.
+
+**The position is not the document version.** The version a target orders
+documents by stays a separate `Option<u64>` that the source projects (sent to
+targets as `i64`). A source that cannot project a monotone integer runs
+unversioned. The two used to be one token, which is what tied every source to a
+`u64` position.
 
 **New targets implement `Sink`.** No `match sink_kind` anywhere in the engine.
 
@@ -505,6 +525,19 @@ source is clamped to the persisted checkpoint. Acknowledging further lets the
 database recycle history for rows that are not indexed yet — the classic way a
 CDC pipeline loses data on crash-restart.
 
+The durable position is a `watch` of `Option<Position>` that the checkpoint
+task replaces only after a persist succeeds. The engine never interprets it;
+the PostgreSQL source decodes it back to an LSN for its standby status, and
+anything it cannot decode — nothing persisted yet, or bytes that are not an
+LSN — is reported as `0/0` rather than as the stream's own end, because the
+failure that matters is acknowledging too much. The position gauges are a
+separate numeric projection the binary supplies per source (the LSN on
+PostgreSQL, the packed binlog coordinate on MySQL), so what gates
+acknowledgement never depends on what a dashboard can draw. A pipeline built
+without a projection exposes no position gauges at all: a zero would read as
+caught up, where an absent series reads as no data. PostgreSQL poll mode is
+one, since it streams no positions to project. (#184.)
+
 **Buffer until commit.** Rows are held until their commit boundary so a partial
 transaction is never presented as complete. A transaction that exceeds the batch
 limits is split, which is a deliberate, documented exception: an unbounded
@@ -545,7 +578,7 @@ and a batch arriving once the limit is already spent is left unacknowledged, so
 the source sends it again when the mapping is fixed.
 
 **A rejected document is replayed through the ordinary write path.** `pg2osync
-rejects --replay` submits it again with its original position as its version, so a
+rejects --replay` submits it again with the version it was refused at, so a
 row the source has since changed loses to the newer value by the same rule that
 orders everything else, and the record is cleared only once the target has taken
 it. The target is prepared first exactly as a run prepares it, from the same
@@ -603,12 +636,12 @@ document version.** Streamed rows carry their commit position, copied rows the
 position read before their range. A copied row that is already stale therefore
 loses to the streamed change at the target, whichever order the two arrive in,
 and a version conflict is success rather than a rejection. It is deliberately
-separate from the checkpoint token: a copied row needs a version and must never
+separate from the checkpoint position: a copied row needs a version and must never
 advance a position. Poll mode, which has no position at all, writes no version
 and relies on ordering alone.
 
 **MySQL versions by its binlog coordinate, not by a GTID.** `(file index << 32)
-| offset` is monotonic across rotation and was already the ordering token, and a
+| offset` is monotonic across rotation, and a
 transaction's events are written to the binlog as one group at commit — so no
 position inside a group can predate a coordinate a reader saw earlier, which is
 what makes an event's own offset a sound version. A GTID could not be one: it is
@@ -624,8 +657,22 @@ moves to a different one: the new coordinate may be *lower* than what the target
 already holds, and `external_gte` would then refuse every write and leave the
 index quietly stale. So when the source is behind the checkpoint and there is a
 GTID position to resume the stream from, a new generation opens at
-`stored token + 2^40` instead, and every later version outranks everything
+`stored version + 2^40` instead, and every later version outranks everything
 written under the old numbering.
+
+The stream position does not carry the generation: its bytes are the file
+index then the offset, big-endian, and nothing else. `base` belongs to the
+version, so it rides only in the textual position beside the GTID set, which is
+where a restart reads it back from. Bytes from two generations therefore do not
+compare — the new server's coordinate is usually the lower one — so opening a
+generation also forgets what this process had acknowledged and made durable.
+Kept across that point, the old server's last acknowledgement would outrank
+every position the new server reports, and `/synced` would tell a caller waiting
+on a new write that it is synced before it is. A reconnect that stays in its
+generation keeps both, or a wait on a position already acknowledged would time
+out on a quiet server. Which GTID set a checkpoint records is looked up by
+position: the tracker turns the position into the coordinate it is keyed by
+itself, so callers hand it positions and never that number.
 
 The margin has to exceed the highest version written but not yet acknowledged.
 That gap is bounded by how much binlog one unacknowledged transaction can span —
@@ -816,7 +863,7 @@ because a document it writes has to be indistinguishable from one the load wrote
 and a second write path would drift immediately.
 
 It cannot move the checkpoint by construction rather than by care: its rows carry
-position `0`, so nothing acknowledges a position and the checkpoint task has
+no position, so nothing acknowledges a position and the checkpoint task has
 nothing to persist. That is what makes it safe beside a running pipeline, together
 with the versioning that already orders a copied row against a streamed change.
 
@@ -845,7 +892,7 @@ row and a streamed change meet at the target and the higher position wins — a
 comparison between two documents in *one* index. A fresh index the stream is
 not writing to has no second operand: a row updated during the load would be
 permanently wrong there and the count would still match. So a rebuild closes
-the window the way the initial load does — its rows carry position `0`, the
+the window the way the initial load does — its rows carry no position, the
 checkpoint does not move, and restarting the pipeline against the new index
 replays everything committed since. The refusal is positive evidence rather
 than a flag: an active replication slot on PostgreSQL, and on either source a
@@ -1125,10 +1172,50 @@ keeps the same document in a `pg2osync_state` table and Qdrant in a
 `pg2osync_state` collection: different spellings of the one rule, that only the
 target is visible to both the process that stopped and the one that takes over.
 
-**One position format for every source.** The document stores an ordering token
-plus the source's own textual position. Documents written by earlier versions,
-which stored only an LSN, are still readable: refusing them would force a full
-re-index on upgrade.
+**One position format for every source.** Schema v3 stores the ordering bytes
+as a hex string plus the source's own textual position; the bytes are what the
+engine compares, the text is what the source resumes from. Earlier layouts —
+v1's `confirmed_lsn`, v2's numeric token, the shared `default` document and
+Meilisearch's shared pre-stream file — are not resumed from, so a pipeline
+upgraded from 1.x starts with a fresh initial load; resuming from them would
+have needed a per-source rule to turn a number into bytes.
+
+**1.x checkpoints are not resumed from, but a MySQL one's version base is
+carried over.** A MySQL document's version is the binlog coordinate plus the
+generation base, and a 1.x pipeline that had failed over left versions in the
+target above base 0. Starting the fresh load at 0 would have every write
+refused as older than what is indexed, and the index would go stale with no
+error. So when no current checkpoint exists, the 1.x one — the stream's own
+document, then the shared one, each only if it belongs to this stream — is
+read as text for its base alone, and the same rule a failover uses settles it
+against the server's coordinate now: kept when the server is further along,
+a new generation above the 1.x version when its history restarted. The first
+current checkpoint carries that base, before it replaces the 1.x document.
+Refusing to start (the same detection, and a worse upgrade) and only
+documenting it (the staleness stays silent) were rejected. Until that first
+checkpoint exists the answer is recorded nowhere and depends on where the
+server is when it is asked, so `resnapshot` and `reindex` refuse to run on a
+MySQL stream that has only a 1.x checkpoint: settling it themselves, they could
+write under a higher generation than the run then picks, and the target would
+refuse the stream's changes to those documents. The run's initial load reads
+every table, so nothing is lost by waiting for it. Having the one-shot load
+write the first checkpoint was rejected because neither command touching the
+checkpoint is what makes them safe beside a live pipeline, and having the run
+never pick a lower base was rejected because nothing records which base a
+one-shot load used. PostgreSQL has
+nothing to carry: its version is the LSN, which never goes backwards on one
+slot. There an unfinished 1.x load resumes from its own progress and the
+stream resumes from the slot.
+
+**A quarantined document keeps its position and its version apart.** The
+reject store records the position as hex under `ordering` — absent for a row
+that had none — and the document version in its own field; a replay writes with
+the stored version and never derives one from the position. The hex does not
+reuse 1.x's `position` field: 1.x wrote a number there, so a search engine that
+holds a 1.x store has mapped it as `long`, refuses the hex string, and a
+pipeline that cannot quarantine halts. A record 1.x wrote is read with no
+position rather than dropped: it is the only copy of that document, and its
+version alone is enough to replay it.
 
 ## Types
 

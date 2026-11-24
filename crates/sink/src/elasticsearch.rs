@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use pg2osync_core::checkpoint::Checkpoint;
 use pg2osync_core::error::CoreError;
-use pg2osync_core::lsn::Lsn;
+use pg2osync_core::position::Position;
 use pg2osync_core::sink::{BulkLoadSettings, DocumentOp, Health, IndexSpec, LsnOp, Sink, SinkAck};
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -487,7 +487,10 @@ impl ElasticsearchSink {
     /// its position in `batch` and why — the position because there is exactly
     /// one action per operation, in order, so it identifies the operation even
     /// when a batch holds two writes for the same document.
-    async fn bulk_once(&self, batch: &[LsnOp]) -> Result<(Lsn, Vec<(usize, String)>), CoreError> {
+    async fn bulk_once(
+        &self,
+        batch: &[LsnOp],
+    ) -> Result<(Option<Position>, Vec<(usize, String)>), CoreError> {
         let ndjson = ndjson_body(batch, self.require_alias)?;
 
         let resp = self
@@ -507,7 +510,7 @@ impl ElasticsearchSink {
             .await
             .map_err(|e| CoreError::Sink(e.to_string()))?;
         if body["errors"] != json!(true) {
-            return Ok((batch.last().expect("nonempty").lsn, vec![]));
+            return Ok((batch.last().expect("nonempty").position.clone(), vec![]));
         }
         let mut retryable = false;
         let mut permanent = vec![];
@@ -556,13 +559,13 @@ impl ElasticsearchSink {
                 "item-level 429/5xx in bulk response".into(),
             ));
         }
-        Ok((batch.last().expect("nonempty").lsn, permanent))
+        Ok((batch.last().expect("nonempty").position.clone(), permanent))
     }
 
     async fn bulk_with_retry(
         &self,
         batch: &[LsnOp],
-    ) -> Result<(Lsn, Vec<(usize, String)>), CoreError> {
+    ) -> Result<(Option<Position>, Vec<(usize, String)>), CoreError> {
         crate::retry_transient(&self.retry, || self.bulk_once(batch)).await
     }
 }
@@ -751,9 +754,9 @@ impl Sink for ElasticsearchSink {
             permanent.extend(perm.into_iter().map(|(i, why)| (start + i, why)));
         }
         // the batch is non-empty, checked above
-        let max_lsn = batch.last().expect("nonempty").lsn;
+        let max_position = batch.last().expect("nonempty").position.clone();
         Ok(SinkAck {
-            max_lsn,
+            max_position,
             rejected: crate::rejections(&batch, permanent)?,
         })
     }
@@ -1203,24 +1206,42 @@ impl Sink for ElasticsearchSink {
             )
             .await?;
         if status == 404 {
-            // written before checkpoints were kept per stream; the caller
-            // still checks that it belongs to this one
-            let (status, body) = self
-                .send(
-                    reqwest::Method::GET,
-                    &format!("/{META_INDEX}/_doc/{}", crate::CHECKPOINT_DOC_ID),
-                    None,
-                )
-                .await?;
-            if status != 200 {
-                return Ok(None);
-            }
-            return Ok(crate::checkpoint_from_doc(&body["_source"]));
+            return Ok(None);
         }
         if status != 200 {
             return Err(CoreError::Sink(format!("read checkpoint: {status}")));
         }
         Ok(crate::checkpoint_from_doc(&body["_source"]))
+    }
+
+    async fn read_legacy_position_text(
+        &self,
+        stream: &pg2osync_core::checkpoint::StreamId,
+    ) -> Result<Option<String>, CoreError> {
+        // 1.x read the shared document only when the stream's own was absent,
+        // so that is the order its checkpoints can be found in
+        for doc_id in [
+            crate::checkpoint_doc_id(stream),
+            crate::LEGACY_CHECKPOINT_DOC_ID.into(),
+        ] {
+            let (status, body) = self
+                .send(
+                    reqwest::Method::GET,
+                    &format!("/{META_INDEX}/_doc/{doc_id}"),
+                    None,
+                )
+                .await?;
+            match status {
+                404 => continue,
+                200 => return Ok(crate::legacy_position_text(&body["_source"], stream)),
+                other => {
+                    return Err(CoreError::Sink(format!(
+                        "read 1.x checkpoint {doc_id}: {other}"
+                    )));
+                }
+            }
+        }
+        Ok(None)
     }
 
     async fn health(&self) -> Result<Health, CoreError> {
@@ -1286,7 +1307,7 @@ mod tests {
     fn a_routed_action_header_carries_routing_and_version() {
         let batch = vec![
             LsnOp {
-                lsn: Lsn(0x2A),
+                position: crate::test_position(0x2A),
                 op: DocumentOp::Upsert {
                     index: "shop".into(),
                     id: "order-7".into(),
@@ -1298,7 +1319,7 @@ mod tests {
                 },
             },
             LsnOp {
-                lsn: Lsn(0x2A),
+                position: crate::test_position(0x2A),
                 op: DocumentOp::Delete {
                     index: "shop".into(),
                     id: "order-8".into(),
@@ -1342,7 +1363,7 @@ mod tests {
     fn an_upsert_names_its_pipeline_and_a_delete_does_not() {
         let batch = vec![
             LsnOp {
-                lsn: Lsn(0x2A),
+                position: crate::test_position(0x2A),
                 op: DocumentOp::Upsert {
                     index: "products".into(),
                     id: "7".into(),
@@ -1354,7 +1375,7 @@ mod tests {
                 },
             },
             LsnOp {
-                lsn: Lsn(0x2A),
+                position: crate::test_position(0x2A),
                 op: DocumentOp::Delete {
                     index: "products".into(),
                     id: "8".into(),
@@ -1379,7 +1400,7 @@ mod tests {
     #[test]
     fn an_unrouted_action_header_is_unchanged() {
         let batch = vec![LsnOp {
-            lsn: Lsn(1),
+            position: crate::test_position(1),
             op: DocumentOp::Delete {
                 index: "users".into(),
                 id: "1".into(),
@@ -1398,7 +1419,7 @@ mod tests {
     fn require_alias_rides_on_the_upsert_and_the_delete_alike() {
         let batch = vec![
             LsnOp {
-                lsn: Lsn(0x2A),
+                position: crate::test_position(0x2A),
                 op: DocumentOp::Upsert {
                     index: "users".into(),
                     id: "1".into(),
@@ -1410,7 +1431,7 @@ mod tests {
                 },
             },
             LsnOp {
-                lsn: Lsn(0x2A),
+                position: crate::test_position(0x2A),
                 op: DocumentOp::Delete {
                     index: "users".into(),
                     id: "2".into(),
@@ -1629,7 +1650,7 @@ mod tests {
             index: "orders".into(),
             doc_id: "7".into(),
             reason: "mapper_parsing_exception".into(),
-            lsn: Lsn(0x2A),
+            position: crate::test_position(0x2A),
             op: DocumentOp::Upsert {
                 index: "orders".into(),
                 id: "7".into(),
@@ -1806,7 +1827,7 @@ mod tests {
         .await
         .expect("a template is recorded");
         sink.write(vec![LsnOp {
-            lsn: Lsn(1),
+            position: crate::test_position(1),
             op: DocumentOp::Upsert {
                 index: "events-acme".into(),
                 id: "1".into(),
@@ -1851,7 +1872,7 @@ mod tests {
         .expect("a template is recorded");
         for _ in 0..2 {
             sink.write(vec![LsnOp {
-                lsn: Lsn(1),
+                position: crate::test_position(1),
                 op: DocumentOp::Upsert {
                     index: "events-acme".into(),
                     id: "1".into(),
@@ -1912,7 +1933,7 @@ mod tests {
         .await
         .expect("a template is recorded");
         sink.write(vec![LsnOp {
-            lsn: Lsn(1),
+            position: crate::test_position(1),
             op: DocumentOp::Upsert {
                 index: "events-events-live".into(),
                 id: "1".into(),
@@ -2032,7 +2053,7 @@ mod tests {
         let ack = target
             .sink_with(true)
             .write(vec![LsnOp {
-                lsn: Lsn(0x2A),
+                position: crate::test_position(0x2A),
                 op: DocumentOp::Upsert {
                     index: "orders".into(),
                     id: "1".into(),
@@ -2054,6 +2075,127 @@ mod tests {
         assert!(
             target.seen().contains(&"POST /_bulk".to_string()),
             "the refusal came out of a real bulk request"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_under_the_shared_document_is_not_read() {
+        use pg2osync_core::checkpoint::{SOURCE_MYSQL, StreamId};
+        // nothing writes the shared document any more, so nothing may resume
+        // from it either, even when it holds a complete current-layout one
+        let target = FakeTarget::start(|line, _sent| {
+            if line.ends_with("/_doc/default") {
+                (
+                    200,
+                    r#"{"found":true,"_source":{"source":"mysql","stream":"424242",
+                        "slot_name":"424242","publication":"","position":"binlog.000001:4",
+                        "ordering":"0000000100000004","schema_version":3}}"#,
+                )
+            } else {
+                (404, r#"{"found":false}"#)
+            }
+        })
+        .await;
+        let stream = StreamId {
+            source: SOURCE_MYSQL.into(),
+            stream: "424242".into(),
+            publication: String::new(),
+        };
+        assert_eq!(target.sink().read_checkpoint(&stream).await.unwrap(), None);
+        assert_eq!(
+            target.seen(),
+            vec![format!("GET /{META_INDEX}/_doc/mysql-424242")]
+        );
+    }
+
+    /// `_source` as 1.5.2 wrote it for MySQL server 424242.
+    const MYSQL_1X_HIT: &str = r#"{"found":true,"_source":{"source":"mysql","stream":"424242",
+        "slot_name":"424242","publication":"","position":"binlog.000004:1234;base=1099511627776",
+        "token":1116691498194,"instance_id":"","updated_at_epoch":1700000000,"schema_version":2}}"#;
+
+    #[tokio::test]
+    async fn a_1x_checkpoint_under_the_stream_document_is_read_as_text() {
+        let target = FakeTarget::start(|line, _sent| {
+            if line.ends_with("/_doc/mysql-424242") {
+                (200, MYSQL_1X_HIT)
+            } else {
+                (404, r#"{"found":false}"#)
+            }
+        })
+        .await;
+        assert_eq!(
+            target
+                .sink()
+                .read_legacy_position_text(&crate::tests::mysql_stream())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("binlog.000004:1234;base=1099511627776")
+        );
+        assert_eq!(
+            target.seen(),
+            vec![format!("GET /{META_INDEX}/_doc/mysql-424242")]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_1x_checkpoint_under_the_shared_document_is_read_as_text() {
+        let target = FakeTarget::start(|line, _sent| {
+            if line.ends_with("/_doc/default") {
+                (200, MYSQL_1X_HIT)
+            } else {
+                (404, r#"{"found":false}"#)
+            }
+        })
+        .await;
+        assert_eq!(
+            target
+                .sink()
+                .read_legacy_position_text(&crate::tests::mysql_stream())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("binlog.000004:1234;base=1099511627776")
+        );
+        assert_eq!(
+            target.seen(),
+            vec![
+                format!("GET /{META_INDEX}/_doc/mysql-424242"),
+                format!("GET /{META_INDEX}/_doc/default"),
+            ]
+        );
+        let other = pg2osync_core::checkpoint::StreamId {
+            stream: "7".into(),
+            ..crate::tests::mysql_stream()
+        };
+        assert_eq!(
+            target
+                .sink()
+                .read_legacy_position_text(&other)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn no_1x_checkpoint_anywhere_is_none_and_an_unreadable_one_is_an_error() {
+        let target = FakeTarget::start(|_, _| (404, r#"{"found":false}"#)).await;
+        assert_eq!(
+            target
+                .sink()
+                .read_legacy_position_text(&crate::tests::mysql_stream())
+                .await
+                .unwrap(),
+            None
+        );
+        let target = FakeTarget::start(|_, _| (500, r#"{"error":"boom"}"#)).await;
+        assert!(
+            target
+                .sink()
+                .read_legacy_position_text(&crate::tests::mysql_stream())
+                .await
+                .is_err()
         );
     }
 }

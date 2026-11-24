@@ -7,6 +7,7 @@
 use crate::connection::MySqlConnection;
 use crate::error::{Context as _, MySqlError, Result};
 use crate::typemap::{self, ValueShape};
+use pg2osync_core::Position;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 
@@ -391,18 +392,63 @@ pub fn split_binlog_file(file: &str) -> Option<(String, u32)> {
     Some((prefix.to_string(), idx.parse().ok()?))
 }
 
-/// Pack a binlog coordinate into the engine's monotonic position token.
+/// Pack a binlog coordinate into one monotonic integer, the base of the version.
 ///
 /// The file index occupies the high 32 bits so a rotation always compares
 /// greater than any position in the previous file.
-pub fn position_token(file: &str, pos: u32) -> u64 {
+pub fn pack_coordinate(file: &str, pos: u32) -> u64 {
     let index = split_binlog_file(file).map(|(_, i)| i).unwrap_or(0);
     (u64::from(index) << 32) | u64::from(pos)
 }
 
-/// Render a token back into `prefix.NNNNNN:pos` form.
-pub fn position_text(prefix: &str, token: u64) -> String {
-    format!("{prefix}.{:06}:{}", token >> 32, token as u32)
+/// The document version of a binlog coordinate in generation `base`.
+///
+/// Unlike the position, the version has to outrank everything the target
+/// already holds after a failover onto a lower coordinate, so this is the one
+/// place the generation is added.
+pub fn version(base: u64, file: &str, pos: u32) -> u64 {
+    base.saturating_add(pack_coordinate(file, pos))
+}
+
+/// The stream position of a binlog coordinate: the file index then the offset,
+/// big-endian, so the bytes order across rotation.
+///
+/// The version generation stays out of it. Positions only ever compare within
+/// one server's binlog history, and a failover that opens a generation also
+/// forgets what was acknowledged under the old one, so there is nothing for a
+/// generation in the bytes to outrank.
+pub fn position(file: &str, pos: u32) -> Position {
+    Position::from_bytes(pack_coordinate(file, pos).to_be_bytes())
+}
+
+/// The packed coordinate a position stands for.
+///
+/// `None` for anything that is not eight bytes, which no coordinate encodes.
+pub fn coordinate(position: &Position) -> Option<u64> {
+    let bytes: [u8; 8] = position.as_bytes().try_into().ok()?;
+    Some(u64::from_be_bytes(bytes))
+}
+
+/// The checkpoint text for a stream position.
+///
+/// A position this source could not have produced renders as its hex, which no
+/// parse accepts: a checkpoint that does not resume is recoverable, one that
+/// resumes in the wrong place is not.
+pub fn checkpoint_text(
+    prefix: &str,
+    position: &Position,
+    base: u64,
+    gtid_at: impl FnOnce(&Position) -> Option<String>,
+) -> String {
+    let Some(coordinate) = coordinate(position) else {
+        return position.to_hex();
+    };
+    position_text_full(prefix, coordinate, base, gtid_at(position).as_deref())
+}
+
+/// Render a packed coordinate back into `prefix.NNNNNN:pos` form.
+pub fn position_text(prefix: &str, coordinate: u64) -> String {
+    format!("{prefix}.{:06}:{}", coordinate >> 32, coordinate as u32)
 }
 
 /// Parse the textual form produced by [`position_text`].
@@ -430,9 +476,8 @@ pub struct StoredPosition {
 
 impl StoredPosition {
     /// The version the coordinate in this position maps to.
-    pub fn token(&self) -> u64 {
-        self.base
-            .saturating_add(position_token(&self.file, self.pos))
+    pub fn version(&self) -> u64 {
+        version(self.base, &self.file, self.pos)
     }
 }
 
@@ -440,8 +485,8 @@ impl StoredPosition {
 ///
 /// The bare `file:pos` form is kept when there is nothing to add, so a
 /// checkpoint only grows the extra fields once they mean something.
-pub fn position_text_full(prefix: &str, token: u64, base: u64, gtid: Option<&str>) -> String {
-    let mut out = position_text(prefix, token.saturating_sub(base));
+pub fn position_text_full(prefix: &str, coordinate: u64, base: u64, gtid: Option<&str>) -> String {
+    let mut out = position_text(prefix, coordinate);
     if let Some(gtid) = gtid {
         out.push_str(";gtid=");
         out.push_str(gtid);
@@ -536,9 +581,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn position_tokens_order_across_rotations() {
-        let a = position_token("binlog.000004", 900);
-        let b = position_token("binlog.000005", 4);
+    fn packed_coordinates_order_across_rotations() {
+        let a = pack_coordinate("binlog.000004", 900);
+        let b = pack_coordinate("binlog.000005", 4);
         assert!(
             b > a,
             "a rotation must compare greater than any prior offset"
@@ -551,19 +596,98 @@ mod tests {
     }
 
     #[test]
+    fn position_bytes_order_across_binlog_rotation() {
+        let ordered = [
+            ("binlog.000004", 4),
+            ("binlog.000004", 900),
+            ("binlog.000004", u32::MAX),
+            ("binlog.000005", 4),
+            ("binlog.000256", 4),
+            ("binlog.065536", 120),
+        ];
+        for pair in ordered.windows(2) {
+            let (a, b) = (
+                position(pair[0].0, pair[0].1),
+                position(pair[1].0, pair[1].1),
+            );
+            assert!(a < b, "{:?} < {:?}", pair[0], pair[1]);
+        }
+        assert_eq!(
+            position("binlog.000004", 900).as_bytes(),
+            [0, 0, 0, 4, 0, 0, 0x03, 0x84],
+            "file index then offset, each big-endian"
+        );
+    }
+
+    #[test]
+    fn a_position_is_the_coordinate_alone_whatever_the_generation() {
+        // Decision 5 of #184: the generation belongs to the version, so a
+        // position must not change with it — a checkpoint rendered from bytes
+        // that carried it would otherwise resume somewhere else.
+        let p = position("binlog.000004", 900);
+        assert_eq!(coordinate(&p), Some(pack_coordinate("binlog.000004", 900)));
+        assert_eq!(coordinate(&Position::from_bytes(vec![0; 4])), None);
+    }
+
+    #[test]
+    fn the_generation_moves_the_version_and_never_the_position() {
+        let base = 1u64 << 40;
+        assert_eq!(
+            version(base, "binlog.000004", 900),
+            base + pack_coordinate("binlog.000004", 900),
+            "a version from a new generation outranks the old server's"
+        );
+        assert_eq!(
+            version(0, "binlog.000004", 900),
+            pack_coordinate("binlog.000004", 900)
+        );
+        assert_eq!(
+            coordinate(&position("binlog.000004", 900)),
+            Some(pack_coordinate("binlog.000004", 900)),
+            "the position the same event carries has no generation in it"
+        );
+    }
+
+    #[test]
+    fn checkpoint_text_keeps_the_generation_and_the_gtid_of_its_position() {
+        // The GTID is looked up by the very position the checkpoint is for,
+        // so the lookup and the recording cannot disagree about what it holds.
+        let base = 1u64 << 40;
+        let p = position("binlog.000004", 900);
+        let mut tracker = crate::gtid::GtidTracker::new(false, None);
+        tracker.record_mysql(&p, "3e11fa47-71ca-11e1-9e33-c80aa9429562".into(), 7);
+        let text = checkpoint_text("binlog", &p, base, |at| tracker.position_at(at));
+        let stored = parse_stored_position(&text).expect("parses");
+        assert_eq!(
+            (stored.file.as_str(), stored.pos),
+            ("binlog.000004", 900),
+            "the coordinate resumed from is the one streamed, not one shifted by the generation"
+        );
+        assert_eq!(stored.base, base);
+        assert_eq!(
+            stored.gtid.as_ref().map(|g| g.to_text()).as_deref(),
+            Some("3e11fa47-71ca-11e1-9e33-c80aa9429562:7")
+        );
+        assert_eq!(
+            stored.version(),
+            base + pack_coordinate("binlog.000004", 900)
+        );
+    }
+
+    #[test]
     fn a_position_written_before_generations_still_reads() {
         let stored = parse_stored_position("binlog.000004:900").expect("parses");
         assert_eq!(stored.file, "binlog.000004");
         assert_eq!(stored.pos, 900);
         assert_eq!(stored.base, 0, "no generation means the first one");
         assert!(stored.gtid.is_none());
-        assert_eq!(stored.token(), position_token("binlog.000004", 900));
+        assert_eq!(stored.version(), pack_coordinate("binlog.000004", 900));
     }
 
     #[test]
     fn a_full_position_survives_its_own_text() {
-        let token = position_token("binlog.000004", 900) + 4096;
-        let text = position_text_full("binlog", token, 4096, Some("0-3307-1431"));
+        let coordinate = pack_coordinate("binlog.000004", 900);
+        let text = position_text_full("binlog", coordinate, 4096, Some("0-3307-1431"));
         assert_eq!(text, "binlog.000004:900;gtid=0-3307-1431;base=4096");
         let stored = parse_stored_position(&text).expect("parses");
         assert_eq!(stored.pos, 900);
@@ -573,17 +697,17 @@ mod tests {
             Some("0-3307-1431")
         );
         assert_eq!(
-            stored.token(),
-            token,
-            "the token round trips through the text"
+            stored.version(),
+            coordinate + 4096,
+            "the version round trips through the text"
         );
     }
 
     #[test]
     fn nothing_extra_is_written_when_there_is_nothing_extra_to_say() {
-        let token = position_token("binlog.000004", 900);
+        let coordinate = pack_coordinate("binlog.000004", 900);
         assert_eq!(
-            position_text_full("binlog", token, 0, None),
+            position_text_full("binlog", coordinate, 0, None),
             "binlog.000004:900",
             "a checkpoint only grows the extra fields once they mean something"
         );

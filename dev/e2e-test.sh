@@ -656,6 +656,14 @@ trap 'cleanup; resume_cleanup; reject_cleanup' EXIT
 pg "DROP TABLE IF EXISTS reject_probe; CREATE TABLE reject_probe(id bigint primary key, amount text);" > /dev/null 2>&1
 pg "DROP PUBLICATION IF EXISTS ${QSLOT}_pub; CREATE PUBLICATION ${QSLOT}_pub FOR TABLE reject_probe;" > /dev/null 2>&1
 curl -s -XDELETE "$OS/e2e_reject,.pg2osync_rejects?ignore_unavailable=true" > /dev/null
+# The store as 1.x left it once its records were replayed: the numbers 1.x
+# filed had the target map those fields as longs, and a quarantine refused
+# there halts
+curl -s -XPUT "$OS/.pg2osync_rejects" -H 'Content-Type: application/json' \
+  -d '{"settings":{"index":{"hidden":true,"number_of_shards":1}},
+       "mappings":{"properties":{"document":{"type":"object","enabled":false},
+                                 "position":{"type":"long"},
+                                 "at_epoch":{"type":"long"}}}}' > /dev/null
 curl -s -XDELETE "$OS/.pg2osync_meta/_doc/postgres-$QSLOT" > /dev/null
 # amount is declared a long, so a row holding text is refused permanently
 curl -s -XPUT "$OS/e2e_reject" -H 'Content-Type: application/json' \

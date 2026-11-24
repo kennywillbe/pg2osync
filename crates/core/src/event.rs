@@ -4,24 +4,30 @@
 //! the source database. Nothing here mentions PostgreSQL specifics — table
 //! identity is a logical (schema, name) pair resolved by the source crate.
 
-use crate::lsn::Lsn;
+use crate::position::Position;
 use serde_json::Value;
 
 /// Boundary signals emitted around committed transactions.
 ///
 /// The engine must treat rows as invisible until their `Commit` arrives:
 /// buffering until COMMIT is a correctness invariant, not an optimization.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransactionBoundary {
-    /// `lsn` is the position this transaction will commit at, which pgoutput
+    /// `position` is where this transaction will commit, which pgoutput
     /// reports up front. It marks the transaction open: while one is, nothing
     /// may flush a batch, or a concurrent producer's boundary would split it.
-    Begin { lsn: Lsn },
-    /// `lsn` is the commit LSN; it is the highest position that may be
-    /// acknowledged to the source once this transaction's rows are durable.
+    Begin { position: Position },
+    /// `position` is the commit position; it is the highest position that may
+    /// be acknowledged to the source once this transaction's rows are durable.
+    /// `None` is a boundary that only flushes: the initial load and poll mode
+    /// have rows with no position, and acknowledging anything for them would
+    /// corrupt the source's position chain.
     /// `commit_ts_micros` is microseconds since 2000-01-01 (PG epoch), or 0
     /// when unavailable (backfill boundaries).
-    Commit { lsn: Lsn, commit_ts_micros: i64 },
+    Commit {
+        position: Option<Position>,
+        commit_ts_micros: i64,
+    },
 }
 
 /// A single committed row change.
@@ -33,7 +39,7 @@ pub struct RowChange {
     /// The source position at which this change became visible, carried on the
     /// row rather than inferred from the surrounding boundaries: two producers
     /// may feed the engine at once, so ambient state would attribute one's
-    /// position to the other's rows. Deliberately not the checkpoint token —
+    /// position to the other's rows. Deliberately not the checkpoint position —
     /// the target versions documents by it, nothing acknowledges it.
     pub version: Option<u64>,
 }

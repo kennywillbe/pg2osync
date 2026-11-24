@@ -8,7 +8,7 @@
 //! once, with `source` on every series, and health is answered per source.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
@@ -45,10 +45,14 @@ pub struct Metrics {
     pub source_connected: AtomicU64,
     /// end-to-end latency samples in ms (commit -> indexed), capped ring
     pub latencies_ms: Mutex<Vec<u64>>,
-    /// Highest position token seen from the source (WAL LSN / binlog offset).
+    /// Highest source position seen, as the source's numeric projection.
     pub position_current: AtomicU64,
-    /// Highest position token whose checkpoint is durably persisted.
+    /// Highest position durably checkpointed, in the same projection.
     pub position_confirmed: AtomicU64,
+    /// Whether the pipeline can draw its positions as numbers at all. Without
+    /// that the gauges stay absent: a zero would read as caught up, where an
+    /// absent series reads as no data.
+    position_gauges: AtomicBool,
     /// What each replication slot on the source is holding, refreshed by a
     /// poller rather than counted here.
     ///
@@ -194,6 +198,14 @@ impl Metrics {
 
     pub fn set_confirmed_position(&self, token: u64) {
         self.position_confirmed.store(token, Ordering::Relaxed);
+    }
+
+    /// Expose the position gauges, for a pipeline that has a projection.
+    ///
+    /// Said once at the start rather than inferred from a first value: an idle
+    /// pipeline that has seen no position yet still has gauges to show.
+    pub fn report_positions(&self) {
+        self.position_gauges.store(true, Ordering::Relaxed);
     }
 
     /// Replace what is known about the source's slots.
@@ -383,25 +395,28 @@ impl Metrics {
             );
         }
         drop(lat);
+        if !self.position_gauges.load(Ordering::Relaxed) {
+            return;
+        }
         let current = self.position_current.load(Ordering::Relaxed);
         let confirmed = self.position_confirmed.load(Ordering::Relaxed);
         out.push(
             "pg2osync_position_current",
-            "Highest source position token received (WAL LSN or binlog offset)",
+            "Highest source position received (WAL LSN or packed binlog coordinate)",
             "gauge",
             &src,
             current,
         );
         out.push(
             "pg2osync_position_confirmed",
-            "Highest source position token durably checkpointed",
+            "Highest source position durably checkpointed",
             "gauge",
             &src,
             confirmed,
         );
         out.push(
             "pg2osync_position_lag",
-            "Position tokens received but not yet checkpointed",
+            "Source position received but not yet checkpointed",
             "gauge",
             &src,
             current.saturating_sub(confirmed),
@@ -818,6 +833,27 @@ mod tests {
             .filter_map(|line| line.strip_prefix("# HELP "))
             .filter_map(|line| line.split_whitespace().next())
             .collect()
+    }
+
+    #[test]
+    fn position_gauges_are_absent_until_the_pipeline_can_project_positions() {
+        let metrics = Metrics::default();
+        assert!(
+            !metrics.render("s").contains("pg2osync_position_"),
+            "a pipeline without a projection is no data, not caught up at zero"
+        );
+        metrics.report_positions();
+        let out = metrics.render("s");
+        for family in [
+            "pg2osync_position_current",
+            "pg2osync_position_confirmed",
+            "pg2osync_position_lag",
+        ] {
+            assert!(
+                out.contains(&format!("{family}{{source=\"s\"}} 0")),
+                "{family} is drawn from the start, before any position: {out}"
+            );
+        }
     }
 
     #[test]

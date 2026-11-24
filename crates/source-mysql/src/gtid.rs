@@ -12,6 +12,7 @@
 //! Both are implemented rather than one emulated: the difference is in the
 //! server, and neither is a dialect of the other.
 
+use pg2osync_core::Position;
 use std::collections::BTreeMap;
 
 /// A consumed-transaction position, in whichever form its server speaks.
@@ -265,14 +266,16 @@ impl MariaGtidPos {
 /// What has been consumed, tracked against the positions it was consumed at.
 ///
 /// The checkpoint may only claim the transactions that are durably written, and
-/// the token it is written for lags the stream. So each GTID is held with the
+/// the position it is written for lags the stream. So each GTID is held with the
 /// position of its commit and folded into the position only once a checkpoint
 /// asks for that position or later — claiming the newest set instead would make
 /// a resume skip everything the target had not yet taken.
 #[derive(Debug)]
 pub struct GtidTracker {
     position: GtidPosition,
-    /// Commits not yet covered by a checkpoint, oldest first.
+    /// Commits not yet covered by a checkpoint, oldest first, each under the
+    /// number its position decodes to. The number never leaves this type:
+    /// callers speak positions, and what a position encodes is this crate's.
     pending: Vec<(u64, Consumed)>,
     /// Set once something arrived that no set can describe, after which the
     /// position is withheld rather than understated.
@@ -307,19 +310,28 @@ impl GtidTracker {
         }
     }
 
-    pub fn record_mysql(&mut self, token: u64, uuid: String, gno: u64) {
-        self.pending.push((token, Consumed::MySql { uuid, gno }));
+    pub fn record_mysql(&mut self, at: &Position, uuid: String, gno: u64) {
+        self.record(at, Consumed::MySql { uuid, gno });
     }
 
-    pub fn record_mariadb(&mut self, token: u64, domain: u32, server_id: u32, seq_no: u64) {
-        self.pending.push((
-            token,
+    pub fn record_mariadb(&mut self, at: &Position, domain: u32, server_id: u32, seq_no: u64) {
+        self.record(
+            at,
             Consumed::MariaDb {
                 domain,
                 server_id,
                 seq_no,
             },
-        ));
+        );
+    }
+
+    fn record(&mut self, at: &Position, consumed: Consumed) {
+        match crate::catalog::coordinate(at) {
+            Some(key) => self.pending.push((key, consumed)),
+            // No checkpoint could ever be said to cover it, so a set that
+            // left it out would be one that resumes before or after it.
+            None => self.mark_incomplete("a GTID was read at a position no coordinate encodes"),
+        }
     }
 
     /// Say that something happened which a set cannot express, naming it once.
@@ -337,11 +349,14 @@ impl GtidTracker {
         }
     }
 
-    /// The position as of `token`, or nothing if it cannot be trusted.
+    /// The GTID position as of stream position `at`, or nothing if it cannot
+    /// be trusted.
     ///
-    /// Called with a non-decreasing token by the checkpoint task, so folding
-    /// is a single pass that consumes what it covers.
-    pub fn position_at(&mut self, token: u64) -> Option<String> {
+    /// Called with non-decreasing positions by the checkpoint task, so folding
+    /// is a single pass that consumes what it covers. A position that is no
+    /// coordinate covers nothing, and consumes nothing either.
+    pub fn position_at(&mut self, at: &Position) -> Option<String> {
+        let token = crate::catalog::coordinate(at)?;
         let mut i = 0;
         while i < self.pending.len() {
             if self.pending[i].0 > token {
@@ -505,20 +520,25 @@ mod tests {
         assert!(GtidPosition::parse("nonsense").is_none());
     }
 
+    /// A commit at `offset` in the first binlog file, as the stream names it.
+    fn at(offset: u32) -> Position {
+        crate::catalog::position("binlog.000001", offset)
+    }
+
     #[test]
     fn a_checkpoint_claims_only_what_is_written() {
         let mut tracker = GtidTracker::new(false, None);
         let uuid = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
-        tracker.record_mysql(100, uuid.into(), 1);
-        tracker.record_mysql(200, uuid.into(), 2);
-        tracker.record_mysql(300, uuid.into(), 3);
+        tracker.record_mysql(&at(100), uuid.into(), 1);
+        tracker.record_mysql(&at(200), uuid.into(), 2);
+        tracker.record_mysql(&at(300), uuid.into(), 3);
         assert_eq!(
-            tracker.position_at(200).as_deref(),
+            tracker.position_at(&at(200)).as_deref(),
             Some("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-2"),
             "the third transaction is not durable yet, so resuming past it would skip it"
         );
         assert_eq!(
-            tracker.position_at(300).as_deref(),
+            tracker.position_at(&at(300)).as_deref(),
             Some("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-3")
         );
     }
@@ -526,16 +546,16 @@ mod tests {
     #[test]
     fn nothing_consumed_yet_is_no_position_rather_than_an_empty_one() {
         let mut tracker = GtidTracker::new(true, None);
-        assert!(tracker.position_at(1000).is_none());
+        assert!(tracker.position_at(&at(1000)).is_none());
     }
 
     #[test]
     fn a_transaction_without_a_gtid_withholds_the_position() {
         let mut tracker = GtidTracker::new(false, None);
-        tracker.record_mysql(100, "3e11fa47-71ca-11e1-9e33-c80aa9429562".into(), 1);
+        tracker.record_mysql(&at(100), "3e11fa47-71ca-11e1-9e33-c80aa9429562".into(), 1);
         tracker.mark_incomplete("a transaction was written with no GTID");
         assert!(
-            tracker.position_at(100).is_none(),
+            tracker.position_at(&at(100)).is_none(),
             "a set that omits a transaction would resume in the wrong place"
         );
     }
@@ -544,9 +564,55 @@ mod tests {
     fn a_resumed_tracker_carries_what_it_was_given() {
         let start = GtidPosition::parse("0-3307-1431").expect("parses");
         let mut tracker = GtidTracker::new(true, Some(start));
-        tracker.record_mariadb(500, 0, 3307, 1432);
-        assert_eq!(tracker.position_at(499).as_deref(), Some("0-3307-1431"));
-        assert_eq!(tracker.position_at(500).as_deref(), Some("0-3307-1432"));
+        tracker.record_mariadb(&at(500), 0, 3307, 1432);
+        assert_eq!(
+            tracker.position_at(&at(499)).as_deref(),
+            Some("0-3307-1431")
+        );
+        assert_eq!(
+            tracker.position_at(&at(500)).as_deref(),
+            Some("0-3307-1432")
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_after_a_rotation_claims_what_the_earlier_file_held() {
+        let mut tracker = GtidTracker::new(false, None);
+        let uuid = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+        tracker.record_mysql(
+            &crate::catalog::position("binlog.000001", 900),
+            uuid.into(),
+            1,
+        );
+        tracker.record_mysql(
+            &crate::catalog::position("binlog.000002", 4),
+            uuid.into(),
+            2,
+        );
+        assert_eq!(
+            tracker
+                .position_at(&crate::catalog::position("binlog.000002", 4))
+                .as_deref(),
+            Some("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-2"),
+            "a low offset in a later file is past every offset in an earlier one"
+        );
+    }
+
+    #[test]
+    fn a_position_no_coordinate_encodes_claims_nothing_and_consumes_nothing() {
+        let mut tracker = GtidTracker::new(false, None);
+        let uuid = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+        tracker.record_mysql(&at(100), uuid.into(), 1);
+        assert!(
+            tracker
+                .position_at(&Position::from_bytes(vec![0xFF; 12]))
+                .is_none()
+        );
+        assert_eq!(
+            tracker.position_at(&at(100)).as_deref(),
+            Some("3e11fa47-71ca-11e1-9e33-c80aa9429562:1"),
+            "what was recorded is still there for the next checkpoint"
+        );
     }
 
     #[test]

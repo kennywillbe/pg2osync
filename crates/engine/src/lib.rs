@@ -18,7 +18,7 @@ use crate::mapping::{IdTemplate, IndexTarget, TableMapping};
 use pg2osync_core::checkpoint::{Checkpoint, StreamId};
 use pg2osync_core::error::CoreError;
 use pg2osync_core::event::{ChangeEvent, RowKind, TransactionBoundary};
-use pg2osync_core::lsn::Lsn;
+use pg2osync_core::position::Position;
 use pg2osync_core::sink::{DocumentOp, LsnOp, Sink, SinkAck};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -152,16 +152,6 @@ impl Default for EngineConfig {
 
 pub use crate::mapping::pk_to_id;
 
-/// Shared durable position: how far ahead the source may acknowledge.
-#[derive(Clone, Default)]
-pub struct DurableLsn(pub Arc<std::sync::atomic::AtomicU64>);
-
-impl DurableLsn {
-    pub fn store(&self, lsn: Lsn) {
-        self.0.store(lsn.0, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
 /// Work handed to the sink task, in the order the source produced it.
 ///
 /// TRUNCATE travels through the same channel as writes: executing it directly
@@ -183,25 +173,21 @@ enum SinkCommand {
     /// one whose row count was an exact multiple of the batch size. The
     /// position still has to be acknowledged, and it travels through this
     /// channel so it lands *after* the writes it belongs behind.
-    Position(Lsn),
+    Position(Position),
 }
 
-/// Renders an engine position token into the source's own textual form.
+/// Renders a position into the source's own textual form.
 ///
 /// Injected by the binary so the engine can persist a resumable checkpoint
-/// without knowing whether the token is a WAL LSN or a binlog offset.
-pub type PositionRenderer = Arc<dyn Fn(u64) -> String + Send + Sync>;
+/// without knowing whether the position is a WAL LSN or a binlog coordinate.
+pub type PositionRenderer = Arc<dyn Fn(&Position) -> String + Send + Sync>;
 
 /// A position as a log line names it, through the source's display renderer.
 ///
-/// Zero is the load's sentinel rather than a place in the stream, and a source
-/// would otherwise render it as a coordinate that never existed.
-fn logged_position(display: &PositionRenderer, lsn: Lsn) -> String {
-    if lsn.0 == 0 {
-        "no position".to_string()
-    } else {
-        display(lsn.0)
-    }
+/// A loaded row has no place in the stream, and is worded so rather than
+/// rendered as a coordinate that never existed.
+fn logged_position(display: &PositionRenderer, position: Option<&Position>) -> String {
+    position.map_or_else(|| "no position".to_string(), |position| display(position))
 }
 
 /// The line a refused document is logged with, matching what
@@ -214,17 +200,24 @@ fn rejection_line(
         "PERMANENT rejection {}/{} at {}: {}",
         rejection.index,
         rejection.doc_id,
-        logged_position(display, rejection.lsn),
+        logged_position(display, rejection.position.as_ref()),
         rejection.reason
     )
 }
 
-/// The inverse: turns a position a caller supplies back into an ordering token.
+/// The inverse: turns a position a caller supplies back into a position.
 ///
 /// Returns `None` when the text does not belong to this source's position
 /// space, so a caller pasting a MySQL coordinate at a PostgreSQL pipeline gets
 /// a clear rejection rather than a nonsensical wait.
-pub type PositionParser = Arc<dyn Fn(&str) -> Option<u64> + Send + Sync>;
+pub type PositionParser = Arc<dyn Fn(&str) -> Option<Position> + Send + Sync>;
+
+/// A position as the number the position gauges show.
+///
+/// Supplied by the source because only it knows what its bytes mean. `None`
+/// for one position leaves the number where it was; a pipeline built without a
+/// projection at all reports no position gauges rather than a made-up one.
+pub type PositionProjection = Arc<dyn Fn(&Position) -> Option<u64> + Send + Sync>;
 
 /// Everything the engine knows about the configured tables, as one value.
 ///
@@ -276,11 +269,14 @@ pub struct PipelineCtx {
     /// next batch without the pipeline being rebuilt.
     pub settings: watch::Receiver<EngineSettings>,
     /// Updated by the sink task after every successful flush.
-    pub ack_tx: watch::Sender<Option<Lsn>>,
+    pub ack_tx: watch::Sender<Option<Position>>,
     /// Highest initial-load mark whose rows are durably written. The load
     /// records its progress behind this and nothing else.
     pub load_done_tx: watch::Sender<u64>,
     pub metrics: Arc<crate::metrics::Metrics>,
+    /// How the position gauges draw a position. `None` for a source with no
+    /// numeric form, which leaves the gauges absent.
+    pub project_position: Option<PositionProjection>,
 }
 
 /// One span per batch: the unit an operator follows from the replication log
@@ -305,11 +301,21 @@ fn seal_batch_span(
     span: &mut Option<tracing::Span>,
     batch: &[LsnOp],
     bytes: usize,
+    project: Option<&PositionProjection>,
 ) -> tracing::Span {
     let span = span.take().unwrap_or_else(new_batch_span);
     span.record("rows", batch.len());
     span.record("bytes", bytes);
-    span.record("position", batch.last().map_or(0, |op| op.lsn.0));
+    // Left empty rather than zero when there is nothing to show: a loaded or
+    // polled batch was never at any position, and a zero reads as the start of
+    // the stream.
+    if let Some(position) = batch
+        .last()
+        .and_then(|op| op.position.as_ref())
+        .and_then(|p| project.and_then(|project| project(p)))
+    {
+        span.record("position", position);
+    }
     span
 }
 
@@ -329,7 +335,7 @@ pub async fn run(
     stream: StreamId,
     render_position: PositionRenderer,
     display_position: PositionRenderer,
-    durable: crate::mapping::DurableLsn,
+    durable: crate::mapping::DurablePosition,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), CoreError> {
     // The whole struct is copied out of the watch at the top of every turn:
@@ -341,8 +347,11 @@ pub async fn run(
             "the load is capped at {rows_per_sec} rows/s; the stream is not capped");
     }
     let mut copy = LoadIntake::new(copy, settings.load_max_rows_per_sec);
+    if ctx.project_position.is_some() {
+        ctx.metrics.report_positions();
+    }
     let (batch_tx, batch_rx) = mpsc::channel::<SinkCommand>(64);
-    let (ckpt_done_tx, ckpt_done_rx) = watch::channel::<Option<Lsn>>(None);
+    let (ckpt_done_tx, ckpt_done_rx) = watch::channel::<Option<Position>>(None);
 
     let sink_task = tokio::spawn(sink_loop(
         batch_rx,
@@ -363,12 +372,13 @@ pub async fn run(
     let ckpt_stream = stream;
     let ckpt_render = render_position;
     let ckpt_metrics = ctx.metrics.clone();
+    let ckpt_project = ctx.project_position.clone();
     // Read per iteration rather than captured, so a reloaded interval takes
     // effect — one interval late, since the sleep already under way is the old
     // one and cutting it short would persist a checkpoint nobody asked for.
     let ckpt_settings = ctx.settings.clone();
     let ckpt_task = tokio::spawn(async move {
-        let mut last_persisted: Option<Lsn> = None;
+        let mut last_persisted: Option<Position> = None;
         let mut ckpt_done_rx = ckpt_done_rx;
         loop {
             let ckpt_interval = ckpt_settings.borrow().checkpoint_interval_ms.max(100);
@@ -383,14 +393,14 @@ pub async fn run(
             };
             // plain polling keeps every value cloned out of the guard before
             // any await point (watch guards are not Send across awaits)
-            let new_lsn = *ckpt_done_rx.borrow_and_update();
-            if let Some(lsn) = new_lsn
-                && last_persisted != new_lsn
+            let new_position = ckpt_done_rx.borrow_and_update().clone();
+            if let Some(position) = &new_position
+                && last_persisted != new_position
             {
                 let checkpoint = Checkpoint {
                     stream: ckpt_stream.clone(),
-                    token: lsn.0,
-                    position: ckpt_render(lsn.0),
+                    ordering: position.clone(),
+                    position: ckpt_render(position),
                 };
                 let span = tracing::info_span!(
                     target: "pg2osync::checkpoint",
@@ -405,9 +415,13 @@ pub async fn run(
                     Ok(()) => {
                         // `durable` gates what the source may acknowledge, so it
                         // must advance only after the checkpoint is persisted
-                        durable.store(lsn);
-                        ckpt_metrics.set_confirmed_position(lsn.0);
-                        last_persisted = new_lsn;
+                        durable.store(position.clone());
+                        if let Some(projected) =
+                            ckpt_project.as_ref().and_then(|project| project(position))
+                        {
+                            ckpt_metrics.set_confirmed_position(projected);
+                        }
+                        last_persisted = new_position;
                     }
                     Err(e) => {
                         tracing::warn!(target: "pg2osync::checkpoint", "checkpoint persist failed: {e}");
@@ -515,13 +529,13 @@ pub async fn run(
         };
         tracing::trace!(target: "pg2osync::engine", "engine got event");
         match ev {
-            ChangeEvent::Transaction(TransactionBoundary::Begin { lsn }) => {
+            ChangeEvent::Transaction(TransactionBoundary::Begin { position }) => {
                 tracing::debug!(target: "pg2osync::engine",
-                    "BEGIN at {}", logged_position(&display_position, lsn));
+                    "BEGIN at {}", display_position(&position));
                 stream_txn_open = true;
             }
             ChangeEvent::Transaction(TransactionBoundary::Commit {
-                lsn,
+                position,
                 commit_ts_micros,
             }) => {
                 // end-to-end latency: PG commit wall clock -> now. PG's time
@@ -536,16 +550,23 @@ pub async fn run(
                         ctx.metrics.record_latency(now_ms - committed_unix_ms);
                     }
                 }
-                // backfill boundaries carry Lsn(0): their rows have no WAL
-                // position, so they must NEVER advance ack/checkpoint state
-                let backfill_boundary = lsn.0 == 0;
-                if !backfill_boundary {
-                    ctx.metrics.set_current_position(lsn.0);
+                // backfill boundaries carry no position: their rows have no
+                // source position, so they must NEVER advance ack/checkpoint state
+                if let Some(at) = &position {
+                    if let Some(projected) = ctx
+                        .project_position
+                        .as_ref()
+                        .and_then(|project| project(at))
+                    {
+                        ctx.metrics.set_current_position(projected);
+                    }
                     stream_txn_open = false;
                 }
                 if !txn_buffer.is_empty() {
-                    if !backfill_boundary && let Some(last) = txn_buffer.last_mut() {
-                        last.lsn = lsn;
+                    if position.is_some()
+                        && let Some(last) = txn_buffer.last_mut()
+                    {
+                        last.position = position;
                     }
                     // Hold the buffer when another event is already waiting:
                     // a commit is what forces a batch, so a stream of
@@ -570,7 +591,12 @@ pub async fn run(
                     } else {
                         coalescing_since = None;
                         let batch = std::mem::take(&mut txn_buffer);
-                        let span = seal_batch_span(&mut batch_span, &batch, txn_bytes);
+                        let span = seal_batch_span(
+                            &mut batch_span,
+                            &batch,
+                            txn_bytes,
+                            ctx.project_position.as_ref(),
+                        );
                         txn_bytes = 0;
                         if batch_tx
                             .send(SinkCommand::Write(batch, span))
@@ -580,8 +606,8 @@ pub async fn run(
                             break Err(CoreError::Other("batch channel closed".into()));
                         }
                     }
-                } else if !backfill_boundary
-                    && batch_tx.send(SinkCommand::Position(lsn)).await.is_err()
+                } else if let Some(at) = position
+                    && batch_tx.send(SinkCommand::Position(at)).await.is_err()
                 {
                     break Err(CoreError::Other("batch channel closed".into()));
                 }
@@ -614,7 +640,12 @@ pub async fn run(
                 if !txn_buffer.is_empty() {
                     coalescing_since = None;
                     let batch = std::mem::take(&mut txn_buffer);
-                    let span = seal_batch_span(&mut batch_span, &batch, txn_bytes);
+                    let span = seal_batch_span(
+                        &mut batch_span,
+                        &batch,
+                        txn_bytes,
+                        ctx.project_position.as_ref(),
+                    );
                     txn_bytes = 0;
                     if batch_tx
                         .send(SinkCommand::Write(batch, span))
@@ -846,7 +877,12 @@ pub async fn run(
                         // oversized transaction split: safe because every op is
                         // idempotent and the commit LSN lands on the final piece
                         let piece = std::mem::take(&mut txn_buffer);
-                        let span = seal_batch_span(&mut batch_span, &piece, txn_bytes);
+                        let span = seal_batch_span(
+                            &mut batch_span,
+                            &piece,
+                            txn_bytes,
+                            ctx.project_position.as_ref(),
+                        );
                         if batch_tx
                             .send(SinkCommand::Write(piece, span))
                             .await
@@ -916,7 +952,12 @@ pub async fn run(
                 // rows buffered before the TRUNCATE belong before it
                 if !txn_buffer.is_empty() {
                     let batch = std::mem::take(&mut txn_buffer);
-                    let span = seal_batch_span(&mut batch_span, &batch, txn_bytes);
+                    let span = seal_batch_span(
+                        &mut batch_span,
+                        &batch,
+                        txn_bytes,
+                        ctx.project_position.as_ref(),
+                    );
                     if batch_tx
                         .send(SinkCommand::Write(batch, span))
                         .await
@@ -1132,8 +1173,8 @@ impl RateLimit {
 async fn sink_loop(
     mut commands: mpsc::Receiver<SinkCommand>,
     sink: Arc<dyn Sink>,
-    ack_tx: watch::Sender<Option<Lsn>>,
-    ckpt_done_tx: watch::Sender<Option<Lsn>>,
+    ack_tx: watch::Sender<Option<Position>>,
+    ckpt_done_tx: watch::Sender<Option<Position>>,
     load_done_tx: watch::Sender<u64>,
     metrics: Arc<crate::metrics::Metrics>,
     policy: RejectionPolicy,
@@ -1253,12 +1294,12 @@ async fn sink_loop(
                 ));
                 continue;
             }
-            SinkCommand::Position(lsn) => {
+            SinkCommand::Position(position) => {
                 if !drain(&mut inflight, &mut acks).await {
                     halted = true;
                     break;
                 }
-                Ok(Some(SinkAck::written(lsn)))
+                Ok(Some(SinkAck::written(Some(position))))
             }
             SinkCommand::LoadMark(mark) => {
                 // reached only after every write queued ahead of it succeeded,
@@ -1356,8 +1397,8 @@ async fn drain(inflight: &mut Inflight, acks: &mut Acks<'_>) -> bool {
 /// acknowledged, and a failure acknowledges nothing.
 struct Acks<'a> {
     sink: &'a dyn Sink,
-    ack_tx: &'a watch::Sender<Option<Lsn>>,
-    ckpt_done_tx: &'a watch::Sender<Option<Lsn>>,
+    ack_tx: &'a watch::Sender<Option<Position>>,
+    ckpt_done_tx: &'a watch::Sender<Option<Position>>,
     metrics: &'a crate::metrics::Metrics,
     policy: RejectionPolicy,
     max_rejects: u64,
@@ -1430,11 +1471,11 @@ impl Acks<'_> {
                         return false;
                     }
                 }
-                // zero-position acks come from initial-load batches;
+                // positionless acks come from initial-load batches;
                 // acknowledging them would corrupt the source position chain
-                if ack.max_lsn.0 > 0 {
-                    self.ack_tx.send_replace(Some(ack.max_lsn));
-                    self.ckpt_done_tx.send_replace(Some(ack.max_lsn));
+                if let Some(position) = ack.max_position {
+                    self.ack_tx.send_replace(Some(position.clone()));
+                    self.ckpt_done_tx.send_replace(Some(position));
                 }
                 true
             }
@@ -1863,13 +1904,10 @@ fn materialize(
     // the caller sees one list for however many documents the row became.
     left_as_is: &mut Vec<String>,
 ) -> Result<Vec<LsnOp>, CoreError> {
-    // PENDING_LSN is overwritten by the commit handler before any ack can
-    // reference it: rows never leave the buffer without their commit attached.
-    const PENDING_LSN: Lsn = Lsn(0);
-    let mk = |op| LsnOp {
-        lsn: PENDING_LSN,
-        op,
-    };
+    // The commit handler gives the transaction's last operation its position
+    // before any ack can reference it: rows never leave the buffer without
+    // their commit attached.
+    let mk = |op| LsnOp { position: None, op };
     // Stamped here and on nothing else: an ingest pipeline runs on index
     // actions, so a delete has nothing to carry.
     let pipeline = rules.pipelines.for_table(table.0, table.1);
@@ -2229,20 +2267,31 @@ mod tests {
         assert!(cfg.retry_max > 0);
     }
 
+    fn packed(n: u64) -> Position {
+        Position::from_bytes(n.to_be_bytes())
+    }
+
     /// Stands in for a source whose positions are not PostgreSQL's `X/Y`.
     fn binlog_display() -> PositionRenderer {
-        Arc::new(|token| format!("binlog.{:06}:{}", token >> 32, token as u32))
+        Arc::new(|position| {
+            let bytes: [u8; 8] = position
+                .as_bytes()
+                .try_into()
+                .expect("8-byte test position");
+            let coordinate = u64::from_be_bytes(bytes);
+            format!("binlog.{:06}:{}", coordinate >> 32, coordinate as u32)
+        })
     }
 
     #[test]
     fn a_logged_position_is_in_the_sources_own_terms() {
         let display = binlog_display();
         assert_eq!(
-            logged_position(&display, Lsn((4 << 32) | 900)),
+            logged_position(&display, Some(&packed((4 << 32) | 900))),
             "binlog.000004:900"
         );
         assert_eq!(
-            logged_position(&display, Lsn(0)),
+            logged_position(&display, None),
             "no position",
             "a load row was never at a binlog coordinate"
         );
@@ -2254,7 +2303,7 @@ mod tests {
             index: "orders".into(),
             doc_id: "7".into(),
             reason: "mapper_parsing_exception: nope".into(),
-            lsn: Lsn((4 << 32) | 900),
+            position: Some(packed((4 << 32) | 900)),
             op: DocumentOp::Delete {
                 index: "orders".into(),
                 id: "7".into(),
@@ -2278,6 +2327,32 @@ mod pipeline_tests {
     use pg2osync_core::sink::{Health, IndexSpec};
     use serde_json::json;
     use std::sync::Mutex;
+
+    /// A position the way PostgreSQL encodes one: the LSN, big-endian.
+    fn at(n: u64) -> Position {
+        Position::from_bytes(n.to_be_bytes())
+    }
+
+    fn number(position: &Position) -> u64 {
+        u64::from_be_bytes(
+            position
+                .as_bytes()
+                .try_into()
+                .expect("8-byte test position"),
+        )
+    }
+
+    /// The source's own rendering, as the binary injects it for PostgreSQL.
+    fn render_lsn() -> PositionRenderer {
+        Arc::new(|position| {
+            let n = number(position);
+            format!("{:X}/{:X}", n >> 32, n & u64::from(u32::MAX))
+        })
+    }
+
+    fn project() -> Option<PositionProjection> {
+        Some(Arc::new(|position| Some(number(position))))
+    }
 
     /// Settings that never change, for the runs that are not about reloading.
     /// The sender is dropped: a receiver keeps answering with the last value
@@ -2390,7 +2465,11 @@ mod pipeline_tests {
         }
 
         async fn write(&self, batch: Vec<LsnOp>) -> Result<SinkAck, CoreError> {
-            let max_lsn = batch.last().expect("engine never sends empty batches").lsn;
+            let max_position = batch
+                .last()
+                .expect("engine never sends empty batches")
+                .position
+                .clone();
             let refuse = self.refuse.lock().expect("not poisoned").clone();
             let rejected: Vec<pg2osync_core::sink::Rejection> = batch
                 .iter()
@@ -2413,7 +2492,7 @@ mod pipeline_tests {
                         index,
                         doc_id,
                         reason: "refused by the test target".into(),
-                        lsn: op.lsn,
+                        position: op.position.clone(),
                         op: op.op.clone(),
                     }
                 })
@@ -2484,7 +2563,10 @@ mod pipeline_tests {
                 .lock()
                 .expect("not poisoned")
                 .push(format!("write[{}]", rendered.join(" ")));
-            Ok(SinkAck { max_lsn, rejected })
+            Ok(SinkAck {
+                max_position,
+                rejected,
+            })
         }
 
         fn can_quarantine(&self) -> bool {
@@ -2572,12 +2654,21 @@ mod pipeline_tests {
     }
 
     fn begin(lsn: u64) -> ChangeEvent {
-        ChangeEvent::Transaction(TransactionBoundary::Begin { lsn: Lsn(lsn) })
+        ChangeEvent::Transaction(TransactionBoundary::Begin { position: at(lsn) })
     }
 
     fn commit(lsn: u64) -> ChangeEvent {
         ChangeEvent::Transaction(TransactionBoundary::Commit {
-            lsn: Lsn(lsn),
+            position: Some(at(lsn)),
+            commit_ts_micros: 0,
+        })
+    }
+
+    /// The boundary the initial load and poll mode send: it flushes and must
+    /// acknowledge nothing.
+    fn positionless_commit() -> ChangeEvent {
+        ChangeEvent::Transaction(TransactionBoundary::Commit {
+            position: None,
             commit_ts_micros: 0,
         })
     }
@@ -2641,15 +2732,7 @@ mod pipeline_tests {
         script: Vec<ChangeEvent>,
         copy_script: Vec<ChangeEvent>,
     ) -> (Arc<RecordingSink>, u64) {
-        drive_displayed(
-            metrics,
-            sink,
-            cfg,
-            script,
-            copy_script,
-            Arc::new(|token| Lsn(token).to_string()),
-        )
-        .await
+        drive_displayed(metrics, sink, cfg, script, copy_script, render_lsn()).await
     }
 
     /// As `drive_metrics`, with log lines naming positions through `display`
@@ -2661,6 +2744,54 @@ mod pipeline_tests {
         script: Vec<ChangeEvent>,
         copy_script: Vec<ChangeEvent>,
         display: PositionRenderer,
+    ) -> (Arc<RecordingSink>, u64) {
+        drive_full(
+            metrics,
+            sink,
+            cfg,
+            script,
+            copy_script,
+            display,
+            project(),
+            crate::mapping::DurablePosition::default(),
+        )
+        .await
+    }
+
+    /// As `drive_metrics`, with the projection and the durable cell the
+    /// caller chooses — for the tests about what a checkpoint releases.
+    async fn drive_durable(
+        metrics: crate::metrics::SharedMetrics,
+        sink: Arc<RecordingSink>,
+        cfg: EngineConfig,
+        script: Vec<ChangeEvent>,
+        copy_script: Vec<ChangeEvent>,
+        project_position: Option<PositionProjection>,
+        durable: crate::mapping::DurablePosition,
+    ) -> (Arc<RecordingSink>, u64) {
+        drive_full(
+            metrics,
+            sink,
+            cfg,
+            script,
+            copy_script,
+            render_lsn(),
+            project_position,
+            durable,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_full(
+        metrics: crate::metrics::SharedMetrics,
+        sink: Arc<RecordingSink>,
+        cfg: EngineConfig,
+        script: Vec<ChangeEvent>,
+        copy_script: Vec<ChangeEvent>,
+        display: PositionRenderer,
+        project_position: Option<PositionProjection>,
+        durable: crate::mapping::DurablePosition,
     ) -> (Arc<RecordingSink>, u64) {
         let (events_tx, events_rx) = mpsc::channel(1024);
         let (copy_tx, copy_rx) = mpsc::channel(1024);
@@ -2681,13 +2812,14 @@ mod pipeline_tests {
             ack_tx,
             load_done_tx,
             metrics,
+            project_position,
         });
         let stream = StreamId {
             source: SOURCE_POSTGRES.into(),
             stream: "slot".into(),
             publication: "pub".into(),
         };
-        let render: PositionRenderer = Arc::new(|token| Lsn(token).to_string());
+        let render: PositionRenderer = render_lsn();
         for event in copy_script {
             copy_tx.send(event).await.expect("copy channel open");
         }
@@ -2705,7 +2837,7 @@ mod pipeline_tests {
             stream,
             render,
             display,
-            crate::mapping::DurableLsn::default(),
+            durable,
             shutdown_rx,
         ));
         // let the checkpoint loop observe the final acknowledged position
@@ -2765,6 +2897,12 @@ mod pipeline_tests {
         // The runtime of a plain tokio test is this one thread, so the sink
         // task's lines land here too.
         let _guard = tracing::subscriber::set_default(captured.clone());
+        // While a single dispatcher is registered, tracing-core decides a
+        // callsite another test thread reaches first by that thread's default,
+        // which has nothing installed, and turns it off for this one too. A
+        // second registration of the same subscriber makes every decision ask
+        // all registered dispatchers instead.
+        let _registered_twice = tracing::Dispatch::new(captured.clone());
         let at = (4u64 << 32) | 900;
         let (sink, _) = drive_displayed(
             Arc::new(crate::metrics::Metrics::default()),
@@ -2772,7 +2910,10 @@ mod pipeline_tests {
             quarantining(100),
             vec![begin(at), row(1), row(2), commit(at)],
             vec![],
-            Arc::new(|token| format!("binlog.{:06}:{}", token >> 32, token as u32)),
+            Arc::new(|position| {
+                let coordinate = number(position);
+                format!("binlog.{:06}:{}", coordinate >> 32, coordinate as u32)
+            }),
         )
         .await;
         let lines = captured.lines();
@@ -2792,9 +2933,64 @@ mod pipeline_tests {
         );
         assert_eq!(
             sink.last_checkpoint().map(|c| c.position),
-            Some(Lsn(at).to_string()),
+            Some("4/384".to_string()),
             "the checkpoint still goes through its own renderer"
         );
+    }
+
+    #[tokio::test]
+    async fn the_durable_position_advances_with_the_checkpoint_even_without_a_projection() {
+        // What the source may acknowledge is the persisted position itself;
+        // whether a gauge can draw it as a number must not hold it back.
+        let metrics = Arc::new(crate::metrics::Metrics::default());
+        let durable = crate::mapping::DurablePosition::default();
+        let (sink, _) = drive_durable(
+            metrics.clone(),
+            Arc::new(RecordingSink::default()),
+            EngineConfig {
+                batch_size: 500,
+                checkpoint_interval_ms: 100,
+                ..EngineConfig::default()
+            },
+            vec![row_at(1, Some(0x100)), commit(0x100)],
+            Vec::new(),
+            None,
+            durable.clone(),
+        )
+        .await;
+        assert_eq!(
+            sink.checkpoints
+                .lock()
+                .expect("not poisoned")
+                .last()
+                .map(|c| c.ordering.clone()),
+            Some(at(0x100))
+        );
+        assert_eq!(durable.get(), Some(at(0x100)));
+        assert!(
+            !metrics.render("s").contains("pg2osync_position_"),
+            "no projection, no gauges: a zero would read as caught up"
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_is_durable_before_a_checkpoint_persists() {
+        let durable = crate::mapping::DurablePosition::default();
+        let (_, _) = drive_durable(
+            Arc::new(crate::metrics::Metrics::default()),
+            Arc::new(RecordingSink::default()),
+            EngineConfig {
+                batch_size: 500,
+                checkpoint_interval_ms: 100,
+                ..EngineConfig::default()
+            },
+            vec![row_at(1, None), positionless_commit()],
+            Vec::new(),
+            project(),
+            durable.clone(),
+        )
+        .await;
+        assert_eq!(durable.get(), None);
     }
 
     #[tokio::test]
@@ -2883,7 +3079,7 @@ mod pipeline_tests {
         let sink = run_script(500, vec![row(1), row(2), commit(0x100)]).await;
         assert_eq!(sink.events(), vec!["write[upsert:1 upsert:2]"]);
         let ckpt = sink.last_checkpoint().expect("checkpoint persisted");
-        assert_eq!(ckpt.token, 0x100);
+        assert_eq!(ckpt.ordering, at(0x100));
         assert_eq!(ckpt.position, "0/100", "position is rendered by the source");
     }
 
@@ -2931,7 +3127,7 @@ mod pipeline_tests {
     #[tokio::test]
     async fn rows_with_no_position_go_unversioned() {
         // a polling source reconstructs state and has no log position to offer
-        let sink = run_script(10, vec![row(1), commit(0)]).await;
+        let sink = run_script(10, vec![row(1), positionless_commit()]).await;
         assert_eq!(sink.events(), vec!["write[upsert:1]"]);
     }
 
@@ -2943,8 +3139,8 @@ mod pipeline_tests {
         let sink = run_script(2, vec![row(1), row(2), commit(0x200)]).await;
         assert_eq!(sink.events(), vec!["write[upsert:1 upsert:2]"]);
         assert_eq!(
-            sink.last_checkpoint().map(|c| c.token),
-            Some(0x200),
+            sink.last_checkpoint().map(|c| c.ordering),
+            Some(at(0x200)),
             "the commit position must be checkpointed even with nothing buffered"
         );
     }
@@ -2953,7 +3149,7 @@ mod pipeline_tests {
     async fn empty_transaction_advances_the_position() {
         let sink = run_script(500, vec![commit(0x300)]).await;
         assert!(sink.events().is_empty(), "nothing to write");
-        assert_eq!(sink.last_checkpoint().map(|c| c.token), Some(0x300));
+        assert_eq!(sink.last_checkpoint().map(|c| c.ordering), Some(at(0x300)));
     }
 
     #[tokio::test]
@@ -2982,13 +3178,22 @@ mod pipeline_tests {
 
     #[tokio::test]
     async fn initial_load_boundaries_never_advance_the_checkpoint() {
-        // Lsn(0) marks rows that have no source position of their own
-        let sink = run_script(500, vec![row(1), commit(0)]).await;
+        // rows that have no source position of their own
+        let sink = run_script(500, vec![row(1), positionless_commit()]).await;
         assert_eq!(sink.events(), vec!["write[upsert:1]"]);
         assert!(
             sink.last_checkpoint().is_none(),
             "a positionless batch must never be checkpointed"
         );
+    }
+
+    #[tokio::test]
+    async fn an_empty_positionless_boundary_sends_nothing_to_acknowledge() {
+        // with nothing buffered a stream commit still travels as a bare
+        // position; a positionless one has no position to send
+        let sink = run_script(500, vec![positionless_commit()]).await;
+        assert!(sink.events().is_empty());
+        assert!(sink.last_checkpoint().is_none());
     }
 
     #[tokio::test]
@@ -3005,7 +3210,7 @@ mod pipeline_tests {
             ],
             "splitting is expected; every op is idempotent"
         );
-        assert_eq!(sink.last_checkpoint().map(|c| c.token), Some(0x600));
+        assert_eq!(sink.last_checkpoint().map(|c| c.ordering), Some(at(0x600)));
     }
 
     fn moved(from: i64, to: i64, toast: &[&str]) -> ChangeEvent {
@@ -3289,8 +3494,8 @@ mod pipeline_tests {
             "the write is reported, then the refusal is filed"
         );
         assert_eq!(
-            sink.last_checkpoint().map(|c| c.token),
-            Some(0x100),
+            sink.last_checkpoint().map(|c| c.ordering),
+            Some(at(0x100)),
             "and only then does the position move"
         );
     }
@@ -3452,22 +3657,23 @@ mod pipeline_tests {
         }
 
         async fn write(&self, batch: Vec<LsnOp>) -> Result<SinkAck, CoreError> {
-            let lsn = batch.last().expect("nonempty").lsn;
+            let position = batch.last().expect("nonempty").position.clone();
+            let lsn = position.as_ref().map_or(0, number);
             let open = self.open.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(open, Ordering::SeqCst);
             let mut release = self.release.subscribe();
             loop {
-                if *release.borrow_and_update() >= lsn.0 {
+                if *release.borrow_and_update() >= lsn {
                     break;
                 }
                 release.changed().await.expect("gate open");
             }
             self.open.fetch_sub(1, Ordering::SeqCst);
-            self.finished.lock().expect("not poisoned").push(lsn.0);
-            if self.fail_at == Some(lsn.0) {
+            self.finished.lock().expect("not poisoned").push(lsn);
+            if self.fail_at == Some(lsn) {
                 return Err(CoreError::Sink("refused".into()));
             }
-            Ok(SinkAck::written(lsn))
+            Ok(SinkAck::written(position))
         }
 
         async fn refresh(&self, _indices: &[String]) -> Result<(), CoreError> {
@@ -3503,7 +3709,7 @@ mod pipeline_tests {
     /// acknowledges the position from.
     fn batch_at(lsn: u64) -> Vec<LsnOp> {
         vec![LsnOp {
-            lsn: Lsn(lsn),
+            position: Some(at(lsn)),
             op: DocumentOp::Upsert {
                 index: "users".into(),
                 id: lsn.to_string(),
@@ -3520,7 +3726,7 @@ mod pipeline_tests {
     /// about how the engine happens to batch.
     struct Writer {
         commands: mpsc::Sender<SinkCommand>,
-        acked: watch::Receiver<Option<Lsn>>,
+        acked: watch::Receiver<Option<Position>>,
         load_done: watch::Receiver<u64>,
         task: tokio::task::JoinHandle<()>,
     }
@@ -3540,7 +3746,7 @@ mod pipeline_tests {
             RejectionPolicy::Halt,
             100,
             concurrency,
-            Arc::new(|token| Lsn(token).to_string()),
+            render_lsn(),
         ));
         Writer {
             commands,
@@ -3624,6 +3830,28 @@ mod pipeline_tests {
     }
 
     #[tokio::test]
+    async fn a_batch_ending_without_a_position_acknowledges_nothing() {
+        // a load batch written after a stream batch must not take the
+        // acknowledged position anywhere, not even back to "none"
+        let sink = GatedSink::new(None);
+        let mut writer = writer(sink.clone(), 1);
+        let mut load = batch_at(200);
+        load[0].position = None;
+        for batch in [batch_at(100), load] {
+            writer
+                .commands
+                .send(SinkCommand::Write(batch, tracing::Span::none()))
+                .await
+                .expect("writer running");
+        }
+        sink.release.send_replace(300);
+        drop(writer.commands);
+        writer.task.await.ok();
+        assert_eq!(sink.finished(), vec![100, 0], "both batches were written");
+        assert_eq!(*writer.acked.borrow_and_update(), Some(at(100)));
+    }
+
+    #[tokio::test]
     async fn write_concurrency_is_how_many_requests_stay_open() {
         let sink = GatedSink::new(None);
         let writer = writer(sink.clone(), 3);
@@ -3681,8 +3909,8 @@ mod pipeline_tests {
             let mut acked = writer.acked.clone();
             tokio::spawn(async move {
                 while acked.changed().await.is_ok() {
-                    if let Some(lsn) = *acked.borrow_and_update() {
-                        seen.lock().expect("not poisoned").push(lsn.0);
+                    if let Some(position) = acked.borrow_and_update().as_ref() {
+                        seen.lock().expect("not poisoned").push(number(position));
                     }
                 }
             })
@@ -3761,7 +3989,7 @@ mod pipeline_tests {
         writer.task.await.ok();
         assert_eq!(
             *writer.acked.borrow_and_update(),
-            Some(Lsn(100)),
+            Some(at(100)),
             "300 was written but sits behind a failure, so its position must not pass"
         );
     }
@@ -3880,13 +4108,14 @@ mod pipeline_tests {
             ack_tx,
             load_done_tx,
             metrics: Arc::new(crate::metrics::Metrics::default()),
+            project_position: project(),
         });
         let stream = StreamId {
             source: SOURCE_POSTGRES.into(),
             stream: "slot".into(),
             publication: "pub".into(),
         };
-        let render: PositionRenderer = Arc::new(|token| Lsn(token).to_string());
+        let render: PositionRenderer = render_lsn();
         for event in script {
             events_tx.send(event).await.expect("channel has room");
         }
@@ -3897,7 +4126,7 @@ mod pipeline_tests {
             stream,
             render.clone(),
             render,
-            crate::mapping::DurableLsn::default(),
+            crate::mapping::DurablePosition::default(),
             shutdown_rx,
         ));
         drop(events_tx);
@@ -4022,6 +4251,7 @@ mod pipeline_tests {
             ack_tx,
             load_done_tx,
             metrics: Arc::new(crate::metrics::Metrics::default()),
+            project_position: project(),
         });
         for event in [row_doc(7, json!({"id": 7, "name": "x"})), commit(0x100)] {
             events_tx.send(event).await.unwrap();
@@ -4036,9 +4266,9 @@ mod pipeline_tests {
                 stream: "slot".into(),
                 publication: "pub".into(),
             },
-            Arc::new(|token| Lsn(token).to_string()),
-            Arc::new(|token| Lsn(token).to_string()),
-            crate::mapping::DurableLsn::default(),
+            render_lsn(),
+            render_lsn(),
+            crate::mapping::DurablePosition::default(),
             shutdown_rx,
         )
         .await
@@ -4079,6 +4309,7 @@ mod pipeline_tests {
             ack_tx,
             load_done_tx,
             metrics: metrics.clone(),
+            project_position: project(),
         });
         for event in [row_doc(7, json!({"id": 7, "price": "abc"})), commit(0x100)] {
             events_tx.send(event).await.unwrap();
@@ -4093,9 +4324,9 @@ mod pipeline_tests {
                 stream: "slot".into(),
                 publication: "pub".into(),
             },
-            Arc::new(|token| Lsn(token).to_string()),
-            Arc::new(|token| Lsn(token).to_string()),
-            crate::mapping::DurableLsn::default(),
+            render_lsn(),
+            render_lsn(),
+            crate::mapping::DurablePosition::default(),
             shutdown_rx,
         )
         .await
@@ -4140,6 +4371,7 @@ mod pipeline_tests {
             ack_tx,
             load_done_tx,
             metrics: Arc::new(crate::metrics::Metrics::default()),
+            project_position: project(),
         });
         for event in [moved(1, 2, &["bio"]), commit(0x900)] {
             events_tx.send(event).await.unwrap();
@@ -4154,9 +4386,9 @@ mod pipeline_tests {
                 stream: "slot".into(),
                 publication: "pub".into(),
             },
-            Arc::new(|token| Lsn(token).to_string()),
-            Arc::new(|token| Lsn(token).to_string()),
-            crate::mapping::DurableLsn::default(),
+            render_lsn(),
+            render_lsn(),
+            crate::mapping::DurablePosition::default(),
             shutdown_rx,
         )
         .await
@@ -4453,6 +4685,7 @@ mod pipeline_tests {
             ack_tx,
             load_done_tx,
             metrics: Arc::new(crate::metrics::Metrics::default()),
+            project_position: project(),
         });
         events_tx
             .send(row_doc(7, json!({"id": 7, "tenant": null})))
@@ -4467,9 +4700,9 @@ mod pipeline_tests {
                 stream: "slot".into(),
                 publication: "pub".into(),
             },
-            Arc::new(|token| Lsn(token).to_string()),
-            Arc::new(|token| Lsn(token).to_string()),
-            crate::mapping::DurableLsn::default(),
+            render_lsn(),
+            render_lsn(),
+            crate::mapping::DurablePosition::default(),
             shutdown_rx,
         )
         .await
@@ -4490,7 +4723,7 @@ mod pipeline_tests {
         joins: crate::mapping::Joins,
     ) -> (
         Arc<PipelineCtx>,
-        watch::Sender<Option<Lsn>>,
+        watch::Sender<Option<Position>>,
         watch::Sender<u64>,
     ) {
         let (ack_tx, _ack_rx) = watch::channel(None);
@@ -4517,6 +4750,7 @@ mod pipeline_tests {
             ack_tx: ack_tx.clone(),
             load_done_tx: load_done_tx.clone(),
             metrics,
+            project_position: project(),
         });
         (ctx, ack_tx, load_done_tx)
     }
@@ -4547,9 +4781,9 @@ mod pipeline_tests {
                 stream: "slot".into(),
                 publication: "pub".into(),
             },
-            Arc::new(|token| Lsn(token).to_string()),
-            Arc::new(|token| Lsn(token).to_string()),
-            crate::mapping::DurableLsn::default(),
+            render_lsn(),
+            render_lsn(),
+            crate::mapping::DurablePosition::default(),
             shutdown_rx,
         )
         .await
@@ -4840,6 +5074,7 @@ mod pipeline_tests {
             ack_tx,
             load_done_tx,
             metrics: Arc::new(crate::metrics::Metrics::default()),
+            project_position: project(),
         });
         for event in script {
             events_tx.send(event).await.expect("channel has room");
@@ -4854,9 +5089,9 @@ mod pipeline_tests {
                 stream: "slot".into(),
                 publication: "pub".into(),
             },
-            Arc::new(|token| Lsn(token).to_string()),
-            Arc::new(|token| Lsn(token).to_string()),
-            crate::mapping::DurableLsn::default(),
+            render_lsn(),
+            render_lsn(),
+            crate::mapping::DurablePosition::default(),
             shutdown_rx,
         )
         .await
@@ -5448,13 +5683,14 @@ mod pipeline_tests {
             ack_tx,
             load_done_tx,
             metrics: metrics.clone(),
+            project_position: project(),
         });
         let stream = StreamId {
             source: SOURCE_POSTGRES.into(),
             stream: "slot".into(),
             publication: "pub".into(),
         };
-        let render: PositionRenderer = Arc::new(|token| Lsn(token).to_string());
+        let render: PositionRenderer = render_lsn();
         for event in script {
             events_tx.send(event).await.expect("channel has room");
         }
@@ -5465,7 +5701,7 @@ mod pipeline_tests {
             stream,
             render.clone(),
             render,
-            crate::mapping::DurableLsn::default(),
+            crate::mapping::DurablePosition::default(),
             shutdown_rx,
         ));
         drop(events_tx);
@@ -5800,6 +6036,7 @@ mod pipeline_tests {
             ack_tx,
             load_done_tx,
             metrics: Arc::new(crate::metrics::Metrics::default()),
+            project_position: project(),
         });
         for event in script {
             events_tx.send(event).await.expect("channel has room");
@@ -5814,9 +6051,9 @@ mod pipeline_tests {
                 stream: "slot".into(),
                 publication: "pub".into(),
             },
-            Arc::new(|token| Lsn(token).to_string()),
-            Arc::new(|token| Lsn(token).to_string()),
-            crate::mapping::DurableLsn::default(),
+            render_lsn(),
+            render_lsn(),
+            crate::mapping::DurablePosition::default(),
             shutdown_rx,
         )
         .await
@@ -6042,6 +6279,7 @@ mod pipeline_tests {
             ack_tx,
             load_done_tx,
             metrics: Arc::new(crate::metrics::Metrics::default()),
+            project_position: project(),
         });
         for event in script {
             events_tx.send(event).await.expect("channel has room");
@@ -6056,9 +6294,9 @@ mod pipeline_tests {
                 stream: "slot".into(),
                 publication: "pub".into(),
             },
-            Arc::new(|token| Lsn(token).to_string()),
-            Arc::new(|token| Lsn(token).to_string()),
-            crate::mapping::DurableLsn::default(),
+            render_lsn(),
+            render_lsn(),
+            crate::mapping::DurablePosition::default(),
             shutdown_rx,
         )
         .await;
@@ -6236,13 +6474,14 @@ mod pipeline_tests {
             ack_tx,
             load_done_tx,
             metrics: Arc::new(crate::metrics::Metrics::default()),
+            project_position: project(),
         });
         let stream = StreamId {
             source: SOURCE_POSTGRES.into(),
             stream: "slot".into(),
             publication: "pub".into(),
         };
-        let render: PositionRenderer = Arc::new(|token| Lsn(token).to_string());
+        let render: PositionRenderer = render_lsn();
         let engine = tokio::spawn(run(
             events_rx,
             copy_rx,
@@ -6250,7 +6489,7 @@ mod pipeline_tests {
             stream,
             render.clone(),
             render,
-            crate::mapping::DurableLsn::default(),
+            crate::mapping::DurablePosition::default(),
             shutdown_rx,
         ));
         // no load in this run, and the engine only leaves once both its
@@ -6450,6 +6689,9 @@ mod pipeline_tests {
             tracing::callsite::rebuild_interest_cache();
 
             run_script(500, vec![begin(0x10), row(1), row(2), commit(0x2A)]).await;
+            // In the same test because only one test in this binary may install
+            // the process's subscriber; it runs second, so its batch is the last.
+            run_script(500, vec![row(1), row(2), row(3), positionless_commit()]).await;
 
             let capture = capture.lock().expect("not poisoned");
             let spans = &capture.spans;
@@ -6481,6 +6723,20 @@ mod pipeline_tests {
                     "the batch's {stage} stage has a span of its own"
                 );
             }
+            let positionless = spans
+                .iter()
+                .rev()
+                .find(|s| s.name == "pg2osync.batch")
+                .expect("the positionless batch has a span");
+            assert_eq!(
+                positionless.fields.get("rows").map(String::as_str),
+                Some("3")
+            );
+            assert_eq!(
+                positionless.fields.get("position"),
+                None,
+                "a batch with no position records none, not a zero a trace reads as the stream's start"
+            );
         }
     }
 }

@@ -63,6 +63,7 @@ async fn the_opensearch_sink_honours_the_sink_contract() {
     .with_unacceptable_document(json!({"name": "bad", "weight": "not a number"}))
     .with_index_listing()
     .with_alias_switching()
+    .with_legacy_checkpoints()
     .run(&sink)
     .await
     .expect("the OpenSearch sink honours the Sink contract");
@@ -116,6 +117,7 @@ async fn the_elasticsearch_sink_honours_the_sink_contract() {
     .with_unacceptable_document(json!({"name": "bad", "weight": "not a number"}))
     .with_index_listing()
     .with_alias_switching()
+    .with_legacy_checkpoints()
     .run(&sink)
     .await
     .expect("the Elasticsearch sink honours the Sink contract");
@@ -174,6 +176,7 @@ async fn the_meilisearch_sink_honours_the_sink_contract() {
         |id| json!({"id": id, "name": format!("row {id}")}),
     )
     // no unacceptable document: a schema-less target refuses none
+    .with_legacy_checkpoints()
     .run(&sink)
     .await
     .expect("the Meilisearch sink honours the Sink contract");
@@ -230,6 +233,7 @@ async fn the_qdrant_sink_honours_the_sink_contract() {
     // the collection holds three dimensions, which is what this target refuses
     // a document for
     .with_unacceptable_document(json!({"title": "bad", "embedding": [1.0, 2.0]}))
+    .with_legacy_checkpoints()
     .run(&sink)
     .await
     .expect("the Qdrant sink honours the Sink contract");
@@ -270,6 +274,7 @@ async fn the_postgres_sink_honours_the_sink_contract() {
     )
     // no column of that name, which is what this target refuses a document for
     .with_unacceptable_document(json!({"nickname": "nobody"}))
+    .with_legacy_checkpoints()
     .run(&sink)
     .await
     .expect("the PostgreSQL sink honours the Sink contract");
@@ -278,5 +283,48 @@ async fn the_postgres_sink_honours_the_sink_contract() {
         ["index listing", "alias switching"],
         "the checks a target that refuses index templates cannot answer, and no \
          others: {report:?}"
+    );
+
+    // The row 1.5.2 kept for MySQL server 990077, written the way it wrote it.
+    // The kit cannot stage this through the trait, which only writes the
+    // current layout.
+    let (client, connection) = tokio_postgres::connect(
+        &std::env::var("PG2OSYNC_TEST_PG_SINK_URL").expect("set above"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("a direct connection to the target database");
+    let connection = tokio::spawn(connection);
+    let legacy = json!({
+        "source": "mysql", "stream": "990077", "slot_name": "990077", "publication": "",
+        "position": "binlog.000004:1234;base=1099511627776", "token": 1_116_691_498_194u64,
+        "instance_id": "", "updated_at_epoch": 1_700_000_000u64, "schema_version": 2
+    });
+    client
+        .execute(
+            "INSERT INTO pg2osync_state (key, doc) VALUES ('checkpoint-mysql-990077', $1) \
+             ON CONFLICT (key) DO UPDATE SET doc = EXCLUDED.doc",
+            &[&legacy],
+        )
+        .await
+        .expect("the 1.x row, staged");
+    let stream = pg2osync_core::checkpoint::StreamId {
+        source: pg2osync_core::checkpoint::SOURCE_MYSQL.into(),
+        stream: "990077".into(),
+        publication: String::new(),
+    };
+    let read = sink.read_legacy_position_text(&stream).await;
+    client
+        .execute(
+            "DELETE FROM pg2osync_state WHERE key = 'checkpoint-mysql-990077'",
+            &[],
+        )
+        .await
+        .expect("the staged row, removed");
+    drop(client);
+    let _ = connection.await;
+    assert_eq!(
+        read.expect("the 1.x row reads").as_deref(),
+        Some("binlog.000004:1234;base=1099511627776")
     );
 }

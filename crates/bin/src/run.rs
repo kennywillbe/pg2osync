@@ -4,16 +4,17 @@
 //! wiring below is identical for every source.
 
 use anyhow::{Context as _, Result, bail};
+use pg2osync_core::Position;
 use pg2osync_core::checkpoint::{Checkpoint, StreamId};
 use pg2osync_core::event::ChangeEvent;
-use pg2osync_core::lsn::Lsn;
 use pg2osync_core::sink::{IndexSpec, Sink};
 use pg2osync_engine::mapping::{
-    Constants, DurableLsn, Flattens, IndexTarget, JoinParent, JoinRule, Joins, ParentId,
+    Constants, DurablePosition, Flattens, IndexTarget, JoinParent, JoinRule, Joins, ParentId,
     Projection, Projections, Rename, Renames, TableMapping, Transforms,
 };
 use pg2osync_engine::metrics::{SharedMetrics, SourceState};
 use pg2osync_engine::{PipelineCtx, PositionRenderer};
+use pg2osync_source::Lsn;
 use pg2osync_source::reconnect::ReconnectPolicy;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -807,7 +808,7 @@ pub fn pipeline_ctx(
     cfg: &AppConfig,
     sink: Arc<dyn Sink>,
     metrics: SharedMetrics,
-    ack_tx: watch::Sender<Option<Lsn>>,
+    ack_tx: watch::Sender<Option<Position>>,
     load_done_tx: watch::Sender<u64>,
     settings: watch::Receiver<pg2osync_engine::EngineSettings>,
     rules: watch::Receiver<Arc<pg2osync_engine::RuleSet>>,
@@ -820,7 +821,25 @@ pub fn pipeline_ctx(
         ack_tx,
         load_done_tx,
         metrics,
+        project_position: position_projection(cfg),
     }))
+}
+
+/// The number the position gauges show for a position: the LSN on
+/// PostgreSQL, the packed binlog coordinate on MySQL.
+///
+/// None in poll mode, which streams no positions: the gauges would otherwise
+/// sit at zero, and a zero lag reads as caught up where the truth is no data.
+fn position_projection(cfg: &AppConfig) -> Option<pg2osync_engine::PositionProjection> {
+    if cfg.source.flavor == "mysql" {
+        Some(Arc::new(pg2osync_source_mysql::catalog::coordinate))
+    } else if cfg.source.mode == "poll" {
+        None
+    } else {
+        Some(Arc::new(|position| {
+            Lsn::from_position(position).map(|lsn| lsn.0)
+        }))
+    }
 }
 
 /// The tables one source streams as it starts, for the handle a reload edits.
@@ -1376,9 +1395,9 @@ async fn run_postgres(
     }
 
     let stream_id = cfg.stream_id();
-    let render: PositionRenderer = Arc::new(|token| Lsn(token).to_string());
+    let render: PositionRenderer = Arc::new(render_lsn);
     let parse: pg2osync_engine::PositionParser =
-        Arc::new(|text| text.trim().parse::<Lsn>().ok().map(|lsn| lsn.0));
+        Arc::new(|text| text.trim().parse::<Lsn>().ok().map(Lsn::to_position));
     start_slot_watch(&cfg, admin_url.clone(), metrics.clone())?;
     // Reloads are watched from here rather than from `main`, because this is
     // where the settings channel and the sink they reach into exist, and only
@@ -1427,7 +1446,7 @@ async fn run_postgres(
         Some(Arc::new(move || {
             let url = url.clone();
             let tls = tls.clone();
-            Box::pin(async move { read_current_lsn(&tls, &url).await })
+            Box::pin(async move { read_current_lsn(&tls, &url).await.map(Lsn::to_position) })
         }))
     } else {
         None
@@ -1543,10 +1562,10 @@ async fn attempt_postgres(
     src_cfg: pg2osync_source::runner::WalSourceConfig,
     sink: Arc<dyn Sink>,
     metrics: SharedMetrics,
-    ack_tx: watch::Sender<Option<Lsn>>,
+    ack_tx: watch::Sender<Option<Position>>,
     stream_id: StreamId,
     render: PositionRenderer,
-    durable: DurableLsn,
+    durable: DurablePosition,
     shutdown_rx: watch::Receiver<bool>,
     polling: bool,
     settings: watch::Receiver<pg2osync_engine::EngineSettings>,
@@ -1584,7 +1603,11 @@ async fn attempt_postgres(
     } else {
         pg2osync_source::catalog::confirmed_flush_lsn(admin, &cfg.source.slot_name).await?
     };
-    let resume_from = resume_position(polling, stored.map(|c| Lsn(c.token)), slot_lsn);
+    let resume_from = resume_position(
+        polling,
+        stored.and_then(|c| Lsn::from_position(&c.ordering)),
+        slot_lsn,
+    );
     // A checkpoint is not proof that the load finished: it says where streaming
     // got to, and with a load recording its own progress the two are separate
     // facts. Trusting the checkpoint alone is what silently skips a load.
@@ -1742,13 +1765,21 @@ async fn emit_stream_marker(
 }
 
 /// The source's current WAL position, read on pg2osync's own connection.
-async fn read_current_lsn(tls: &pg2osync_source::tls::TlsSettings, admin_url: &str) -> Option<u64> {
+async fn read_current_lsn(tls: &pg2osync_source::tls::TlsSettings, admin_url: &str) -> Option<Lsn> {
     let client = pg2osync_source::tls::connect(tls, admin_url).await.ok()?;
     let row = client
         .query_one("SELECT pg_current_wal_lsn()::text", &[])
         .await
         .ok()?;
-    row.get::<_, String>(0).parse::<Lsn>().ok().map(|lsn| lsn.0)
+    row.get::<_, String>(0).parse::<Lsn>().ok()
+}
+
+/// A PostgreSQL position in PostgreSQL's own `X/Y` form.
+///
+/// Only ever handed positions this source produced, which are LSNs; anything
+/// else is shown as its bytes rather than as a made-up LSN.
+pub(crate) fn render_lsn(position: &Position) -> String {
+    Lsn::from_position(position).map_or_else(|| position.to_hex(), |lsn| lsn.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1759,7 +1790,7 @@ fn wal_config(
     tables: pg2osync_core::tables::SharedTables,
     children: &HashMap<(String, String), Vec<pg2osync_source::children::ChildSpec>>,
     aggregates: &HashMap<(String, String), Vec<pg2osync_core::aggregate::AggregateSpec>>,
-    durable: &DurableLsn,
+    durable: &DurablePosition,
     tls: &pg2osync_source::tls::TlsSettings,
 ) -> Result<pg2osync_source::runner::WalSourceConfig> {
     let url = url::Url::parse(source_url).context("source url is not a valid URL")?;
@@ -1808,7 +1839,7 @@ fn wal_config(
         // Feedback to PostgreSQL is clamped to this: acknowledging beyond the
         // durable checkpoint lets PG recycle WAL we have not indexed yet, which
         // loses data on crash-restart.
-        durable: Some(durable.0.clone()),
+        durable: Some(durable.subscribe()),
         admin_url: Some(admin_url.to_string()),
         tls: tls.clone(),
         children: children.clone(),
@@ -2077,9 +2108,9 @@ async fn run_mysql(
     // a pipeline that is actually running has anything to reload.
     let (settings_tx, settings_rx) = cfg.engine.settings_channel();
     let (ack_tx, ack_rx) = watch::channel(None);
-    // The generation the pipeline is versioning in, shared with the endpoints
-    // outside the retry loop. They speak binlog coordinates, the pipeline
-    // speaks versions, and after a failover those differ by exactly this.
+    // The generation the pipeline is versioning in, shared with a table added
+    // by a reload, which loads outside the retry loop: its rows need versions
+    // from the generation the stream is in, not from the one it started in.
     let version_base = Arc::new(std::sync::atomic::AtomicU64::new(0));
     crate::reload::spawn(
         reload,
@@ -2098,24 +2129,7 @@ async fn run_mysql(
         },
     );
     {
-        let prefix = api_prefix.clone();
-        let render: PositionRenderer = {
-            let base = version_base.clone();
-            Arc::new(move |token| {
-                let base = base.load(std::sync::atomic::Ordering::Relaxed);
-                pg2osync_source_mysql::catalog::position_text(&prefix, token.saturating_sub(base))
-            })
-        };
-        let parse: pg2osync_engine::PositionParser = {
-            let base = version_base.clone();
-            Arc::new(move |text| {
-                let (file, pos) = pg2osync_source_mysql::catalog::parse_position(text)?;
-                Some(
-                    base.load(std::sync::atomic::Ordering::Relaxed)
-                        .saturating_add(pg2osync_source_mysql::catalog::position_token(&file, pos)),
-                )
-            })
-        };
+        let (render, parse) = mysql_api_codec(api_prefix.clone());
         let current_position: Option<pg2osync_engine::api::CurrentPosition> = if cfg.api.enabled {
             let cfg = cfg.clone();
             let url = source_url.clone();
@@ -2183,11 +2197,11 @@ async fn run_mysql(
 struct AttemptWiring {
     sink: Arc<dyn Sink>,
     metrics: SharedMetrics,
-    ack_tx: watch::Sender<Option<Lsn>>,
+    ack_tx: watch::Sender<Option<Position>>,
     stream_id: StreamId,
-    durable: DurableLsn,
+    durable: DurablePosition,
     shutdown_rx: watch::Receiver<bool>,
-    /// Where the endpoints learn which generation the pipeline is in.
+    /// Where a reload's load learns which generation the pipeline is in.
     version_base: Arc<std::sync::atomic::AtomicU64>,
     /// The `[engine]` settings each batch re-reads, so a reload reaches one
     /// without the attempt being rebuilt.
@@ -2217,13 +2231,144 @@ pub(crate) const GENERATION_MARGIN: u64 = 1 << 40;
 /// The version is `base + coordinate`, and a version at the target only ever
 /// goes up. A failover onto a server whose numbering is lower would therefore
 /// have every write refused, leaving the index quietly stale — so when the
-/// coordinate the source is at now versions below the checkpoint's own token, a
-/// new generation opens above that token instead.
-fn version_base_for(base: u64, stored_token: u64, current_coordinate: u64) -> VersionBase {
-    if base.saturating_add(current_coordinate) >= stored_token {
+/// coordinate the source is at now versions below the checkpoint's own version, a
+/// new generation opens above that version instead.
+fn version_base_for(base: u64, stored_version: u64, current_coordinate: u64) -> VersionBase {
+    if base.saturating_add(current_coordinate) >= stored_version {
         return VersionBase::Kept(base);
     }
-    VersionBase::NewGeneration(stored_token.saturating_add(GENERATION_MARGIN))
+    VersionBase::NewGeneration(stored_version.saturating_add(GENERATION_MARGIN))
+}
+
+/// The version base a pipeline with no current checkpoint starts in, given the
+/// position text a 1.x checkpoint left and the source's coordinate now.
+///
+/// The 1.x position is never resumed from, but the versions it wrote are in
+/// the target: starting at base 0 under a 1.x pipeline that had failed over
+/// would have every write refused as older than what is indexed. Either answer
+/// of `version_base_for` is the base, because nothing is resumed that would
+/// need a GTID to land on.
+fn carried_over_base(legacy: Option<&str>, head: u64) -> u64 {
+    let Some(old) = legacy.and_then(pg2osync_source_mysql::catalog::parse_stored_position) else {
+        return 0;
+    };
+    match version_base_for(old.base, old.version(), head) {
+        VersionBase::Kept(base) | VersionBase::NewGeneration(base) => base,
+    }
+}
+
+/// Read the 1.x checkpoint `stream` may have left and settle the base it
+/// carries over onto the source's current coordinate; 0 when there is none.
+///
+/// A read that fails is an error rather than a 0: a 0 under a 1.x generation
+/// is the silent staleness this exists to prevent.
+async fn mysql_base_from_1x(
+    sink: &dyn Sink,
+    stream: &StreamId,
+    admin: &mut pg2osync_source_mysql::connection::MySqlConnection,
+) -> Result<u64> {
+    use pg2osync_source_mysql::catalog as mysql_catalog;
+    let Some(legacy) = sink
+        .read_legacy_position_text(stream)
+        .await
+        .context("reading the checkpoint 1.x left, for its version generation")?
+    else {
+        return Ok(0);
+    };
+    let (file, pos) = mysql_catalog::master_position(admin).await?;
+    let base = carried_over_base(Some(&legacy), mysql_catalog::pack_coordinate(&file, pos));
+    if base > 0 {
+        tracing::info!(target: "pg2osync::run",
+            "a 1.x checkpoint is not resumed from, but its versions are in the target: \
+             versioning documents from generation {base} so none goes backwards");
+    }
+    Ok(base)
+}
+
+/// The checkpoint a first run writes before its first chunk, in the
+/// generation it versions in.
+fn first_mysql_checkpoint(
+    stream: &StreamId,
+    file: &str,
+    pos: u32,
+    base: u64,
+    gtid_baseline: Option<&str>,
+) -> Checkpoint {
+    use pg2osync_source_mysql::catalog as mysql_catalog;
+    Checkpoint {
+        stream: stream.clone(),
+        ordering: mysql_catalog::position(file, pos),
+        position: mysql_catalog::position_text_full(
+            &mysql_catalog::split_binlog_file(file)
+                .map(|(prefix, _)| prefix)
+                .unwrap_or_else(|| "binlog".to_string()),
+            mysql_catalog::pack_coordinate(file, pos),
+            base,
+            gtid_baseline,
+        ),
+    }
+}
+
+/// Forget what this process acknowledged and made durable under the previous
+/// generation.
+///
+/// Positions carry no generation, and the new server's coordinates are usually
+/// below the old one's: kept, the old acknowledgement would outrank them and
+/// `/synced` would call a write synced before it is indexed. Only for a new
+/// generation, because a reconnect within one has to keep answering for what
+/// was already acknowledged.
+fn forget_previous_generation(ack_tx: &watch::Sender<Option<Position>>, durable: &DurablePosition) {
+    ack_tx.send_replace(None);
+    durable.clear();
+}
+
+/// Settle the version base for resuming `stored` onto the source's current
+/// coordinate, refusing a new history the target could never accept.
+///
+/// The previous generation's acknowledgement is dropped here and only once the
+/// resume is certain: a refused attempt opens nothing, and the next attempt may
+/// find the old server back behind the address.
+fn resume_generation(
+    stored: &pg2osync_source_mysql::catalog::StoredPosition,
+    (current_file, current_pos): (&str, u32),
+    gtids_usable: bool,
+    ack_tx: &watch::Sender<Option<Position>>,
+    durable: &DurablePosition,
+) -> Result<u64> {
+    let (file, pos) = (&stored.file, stored.pos);
+    let opened = match version_base_for(
+        stored.base,
+        stored.version(),
+        pg2osync_source_mysql::catalog::pack_coordinate(current_file, current_pos),
+    ) {
+        VersionBase::Kept(base) => return Ok(base),
+        VersionBase::NewGeneration(opened) => opened,
+    };
+    let Some(position) = &stored.gtid else {
+        bail!(
+            "the source is at {current_file}@{current_pos}, behind the checkpointed \
+             {file}@{pos}, and the checkpoint carries no GTID position to resume from. \
+             Either this server's binlog history restarted or it is not the server the \
+             checkpoint came from; the target's document versions come from the old \
+             numbering and would reject everything written under the new one, so \
+             pg2osync will not continue. Turn on GTIDs before the next failover, or \
+             point [sync] at a fresh index name to load again from here"
+        );
+    };
+    if !gtids_usable {
+        bail!(
+            "the source is at {current_file}@{current_pos}, behind the checkpointed \
+             {file}@{pos}, and this server cannot resume from the checkpoint's GTID \
+             position because GTIDs are off on it. Enable them, or point [sync] at a \
+             fresh index name to load again from here"
+        );
+    }
+    forget_previous_generation(ack_tx, durable);
+    tracing::warn!(target: "pg2osync::run",
+        "the source is behind the checkpoint, so this is a different binlog history: \
+         resuming from gtid {} and versioning documents from a new generation at {opened}",
+        position.to_text());
+    Ok(opened)
 }
 
 async fn attempt_mysql(
@@ -2269,7 +2414,7 @@ async fn attempt_mysql(
     let synced_tables: Vec<String> = cfg.sync.values().map(|t| t.table.clone()).collect();
     let load_pending =
         pg2osync_core::load::unfinished(sink.as_ref(), &stream_id, &synced_tables).await?;
-    // The position token is now a document version as well as a checkpoint, and
+    // The coordinate is a document version as well as a checkpoint, and
     // a version at the target only ever goes up. So a history that restarted —
     // RESET BINARY LOGS AND GTIDS, or a different server behind the same
     // address — would have every write from the new, lower numbering silently
@@ -2279,49 +2424,25 @@ async fn attempt_mysql(
     // The version is `base + coordinate`, so a failover onto a server whose
     // numbering is lower does not push versions backwards — which would have
     // the target refuse every write and leave the index quietly stale.
-    let mut base = stored_position.as_ref().map(|p| p.base).unwrap_or(0);
     let gtid_support = mysql_catalog::gtid_support(&mut admin).await?;
     let mut gtid_resume = stored_position.as_ref().and_then(|p| p.gtid.clone());
     // What the server had before this stream began, for a first run that has no
     // checkpoint to resume from but still has to leave one that can be resumed.
     let mut gtid_baseline: Option<pg2osync_source_mysql::gtid::GtidPosition> = None;
-    if let Some((file, pos)) = &resume {
+    let base = if let Some(stored) = &stored_position {
         let (current_file, current_pos) = mysql_catalog::master_position(&mut admin).await?;
-        let stored_token = stored_position
-            .as_ref()
-            .map(mysql_catalog::StoredPosition::token)
-            .unwrap_or(0);
-        if let VersionBase::NewGeneration(opened) = version_base_for(
-            base,
-            stored_token,
-            mysql_catalog::position_token(&current_file, current_pos),
-        ) {
-            let Some(position) = gtid_resume.clone() else {
-                bail!(
-                    "the source is at {current_file}@{current_pos}, behind the checkpointed \
-                     {file}@{pos}, and the checkpoint carries no GTID position to resume from. \
-                     Either this server's binlog history restarted or it is not the server the \
-                     checkpoint came from; the target's document versions come from the old \
-                     numbering and would reject everything written under the new one, so \
-                     pg2osync will not continue. Turn on GTIDs before the next failover, or \
-                     point [sync] at a fresh index name to load again from here"
-                );
-            };
-            if !gtid_support.usable {
-                bail!(
-                    "the source is at {current_file}@{current_pos}, behind the checkpointed \
-                     {file}@{pos}, and this server cannot resume from the checkpoint's GTID \
-                     position because GTIDs are off on it. Enable them, or point [sync] at a \
-                     fresh index name to load again from here"
-                );
-            }
-            base = opened;
-            tracing::warn!(target: "pg2osync::run",
-                "the source is behind the checkpoint, so this is a different binlog history: \
-                 resuming from gtid {} and versioning documents from a new generation at {base}",
-                position.to_text());
-        }
-    }
+        resume_generation(
+            stored,
+            (&current_file, current_pos),
+            gtid_support.usable,
+            &ack_tx,
+            &durable,
+        )?
+    } else {
+        // Settled before the first checkpoint replaces the 1.x one, which is
+        // the last place the generation 1.x reached is written down.
+        mysql_base_from_1x(sink.as_ref(), &stream_id, &mut admin).await?
+    };
     version_base.store(base, std::sync::atomic::Ordering::Relaxed);
     if gtid_resume.is_some() && !gtid_support.usable {
         tracing::warn!(target: "pg2osync::run",
@@ -2348,16 +2469,21 @@ async fn attempt_mysql(
             // go with it. The load would carry on from its cursor while the
             // stream could only start from here, and every change made in
             // between to a key the cursor has already passed would be lost.
+            // Cleared whether or not a table reads as unfinished: a load stopped
+            // between two tables leaves the first marked finished and nothing
+            // for the next, and a finished table would be skipped while the
+            // stream starts past every change made to it since — which is what
+            // an upgrade from 1.x, whose checkpoint is refused, runs into.
             if load_pending {
                 tracing::warn!(target: "pg2osync::run",
                     "an unfinished load has no checkpoint to resume its stream from, \
                      so it starts over rather than leaving a gap behind its cursor");
-                for tbl in cfg.sync.values() {
-                    let key = pg2osync_core::load::load_progress_key(&stream_id, &tbl.table);
-                    if let Err(e) = sink.clear_state(&key).await {
-                        tracing::warn!(target: "pg2osync::run",
-                            "could not discard load progress {key}: {e}");
-                    }
+            }
+            for tbl in cfg.sync.values() {
+                let key = pg2osync_core::load::load_progress_key(&stream_id, &tbl.table);
+                if let Err(e) = sink.clear_state(&key).await {
+                    tracing::warn!(target: "pg2osync::run",
+                        "could not discard load progress {key}: {e}");
                 }
             }
             // Read before the coordinate on purpose: it is the GTID form of
@@ -2372,18 +2498,13 @@ async fn attempt_mysql(
             // else to put it, so it is persisted here, before the first chunk:
             // the load's replay argument rests on the stream resuming from a
             // position that predates every chunk, and this is what remembers it.
-            sink.write_checkpoint(&Checkpoint {
-                stream: stream_id.clone(),
-                token: mysql_catalog::position_token(&file, pos),
-                position: mysql_catalog::position_text_full(
-                    &mysql_catalog::split_binlog_file(&file)
-                        .map(|(prefix, _)| prefix)
-                        .unwrap_or_else(|| "binlog".to_string()),
-                    mysql_catalog::position_token(&file, pos),
-                    0,
-                    gtid_baseline.as_ref().map(|p| p.to_text()).as_deref(),
-                ),
-            })
+            sink.write_checkpoint(&first_mysql_checkpoint(
+                &stream_id,
+                &file,
+                pos,
+                base,
+                gtid_baseline.as_ref().map(|p| p.to_text()).as_deref(),
+            ))
             .await?;
             (file, pos)
         }
@@ -2402,17 +2523,18 @@ async fn attempt_mysql(
     });
     let (prefix, _) =
         mysql_catalog::split_binlog_file(&start_file).unwrap_or_else(|| ("binlog".to_string(), 0));
-    let display = mysql_display_renderer(prefix.clone(), base);
+    let display = mysql_display_renderer(prefix.clone());
     let render: PositionRenderer = {
         let tracker = tracker.clone();
-        Arc::new(move |token| {
-            // Asked for the position *as of this token*, never the newest one:
-            // the stream runs ahead of what the target has taken, and claiming
-            // its position would resume past data that was never written.
-            let gtid = tracker
-                .as_ref()
-                .and_then(|t| t.lock().expect("not poisoned").position_at(token));
-            mysql_catalog::position_text_full(&prefix, token, base, gtid.as_deref())
+        Arc::new(move |position| {
+            // Asked for the GTID set *as of this position*, never the newest
+            // one: the stream runs ahead of what the target has taken, and
+            // claiming its set would resume past data that was never written.
+            mysql_catalog::checkpoint_text(&prefix, position, base, |at| {
+                tracker
+                    .as_ref()
+                    .and_then(|t| t.lock().expect("not poisoned").position_at(at))
+            })
         })
     };
 
@@ -2538,18 +2660,36 @@ async fn attempt_mysql(
     })
 }
 
+/// How the endpoints turn binlog text into a position and back.
+///
+/// Callers speak bare binlog coordinates and so do positions, so neither
+/// direction needs the generation the pipeline is versioning in.
+fn mysql_api_codec(prefix: String) -> (PositionRenderer, pg2osync_engine::PositionParser) {
+    let render: PositionRenderer = Arc::new(move |position| {
+        pg2osync_source_mysql::catalog::coordinate(position).map_or_else(
+            || position.to_hex(),
+            |coordinate| pg2osync_source_mysql::catalog::position_text(&prefix, coordinate),
+        )
+    });
+    let parse: pg2osync_engine::PositionParser = Arc::new(move |text| {
+        let (file, pos) = pg2osync_source_mysql::catalog::parse_position(text)?;
+        Some(pg2osync_source_mysql::catalog::position(&file, pos))
+    });
+    (render, parse)
+}
+
 /// The source's current binlog coordinate, read on pg2osync's own connection.
 ///
 /// Reading it needs `REPLICATION CLIENT`, which an application account should
 /// not hold — so pg2osync reads it instead of asking the caller to.
-async fn read_current_binlog_position(cfg: &AppConfig, source_url: &str) -> Option<u64> {
+async fn read_current_binlog_position(cfg: &AppConfig, source_url: &str) -> Option<Position> {
     use pg2osync_source_mysql::catalog as mysql_catalog;
     let source = pg2osync_source_mysql::runner::MySqlSource::new(
         mysql_config_for(cfg, source_url, None).ok()?,
     );
     let mut admin = source.admin_connection().await.ok()?;
     let (file, pos) = mysql_catalog::master_position(&mut admin).await.ok()?;
-    Some(mysql_catalog::position_token(&file, pos))
+    Some(mysql_catalog::position(&file, pos))
 }
 
 /// The binlog file prefix in use, so positions can be rendered and parsed.
@@ -2687,12 +2827,16 @@ fn only_section(cfg: &AppConfig, key: &str) -> AppConfig {
 /// channel: an acknowledged position is the only proof this process has that
 /// the walsender is past a point, and the walsender being past the `ALTER
 /// PUBLICATION` is what makes the table's later changes ours to read.
-async fn wait_until_acked(mut acked: watch::Receiver<Option<Lsn>>, position: u64) -> bool {
+async fn wait_until_acked(
+    mut acked: watch::Receiver<Option<Position>>,
+    position: &Position,
+) -> bool {
     let deadline = tokio::time::Instant::now() + BARRIER_TIMEOUT;
     loop {
         if acked
             .borrow_and_update()
-            .is_some_and(|lsn| lsn.0 >= position)
+            .as_ref()
+            .is_some_and(|acked| acked >= position)
         {
             return true;
         }
@@ -2713,7 +2857,7 @@ struct PostgresSections {
     source_url: String,
     sink: Arc<dyn Sink>,
     stream_id: StreamId,
-    acked: watch::Receiver<Option<Lsn>>,
+    acked: watch::Receiver<Option<Position>>,
 }
 
 /// `None` under a polling source: its query names the tables it reads when the
@@ -2773,12 +2917,12 @@ async fn add_table_postgres(deps: &PostgresSections, key: &str, file: &AppConfig
     let position = read_current_lsn(&deps.tls, &deps.admin_url)
         .await
         .ok_or_else(|| anyhow::anyhow!("cannot read the source's current position"))?;
-    if !wait_until_acked(deps.acked.clone(), position).await {
+    if !wait_until_acked(deps.acked.clone(), &position.to_position()).await {
         bail!(
             "the stream did not reach {} within {}s of {} joining publication {}, so a row \
              changed in between could be missed by both the load and the stream. It is in \
              the publication now; the next SIGHUP takes it from there",
-            Lsn(position),
+            position,
             BARRIER_TIMEOUT.as_secs(),
             tbl.table,
             file.source.publication
@@ -2975,7 +3119,7 @@ pub fn spawn_engine(
     stream_id: StreamId,
     render: PositionRenderer,
     display: PositionRenderer,
-    durable: DurableLsn,
+    durable: DurablePosition,
     shutdown: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<Result<(), pg2osync_core::CoreError>> {
     tokio::spawn(async move {
@@ -2989,11 +3133,16 @@ pub fn spawn_engine(
 /// How a MySQL log line names a stream position: the binlog coordinate alone.
 ///
 /// The checkpoint renderer cannot serve here. It folds GTIDs into the resume
-/// position up to the token it is given, and a log names positions the target
-/// has not taken yet.
-fn mysql_display_renderer(prefix: String, base: u64) -> PositionRenderer {
-    Arc::new(move |token| {
-        pg2osync_source_mysql::catalog::position_text(&prefix, token.saturating_sub(base))
+/// position up to the position it is given, and a log names positions the
+/// target has not taken yet. A position this source could not have produced is
+/// shown as its bytes rather than as a made-up coordinate.
+fn mysql_display_renderer(prefix: String) -> PositionRenderer {
+    use pg2osync_source_mysql::catalog;
+    Arc::new(move |position| {
+        catalog::coordinate(position).map_or_else(
+            || position.to_hex(),
+            |coordinate| catalog::position_text(&prefix, coordinate),
+        )
     })
 }
 
@@ -3011,14 +3160,19 @@ mod tests {
 
     #[test]
     fn a_logged_mysql_position_is_the_bare_binlog_coordinate() {
-        let display = mysql_display_renderer("binlog".to_string(), 4096);
+        let display = mysql_display_renderer("binlog".to_string());
         assert_eq!(
-            display(4096 + coordinate(4, 900)),
+            display(&pg2osync_source_mysql::catalog::position(
+                "binlog.000004",
+                900
+            )),
             "binlog.000004:900",
             "the generation base belongs to the version, not the coordinate"
         );
         assert_eq!(
-            mysql_display_renderer("mysql-bin".to_string(), 0)(coordinate(4, 900)),
+            mysql_display_renderer("mysql-bin".to_string())(
+                &pg2osync_source_mysql::catalog::position("mysql-bin.000004", 900)
+            ),
             "mysql-bin.000004:900",
             "no ;gtid= or ;base= suffix in a log line"
         );
@@ -3082,6 +3236,164 @@ mod tests {
         };
         assert!(third_base > second_base);
         assert_eq!(third_base, reached + MARGIN);
+    }
+
+    #[test]
+    fn an_upgrade_from_1x_keeps_the_generation_1x_had_opened() {
+        // 1.x had failed over once, so the target holds versions above MARGIN;
+        // the same server, further along, keeps numbering in that generation
+        let legacy = format!("binlog.000007:120;base={MARGIN}");
+        let base = carried_over_base(Some(&legacy), coordinate(9, 4));
+        assert_eq!(base, MARGIN);
+        assert!(base + coordinate(9, 4) > MARGIN + coordinate(7, 120));
+    }
+
+    #[test]
+    fn an_upgrade_onto_a_restarted_history_opens_a_generation_above_the_1x_version() {
+        let legacy = format!("binlog.000009:800;gtid=0-1-50;base={MARGIN}");
+        let old_version = MARGIN + coordinate(9, 800);
+        let head = coordinate(1, 4);
+        let base = carried_over_base(Some(&legacy), head);
+        assert_eq!(base, old_version + MARGIN);
+        assert!(base + head > old_version);
+    }
+
+    #[test]
+    fn an_upgrade_with_no_1x_checkpoint_versions_from_zero() {
+        assert_eq!(carried_over_base(None, coordinate(3, 4)), 0);
+        // a position 1.x wrote for another source has no binlog coordinate
+        assert_eq!(carried_over_base(Some("0/1B4F2A8"), coordinate(3, 4)), 0);
+        // and one from before generations existed is the first generation
+        assert_eq!(
+            carried_over_base(Some("binlog.000002:4"), coordinate(3, 4)),
+            0
+        );
+    }
+
+    #[test]
+    fn the_first_checkpoint_carries_the_generation_it_opens_in() {
+        // the next start reads its base from here; written as zero, it would
+        // put versions back below what 1.x left in the target
+        let stream = StreamId {
+            source: pg2osync_core::checkpoint::SOURCE_MYSQL.into(),
+            stream: "990001".into(),
+            publication: String::new(),
+        };
+        let first = first_mysql_checkpoint(&stream, "binlog.000003", 4, MARGIN, None);
+        let stored = pg2osync_source_mysql::catalog::parse_stored_position(&first.position)
+            .expect("the first checkpoint parses");
+        assert_eq!(stored.base, MARGIN);
+        assert_eq!((stored.file.as_str(), stored.pos), ("binlog.000003", 4));
+        assert_eq!(
+            first.ordering,
+            pg2osync_source_mysql::catalog::position("binlog.000003", 4)
+        );
+        let fresh = first_mysql_checkpoint(&stream, "binlog.000003", 4, 0, Some("0-1-5"));
+        assert_eq!(fresh.position, "binlog.000003:4;gtid=0-1-5");
+    }
+
+    #[test]
+    fn a_synced_position_on_the_promoted_server_waits_for_an_ack_of_its_own_generation() {
+        // The ack channel and the durable cell outlive the attempt, so right
+        // after an in-place failover they still hold the old server's last
+        // position. A write on the new server, at a lower coordinate, must not
+        // read as synced against it.
+        let (_, parse) = mysql_api_codec("binlog".into());
+        let stale = parse("binlog.000900:4000").expect("parses");
+        let (ack_tx, acked) = watch::channel(Some(stale.clone()));
+        let durable = DurablePosition::default();
+        durable.store(stale);
+
+        let stored = pg2osync_source_mysql::catalog::StoredPosition {
+            file: "binlog.000900".into(),
+            pos: 4000,
+            gtid: Some(gtid_position()),
+            base: 0,
+        };
+        let base = resume_generation(&stored, ("binlog.000002", 120), true, &ack_tx, &durable)
+            .expect("a GTID position resumes onto the promoted server");
+        assert_eq!(
+            base,
+            coordinate(900, 4000) + MARGIN,
+            "a new generation opens"
+        );
+
+        let requested = parse("binlog.000002:300").expect("parses");
+        assert!(
+            !acked.borrow().as_ref().is_some_and(|ack| ack >= &requested),
+            "the new server's write is not acknowledged by the old server's ack"
+        );
+        assert!(
+            durable.get().is_none(),
+            "nothing is durable in the new generation yet"
+        );
+    }
+
+    fn gtid_position() -> pg2osync_source_mysql::gtid::GtidPosition {
+        pg2osync_source_mysql::gtid::GtidPosition::parse("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5")
+            .expect("parses")
+    }
+
+    #[test]
+    fn a_resume_within_the_same_history_keeps_what_was_acknowledged() {
+        // A reconnect to the same server has to keep answering `/synced` for
+        // what this process already acknowledged.
+        let (_, parse) = mysql_api_codec("binlog".into());
+        let acked_at = parse("binlog.000004:900").expect("parses");
+        let (ack_tx, acked) = watch::channel(Some(acked_at.clone()));
+        let durable = DurablePosition::default();
+        durable.store(acked_at.clone());
+        let stored = pg2osync_source_mysql::catalog::StoredPosition {
+            file: "binlog.000004".into(),
+            pos: 900,
+            gtid: None,
+            base: 7,
+        };
+
+        let base = resume_generation(&stored, ("binlog.000005", 4), false, &ack_tx, &durable)
+            .expect("a source ahead of the checkpoint resumes");
+
+        assert_eq!(base, 7, "the generation holds");
+        assert_eq!(acked.borrow().as_ref(), Some(&acked_at));
+        assert_eq!(durable.get(), Some(acked_at));
+    }
+
+    #[test]
+    fn a_refused_resume_leaves_the_acknowledgement_alone() {
+        // A refusal ends the attempt without opening a generation, so the next
+        // attempt may still find the old server behind the address.
+        let (_, parse) = mysql_api_codec("binlog".into());
+        let acked_at = parse("binlog.000900:4000").expect("parses");
+        let behind = ("binlog.000002", 120);
+        for (gtid, gtids_usable) in [(None, true), (Some(gtid_position()), false)] {
+            let (ack_tx, acked) = watch::channel(Some(acked_at.clone()));
+            let durable = DurablePosition::default();
+            durable.store(acked_at.clone());
+            let stored = pg2osync_source_mysql::catalog::StoredPosition {
+                file: "binlog.000900".into(),
+                pos: 4000,
+                gtid,
+                base: 0,
+            };
+
+            let refused = resume_generation(&stored, behind, gtids_usable, &ack_tx, &durable);
+
+            assert!(refused.is_err(), "nothing to resume the new history from");
+            assert_eq!(acked.borrow().as_ref(), Some(&acked_at));
+            assert_eq!(durable.get(), Some(acked_at.clone()));
+        }
+    }
+
+    #[test]
+    fn the_endpoints_speak_the_coordinate_in_any_generation() {
+        // The bare `/synced` reads the server's coordinate and acks carry the
+        // stream's positions: both are coordinates, so they compare, and a
+        // position renders as the coordinate it is rather than one shifted by
+        // a generation it never carried.
+        let (render, parse) = mysql_api_codec("binlog".into());
+        let streamed = pg2osync_source_mysql::catalog::position("binlog.000002", 300);
+        assert_eq!(parse("binlog.000002:300"), Some(streamed.clone()));
+        assert_eq!(render(&streamed), "binlog.000002:300");
     }
 
     #[test]
@@ -3326,6 +3638,133 @@ table = "public.users"
     }
 
     #[test]
+    fn the_position_gauges_keep_the_numbers_they_had_before_positions_were_bytes() {
+        let config = |flavor: &str| -> AppConfig {
+            toml::from_str(&format!(
+                r#"
+[source]
+url = "postgres://u:p@localhost/db"
+flavor = "{flavor}"
+[target]
+url = "http://localhost:9200"
+[sync.users]
+table = "public.users"
+index = "users"
+"#
+            ))
+            .unwrap()
+        };
+        let lsn: Lsn = "16/B374D848".parse().unwrap();
+        let project = position_projection(&config("postgres")).expect("WAL mode projects");
+        assert_eq!(project(&lsn.to_position()), Some(lsn.0));
+
+        let project = position_projection(&config("mysql")).expect("the binlog projects");
+        let coordinate = pg2osync_source_mysql::catalog::position("binlog.000004", 900);
+        assert_eq!(
+            project(&coordinate),
+            Some((4 << 32) | 900),
+            "the packed coordinate, which no generation shifts"
+        );
+    }
+
+    #[test]
+    fn poll_mode_has_no_position_to_project_so_its_gauges_stay_absent() {
+        let cfg: AppConfig = toml::from_str(
+            r#"
+[source]
+url = "postgres://u:p@localhost/db"
+mode = "poll"
+[target]
+url = "http://localhost:9200"
+[sync.users]
+table = "public.users"
+index = "users"
+"#,
+        )
+        .unwrap();
+        assert!(position_projection(&cfg).is_none());
+
+        let (ack_tx, _) = watch::channel(None);
+        let (load_done_tx, _) = watch::channel(0);
+        let (_, settings) = watch::channel(cfg.engine.settings());
+        let (_, rules) = watch::channel(Arc::new(pg2osync_engine::RuleSet::default()));
+        let ctx = pipeline_ctx(
+            &cfg,
+            build_sink(&cfg, None).expect("builds without connecting"),
+            Arc::new(pg2osync_engine::metrics::Metrics::default()),
+            ack_tx,
+            load_done_tx,
+            settings,
+            rules,
+        )
+        .unwrap();
+        assert!(
+            ctx.project_position.is_none(),
+            "a zero lag would read as caught up where the truth is no data"
+        );
+    }
+
+    #[test]
+    fn the_lag_gauge_is_the_projected_gap_between_received_and_checkpointed() {
+        let config = |flavor: &str| -> AppConfig {
+            toml::from_str(&format!(
+                r#"
+[source]
+url = "postgres://u:p@localhost/db"
+flavor = "{flavor}"
+[target]
+url = "http://localhost:9200"
+[sync.users]
+table = "public.users"
+index = "users"
+"#
+            ))
+            .unwrap()
+        };
+        let lag = |flavor: &str, current: &Position, confirmed: &Position| {
+            let project = position_projection(&config(flavor)).expect("streams project");
+            let metrics = pg2osync_engine::metrics::Metrics::default();
+            metrics.report_positions();
+            metrics.set_current_position(project(current).expect("projects"));
+            metrics.set_confirmed_position(project(confirmed).expect("projects"));
+            let out = metrics.render("s");
+            out.lines()
+                .find_map(|l| l.strip_prefix("pg2osync_position_lag{source=\"s\"} "))
+                .map(str::to_string)
+                .unwrap_or_else(|| panic!("no lag line in {out}"))
+        };
+
+        let current: Lsn = "1/10".parse().unwrap();
+        let confirmed: Lsn = "0/FFFFFFF0".parse().unwrap();
+        assert_eq!(
+            lag("postgres", &current.to_position(), &confirmed.to_position()),
+            "32",
+            "WAL bytes, carried across the 4 GiB boundary"
+        );
+
+        use pg2osync_source_mysql::catalog::{pack_coordinate, position};
+        let current = position("binlog.000005", 120);
+        let confirmed = position("binlog.000004", 900);
+        assert_eq!(
+            lag("mysql", &current, &confirmed),
+            (pack_coordinate("binlog.000005", 120) - pack_coordinate("binlog.000004", 900))
+                .to_string(),
+            "the packed coordinate, so a rotation reads as a jump in the high half"
+        );
+    }
+
+    #[test]
+    fn a_postgres_position_is_shown_as_an_lsn() {
+        let lsn: Lsn = "0/1B4F2A8".parse().unwrap();
+        assert_eq!(render_lsn(&lsn.to_position()), "0/1B4F2A8");
+        assert_eq!(
+            render_lsn(&Position::from_bytes(vec![1, 2])),
+            "0102",
+            "never a made-up LSN"
+        );
+    }
+
+    #[test]
     fn an_element_parent_resolves_to_the_fan_out_field() {
         let cfg: AppConfig = toml::from_str(
             r#"
@@ -3399,7 +3838,7 @@ parent = "{element}"
                 stream: "slot_b".into(),
                 publication: "pub".into(),
             },
-            token: 42,
+            ordering: Lsn(42).to_position(),
             position: "0/2A".into(),
         };
         assert!(usable_checkpoint(Some(stored.clone()), &expected).is_none());

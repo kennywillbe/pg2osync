@@ -155,9 +155,9 @@ pub(crate) async fn load_one(
         copy_rx,
         ctx,
         stream_id.clone(),
-        Arc::new(|token| token.to_string()),
-        Arc::new(|token| token.to_string()),
-        pg2osync_engine::mapping::DurableLsn::default(),
+        Arc::new(|position| position.to_hex()),
+        Arc::new(|position| position.to_hex()),
+        pg2osync_engine::mapping::DurablePosition::default(),
         shutdown_rx,
     );
 
@@ -251,15 +251,7 @@ async fn mysql(
     let source = pg2osync_source_mysql::runner::MySqlSource::new(src_cfg);
     let mut conn = source.admin_connection().await?;
     run::resolve_mysql_child_order(&mut children, &mut conn).await?;
-    // The generation the pipeline is versioning in. A re-snapshot writing under
-    // an older one would have every document refused by the target and repair
-    // nothing, which is the one outcome worse than doing nothing at all.
-    let version_base = sink
-        .read_checkpoint(stream_id)
-        .await?
-        .and_then(|c| pg2osync_source_mysql::catalog::parse_stored_position(&c.position))
-        .map(|p| p.base)
-        .unwrap_or(0);
+    let version_base = mysql_version_base(sink, stream_id).await?;
     Ok(pg2osync_source_mysql::load::run(
         &mut conn,
         &admitted.tables,
@@ -276,4 +268,87 @@ async fn mysql(
         cfg.engine.load_max_rows_per_sec,
     )
     .await?)
+}
+
+/// The generation the pipeline is versioning in, as the target records it.
+///
+/// A re-snapshot writing under an older one would have every document refused
+/// by the target and repair nothing, which is the one outcome worse than doing
+/// nothing at all. `reindex` asks this before it creates its fresh index, so a
+/// refusal leaves nothing behind on the target.
+pub(crate) async fn mysql_version_base(
+    sink: &dyn pg2osync_core::sink::Sink,
+    stream_id: &pg2osync_core::checkpoint::StreamId,
+) -> Result<u64> {
+    let current = sink.read_checkpoint(stream_id).await?.map(|c| c.position);
+    // Read only where the run would read it: when no current checkpoint
+    // gives the base.
+    let legacy = match current
+        .as_deref()
+        .and_then(pg2osync_source_mysql::catalog::parse_stored_position)
+    {
+        Some(_) => None,
+        None => sink
+            .read_legacy_position_text(stream_id)
+            .await
+            .context("reading the checkpoint 1.x left, for its version generation")?,
+    };
+    version_base(current.as_deref(), legacy.as_deref())
+}
+
+/// The MySQL version base a re-snapshot or re-index writes in, from the current
+/// checkpoint's position text and, when that gives none, the 1.x one's.
+///
+/// Before the first run after an upgrade only the 1.x checkpoint exists, and
+/// the generation carried over from it is settled against the server's
+/// coordinate at the moment it is asked for. Nothing records that answer until
+/// the run's first checkpoint, and a re-snapshot must not write one, so a
+/// re-snapshot and the run after it could settle different generations; the
+/// run's, if lower, would have every later change to these documents refused.
+/// The run's initial load reads every table anyway, so there is nothing for a
+/// re-snapshot to repair yet.
+fn version_base(current: Option<&str>, legacy: Option<&str>) -> Result<u64> {
+    use pg2osync_source_mysql::catalog::parse_stored_position;
+    if let Some(stored) = current.and_then(parse_stored_position) {
+        return Ok(stored.base);
+    }
+    if legacy.is_some() {
+        bail!(
+            "this stream still has only the checkpoint 1.x left, so the version generation \
+             it carries over is not settled yet and a one-shot load could write under a \
+             different one than the pipeline will; start `pg2osync run` first, whose initial \
+             load reads every table, and run this again once it has written its checkpoint"
+        );
+    }
+    Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MARGIN: u64 = run::GENERATION_MARGIN;
+
+    #[test]
+    fn a_resnapshot_versions_in_the_generation_the_checkpoint_records() {
+        let current = format!("binlog.000004:120;base={MARGIN}");
+        assert_eq!(version_base(Some(&current), None).unwrap(), MARGIN);
+        // the current checkpoint has replaced whatever 1.x left
+        let legacy = "binlog.000300:4;base=7";
+        assert_eq!(version_base(Some(&current), Some(legacy)).unwrap(), MARGIN);
+    }
+
+    #[test]
+    fn a_resnapshot_with_no_checkpoint_at_all_versions_from_zero() {
+        assert_eq!(version_base(None, None).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_resnapshot_before_the_first_run_after_a_1x_upgrade_is_refused() {
+        // the generation carried over from 1.x is settled against the server's
+        // coordinate when it is needed, so this read and the run after it could
+        // settle different ones and the run's would be refused by the target
+        let err = version_base(None, Some("binlog.000300:4;base=7")).unwrap_err();
+        assert!(err.to_string().contains("pg2osync run"), "{err}");
+    }
 }

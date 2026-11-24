@@ -22,7 +22,6 @@ use pg2osync_core::checkpoint::StreamId;
 use pg2osync_core::children::ChildSpec;
 use pg2osync_core::event::{ChangeEvent, RowChange, RowKind, TransactionBoundary};
 use pg2osync_core::load::{LoadCursor, LoadProgress, LoadScope, load_progress_key};
-use pg2osync_core::lsn::Lsn;
 use pg2osync_core::sink::Sink;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::watch;
@@ -165,7 +164,7 @@ pub async fn run(
             // to run beside the stream. It is a version only: these rows still
             // never advance the checkpoint.
             let (file, pos) = catalog::master_position(conn).await?;
-            let version = Some(version_base.saturating_add(catalog::position_token(&file, pos)));
+            let version = Some(catalog::version(version_base, &file, pos));
             let sql = chunk_statement(
                 schema,
                 table,
@@ -331,11 +330,11 @@ async fn attach_to_chunk(
     Ok(())
 }
 
-/// A boundary carrying `Lsn(0)`: it flushes the batch without advancing the
+/// A boundary with no position: it flushes the batch without advancing the
 /// checkpoint, because loaded rows have no binlog coordinate of their own.
 async fn send_boundary(tx: &Sender<ChangeEvent>) -> Result<()> {
     tx.send(ChangeEvent::Transaction(TransactionBoundary::Commit {
-        lsn: Lsn(0),
+        position: None,
         commit_ts_micros: 0,
     }))
     .await

@@ -706,7 +706,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "description": "Position tokens received but not yet checkpointed. Rising over ten minutes is the pipeline falling behind rather than catching up.",
+      "description": "Source position received but not yet checkpointed. Rising over ten minutes is the pipeline falling behind rather than catching up.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },

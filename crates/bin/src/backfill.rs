@@ -25,7 +25,7 @@ use pg2osync_core::aggregate::AggregateSpec;
 use pg2osync_core::checkpoint::StreamId;
 use pg2osync_core::event::{ChangeEvent, RowKind, TransactionBoundary};
 use pg2osync_core::load::{LoadCursor, LoadProgress, LoadScope, load_progress_key};
-use pg2osync_core::lsn::Lsn;
+use pg2osync_source::Lsn;
 use pg2osync_source::children::ChildSpec;
 use std::collections::HashMap;
 use tokio::sync::mpsc::Sender;
@@ -744,11 +744,11 @@ async fn current_lsn(client: &tokio_postgres::Client) -> Result<Option<u64>> {
     }
 }
 
-/// A boundary carrying `Lsn(0)`: it flushes the batch without advancing the
+/// A boundary with no position: it flushes the batch without advancing the
 /// checkpoint, because backfill rows have no WAL position of their own.
 async fn send_boundary(tx: &Sender<ChangeEvent>) -> Result<()> {
     tx.send(ChangeEvent::Transaction(TransactionBoundary::Commit {
-        lsn: Lsn(0),
+        position: None,
         commit_ts_micros: 0,
     }))
     .await

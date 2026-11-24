@@ -16,7 +16,7 @@ use opensearch::params::{ExpandWildcards, VersionType};
 use opensearch::{BulkOperation, BulkParts, GetParts, IndexParts, OpenSearch};
 use pg2osync_core::checkpoint::Checkpoint;
 use pg2osync_core::error::CoreError;
-use pg2osync_core::lsn::Lsn;
+use pg2osync_core::position::Position;
 use pg2osync_core::sink::{
     BulkLoadSettings, DocumentOp, Health, IndexSpec, LsnOp, Rejection, Sink, SinkAck, StoredReject,
     index_matches_pattern,
@@ -33,14 +33,8 @@ pub const META_INDEX: &str = ".pg2osync_meta";
 /// this without going anywhere near a checkpoint, and its contents are bounded
 /// by `max_rejects` rather than by one small document per stream.
 pub const REJECTS_INDEX: &str = ".pg2osync_rejects";
-/// Single checkpoint document per pipeline; per-document atomicity is what
-/// makes the write crash-safe without any compare-and-swap.
-/// The document every pipeline used to write its checkpoint to, whatever
-/// stream it belonged to. Still read as a fallback so an existing deployment
-/// does not re-run its initial load on upgrade; never written any more.
-pub const CHECKPOINT_DOC_ID: &str = "default";
-
-/// Where one stream's checkpoint lives.
+/// Where one stream's checkpoint lives: one document, whose per-document
+/// atomicity is what makes the write crash-safe without any compare-and-swap.
 ///
 /// Two pipelines writing to the same target used to share a single document,
 /// so each overwrote the other's position — which is exactly what the
@@ -60,8 +54,9 @@ pub fn checkpoint_doc_id(stream: &pg2osync_core::checkpoint::StreamId) -> String
         .collect();
     tame
 }
-/// Bumped when the document layout changes; v1 stored only `confirmed_lsn`.
-pub const CHECKPOINT_SCHEMA_VERSION: u32 = 2;
+/// Bumped when the document layout changes. Only this layout is read: v3 is
+/// the first whose ordering is bytes rather than one source's integer.
+pub const CHECKPOINT_SCHEMA_VERSION: u32 = 3;
 
 /// Serialize a checkpoint into its stored document form.
 pub fn checkpoint_doc(ckpt: &Checkpoint) -> Value {
@@ -71,25 +66,23 @@ pub fn checkpoint_doc(ckpt: &Checkpoint) -> Value {
         "slot_name": ckpt.stream.stream,
         "publication": ckpt.stream.publication,
         "position": ckpt.position,
-        "token": ckpt.token,
+        "ordering": ckpt.ordering.to_hex(),
         "instance_id": std::env::var("PG2OSYNC_INSTANCE_ID").unwrap_or_default(),
         "updated_at_epoch": chrono_now(),
         "schema_version": CHECKPOINT_SCHEMA_VERSION,
     })
 }
 
-/// Parse a stored checkpoint document.
-///
-/// Accepts the v1 layout (`confirmed_lsn`, no `source`) so an existing
-/// deployment resumes instead of re-running a full backfill after an upgrade.
+/// Parse a stored checkpoint document, or `None` for anything that is not a
+/// complete one in the current layout.
 pub fn checkpoint_from_doc(src: &Value) -> Option<Checkpoint> {
-    use pg2osync_core::checkpoint::{SOURCE_POSTGRES, StreamId};
+    use pg2osync_core::checkpoint::StreamId;
 
+    if src["schema_version"].as_u64() != Some(u64::from(CHECKPOINT_SCHEMA_VERSION)) {
+        return None;
+    }
     let stream = StreamId {
-        source: src["source"]
-            .as_str()
-            .unwrap_or(SOURCE_POSTGRES)
-            .to_string(),
+        source: src["source"].as_str()?.to_string(),
         stream: src["slot_name"]
             .as_str()
             .or(src["stream"].as_str())
@@ -97,20 +90,45 @@ pub fn checkpoint_from_doc(src: &Value) -> Option<Checkpoint> {
             .to_string(),
         publication: src["publication"].as_str().unwrap_or_default().to_string(),
     };
-    let position = src["position"]
-        .as_str()
-        .or(src["confirmed_lsn"].as_str())?
-        .to_string();
-    let token = match src["token"].as_u64() {
-        Some(t) => t,
-        // v1 documents carry only the textual LSN
-        None => position.parse::<Lsn>().ok()?.0,
-    };
+    let position = src["position"].as_str()?.to_string();
+    let ordering = Position::from_hex(src["ordering"].as_str()?).ok()?;
     Some(Checkpoint {
         stream,
-        token,
+        ordering,
         position,
     })
+}
+
+/// The document id every 1.x pipeline once kept its checkpoint under, whatever
+/// stream it belonged to, before checkpoints were kept per stream.
+pub const LEGACY_CHECKPOINT_DOC_ID: &str = "default";
+
+/// The position text of a checkpoint 1.x wrote for `stream`, or `None` for a
+/// document in the current layout, one written for another stream, or none.
+///
+/// Only the text: 1.x ordered by one source's integer, which is never resumed
+/// from, but the text still says what a source must not go below.
+pub fn legacy_position_text(
+    src: &Value,
+    stream: &pg2osync_core::checkpoint::StreamId,
+) -> Option<String> {
+    if !src.is_object()
+        || src["schema_version"].as_u64() == Some(u64::from(CHECKPOINT_SCHEMA_VERSION))
+    {
+        return None;
+    }
+    // v1 carried no `source`, because PostgreSQL was the only one there was
+    let source = src["source"]
+        .as_str()
+        .unwrap_or(pg2osync_core::checkpoint::SOURCE_POSTGRES);
+    let name = src["slot_name"].as_str().or(src["stream"].as_str())?;
+    if source != stream.source || name != stream.stream {
+        return None;
+    }
+    src["position"]
+        .as_str()
+        .or(src["confirmed_lsn"].as_str())
+        .map(str::to_string)
 }
 
 pub struct OpenSearchSink {
@@ -745,7 +763,10 @@ impl OpenSearchSink {
     /// The position rather than the id: there is exactly one bulk action per
     /// operation, in order, so the position identifies the operation even when a
     /// batch holds two writes for the same document.
-    async fn bulk_once(&self, batch: &[LsnOp]) -> Result<(Lsn, Vec<(usize, String)>), CoreError> {
+    async fn bulk_once(
+        &self,
+        batch: &[LsnOp],
+    ) -> Result<(Option<Position>, Vec<(usize, String)>), CoreError> {
         let ops = batch
             .iter()
             .map(|op| bulk_action(&op.op))
@@ -774,7 +795,10 @@ impl OpenSearchSink {
             .await
             .map_err(|e| CoreError::Sink(e.to_string()))?;
         if body["errors"] != json!(true) {
-            return Ok((batch.last().expect("nonempty checked").lsn, vec![]));
+            return Ok((
+                batch.last().expect("nonempty checked").position.clone(),
+                vec![],
+            ));
         }
 
         // item-level triage: retryable statuses re-queue, permanent ones surface
@@ -834,15 +858,15 @@ impl OpenSearchSink {
                 "item-level 429/5xx in bulk response".into(),
             ));
         }
-        let max_lsn = batch.last().expect("nonempty checked").lsn;
-        Ok((max_lsn, permanent))
+        let max_position = batch.last().expect("nonempty checked").position.clone();
+        Ok((max_position, permanent))
     }
 
     async fn bulk_with_retry(
         &self,
         batch: &[LsnOp],
         retry: &RetryPolicy,
-    ) -> Result<(Lsn, Vec<(usize, String)>), CoreError> {
+    ) -> Result<(Option<Position>, Vec<(usize, String)>), CoreError> {
         retry_transient(retry, || self.bulk_once(batch)).await
     }
 }
@@ -1194,7 +1218,9 @@ pub fn reject_doc(r: &Rejection) -> Value {
         "index": r.index,
         "doc_id": r.doc_id,
         "reason": r.reason,
-        "position": r.lsn.0,
+        // not under 1.x's `position`: a search engine holding a 1.x store
+        // mapped that field as a long and would refuse the hex
+        "ordering": r.position.as_ref().map(Position::to_hex),
         "action": action,
         "document": document,
         "version": version,
@@ -1236,6 +1262,14 @@ pub fn reject_doc(r: &Rejection) -> Value {
 /// Read a stored rejection back, or `None` if the document is not one.
 pub fn reject_from_doc(id: &str, src: &Value) -> Option<StoredReject> {
     let index = src["index"].as_str()?.to_string();
+    // 1.x stored a number under `position`, which no longer maps to bytes
+    // without a per-source rule; the record carries its own version, so it
+    // stays listable and replayable with the position simply unknown
+    let position = match &src["ordering"] {
+        Value::Null => None,
+        Value::String(hex) => Some(Position::from_hex(hex).ok()?),
+        _ => return None,
+    };
     let doc_id = src["doc_id"].as_str()?.to_string();
     let version = src["version"].as_u64();
     let routing = src["routing"].as_str().map(str::to_string);
@@ -1271,7 +1305,7 @@ pub fn reject_from_doc(id: &str, src: &Value) -> Option<StoredReject> {
             index,
             doc_id,
             reason: src["reason"].as_str().unwrap_or_default().to_string(),
-            lsn: Lsn(src["position"].as_u64()?),
+            position,
             op,
         },
         at_epoch: src["at_epoch"].as_u64().unwrap_or_default(),
@@ -1309,7 +1343,7 @@ pub fn rejections(
             index,
             doc_id,
             reason,
-            lsn: op.lsn,
+            position: op.position.clone(),
             op: op.op.clone(),
         });
     }
@@ -1506,9 +1540,12 @@ impl Sink for OpenSearchSink {
             permanent.extend(perm.into_iter().map(|(i, why)| (start + i, why)));
         }
         // the batch is non-empty, checked above
-        let max_lsn = batch.last().expect("nonempty checked").lsn;
+        let max_position = batch.last().expect("nonempty checked").position.clone();
         let rejected = rejections(&batch, permanent)?;
-        Ok(SinkAck { max_lsn, rejected })
+        Ok(SinkAck {
+            max_position,
+            rejected,
+        })
     }
 
     async fn truncate_index(
@@ -2003,22 +2040,7 @@ impl Sink for OpenSearchSink {
             .await
             .map_err(http_err)?;
         if resp.status_code().as_u16() == 404 {
-            // written before checkpoints were kept per stream; the caller
-            // still checks that it belongs to this one
-            let legacy = self
-                .client
-                .get(GetParts::IndexId(META_INDEX, CHECKPOINT_DOC_ID))
-                .send()
-                .await
-                .map_err(http_err)?;
-            if !legacy.status_code().is_success() {
-                return Ok(None);
-            }
-            let body: Value = legacy
-                .json()
-                .await
-                .map_err(|e| CoreError::Sink(e.to_string()))?;
-            return Ok(checkpoint_from_doc(&body["_source"]));
+            return Ok(None);
         }
         if !resp.status_code().is_success() {
             let status = resp.status_code();
@@ -2032,6 +2054,40 @@ impl Sink for OpenSearchSink {
             .await
             .map_err(|e| CoreError::Sink(e.to_string()))?;
         Ok(checkpoint_from_doc(&body["_source"]))
+    }
+
+    async fn read_legacy_position_text(
+        &self,
+        stream: &pg2osync_core::checkpoint::StreamId,
+    ) -> Result<Option<String>, CoreError> {
+        // 1.x read the shared document only when the stream's own was absent,
+        // so that is the order its checkpoints can be found in
+        for doc_id in [
+            crate::checkpoint_doc_id(stream),
+            LEGACY_CHECKPOINT_DOC_ID.into(),
+        ] {
+            let resp = self
+                .client
+                .get(GetParts::IndexId(META_INDEX, &doc_id))
+                .send()
+                .await
+                .map_err(http_err)?;
+            if resp.status_code().as_u16() == 404 {
+                continue;
+            }
+            if !resp.status_code().is_success() {
+                let status = resp.status_code();
+                return Err(CoreError::Sink(format!(
+                    "read 1.x checkpoint {doc_id} failed: {status}"
+                )));
+            }
+            let body: Value = resp
+                .json()
+                .await
+                .map_err(|e| CoreError::Sink(e.to_string()))?;
+            return Ok(legacy_position_text(&body["_source"], stream));
+        }
+        Ok(None)
     }
 
     async fn health(&self) -> Result<Health, CoreError> {
@@ -2084,6 +2140,13 @@ impl Sink for OpenSearchSink {
             ))),
         }
     }
+}
+
+/// A position the way a source would encode one, for tests that only need
+/// positions to differ and order.
+#[cfg(test)]
+pub(crate) fn test_position(n: u64) -> Option<Position> {
+    Some(Position::from_bytes(n.to_be_bytes()))
 }
 
 #[cfg(test)]
@@ -2183,7 +2246,7 @@ mod tests {
 
     fn upsert_into(index: &str, alias: Option<&str>) -> LsnOp {
         LsnOp {
-            lsn: Lsn(1),
+            position: crate::test_position(1),
             op: DocumentOp::Upsert {
                 index: index.into(),
                 id: "1".into(),
@@ -2201,7 +2264,7 @@ mod tests {
         let mapping = Some(json!({"properties": {"at": {"type": "date"}}}));
         let templates = vec![("events-*".to_string(), mapping.clone())];
         let delete_from = |index: &str, alias: Option<&str>, version: Option<u64>| LsnOp {
-            lsn: Lsn(1),
+            position: crate::test_position(1),
             op: DocumentOp::Delete {
                 index: index.into(),
                 id: "1".into(),
@@ -2315,7 +2378,7 @@ mod tests {
                 stream: "pg2osync".into(),
                 publication: "pg2osync_pub".into(),
             },
-            token: 0x1B4_F2A8,
+            ordering: Position::from_bytes(0x1B4_F2A8u64.to_be_bytes()),
             position: "0/1B4F2A8".into(),
         }
     }
@@ -2323,6 +2386,9 @@ mod tests {
     #[test]
     fn checkpoint_documents_round_trip() {
         let doc = checkpoint_doc(&checkpoint());
+        assert_eq!(doc["schema_version"], json!(3));
+        assert_eq!(doc["ordering"], json!("0000000001b4f2a8"));
+        assert_eq!(doc["position"], json!("0/1B4F2A8"));
         assert_eq!(checkpoint_from_doc(&doc), Some(checkpoint()));
     }
 
@@ -2334,32 +2400,142 @@ mod tests {
                 stream: "424242".into(),
                 publication: String::new(),
             },
-            token: (4u64 << 32) | 1234,
-            position: "binlog.000004:1234".into(),
+            ordering: Position::from_bytes([0, 0, 0, 4, 0, 0, 0x04, 0xD2]),
+            position: "binlog.000004:1234;gtid=0-3307-1431;base=4096".into(),
         };
         let doc = checkpoint_doc(&mysql);
+        assert_eq!(doc["ordering"], json!("00000004000004d2"));
         assert_eq!(checkpoint_from_doc(&doc), Some(mysql));
     }
 
     #[test]
-    fn v1_documents_still_resume() {
-        // pre-0.7 deployments stored only the textual LSN; refusing to read
-        // them would force a full re-index on upgrade
-        let legacy = json!({
+    fn a_checkpoint_survives_the_json_text_every_sink_stores() {
+        // Meilisearch keeps the document in a file, PostgreSQL in jsonb,
+        // Qdrant in a payload and the search engines as _source: all of them
+        // hand back the serialized text, so the round trip goes through it
+        let text = serde_json::to_string(&checkpoint_doc(&checkpoint())).unwrap();
+        let back: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(checkpoint_from_doc(&back), Some(checkpoint()));
+    }
+
+    #[test]
+    fn earlier_layouts_are_refused() {
+        // v1 stored only the textual LSN, v2 a numeric token, and a number
+        // cannot say which bytes it stood for without a rule per source; an
+        // upgraded 1.x pipeline loads again instead
+        let v1 = json!({
             "slot_name": "pg2osync",
             "publication": "pg2osync_pub",
             "confirmed_lsn": "0/1B4F2A8",
             "schema_version": 1
         });
-        let parsed = checkpoint_from_doc(&legacy).expect("v1 document must parse");
-        assert_eq!(parsed.stream.source, SOURCE_POSTGRES);
-        assert_eq!(parsed.token, 0x1B4_F2A8);
+        assert_eq!(checkpoint_from_doc(&v1), None);
+        let v2 = json!({
+            "source": "postgres",
+            "stream": "pg2osync",
+            "slot_name": "pg2osync",
+            "publication": "pg2osync_pub",
+            "position": "0/1B4F2A8",
+            "token": 0x1B4_F2A8u64,
+            "schema_version": 2
+        });
+        assert_eq!(checkpoint_from_doc(&v2), None);
+    }
+
+    #[test]
+    fn a_checkpoint_with_unreadable_ordering_is_no_checkpoint() {
+        for bad in [json!("abc"), json!("zz"), json!(42), Value::Null] {
+            let mut doc = checkpoint_doc(&checkpoint());
+            doc["ordering"] = bad.clone();
+            assert_eq!(checkpoint_from_doc(&doc), None, "ordering {bad}");
+        }
     }
 
     #[test]
     fn documents_without_a_position_are_ignored() {
         assert_eq!(checkpoint_from_doc(&json!({})), None);
         assert_eq!(checkpoint_from_doc(&Value::Null), None);
+    }
+
+    /// The document 1.5.2 wrote for a MySQL stream that had opened a later
+    /// version generation, field for field.
+    pub(crate) fn mysql_1x_doc() -> Value {
+        json!({
+            "source": "mysql",
+            "stream": "424242",
+            "slot_name": "424242",
+            "publication": "",
+            "position": "binlog.000004:1234;base=1099511627776",
+            "token": 1_099_511_627_776u64 + (4u64 << 32) + 1234,
+            "instance_id": "",
+            "updated_at_epoch": 1_700_000_000u64,
+            "schema_version": 2
+        })
+    }
+
+    pub(crate) fn mysql_stream() -> StreamId {
+        StreamId {
+            source: SOURCE_MYSQL.into(),
+            stream: "424242".into(),
+            publication: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_1x_checkpoint_hands_back_its_position_text() {
+        assert_eq!(
+            legacy_position_text(&mysql_1x_doc(), &mysql_stream()).as_deref(),
+            Some("binlog.000004:1234;base=1099511627776")
+        );
+    }
+
+    #[test]
+    fn a_v1_document_reads_as_the_postgres_stream_it_was_written_for() {
+        // v1 had no `source`: only PostgreSQL existed, and its text was the LSN
+        let v1 = json!({
+            "slot_name": "pg2osync",
+            "publication": "pg2osync_pub",
+            "confirmed_lsn": "0/1B4F2A8",
+            "schema_version": 1
+        });
+        assert_eq!(
+            legacy_position_text(&v1, &checkpoint().stream).as_deref(),
+            Some("0/1B4F2A8")
+        );
+        assert_eq!(legacy_position_text(&v1, &mysql_stream()), None);
+    }
+
+    #[test]
+    fn a_1x_checkpoint_of_another_stream_is_not_this_ones() {
+        // the shared `default` document belonged to whichever pipeline wrote
+        // it last, which need not be the one asking
+        let other_server = StreamId {
+            stream: "7".into(),
+            ..mysql_stream()
+        };
+        assert_eq!(legacy_position_text(&mysql_1x_doc(), &other_server), None);
+        let postgres = StreamId {
+            source: SOURCE_POSTGRES.into(),
+            ..mysql_stream()
+        };
+        assert_eq!(legacy_position_text(&mysql_1x_doc(), &postgres), None);
+    }
+
+    #[test]
+    fn a_current_checkpoint_is_not_a_1x_one() {
+        // both layouts share the per-stream document id, so the layout is what
+        // tells them apart
+        let current = Checkpoint {
+            stream: mysql_stream(),
+            ordering: Position::from_bytes([0, 0, 0, 4, 0, 0, 0x04, 0xD2]),
+            position: "binlog.000004:1234;base=4096".into(),
+        };
+        assert_eq!(
+            legacy_position_text(&checkpoint_doc(&current), &mysql_stream()),
+            None
+        );
+        assert_eq!(legacy_position_text(&json!({}), &mysql_stream()), None);
+        assert_eq!(legacy_position_text(&Value::Null, &mysql_stream()), None);
     }
 
     #[test]
@@ -2392,7 +2568,7 @@ mod tests {
         // By position, not by id: a batch may hold two writes for one document,
         // and a replay needs the operation that was actually refused.
         let op = |id: &str, doc: Value| LsnOp {
-            lsn: Lsn(0x100),
+            position: crate::test_position(0x100),
             op: DocumentOp::Upsert {
                 index: "i".into(),
                 id: id.into(),
@@ -2423,7 +2599,7 @@ mod tests {
             index: "orders".into(),
             doc_id: "7".into(),
             reason: "mapper_parsing_exception: amount".into(),
-            lsn: Lsn(0x2A),
+            position: crate::test_position(0x2A),
             op: DocumentOp::Delete {
                 index: "orders".into(),
                 id: "7".into(),
@@ -2438,6 +2614,137 @@ mod tests {
     }
 
     #[test]
+    fn a_quarantined_document_keeps_its_position_and_version_apart() {
+        // the version a replay writes with is the stored one, never one read
+        // back out of the position
+        let r = Rejection {
+            index: "orders".into(),
+            doc_id: "7".into(),
+            reason: "mapper_parsing_exception: amount".into(),
+            position: Some(Position::from_bytes([0, 0, 0, 4, 0, 0, 0x03, 0x84])),
+            op: DocumentOp::Upsert {
+                index: "orders".into(),
+                id: "7".into(),
+                routing: None,
+                doc: json!({"amount": "lots"}),
+                version: Some((1 << 40) + 900),
+                pipeline: None,
+                alias: None,
+            },
+        };
+        let doc = reject_doc(&r);
+        assert_eq!(doc["ordering"], json!("0000000400000384"));
+        assert_eq!(doc["version"], json!((1u64 << 40) + 900));
+        let text = serde_json::to_string(&doc).unwrap();
+        let stored =
+            reject_from_doc("orders-7", &serde_json::from_str(&text).unwrap()).expect("readable");
+        assert_eq!(stored.rejection, r);
+    }
+
+    #[test]
+    fn a_quarantined_document_without_a_position_stays_without_one() {
+        // a copied row is refused like any other, and has no position to file
+        let r = Rejection {
+            index: "orders".into(),
+            doc_id: "7".into(),
+            reason: "mapper_parsing_exception: amount".into(),
+            position: None,
+            op: DocumentOp::Upsert {
+                index: "orders".into(),
+                id: "7".into(),
+                routing: None,
+                doc: json!({"amount": "lots"}),
+                version: Some(0x2A),
+                pipeline: None,
+                alias: None,
+            },
+        };
+        let doc = reject_doc(&r);
+        assert_eq!(doc["ordering"], Value::Null);
+        let stored = reject_from_doc("orders-7", &doc).expect("readable");
+        assert_eq!(stored.rejection, r);
+    }
+
+    #[test]
+    fn a_quarantined_document_from_1x_stays_listed_and_replayable() {
+        // the layout 1.x wrote: the position as a bare number
+        let doc = json!({
+            "index": "orders",
+            "doc_id": "7",
+            "reason": "mapper_parsing_exception: amount",
+            "position": 42,
+            "action": "upsert",
+            "document": {"amount": "lots"},
+            "version": 42,
+            "at_epoch": 1,
+            "routing": null,
+            "pipeline": null,
+        });
+        let stored = reject_from_doc("orders-7", &doc).expect("a 1.x record is still readable");
+        assert_eq!(
+            stored.rejection,
+            Rejection {
+                index: "orders".into(),
+                doc_id: "7".into(),
+                reason: "mapper_parsing_exception: amount".into(),
+                position: None,
+                op: DocumentOp::Upsert {
+                    index: "orders".into(),
+                    id: "7".into(),
+                    routing: None,
+                    doc: json!({"amount": "lots"}),
+                    version: Some(42),
+                    pipeline: None,
+                    alias: None,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn a_quarantined_document_with_an_unreadable_position_is_not_this_layout() {
+        let mut doc = reject_doc(&Rejection {
+            index: "orders".into(),
+            doc_id: "7".into(),
+            reason: "r".into(),
+            position: crate::test_position(0x2A),
+            op: DocumentOp::Delete {
+                index: "orders".into(),
+                id: "7".into(),
+                routing: None,
+                version: Some(0x2A),
+                alias: None,
+            },
+        });
+        doc["ordering"] = json!("xyz");
+        assert!(reject_from_doc("orders-7", &doc).is_none());
+        doc["ordering"] = json!(["0000"]);
+        assert!(reject_from_doc("orders-7", &doc).is_none());
+    }
+
+    #[test]
+    fn a_quarantined_document_leaves_the_1x_position_field_alone() {
+        // a search engine holding a 1.x store has mapped `position` as a long
+        // from the numbers 1.x wrote, and refuses a hex string there — and a
+        // refusal to quarantine halts the pipeline
+        let doc = reject_doc(&Rejection {
+            index: "orders".into(),
+            doc_id: "7".into(),
+            reason: "r".into(),
+            position: Some(Position::from_bytes(0x1B4_F2A8u64.to_be_bytes())),
+            op: DocumentOp::Delete {
+                index: "orders".into(),
+                id: "7".into(),
+                routing: None,
+                version: Some(0x1B4_F2A8),
+                alias: None,
+            },
+        });
+        assert_eq!(doc.get("position"), None);
+        assert_eq!(doc["ordering"], json!("0000000001b4f2a8"));
+    }
+
+    #[test]
     fn a_quarantined_document_keeps_its_routing() {
         // A join child lives on its parent's shard; a replay that forgot the
         // routing would write a second copy of the document somewhere else.
@@ -2445,7 +2752,7 @@ mod tests {
             index: "shop".into(),
             doc_id: "order-7".into(),
             reason: "mapper_parsing_exception: amount".into(),
-            lsn: Lsn(0x2A),
+            position: crate::test_position(0x2A),
             op,
         };
         let upsert = rejection(DocumentOp::Upsert {
@@ -2588,7 +2895,7 @@ mod tests {
             index: "products".into(),
             doc_id: "7".into(),
             reason: "mapper_parsing_exception: embedding".into(),
-            lsn: Lsn(0x2A),
+            position: crate::test_position(0x2A),
             op: DocumentOp::Upsert {
                 index: "products".into(),
                 id: "7".into(),
@@ -2613,7 +2920,7 @@ mod tests {
             index: "events-acme".into(),
             doc_id: "7".into(),
             reason: "mapper_parsing_exception: at".into(),
-            lsn: Lsn(0x2A),
+            position: crate::test_position(0x2A),
             op: DocumentOp::Upsert {
                 index: "events-acme".into(),
                 id: "7".into(),
@@ -2719,6 +3026,8 @@ mod tests {
     /// request line (`"GET /_alias/acme-live"`) to the status and body it
     /// replies with, and the returned list records every line in the order
     /// it arrived.
+    ///
+    /// One read per request is enough: nothing sent here outgrows the buffer.
     async fn loopback_target(
         answer: fn(&str) -> (u16, &'static str),
     ) -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
@@ -2851,7 +3160,7 @@ mod tests {
         .expect("a template is recorded");
         let written = sink
             .write(vec![LsnOp {
-                lsn: Lsn(1),
+                position: crate::test_position(1),
                 op: DocumentOp::Upsert {
                     index: "events-events-live".into(),
                     id: "1".into(),
@@ -2960,7 +3269,7 @@ mod tests {
     fn an_upsert_and_a_delete() -> Vec<LsnOp> {
         vec![
             LsnOp {
-                lsn: Lsn(0x2A),
+                position: crate::test_position(0x2A),
                 op: DocumentOp::Upsert {
                     index: "users".into(),
                     id: "1".into(),
@@ -2972,7 +3281,7 @@ mod tests {
                 },
             },
             LsnOp {
-                lsn: Lsn(0x2A),
+                position: crate::test_position(0x2A),
                 op: DocumentOp::Delete {
                     index: "users".into(),
                     id: "2".into(),
@@ -2998,6 +3307,119 @@ mod tests {
     async fn a_target_nobody_asked_to_require_an_alias_sends_what_it_always_sent() {
         let lines = request_lines_of_a_write(false, an_upsert_and_a_delete()).await;
         assert_eq!(lines, vec!["POST /_bulk".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_under_the_shared_document_is_not_read() {
+        use pg2osync_core::checkpoint::{SOURCE_MYSQL, StreamId};
+        // nothing writes the shared document any more, so nothing may resume
+        // from it either, even when it holds a complete current-layout one
+        let (url, seen) = loopback_target(|line| {
+            if line.ends_with("/_doc/default") {
+                (
+                    200,
+                    r#"{"found":true,"_source":{"source":"mysql","stream":"424242",
+                        "slot_name":"424242","publication":"","position":"binlog.000001:4",
+                        "ordering":"0000000100000004","schema_version":3}}"#,
+                )
+            } else {
+                (404, r#"{"found":false}"#)
+            }
+        })
+        .await;
+        let sink = loopback_sink(url, false);
+        let stream = StreamId {
+            source: SOURCE_MYSQL.into(),
+            stream: "424242".into(),
+            publication: String::new(),
+        };
+        assert_eq!(sink.read_checkpoint(&stream).await.unwrap(), None);
+        assert_eq!(
+            lock(&seen).clone(),
+            vec![format!("GET /{META_INDEX}/_doc/mysql-424242")]
+        );
+    }
+
+    /// `_source` as 1.5.2 wrote it for MySQL server 424242.
+    const MYSQL_1X_HIT: &str = r#"{"found":true,"_source":{"source":"mysql","stream":"424242",
+        "slot_name":"424242","publication":"","position":"binlog.000004:1234;base=1099511627776",
+        "token":1116691498194,"instance_id":"","updated_at_epoch":1700000000,"schema_version":2}}"#;
+
+    #[tokio::test]
+    async fn a_1x_checkpoint_under_the_stream_document_is_read_as_text() {
+        let (url, seen) = loopback_target(|line| {
+            if line.ends_with("/_doc/mysql-424242") {
+                (200, MYSQL_1X_HIT)
+            } else {
+                (404, r#"{"found":false}"#)
+            }
+        })
+        .await;
+        let sink = loopback_sink(url, false);
+        assert_eq!(
+            sink.read_legacy_position_text(&mysql_stream())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("binlog.000004:1234;base=1099511627776")
+        );
+        assert_eq!(
+            lock(&seen).clone(),
+            vec![format!("GET /{META_INDEX}/_doc/mysql-424242")]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_1x_checkpoint_under_the_shared_document_is_read_as_text() {
+        let (url, seen) = loopback_target(|line| {
+            if line.ends_with("/_doc/default") {
+                (200, MYSQL_1X_HIT)
+            } else {
+                (404, r#"{"found":false}"#)
+            }
+        })
+        .await;
+        let sink = loopback_sink(url, false);
+        assert_eq!(
+            sink.read_legacy_position_text(&mysql_stream())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("binlog.000004:1234;base=1099511627776")
+        );
+        assert_eq!(
+            lock(&seen).clone(),
+            vec![
+                format!("GET /{META_INDEX}/_doc/mysql-424242"),
+                format!("GET /{META_INDEX}/_doc/default"),
+            ]
+        );
+        let other = pg2osync_core::checkpoint::StreamId {
+            stream: "7".into(),
+            ..mysql_stream()
+        };
+        assert_eq!(sink.read_legacy_position_text(&other).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn no_1x_checkpoint_anywhere_is_none_and_an_unreadable_one_is_an_error() {
+        let (url, _) = loopback_target(|_| (404, r#"{"found":false}"#)).await;
+        let sink = loopback_sink(url, false);
+        assert_eq!(
+            sink.read_legacy_position_text(&mysql_stream())
+                .await
+                .unwrap(),
+            None
+        );
+        // carrying on as though there were none would version below what 1.x
+        // already wrote, which is the staleness this read exists to prevent
+        let (url, _) = loopback_target(|_| (500, r#"{"error":"boom"}"#)).await;
+        let sink = loopback_sink(url, false);
+        assert!(
+            sink.read_legacy_position_text(&mysql_stream())
+                .await
+                .is_err()
+        );
     }
 }
 

@@ -688,10 +688,25 @@ WantedBy=multi-user.target
 
 ## Upgrades and rollbacks
 
-The checkpoint format is forward-compatible: a newer version reads checkpoints
-written by an older one. Rolling *back* across a format change is not
-supported — an older binary that cannot parse the checkpoint ignores it and
-starts a full initial load, which is safe but expensive.
+A newer version resumes from checkpoints in the current layout (schema v3). A
+checkpoint 1.x wrote is in an earlier layout and is not resumed from, so the
+first start after an upgrade from 1.x runs a full initial load. On MySQL that
+start still reads the 1.x checkpoint for its version generation, so the load
+writes versions above the ones a 1.x pipeline that had failed over left in the
+target. Until it has written its checkpoint, `resnapshot` and `reindex` refuse
+to run on a MySQL stream, since the generation is not settled yet. On
+PostgreSQL an initial load 1.x left unfinished carries on from where
+it stopped, and the stream resumes from the slot.
+
+Rolling *back* to 1.x is not supported, and on MySQL it can lose writes
+silently. On PostgreSQL 1.x reads the current checkpoint's LSN and resumes from
+it. On MySQL it cannot parse the current checkpoint, so it starts a full initial
+load in version generation 0. That is only expensive while the checkpoint's
+`position` in `.pg2osync_meta` has no `;base=` part. Once it has one — carried
+over from 1.x or opened by a failover — the target holds versions above
+anything generation 0 writes, and it refuses every write 1.x makes with no
+error. Going back anyway means pointing `[sync]` at fresh index names, so the
+1.x load starts on empty indexes.
 
 A stop — `SIGTERM` from `docker stop` or Kubernetes, `SIGINT` from a terminal —
 finishes the requests already sent to the target and writes a final checkpoint

@@ -421,6 +421,30 @@ open_trx=$(my "SELECT count(*) FROM information_schema.innodb_trx;")
 check "no transaction outlives the load" "$open_trx" "0"
 stop_sync
 
+# An upgrade from 1.x: its checkpoint layout is refused, so the stream starts
+# from the server's current coordinate. A 1.x load stopped between two tables
+# leaves the first marked finished and nothing yet for the next, so no table
+# reads as unfinished. A change made before the upgrade is then on neither
+# side unless the load really starts over.
+curl -s -XPUT "$OS/.pg2osync_meta/_doc/mysql-$RSID?refresh=true" -H 'Content-Type: application/json' \
+  -d "{\"source\":\"mysql\",\"stream\":\"$RSID\",\"slot_name\":\"$RSID\",\"publication\":\"\",
+       \"position\":\"binlog.000001:4\",\"token\":4,\"schema_version\":2}" > /dev/null
+curl -s -XPUT "$OS/.pg2osync_meta/_doc/$PROG?refresh=true" -H 'Content-Type: application/json' \
+  -d '{"after":["999999"],"finished":true}' > /dev/null
+my "UPDATE resume_probe SET v='changed-before-the-upgrade' WHERE id = 78;"
+skips_before=$(grep -c "sourcedb.resume_probe was fully loaded by an earlier run" "$LOG" || true)
+sync_spawn "$RCONFIG"
+for _ in $(seq 1 120); do
+  refresh
+  [ "$(os_field e2e_mysql_resume 78 v)" = "changed-before-the-upgrade" ] && break
+  sleep 0.5
+done
+check "a refused checkpoint loads again, past finished load records" \
+  "$(os_field e2e_mysql_resume 78 v)" "changed-before-the-upgrade"
+check "no table is skipped as already loaded" \
+  "$(grep -c "sourcedb.resume_probe was fully loaded by an earlier run" "$LOG" || true)" "$skips_before"
+stop_sync
+
 say "13. the load and the stream agree on every column type"
 stop_sync
 TCONFIG=$(mktemp /tmp/pg2osync-mysql-types.XXXXXX)
@@ -2039,6 +2063,113 @@ check "and it is counted as refused" \
   "$(ad_metric '^pg2osync_config_reloads_total\{source="[^"]*",result="refused"\}')" "1"
 check "the process survived that too" "$(kill -0 "$ADPID" 2> /dev/null && echo alive)" "alive"
 stop_sync
+
+say "29. an upgrade from 1.x keeps the version generation 1.x had opened"
+# A 1.x pipeline that had failed over left versions this far up in the target.
+# Its checkpoint is not resumed from, but loading under base 0 would have every
+# write refused as older than what is indexed, and the index would go stale
+# without an error.
+LEGACY_BASE=$((1 << 45))
+my "TRUNCATE shop_users;"
+my "INSERT INTO shop_users (id,name,email) VALUES (1,'upgraded','u@test.io');"
+curl -s -XDELETE "$OS/e2e_mysql_users?ignore_unavailable=true" > /dev/null
+# the document 1.5.2 kept for this stream, in its own layout: a numeric token
+# and the base riding in the position text
+curl -s -XPUT "$OS/.pg2osync_meta/_doc/mysql-990001?refresh=true" \
+  -H 'Content-Type: application/json' -d "{
+    \"source\": \"mysql\", \"stream\": \"990001\", \"slot_name\": \"990001\",
+    \"publication\": \"\", \"position\": \"binlog.000001:4;base=$LEGACY_BASE\",
+    \"token\": $((LEGACY_BASE + (1 << 32) + 4)), \"instance_id\": \"\",
+    \"updated_at_epoch\": 1700000000, \"schema_version\": 2}" > /dev/null
+start_sync
+await_count e2e_mysql_users 1
+loaded=$(curl -s "$OS/e2e_mysql_users/_doc/1" | jqf "d.get('_version', 0)")
+if [ "$loaded" -gt "$LEGACY_BASE" ]; then
+  ok "the load versions above the 1.x generation ($loaded)"
+else
+  bad "the load versioned below the 1.x generation ($loaded, base $LEGACY_BASE)"
+fi
+upgraded=$(curl -s "$OS/.pg2osync_meta/_doc/mysql-990001" | jqf "d['_source'].get('position', '')")
+case "$upgraded" in
+  *";base=$LEGACY_BASE"*) ok "the first current checkpoint carries the generation on" ;;
+  *) bad "the first current checkpoint dropped the generation ($upgraded)" ;;
+esac
+check "and replaced the 1.x layout" \
+  "$(curl -s "$OS/.pg2osync_meta/_doc/mysql-990001" | jqf "d['_source'].get('schema_version')")" "3"
+my "UPDATE shop_users SET name='streamed-after-upgrade' WHERE id=1;"
+synced
+check "a streamed change lands over the loaded document" \
+  "$(os_field e2e_mysql_users 1 name)" "streamed-after-upgrade"
+stop_sync
+
+say "30. a re-snapshot before the first run after an upgrade waits for that run"
+# Run before any v3 pipeline has started, the re-snapshot finds only the 1.x
+# checkpoint, and the generation carried over from it is settled against where
+# the server is when it is asked. Settled here, it could differ from the one the
+# run settles next, and the target would refuse the stream's changes to every
+# document written under the higher one.
+LEGACY_VERSION=$((LEGACY_BASE + (1 << 32) + 4))
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/mysql-990001?refresh=true" > /dev/null
+curl -s -XPUT "$OS/.pg2osync_meta/_doc/mysql-990001?refresh=true" \
+  -H 'Content-Type: application/json' -d "{
+    \"source\": \"mysql\", \"stream\": \"990001\", \"slot_name\": \"990001\",
+    \"publication\": \"\", \"position\": \"binlog.000001:4;base=$LEGACY_BASE\",
+    \"token\": $LEGACY_VERSION, \"instance_id\": \"\",
+    \"updated_at_epoch\": 1700000000, \"schema_version\": 2}" > /dev/null
+# What 1.x had indexed, at the version 1.x gave it: far above anything base 0
+# reaches, and below what the carried-over generation writes. Section 29 left
+# the document higher than that, so it starts over from an empty index.
+curl -s -XDELETE "$OS/e2e_mysql_users?ignore_unavailable=true" > /dev/null
+curl -s -XPUT "$OS/e2e_mysql_users/_doc/1?version=$LEGACY_VERSION&version_type=external&refresh=true" \
+  -H 'Content-Type: application/json' -d '{"id":1,"name":"indexed-by-1x"}' > /dev/null
+check "1.x's document is in place" "$(os_field e2e_mysql_users 1 name)" "indexed-by-1x"
+my "UPDATE shop_users SET name='loaded-after-upgrade' WHERE id=1;"
+if $BIN resnapshot -c "$CONFIG" --table sourcedb.shop_users >> "$LOG" 2>&1; then
+  bad "a re-snapshot with only the 1.x checkpoint was accepted"
+else
+  ok "a re-snapshot with only the 1.x checkpoint is refused"
+fi
+if tail -n 20 "$LOG" | grep -qF 'start `pg2osync run` first'; then
+  ok "and the refusal says to start the pipeline first"
+else
+  bad "the refusal does not say to start the pipeline first"
+fi
+check "it wrote nothing" "$(os_field e2e_mysql_users 1 name)" "indexed-by-1x"
+# A rebuild reads through the same load, so it waits for the same run; it has
+# to say so before it creates its fresh index, or every retry leaves an empty
+# one behind.
+refusal=$($BIN reindex -c "$CONFIG" --table sourcedb.shop_users --alias e2e_mysql_users_live 2>&1 || true)
+echo "$refusal" >> "$LOG"
+if echo "$refusal" | grep -qF 'start `pg2osync run` first'; then
+  ok "a rebuild with only the 1.x checkpoint is refused the same way"
+else
+  bad "a rebuild with only the 1.x checkpoint was not refused ($refusal)"
+fi
+check "and it created no index to fill" \
+  "$(curl -s "$OS/_cat/indices/e2e_mysql_users-*?h=index" | wc -l | tr -d ' ')" "0"
+check "and left the 1.x checkpoint alone" \
+  "$(curl -s "$OS/.pg2osync_meta/_doc/mysql-990001" | jqf "d['_source'].get('schema_version')")" "2"
+start_sync
+for _ in $(seq 1 60); do
+  [ "$(os_field e2e_mysql_users 1 name)" = "loaded-after-upgrade" ] && break
+  sleep 0.5
+done
+check "the run's initial load read the table instead" \
+  "$(os_field e2e_mysql_users 1 name)" "loaded-after-upgrade"
+stop_sync
+# Once the run has written its checkpoint the generation is settled, and a
+# re-snapshot versions in it.
+my "UPDATE shop_users SET name='resnapshotted-after-upgrade' WHERE id=1;"
+$BIN resnapshot -c "$CONFIG" --table sourcedb.shop_users >> "$LOG" 2>&1
+refresh
+check "the re-snapshot replaced what 1.x had indexed" \
+  "$(os_field e2e_mysql_users 1 name)" "resnapshotted-after-upgrade"
+resnapshotted=$(curl -s "$OS/e2e_mysql_users/_doc/1" | jqf "d.get('_version', 0)")
+if [ "$resnapshotted" -gt "$LEGACY_VERSION" ]; then
+  ok "it versioned above the 1.x generation ($resnapshotted)"
+else
+  bad "it versioned below the 1.x generation ($resnapshotted, 1.x at $LEGACY_VERSION)"
+fi
 
 
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"

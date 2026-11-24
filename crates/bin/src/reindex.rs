@@ -365,6 +365,11 @@ pub async fn run_for(
 
     let sink = run::build_sink(cfg, target_password)?;
     refuse_a_live_stream(cfg, source_url, sink.as_ref()).await?;
+    // The load asks the same question later, but by then the fresh index
+    // exists and a refusal would leave it behind empty, one per retry.
+    if cfg.source.flavor == "mysql" {
+        resnapshot::mysql_version_base(sink.as_ref(), &cfg.stream_id()).await?;
+    }
     if sink.index_exists(&fresh).await? {
         bail!(
             "{fresh} already exists; a rebuild will not write into an index it did not create. \

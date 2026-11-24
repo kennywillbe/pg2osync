@@ -2,7 +2,7 @@
 //! lifecycle, replica-identity and primary-key discovery.
 
 use crate::error::{Context as _, Result, SourceError};
-use pg2osync_core::Lsn;
+use crate::lsn::Lsn;
 use tokio_postgres::Client;
 
 pub struct TableCatalogInfo {
@@ -739,7 +739,7 @@ pub async fn confirmed_flush_lsn(client: &Client, slot_name: &str) -> Result<Opt
         .catalog_ctx(|| format!("cannot read replication slot {slot_name}"))?;
     // a freshly created slot has a NULL confirmed_flush_lsn until first use
     match row.and_then(|r| r.get::<_, Option<String>>(0)) {
-        Some(text) => Ok(Some(text.parse().map_err(pg2osync_core::CoreError::from)?)),
+        Some(text) => Ok(Some(text.parse::<Lsn>()?)),
         None => Ok(None),
     }
 }

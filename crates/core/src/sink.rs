@@ -7,13 +7,16 @@
 
 use crate::checkpoint::Checkpoint;
 use crate::error::CoreError;
-use crate::lsn::Lsn;
+use crate::position::Position;
 use serde_json::Value;
 
 /// A document operation paired with the source position it came from.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LsnOp {
-    pub lsn: Lsn,
+    /// `None` for an operation that may not be acknowledged: a row with no
+    /// position of its own, or one inside a transaction whose commit position
+    /// rides on its last operation only.
+    pub position: Option<Position>,
     pub op: DocumentOp,
 }
 
@@ -32,7 +35,7 @@ pub enum DocumentOp {
         /// no position to offer — poll mode, and the initial load until it
         /// carries one.
         ///
-        /// It is deliberately separate from `LsnOp::lsn`: that one is the
+        /// It is deliberately separate from `LsnOp::position`: that one is the
         /// position that may be acknowledged, and an initial-load row must
         /// never advance it while still needing a version.
         version: Option<u64>,
@@ -83,8 +86,9 @@ pub enum DocumentOp {
 /// What came back from a `write`: how far it got, and what the target refused.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SinkAck {
-    /// Highest LSN known to be durably written.
-    pub max_lsn: Lsn,
+    /// The batch's last position, once it is durably written; `None` when the
+    /// batch ended on an operation that may not be acknowledged.
+    pub max_position: Option<Position>,
     /// Documents the target will never accept. Reported rather than raised so
     /// the caller can decide between halting and quarantining — and so that
     /// *every* rejection in a batch is visible, not just the first.
@@ -93,9 +97,9 @@ pub struct SinkAck {
 
 impl SinkAck {
     /// The ordinary outcome: everything in the batch was accepted.
-    pub fn written(max_lsn: Lsn) -> Self {
+    pub fn written(max_position: Option<Position>) -> Self {
         Self {
-            max_lsn,
+            max_position,
             rejected: Vec::new(),
         }
     }
@@ -108,9 +112,10 @@ pub struct Rejection {
     pub index: String,
     pub doc_id: String,
     pub reason: String,
-    /// Where in the source this document came from. Recorded so a quarantined
-    /// document can still be accounted for against a position.
-    pub lsn: Lsn,
+    /// Where in the source this document came from, when it came from a
+    /// position at all. Recorded so a quarantined document can still be
+    /// accounted for against one.
+    pub position: Option<Position>,
     /// The operation itself, which is what makes a replay possible at all.
     pub op: DocumentOp,
 }
@@ -217,8 +222,8 @@ pub trait Sink: Send + Sync {
         ids: &[(String, Option<String>)],
     ) -> Result<Vec<Option<Value>>, CoreError>;
 
-    /// Write a batch. On success the ack reports the highest LSN in the batch;
-    /// the engine may only checkpoint up to that LSN.
+    /// Write a batch. On success the ack reports the batch's last position;
+    /// the engine may only checkpoint up to that position.
     async fn write(&self, batch: Vec<LsnOp>) -> Result<SinkAck, CoreError>;
 
     /// Clear all documents of an index after a source-side TRUNCATE.
@@ -495,6 +500,20 @@ pub trait Sink: Send + Sync {
         &self,
         stream: &crate::checkpoint::StreamId,
     ) -> Result<Option<Checkpoint>, CoreError>;
+
+    /// The raw position text of a checkpoint 1.x left for `stream`, wherever
+    /// 1.x kept it; `None` when there is none, or only a current one.
+    ///
+    /// Never resumed from: 1.x ordered positions by one source's integer. It is
+    /// read so a source can carry over what must not go backwards — a MySQL
+    /// version generation — before the first current checkpoint replaces it.
+    /// The default, for a target 1.x never stored a checkpoint in, has none.
+    async fn read_legacy_position_text(
+        &self,
+        _stream: &crate::checkpoint::StreamId,
+    ) -> Result<Option<String>, CoreError> {
+        Ok(None)
+    }
 
     /// Cheap health probe for /status and reconnect logic.
     async fn health(&self) -> Result<Health, CoreError>;

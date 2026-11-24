@@ -63,6 +63,9 @@ pub enum SourceError {
 
     #[error(transparent)]
     Core(#[from] pg2osync_core::CoreError),
+
+    #[error(transparent)]
+    InvalidLsn(#[from] crate::lsn::InvalidLsn),
 }
 
 impl SourceError {

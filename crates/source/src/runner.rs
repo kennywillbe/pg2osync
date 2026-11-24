@@ -6,8 +6,8 @@
 
 use crate::catalog;
 use crate::error::{Context as _, Result, SourceError};
-use crate::transport::to_core_lsn;
-use pg2osync_core::Lsn;
+use crate::lsn::Lsn;
+use crate::transport::{stream_position, to_core_lsn};
 use pg2osync_core::event::ChangeEvent;
 use std::collections::HashMap;
 
@@ -50,7 +50,28 @@ pub struct WalSourceConfig {
     /// checkpoint task. Feedback to PostgreSQL is clamped to this: acking
     /// beyond it lets PG recycle WAL for events we have not indexed yet,
     /// which loses data on crash-restart.
-    pub durable: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    pub durable: Option<tokio::sync::watch::Receiver<Option<pg2osync_core::Position>>>,
+}
+
+/// The LSN a standby status may report for a stream that has read to `wal_end`.
+///
+/// Fails closed: a durable position that is missing or does not decode to an
+/// LSN reports `0/0`, since over-acknowledging loses data and under-acknowledging
+/// only retains WAL until the next checkpoint. Only a stream nobody checkpoints
+/// (`durable` is `None`) acknowledges what it read.
+pub(crate) fn feedback_lsn(
+    wal_end: Lsn,
+    durable: Option<&tokio::sync::watch::Receiver<Option<pg2osync_core::Position>>>,
+) -> Lsn {
+    let Some(durable) = durable else {
+        return wal_end;
+    };
+    let safe = durable
+        .borrow()
+        .as_ref()
+        .and_then(Lsn::from_position)
+        .unwrap_or(Lsn(0));
+    wal_end.min(safe)
 }
 
 pub struct WalSource {
@@ -195,7 +216,7 @@ impl WalSource {
                     // by the position it becomes visible at
                     tx.send(ChangeEvent::Transaction(
                         pg2osync_core::event::TransactionBoundary::Begin {
-                            lsn: to_core_lsn(final_lsn),
+                            position: to_core_lsn(final_lsn).to_position(),
                         },
                     ))
                     .await
@@ -219,7 +240,7 @@ impl WalSource {
                     // caller waiting for its own write compares like with like.
                     tx.send(ChangeEvent::Transaction(
                         pg2osync_core::event::TransactionBoundary::Commit {
-                            lsn: to_core_lsn(end_lsn),
+                            position: stream_position(end_lsn),
                             commit_ts_micros: commit_time_micros,
                         },
                     ))
@@ -317,7 +338,7 @@ impl WalSource {
                 ReplicationEvent::Message { lsn, .. } if !in_transaction => {
                     tx.send(ChangeEvent::Transaction(
                         pg2osync_core::event::TransactionBoundary::Commit {
-                            lsn: to_core_lsn(lsn),
+                            position: stream_position(lsn),
                             commit_ts_micros: 0,
                         },
                     ))
@@ -333,7 +354,7 @@ impl WalSource {
                     if !in_transaction {
                         tx.send(ChangeEvent::Transaction(
                             pg2osync_core::event::TransactionBoundary::Commit {
-                                lsn: to_core_lsn(wal_end),
+                                position: stream_position(wal_end),
                                 commit_ts_micros: 0,
                             },
                         ))
@@ -343,15 +364,8 @@ impl WalSource {
                     // clamp feedback to the durable position: acknowledging
                     // ahead of it would allow PG to discard WAL we cannot
                     // recover from after a crash
-                    let safe = self
-                        .cfg
-                        .durable
-                        .as_ref()
-                        .map(|a| a.load(std::sync::atomic::Ordering::SeqCst))
-                        .unwrap_or(u64::MAX);
-                    client.update_applied_lsn(pgwire_replication::Lsn(
-                        to_core_lsn(wal_end).0.min(safe),
-                    ));
+                    let safe = feedback_lsn(to_core_lsn(wal_end), self.cfg.durable.as_ref());
+                    client.update_applied_lsn(pgwire_replication::Lsn(safe.0));
                 }
                 other => {
                     tracing::debug!(target: "pg2osync::source", "ignoring event {other:?}");
@@ -750,6 +764,37 @@ mod tests {
             parent_pk_columns: HashMap::new(),
             durable: None,
         })
+    }
+
+    #[test]
+    fn feedback_never_reports_past_the_durable_position() {
+        let wal_end: Lsn = "1/2000".parse().unwrap();
+        let (durable, rx) = tokio::sync::watch::channel(None);
+        assert_eq!(
+            feedback_lsn(wal_end, Some(&rx)),
+            Lsn(0),
+            "nothing is durable yet, so nothing may be released"
+        );
+        let behind: Lsn = "1/1000".parse().unwrap();
+        durable.send_replace(Some(behind.to_position()));
+        assert_eq!(feedback_lsn(wal_end, Some(&rx)), behind);
+        durable.send_replace(Some("2/0".parse::<Lsn>().unwrap().to_position()));
+        assert_eq!(
+            feedback_lsn(wal_end, Some(&rx)),
+            wal_end,
+            "a checkpoint ahead of the stream releases no more than was received"
+        );
+        durable.send_replace(Some(pg2osync_core::Position::from_bytes(vec![0xFF; 12])));
+        assert_eq!(
+            feedback_lsn(wal_end, Some(&rx)),
+            Lsn(0),
+            "bytes that are no LSN must not read as permission to release everything"
+        );
+        assert_eq!(
+            feedback_lsn(wal_end, None),
+            wal_end,
+            "only a stream nobody checkpoints acknowledges what it read"
+        );
     }
 
     #[test]
