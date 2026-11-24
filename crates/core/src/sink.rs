@@ -5,7 +5,7 @@
 //! - at-least-once delivery of every `LsnOp` accepted into `write`
 //! - acks only for operations that are durably visible to search
 
-use crate::checkpoint::Checkpoint;
+use crate::checkpoint::{Checkpoint, Lease};
 use crate::error::CoreError;
 use crate::position::Position;
 use serde_json::Value;
@@ -500,6 +500,25 @@ pub trait Sink: Send + Sync {
         &self,
         stream: &crate::checkpoint::StreamId,
     ) -> Result<Option<Checkpoint>, CoreError>;
+
+    /// Record that a pipeline is running `lease.stream`, replacing whatever
+    /// lease that stream had.
+    ///
+    /// Kept wherever the checkpoint is kept, under an id of its own: a
+    /// command that must not run beside a live pipeline reads it from the same
+    /// place it reads the checkpoint, and neither write may replace the other.
+    /// Required rather than defaulted because a default that stored nothing
+    /// would let `reindex` switch an alias away from a running pipeline.
+    async fn write_lease(&self, lease: &Lease) -> Result<(), CoreError>;
+
+    /// The lease last written for `stream`; `None` when there is none.
+    async fn read_lease(
+        &self,
+        stream: &crate::checkpoint::StreamId,
+    ) -> Result<Option<Lease>, CoreError>;
+
+    /// Remove `stream`'s lease, on a clean shutdown; absent is success.
+    async fn clear_lease(&self, stream: &crate::checkpoint::StreamId) -> Result<(), CoreError>;
 
     /// The raw position text of a checkpoint 1.x left for `stream`, wherever
     /// 1.x kept it; `None` when there is none, or only a current one.

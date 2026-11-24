@@ -15,7 +15,8 @@ state_dir = "/var/lib/pg2osync"    # checkpoint fallback directory
 
 Meilisearch has no arbitrary document storage, so the hidden `.pg2osync_meta`
 checkpoint index can't live there. pg2osync persists its checkpoint to a local
-JSON file in `state_dir` instead.
+JSON file in `state_dir` instead, and the lease a running pipeline refreshes
+beside it as `lease-<source>-<stream>.json`.
 
 Operational consequences:
 
@@ -65,9 +66,10 @@ pg2osync reindex -c pg2osync.toml --table public.users --alias users
   back to undo the rebuild — and `--drop-old` deletes it instead.
 - **No config edit follows,** unlike the other targets: the section's `index`
   never changed, so the only step left is starting the pipeline again.
-- **Stop the pipeline first;** the command refuses when it sees one running,
-  but not every running pipeline shows (see
-  [Rebuilding an index](../configuration.md#rebuilding-an-index)). The
+- **Stop the pipeline first;** the command refuses when it sees one running
+  (see [Rebuilding an index](../configuration.md#rebuilding-an-index)). The
+  lease that shows it is a file beside the checkpoint in `state_dir`, so run
+  the command where it can read that directory, as `status` has to. The
   checkpoint file in `state_dir` does not move, so the restart replays
   everything committed since the rebuild started, which is what proves the
   contents — the count only proves how many.

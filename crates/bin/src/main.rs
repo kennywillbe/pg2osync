@@ -3,6 +3,7 @@
 
 mod backfill;
 mod config;
+mod lease;
 mod reconcile;
 mod reindex;
 mod reload;
@@ -1139,6 +1140,13 @@ async fn switch_alias(cfg: config::AppConfig, alias: &str) -> Result<()> {
     let templated = templated_switch(&cfg, alias)?;
     let secrets = cfg.resolve_secrets()?;
     let sink = run::build_sink(&cfg, secrets.target_password)?;
+    // A pipeline still running this config's stream may be one started from
+    // the config before the rebuild, writing the index the alias leaves; its
+    // checkpoint then advances past what it wrote there, so a restart against
+    // the index the alias now names never replays it. The lease cannot tell
+    // that pipeline from one already writing the index switched to, so both
+    // are refused and the switch is made with this stream stopped.
+    lease::refuse_a_running_pipeline(sink.as_ref(), &cfg.stream_id()).await?;
     if let Some((key, tbl)) = templated {
         let target = tbl
             .index_target(key, &run::pk_columns_for(tbl))
@@ -2667,6 +2675,10 @@ async fn status_of(cfg: config::AppConfig, max_retained_mb: Option<u64>) -> Resu
         ),
         None => println!("checkpoint: none (a run will start with a full initial load)"),
     }
+    println!(
+        "{}",
+        lease::status_line(sink.read_lease(&cfg.stream_id()).await?.as_ref())
+    );
 
     if cfg.source.flavor == "mysql" {
         let source = mysql_source(&cfg, &secrets.source_url)?;

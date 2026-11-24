@@ -196,9 +196,12 @@ re-index](../operations.md#zero-downtime-re-index).
    documents whose row is gone, which — on an index Logstash filled — is
    exactly the deletes it could never see. Run it caught up, or rows still on
    their way look like orphans.
-6. **Move the alias.** `pg2osync switch-alias -c pg2osync.toml --alias users`
-   is one atomic request; a reader resolving the alias never sees it point
-   nowhere.
+6. **Move the alias.** Stop `pg2osync run`, then
+   `pg2osync switch-alias -c pg2osync.toml --alias users` is one atomic
+   request; a reader resolving the alias never sees it point nowhere. Start
+   `pg2osync run` again: it resumes from its checkpoint. The switch refuses
+   while the pipeline runs, because it cannot tell one writing the index the
+   alias moves to from one writing the index it leaves.
 7. **Stop the Logstash pipeline,** and keep the old index until you are sure —
    it is the rollback, one alias flip away.
 

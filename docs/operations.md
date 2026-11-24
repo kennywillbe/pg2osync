@@ -187,13 +187,13 @@ needs no flag at all.
 | `validate` | Config, connectivity and server prerequisites, one line each |
 | `run` | Initial load plus continuous streaming (main mode) |
 | `bootstrap` | Create the slot, publication and target indices, then exit |
-| `status` | Checkpoint position versus the source's, and what each slot retains |
+| `status` | Checkpoint position versus the source's, the running pipeline's lease, and what each slot retains |
 | `setup-sql` | Print the SQL a DBA needs, derived from your config |
 | `resnapshot --table T` | Read one table again into its index, without reloading the rest |
 | `reconcile` | Name index documents whose row is gone; `--delete` removes them (PostgreSQL sources only) |
 | `rejects` | What the target refused, and `--replay` to submit it again |
 | `reindex --table T --alias A` | Rebuild the table's index under a fresh name and flip the alias onto it (a swap of the two names on Meilisearch, which has no aliases) |
-| `switch-alias --alias A` | Point an alias at this config's index, atomically |
+| `switch-alias --alias A` | Point an alias at this config's index, atomically; refused while this stream's pipeline runs |
 | `drop-slot` | Drop the slot and publication when decommissioning |
 
 ```sh
@@ -204,7 +204,7 @@ pg2osync validate -c pg2osync.toml   # config, connectivity, server settings
 pg2osync status   -c pg2osync.toml   # checkpoint vs the source's position
 pg2osync status   -c pg2osync.toml --max-retained-mb 10240   # exit 1 over 10 GB
 pg2osync bootstrap -c pg2osync.toml  # create slot/publication/indices, then exit
-pg2osync switch-alias -c pg2osync.toml --alias users   # point an alias here
+pg2osync switch-alias -c pg2osync.toml --alias users   # point an alias here, pipeline stopped
 pg2osync drop-slot -c pg2osync.toml  # teardown; --publication drops that too
 
 pg2osync validate -c pg2osync.toml && kill -HUP "$(pidof pg2osync)"   # reload
@@ -235,6 +235,7 @@ gets a reload.
 
 ```
 checkpoint: source=postgres stream=pg2osync position=0/C174158
+lease: held by pod-a pid 1, refresh 812 every 5000ms, last at epoch 1764000000 by its own clock (a pipeline that stopped without clearing it leaves it here unchanged)
 slot pg2osync (configured): active=true retained_wal=4 kB
 slot pg2osync_old: active=false retained_wal=3 GB
 
@@ -619,11 +620,16 @@ acceptable — a re-snapshot into the new index name, which needs no second slot
 ```sh
 # point a copy of the config at users_v2, then fill it from the source
 pg2osync resnapshot -c users-v2.toml --table public.users
+# stop the pipeline, move the alias, start it again on users-v2.toml
 pg2osync switch-alias -c users-v2.toml --alias users
+pg2osync run -c users-v2.toml
 ```
 
-That leaves the new index static from the moment the re-snapshot finished, so it
-suits a one-off rebuild rather than a live cutover.
+That leaves the new index without the changes the pipeline wrote to `users`
+between the re-snapshot and the stop, so it suits a one-off rebuild rather than
+a live cutover. `switch-alias` refuses while the pipeline still runs: its
+checkpoint would move past what it keeps writing to `users`, and the restart on
+`users_v2` would never replay it.
 
 Or, when the pipeline can be stopped for the length of a load, the same rebuild
 as one command:
@@ -634,14 +640,16 @@ pg2osync reindex -c pg2osync.toml --table public.users --alias users
 
 It builds `users-<unix seconds>` from the section's `mapping_file`, checks what
 it wrote against the source's row count, and moves the alias in one atomic
-request. It refuses to run while the stream is live, and that refusal is the
-point: the fresh index is one the stream is not writing to, so a row that
+request. It refuses to run while the stream is live — an idle pipeline too,
+which it sees by the lease `run` refreshes beside the checkpoint, watched for
+twelve seconds before the load and again before the switch — and that refusal
+is the point: the fresh index is one the stream is not writing to, so a row that
 changed during the load would have nothing there to lose to. The checkpoint
 never moves, so setting `index` to the new name and starting the pipeline again
 replays everything committed since. The old index is kept unless `--drop-old`
 says otherwise — it is the rollback, one alias flip away.
 
-For a live cutover with no freshness gap at all:
+For a live cutover with a freshness gap of only seconds:
 
 ```sh
 # 1. Copy the config. Change `index` to users_v2 and `slot_name` to a new
@@ -652,9 +660,12 @@ pg2osync run -c users-v2.toml
 # 3. Wait for it to catch up — an exit code rather than a metric to watch.
 pg2osync status -c users-v2.toml --caught-up --timeout 300
 
-# 4. Move the alias. This is one atomic request: a reader resolving it never
-#    sees a moment where it points nowhere.
+# 4. Stop it, move the alias and start it again. The switch is one atomic
+#    request: a reader resolving it never sees a moment where it points
+#    nowhere. switch-alias refuses while users-v2's own pipeline runs, so it is
+#    stopped for those seconds and resumes from its checkpoint.
 pg2osync switch-alias -c users-v2.toml --alias users
+pg2osync run -c users-v2.toml
 
 # 5. Stop the old instance, then drop its slot.
 pg2osync drop-slot -c users-v1.toml

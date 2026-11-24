@@ -14,7 +14,7 @@ use opensearch::http::transport::{SingleNodeConnectionPool, TransportBuilder};
 use opensearch::ingest::IngestGetPipelineParts;
 use opensearch::params::{ExpandWildcards, VersionType};
 use opensearch::{BulkOperation, BulkParts, GetParts, IndexParts, OpenSearch};
-use pg2osync_core::checkpoint::Checkpoint;
+use pg2osync_core::checkpoint::{Checkpoint, Lease};
 use pg2osync_core::error::CoreError;
 use pg2osync_core::position::Position;
 use pg2osync_core::sink::{
@@ -96,6 +96,46 @@ pub fn checkpoint_from_doc(src: &Value) -> Option<Checkpoint> {
         stream,
         ordering,
         position,
+    })
+}
+
+/// Where one stream's lease lives, beside its checkpoint. The prefix keeps it
+/// from ever being a checkpoint's id, which always starts with the source.
+pub fn lease_doc_id(stream: &pg2osync_core::checkpoint::StreamId) -> String {
+    format!("lease-{}", checkpoint_doc_id(stream))
+}
+
+/// Serialize a lease into its stored document form.
+///
+/// The shared fields carry the checkpoint document's names and types, because
+/// a search target maps one meta index for both, and a field mapped as text by
+/// one and as a number by the other would refuse whichever came second.
+pub fn lease_doc(lease: &Lease) -> Value {
+    json!({
+        "source": lease.stream.source,
+        "stream": lease.stream.stream,
+        "publication": lease.stream.publication,
+        "lease_run": lease.run,
+        "lease_counter": lease.counter,
+        "lease_interval_ms": lease.interval_ms,
+        "instance_id": lease.holder,
+        "updated_at_epoch": lease.refreshed_at_epoch,
+    })
+}
+
+/// Parse a stored lease document, or `None` for anything that is not one.
+pub fn lease_from_doc(src: &Value) -> Option<Lease> {
+    Some(Lease {
+        stream: pg2osync_core::checkpoint::StreamId {
+            source: src["source"].as_str()?.to_string(),
+            stream: src["stream"].as_str()?.to_string(),
+            publication: src["publication"].as_str().unwrap_or_default().to_string(),
+        },
+        run: src["lease_run"].as_str()?.to_string(),
+        counter: src["lease_counter"].as_u64()?,
+        interval_ms: src["lease_interval_ms"].as_u64()?,
+        holder: src["instance_id"].as_str().unwrap_or_default().to_string(),
+        refreshed_at_epoch: src["updated_at_epoch"].as_u64().unwrap_or_default(),
     })
 }
 
@@ -2056,6 +2096,63 @@ impl Sink for OpenSearchSink {
         Ok(checkpoint_from_doc(&body["_source"]))
     }
 
+    async fn write_lease(&self, lease: &Lease) -> Result<(), CoreError> {
+        self.ensure_meta_index().await?;
+        let doc_id = crate::lease_doc_id(&lease.stream);
+        let resp = self
+            .client
+            .index(IndexParts::IndexId(META_INDEX, &doc_id))
+            .body(crate::lease_doc(lease))
+            .send()
+            .await
+            .map_err(http_err)?;
+        check_status(resp, "write lease").await
+    }
+
+    async fn read_lease(
+        &self,
+        stream: &pg2osync_core::checkpoint::StreamId,
+    ) -> Result<Option<Lease>, CoreError> {
+        let doc_id = crate::lease_doc_id(stream);
+        let resp = self
+            .client
+            .get(GetParts::IndexId(META_INDEX, &doc_id))
+            .send()
+            .await
+            .map_err(http_err)?;
+        if resp.status_code().as_u16() == 404 {
+            return Ok(None);
+        }
+        if !resp.status_code().is_success() {
+            return Err(CoreError::Sink(format!(
+                "read lease: {}",
+                resp.status_code()
+            )));
+        }
+        let body: Value = resp
+            .json()
+            .await
+            .map_err(|e| CoreError::Sink(e.to_string()))?;
+        Ok(crate::lease_from_doc(&body["_source"]))
+    }
+
+    async fn clear_lease(
+        &self,
+        stream: &pg2osync_core::checkpoint::StreamId,
+    ) -> Result<(), CoreError> {
+        let doc_id = crate::lease_doc_id(stream);
+        let resp = self
+            .client
+            .delete(opensearch::DeleteParts::IndexId(META_INDEX, &doc_id))
+            .send()
+            .await
+            .map_err(http_err)?;
+        if resp.status_code().as_u16() == 404 {
+            return Ok(());
+        }
+        check_status(resp, "clear lease").await
+    }
+
     async fn read_legacy_position_text(
         &self,
         stream: &pg2osync_core::checkpoint::StreamId,
@@ -2381,6 +2478,31 @@ mod tests {
             ordering: Position::from_bytes(0x1B4_F2A8u64.to_be_bytes()),
             position: "0/1B4F2A8".into(),
         }
+    }
+
+    #[test]
+    fn lease_documents_round_trip_and_are_never_read_as_a_checkpoint() {
+        let lease = Lease {
+            stream: checkpoint().stream,
+            run: "1a-2b-0".into(),
+            counter: 41,
+            interval_ms: 5_000,
+            holder: "pod-a pid 7".into(),
+            refreshed_at_epoch: 1_700_000_000,
+        };
+        let doc = lease_doc(&lease);
+        assert_eq!(lease_from_doc(&doc), Some(lease.clone()));
+        assert_eq!(checkpoint_from_doc(&doc), None);
+        assert_eq!(lease_from_doc(&checkpoint_doc(&checkpoint())), None);
+        assert_eq!(legacy_position_text(&doc, &lease.stream), None);
+    }
+
+    #[test]
+    fn a_lease_id_is_never_a_checkpoint_id() {
+        let stream = checkpoint().stream;
+        assert_eq!(lease_doc_id(&stream), "lease-postgres-pg2osync");
+        assert_ne!(lease_doc_id(&stream), checkpoint_doc_id(&stream));
+        assert_ne!(lease_doc_id(&stream), LEGACY_CHECKPOINT_DOC_ID);
     }
 
     #[test]

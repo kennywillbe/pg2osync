@@ -40,3 +40,6 @@ opentelemetry-otlp = { version = "0.33.1", default-features = false, features = 
 futures = "0.3.34"
 bytes = "1.12.1"
 url = "2.5.8"
+
+[dev-dependencies]
+async-trait.workspace = true

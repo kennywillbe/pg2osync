@@ -368,8 +368,9 @@ const WHY_POLL: &str = "the poll query is built when a streaming attempt starts 
                         it";
 
 const WHY_ALIAS: &str = "the alias is rendered by the index target the pipeline built when it \
-                         started, so the running value is kept — restart to change it, then run \
-                         switch-alias so the indices that already exist carry it too";
+                         started, so the running value is kept — stop the pipeline, run \
+                         switch-alias so the indices that already exist carry it too (it refuses \
+                         while the pipeline runs), then start it again";
 
 /// What a reload of `new` over the running `old` may and may not do.
 pub fn classify(old: &AppConfig, new: &AppConfig) -> Plan {
@@ -839,6 +840,12 @@ table = "public.users"
         let refusal = &plan.refusals[0];
         assert!(refusal.contains("[sync.users] alias changed"), "{refusal}");
         assert!(refusal.contains("switch-alias"), "{refusal}");
+        // switch-alias refuses a stream whose lease moves, so a hint to run it
+        // beside the restarted pipeline would send the operator into a refusal
+        assert!(
+            refusal.contains("stop the pipeline, run switch-alias"),
+            "{refusal}"
+        );
         assert!(!refusal.contains("reindex"), "{refusal}");
     }
 

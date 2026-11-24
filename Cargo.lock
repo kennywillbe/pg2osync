@@ -2164,6 +2164,7 @@ name = "pg2osync"
 version = "1.5.2"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bytes",
  "clap",
  "futures",

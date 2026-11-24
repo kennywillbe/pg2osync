@@ -578,6 +578,25 @@ mod tests {
         {
             Ok(None)
         }
+        async fn write_lease(
+            &self,
+            _lease: &pg2osync_core::checkpoint::Lease,
+        ) -> Result<(), pg2osync_core::error::CoreError> {
+            Ok(())
+        }
+        async fn read_lease(
+            &self,
+            _stream: &pg2osync_core::checkpoint::StreamId,
+        ) -> Result<Option<pg2osync_core::checkpoint::Lease>, pg2osync_core::error::CoreError>
+        {
+            Ok(None)
+        }
+        async fn clear_lease(
+            &self,
+            _stream: &pg2osync_core::checkpoint::StreamId,
+        ) -> Result<(), pg2osync_core::error::CoreError> {
+            Ok(())
+        }
         async fn health(
             &self,
         ) -> Result<pg2osync_core::sink::Health, pg2osync_core::error::CoreError> {

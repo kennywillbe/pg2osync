@@ -309,10 +309,15 @@ time it sees one, because an index dropped while the pipeline runs (an expired
 month, a removed tenant) is missing again, and the next write would have the
 target auto-create it bare. That costs one `HEAD` per templated index per
 batch. A drop that lands between that look and the bulk still leaves a bare
-index: `switch-alias` gives it its alias once a row in it renders one, but
-not its mapping, and an empty one is dropped by hand. The stream never touches an index that already
+index: `switch-alias`, run with the stream's pipeline stopped, gives it its
+alias once a row in it renders one, but not its mapping, and an empty one is
+dropped by hand. The stream never touches an index that already
 exists: an alias added to the config later reaches the existing indices
-through `switch-alias`, which renders it for each of them. The alias is not
+through `switch-alias`, which renders it for each of them. That is a stop,
+the switch and a start rather than a command beside the running stream,
+because `switch-alias` refuses while the stream's lease moves (see
+[Initial load](#initial-load)) and cannot tell this pipeline from one
+writing an index the alias is leaving. The alias is not
 checked against the index pattern for overlap. `events-{tenant}` and
 `{tenant}-events-live` share `events-x-events-live`, so that check would refuse
 the example above. Only an alias spec identical to its index spec is refused at
@@ -372,8 +377,8 @@ for such a tenant would leave the alias spanning two generations. Both
 commands therefore look up every alias the alias template's pattern claims
 (`Sink::list_aliases`, re-checked by name as `list_indices` is) before they
 switch, and name each one held only outside the generation they switch to.
-Running `switch-alias` again once its index exists here moves it off the other
-generation. `--drop-old` is refused with a template, because
+Stopping the pipeline once its index exists here and running `switch-alias`
+again moves it off the other generation. `--drop-old` is refused with a template, because
 it would delete indices inferred from a pattern, and `delete_index` is only
 ever given a name someone wrote down. `--alias` must be the section's `alias`.
 One source of truth means the tenants the switch moves and the ones the
@@ -896,21 +901,51 @@ the window the way the initial load does — its rows carry no position, the
 checkpoint does not move, and restarting the pipeline against the new index
 replays everything committed since. The refusal is positive evidence rather
 than a flag: an active replication slot on PostgreSQL, and on either source a
-checkpoint that moves while it is watched — for two seconds before the load,
-and again across the whole load just before the alias moves. There is no
-`--force`. The second look exists because a running pipeline with nothing to
-stream leaves no evidence on MySQL (it does not register with the server) and
-none on PostgreSQL between reconnects: it keeps writing the index the section
-names while the alias moves away, its checkpoint advances past those changes,
-and the restart against the new index replays only from there, so they are
-lost from it. A pipeline that stays idle through the whole rebuild and wakes
-after the switch is still not detected; stopping it is the operator's step.
+lease that moves or a checkpoint that moves while it is watched — before the
+load, and again just before the alias moves. There is no `--force`.
+
+**A running pipeline proves it is running with a lease in the target.** A
+running pipeline with nothing to stream leaves no other evidence on MySQL (it
+does not register with the server) and none on PostgreSQL between reconnects,
+and the checkpoint only moves when something is written. Undetected, it keeps
+writing the index the section names after the alias moved away, its checkpoint
+advances past those changes, and the restart against the new index replays
+only from there, so they are lost from it. So `run` keeps one lease record per
+stream beside the checkpoint — the same stream identity, a separate document,
+row, key or file wherever that target keeps its checkpoint — and refreshes it
+every five seconds with a counter that rises on every refresh, a token of its
+own process, the interval it refreshes at, and the instance and time for a
+human to read. `reindex` and `switch-alias` read it, wait two of its intervals
+and a margin (twelve seconds by default), and read it again: any change —
+appearing, a different process, a higher counter — is a pipeline that is
+alive, and they refuse naming the stream and the instance. `reindex` does this
+before the load and again right before the switch, where it also refuses a
+lease that differs from the one the first check saw, because a pipeline that
+started during the load wrote changes the rebuild does not hold. Nothing compares
+the recorded time with a clock, so clock skew between hosts cannot make a dead
+pipeline look alive or a live one look dead; and a pipeline that was killed
+leaves a lease that never moves again, so it never blocks anything — only one
+that is running does. A clean shutdown clears it, which makes the wait the only
+cost of a stopped one. The refresh runs on a sink of its own, beside the
+replication path rather than in it: one mutex-guarded connection shared with the
+writes would queue the refresh behind a long batch and make a busy pipeline look
+stopped. A refresh that fails is logged and retried and never stops the
+pipeline, since the lease is only evidence for another command. An expiry time
+instead of a counter was rejected because it compares two hosts' clocks, and a
+lock that refuses to start a second pipeline because the lease is only a
+signal, not a mutual exclusion the target could enforce. Meilisearch keeps its
+lease in a file beside its checkpoint file, so there it is visible only to a
+command run against the same state directory, which is the reach that target's
+checkpoint already has.
 
 The alias is flipped before the restart because it costs nothing to: the old
 index is exactly as stale as the new one at that moment, and both catch up
-from the same replay. A live cutover with no freshness gap at all is still two
-instances, as [operations.md](https://github.com/kennywillbe/pg2osync/blob/main/docs/operations.md)
-describes — dual-writing from one process is not on the table.
+from the same replay. A live cutover with a freshness gap of seconds is still
+two instances, as [operations.md](https://github.com/kennywillbe/pg2osync/blob/main/docs/operations.md)
+describes — dual-writing from one process is not on the table. The seconds are
+the new instance stopped for its `switch-alias`: the lease check cannot tell a
+pipeline writing the index the alias moves to from one writing the index it
+leaves, so it refuses both, and the second is the one that loses data.
 
 `refresh_interval` *is* suspended for the duration here, unlike a re-snapshot's:
 nothing searches an index no alias points at yet, so there is no visibility to
@@ -1215,7 +1250,9 @@ position — which is what a zero-downtime re-index runs, and what splitting
 tables across instances means. A local file breaks on ephemeral containers, and a table in
 the source database pollutes the user's schema and risks replicating itself.
 Meilisearch has nowhere to put an arbitrary document, so it uses a
-write-then-rename state file — the documented exception. A PostgreSQL target
+write-then-rename state file — the documented exception. Each stream's lease
+(see [Initial load](#initial-load)) sits beside its checkpoint under an id of its
+own, so neither write can replace the other. A PostgreSQL target
 keeps the same document in a `pg2osync_state` table and Qdrant in a
 `pg2osync_state` collection: different spellings of the one rule, that only the
 target is visible to both the process that stopped and the one that takes over.
@@ -1675,7 +1712,10 @@ implementations and their e2e suites proved them, and each new sink
 re-discovered them one bug at a time. `pg2osync_core::testkit` is a suite any
 implementation runs against a live instance of its target: idempotent replay,
 versioned truncate, read-back in request order and in a form the target takes
-back, a partial batch around a refused document, checkpoint durability. Two
+back, a partial batch around a refused document, checkpoint durability, and a
+lease that round-trips per stream without touching the checkpoint beside it —
+the one check with no opt-out, since a target that could not keep a lease would
+let a rebuild switch an alias away from a running pipeline. Two
 things stay the caller's — the documents its target accepts, and one it
 refuses — because only the caller knows them, and a target with no document it
 can refuse reports that check as skipped rather than faking it. Behind a

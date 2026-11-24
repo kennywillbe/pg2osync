@@ -8,7 +8,7 @@
 //!   local JSON file instead of an in-cluster document (documented limitation)
 
 use async_trait::async_trait;
-use pg2osync_core::checkpoint::Checkpoint;
+use pg2osync_core::checkpoint::{Checkpoint, Lease};
 use pg2osync_core::error::CoreError;
 use pg2osync_core::sink::{DocumentOp, Health, IndexSpec, LsnOp, Sink, SinkAck};
 use serde_json::{Value, json};
@@ -175,6 +175,12 @@ impl MeilisearchSink {
             self.state_dir,
             crate::checkpoint_doc_id(stream)
         )
+    }
+
+    /// Beside the checkpoint file, because the lease has to be read wherever
+    /// the checkpoint is.
+    fn lease_path(&self, stream: &pg2osync_core::checkpoint::StreamId) -> String {
+        format!("{}/{}.json", self.state_dir, crate::lease_doc_id(stream))
     }
 
     /// Named state lives beside the checkpoint, for the same reason: there is
@@ -493,6 +499,41 @@ impl Sink for MeilisearchSink {
                 .map_err(|e| CoreError::Sink(e.to_string())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(CoreError::Sink(format!("checkpoint read: {e}"))),
+        }
+    }
+
+    async fn write_lease(&self, lease: &Lease) -> Result<(), CoreError> {
+        let path = self.lease_path(&lease.stream);
+        let tmp = format!("{path}.tmp");
+        let bytes = serde_json::to_vec_pretty(&crate::lease_doc(lease))
+            .map_err(|e| CoreError::Sink(e.to_string()))?;
+        // write-then-rename, as for the checkpoint: a reader must never find
+        // half a lease and take the difference for a refresh
+        std::fs::write(&tmp, bytes).map_err(|e| CoreError::Sink(format!("lease write: {e}")))?;
+        std::fs::rename(&tmp, &path).map_err(|e| CoreError::Sink(format!("lease rename: {e}")))
+    }
+
+    async fn read_lease(
+        &self,
+        stream: &pg2osync_core::checkpoint::StreamId,
+    ) -> Result<Option<Lease>, CoreError> {
+        match std::fs::read(self.lease_path(stream)) {
+            Ok(bytes) => serde_json::from_slice::<Value>(&bytes)
+                .map(|v| crate::lease_from_doc(&v))
+                .map_err(|e| CoreError::Sink(format!("lease read: {e}"))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(CoreError::Sink(format!("lease read: {e}"))),
+        }
+    }
+
+    async fn clear_lease(
+        &self,
+        stream: &pg2osync_core::checkpoint::StreamId,
+    ) -> Result<(), CoreError> {
+        match std::fs::remove_file(self.lease_path(stream)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(CoreError::Sink(format!("lease clear: {e}"))),
         }
     }
 

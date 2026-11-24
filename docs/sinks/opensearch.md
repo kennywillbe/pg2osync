@@ -19,6 +19,9 @@ url = "http://localhost:9200"
 - The checkpoint is one document per stream in a hidden **`.pg2osync_meta`**
   index, named `<source>-<slot_name>` or `<source>-<server_id>`. Deleting it
   forces a full initial load on the next start, which is safe but expensive.
+  Beside it, `lease-<source>-<slot_name>` (or `-<server_id>`) is the lease a
+  running pipeline refreshes so `reindex` and `switch-alias` can tell it is
+  running; a clean stop deletes it, and deleting it by hand changes nothing.
 - TRUNCATE runs as `_delete_by_query` with a refresh first, so a write that has
   not been refreshed yet cannot survive the truncate.
 - Unmodified TOASTed columns are completed before the write — from the old

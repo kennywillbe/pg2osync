@@ -17,7 +17,8 @@ Identical contract to the [OpenSearch sink](opensearch.md):
 
 - `_bulk` writes keyed by primary key (at-least-once and idempotent).
 - The checkpoint is one document per stream in a hidden `.pg2osync_meta` index,
-  in the same format the OpenSearch sink writes.
+  in the same format the OpenSearch sink writes, and so is the lease a running
+  pipeline keeps beside it.
 - TRUNCATE runs as `_delete_by_query?refresh=true&conflicts=proceed`, after an
   explicit refresh so unrefreshed writes cannot outlive it.
 - Retries follow `[engine] retry_max` and `retry_backoff_ms`.

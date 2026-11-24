@@ -2632,6 +2632,28 @@ mod pipeline_tests {
             Ok(self.last_checkpoint())
         }
 
+        // the engine never touches the lease; `run` keeps it beside the engine
+        async fn write_lease(
+            &self,
+            _lease: &pg2osync_core::checkpoint::Lease,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+
+        async fn read_lease(
+            &self,
+            _stream: &pg2osync_core::checkpoint::StreamId,
+        ) -> Result<Option<pg2osync_core::checkpoint::Lease>, CoreError> {
+            Ok(None)
+        }
+
+        async fn clear_lease(
+            &self,
+            _stream: &pg2osync_core::checkpoint::StreamId,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+
         async fn health(&self) -> Result<Health, CoreError> {
             Ok(Health::Up)
         }
@@ -3698,6 +3720,28 @@ mod pipeline_tests {
             _stream: &pg2osync_core::checkpoint::StreamId,
         ) -> Result<Option<Checkpoint>, CoreError> {
             Ok(None)
+        }
+
+        // the engine never touches the lease; `run` keeps it beside the engine
+        async fn write_lease(
+            &self,
+            _lease: &pg2osync_core::checkpoint::Lease,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+
+        async fn read_lease(
+            &self,
+            _stream: &pg2osync_core::checkpoint::StreamId,
+        ) -> Result<Option<pg2osync_core::checkpoint::Lease>, CoreError> {
+            Ok(None)
+        }
+
+        async fn clear_lease(
+            &self,
+            _stream: &pg2osync_core::checkpoint::StreamId,
+        ) -> Result<(), CoreError> {
+            Ok(())
         }
 
         async fn health(&self) -> Result<Health, CoreError> {
