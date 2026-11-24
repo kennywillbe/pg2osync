@@ -112,7 +112,8 @@ enum Command {
         /// than one.
         #[arg(long, value_name = "NAME")]
         source: Option<String>,
-        /// The alias to move. Applies to the single configured table.
+        /// The alias to move. Applies to the single configured table; for a
+        /// templated one, the section's `alias` template, verbatim.
         #[arg(long)]
         alias: String,
     },
@@ -200,7 +201,8 @@ enum Command {
         table: String,
         /// The alias to point at the rebuilt index. On Meilisearch, which has
         /// no aliases, this is the configured index itself: the rebuilt one is
-        /// swapped into that name.
+        /// swapped into that name. For a templated table, the section's
+        /// `alias` template, verbatim.
         #[arg(long)]
         alias: String,
         /// Delete whichever index is left holding the documents from before the
@@ -584,13 +586,8 @@ async fn run_command(command: Command) -> Result<()> {
             alias,
             drop_old,
         } => {
-            reindex_cmd(
-                one_source(&config, source.as_deref(), "reindex")?,
-                &table,
-                &alias,
-                drop_old,
-            )
-            .await
+            let (chosen, workspace) = one_source_in(&config, source.as_deref(), "reindex")?;
+            reindex_cmd(&chosen, &workspace, &table, &alias, drop_old).await
         }
         Command::Rejects {
             config,
@@ -640,7 +637,21 @@ fn one_source(
     source: Option<&str>,
     command: &str,
 ) -> Result<config::AppConfig> {
-    let ws = chosen_sources(config, source)?;
+    one_source_in(config, source, command).map(|(chosen, _)| chosen.cfg)
+}
+
+/// The single source a maintenance command acts on, and every source it was
+/// loaded beside, for a command whose result is an edit to its file.
+fn one_source_in(
+    config: &ConfigArgs,
+    source: Option<&str>,
+    command: &str,
+) -> Result<(workspace::Source, workspace::Workspace)> {
+    let all = workspace::Workspace::load(&config.config, config.config_dir.as_deref())?;
+    let ws = match source {
+        Some(name) => all.clone().only(name)?,
+        None => all.clone(),
+    };
     if ws.sources.len() > 1 {
         let names: Vec<&str> = ws.sources.iter().map(|s| s.name.as_str()).collect();
         bail!(
@@ -652,12 +663,12 @@ fn one_source(
     }
     // A workspace that loaded holds at least one source: an empty directory is
     // refused by the loader, and `only` refuses a name that matches nothing.
-    Ok(ws
+    let chosen = ws
         .sources
         .into_iter()
         .next()
-        .expect("a loaded workspace has a source")
-        .cfg)
+        .expect("a loaded workspace has a source");
+    Ok((chosen, all))
 }
 
 /// Hand the workspace to the supervisor. One source or thirty is the same
@@ -1107,27 +1118,85 @@ async fn reconcile_cmd(cfg: config::AppConfig, delete: bool) -> Result<()> {
 ///
 /// The last step of a reindex, and the one that has to be atomic: a reader
 /// resolving the alias between a remove and an add gets an error, which is
-/// exactly what the exercise was avoiding.
+/// exactly what the exercise was avoiding. A templated section moves the
+/// alias of every index its template claims, all in one request.
 async fn switch_alias(cfg: config::AppConfig, alias: &str) -> Result<()> {
     let indices = run::index_names(&cfg)?;
-    // an alias points at one index, and a template's glob is not one
-    if let Some((key, _)) = cfg.sync.iter().find(|(_, tbl)| tbl.is_templated()) {
-        bail!(
-            "switch-alias needs a config that writes to one fixed index; [sync.{key}] chooses \
-             its index per row"
-        );
-    }
     let [index] = indices.as_slice() else {
         bail!(
             "switch-alias needs a config that writes to exactly one index; this one writes to {}",
             indices.len()
         );
     };
+    let templated = templated_switch(&cfg, alias)?;
     let secrets = cfg.resolve_secrets()?;
     let sink = run::build_sink(&cfg, secrets.target_password)?;
+    if let Some((key, tbl)) = templated {
+        let target = tbl
+            .index_target(key, &run::pk_columns_for(tbl))
+            .map_err(|e| anyhow::anyhow!("[sync.{key}] {e}"))?;
+        let listed = sink.list_indices(index).await?;
+        let pairs =
+            reindex::alias_pairs(&cfg, &secrets.source_url, &tbl.table, &target, &listed).await?;
+        if pairs.is_empty() {
+            bail!("no index {index} matches has an alias to render; nothing was switched");
+        }
+        let left = reindex::switch_generation(
+            sink.as_ref(),
+            &target,
+            &pairs,
+            &listed,
+            "Stop the pipeline, delete them and run switch-alias again: nothing in the source \
+             renders them, so they hold no row it still has, and the stream creates each again \
+             with its alias on the next row that chooses it. Deleted beside a running pipeline, \
+             the next write there would leave the target to create the index with neither its \
+             mapping nor its alias",
+        )
+        .await?;
+        println!(
+            "{} {index} matches",
+            reindex::switch_summary(&pairs, listed.len())
+        );
+        for (alias, index) in pairs.iter().take(10) {
+            println!("  {alias} -> {index}");
+        }
+        if pairs.len() > 10 {
+            println!("  … and {} more", pairs.len() - 10);
+        }
+        reindex::report_left_behind(&left);
+        return Ok(());
+    }
     sink.switch_alias(alias, index).await?;
     println!("alias {alias} now points at {index}");
     Ok(())
+}
+
+/// The templated section a switch moves the aliases of, if there is one, once
+/// `--alias` is known to be that section's own.
+///
+/// Asked before anything connects, so a wrong invocation costs nothing.
+fn templated_switch<'a>(
+    cfg: &'a config::AppConfig,
+    alias: &str,
+) -> Result<Option<(&'a String, &'a config::TableSync)>> {
+    let Some((key, tbl)) = cfg.sync.iter().find(|(_, tbl)| tbl.is_templated()) else {
+        return Ok(None);
+    };
+    let Some(configured) = &tbl.alias else {
+        bail!(
+            "[sync.{key}] chooses its index per row and names no alias; set alias = \
+             \"{alias}\" in the section, so the indices created after the switch carry it too"
+        );
+    };
+    // one source of truth: an alias moved under any other name is one the
+    // stream never creates, so a tenant appearing later would sit outside it
+    if alias != configured {
+        bail!(
+            "--alias {alias} is not [sync.{key}]'s alias {configured:?}; the switch moves the \
+             aliases the stream creates, so the two have to agree"
+        );
+    }
+    Ok(Some((key, tbl)))
 }
 
 /// A binlog checkpoint position as the pair it orders by.
@@ -1241,17 +1310,19 @@ async fn resnapshot_cmd(cfg: config::AppConfig, table: &str, filter: Option<Stri
 
 /// Rebuild one table's index and hand the alias to the copy.
 async fn reindex_cmd(
-    cfg: config::AppConfig,
+    chosen: &workspace::Source,
+    workspace: &workspace::Workspace,
     table: &str,
     alias: &str,
     drop_old: bool,
 ) -> Result<()> {
-    let secrets = cfg.resolve_secrets()?;
+    let secrets = chosen.cfg.resolve_secrets()?;
     for warning in &secrets.warnings {
         tracing::warn!(target: "pg2osync::config", "{warning}");
     }
     reindex::run_for(
-        &cfg,
+        chosen,
+        workspace,
         &secrets.source_url,
         &secrets.admin_url,
         secrets.target_password,
@@ -1288,6 +1359,13 @@ async fn rejects_cmd(cfg: config::AppConfig, replay: bool, limit: usize) -> Resu
             format!(", showing {}", stored.len())
         }
     );
+    if replay {
+        // the sink learns the section's templates here, as a run does: a
+        // replay can be the first write to a per-row index, which must then
+        // appear with its mapping and alias rather than as whatever the
+        // target infers from one document
+        sink.ensure_ready(&run::index_specs(&cfg)?).await?;
+    }
     let mut replayed = 0usize;
     let mut still_refused = 0usize;
     for reject in &stored {
@@ -2594,6 +2672,41 @@ mod tests {
     }
 
     #[test]
+    fn a_templated_switch_moves_only_the_alias_the_section_names() {
+        let section = |extra: &str| -> config::AppConfig {
+            toml::from_str(&format!(
+                "[source]\nurl = \"postgres://u@h/db\"\n[target]\nurl = \"http://t\"\n\
+                 [sync.events]\ntable = \"public.events\"\nindex = \"events-{{tenant}}\"\n{extra}"
+            ))
+            .expect("parses")
+        };
+        let bare = section("");
+        let err = templated_switch(&bare, "{tenant}-live").expect_err("no alias in the section");
+        assert!(err.to_string().contains("names no alias"), "{err}");
+        let aliased = section("alias = \"{tenant}-live\"\n");
+        let err = templated_switch(&aliased, "other").expect_err("another alias");
+        assert!(
+            err.to_string()
+                .contains("--alias other is not [sync.events]'s alias"),
+            "{err}"
+        );
+        let (key, _) = templated_switch(&aliased, "{tenant}-live")
+            .expect("the section's own alias")
+            .expect("a templated section");
+        assert_eq!(key, "events");
+        let fixed = toml::from_str::<config::AppConfig>(
+            "[source]\nurl = \"postgres://u@h/db\"\n[target]\nurl = \"http://t\"\n\
+             [sync.users]\ntable = \"public.users\"\nindex = \"users\"\n",
+        )
+        .expect("parses");
+        assert!(
+            templated_switch(&fixed, "live")
+                .expect("a fixed index")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn a_binlog_coordinate_is_read_past_the_gtid_and_generation_suffixes() {
         let uuid = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
         let want = Some(("binlog.000004".to_string(), 900));
@@ -2719,6 +2832,22 @@ mod tests {
         assert!(
             one_source(&args, Some("typo"), "drop-slot").is_err(),
             "a name no file carries is a refusal, not the first file"
+        );
+    }
+
+    #[test]
+    fn a_named_source_keeps_the_directory_it_was_loaded_beside() {
+        // reindex checks the config it tells the operator to write against
+        // the other files, so narrowing to one must not lose them
+        let (_dir, args) = two_sources("beside");
+        let (chosen, all) = one_source_in(&args, Some("billing"), "reindex").expect("named");
+        assert_eq!(chosen.name, "billing");
+        assert_eq!(
+            all.sources
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            ["billing", "orders"]
         );
     }
 

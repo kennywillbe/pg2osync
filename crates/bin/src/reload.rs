@@ -367,6 +367,10 @@ const WHY_POLL: &str = "the poll query is built when a streaming attempt starts 
                         which rows it picks up, so the running value is kept — restart to change \
                         it";
 
+const WHY_ALIAS: &str = "the alias is rendered by the index target the pipeline built when it \
+                         started, so the running value is kept — restart to change it, then run \
+                         switch-alias so the indices that already exist carry it too";
+
 /// What a reload of `new` over the running `old` may and may not do.
 pub fn classify(old: &AppConfig, new: &AppConfig) -> Plan {
     let mut refusals = Vec::new();
@@ -584,6 +588,9 @@ fn section_refusals(
         WHY_POLL,
         [poll_column]
     );
+    // the same class: neither a refile nor a reshape, since it only names
+    // what an index is created with
+    refuse_changed!(restart, old, new, format!("sync.{key}"), WHY_ALIAS, [alias]);
     if !out.is_empty() {
         out.extend(restart);
         return out;
@@ -814,6 +821,25 @@ table = "public.users"
         let plan = classify(&old, &new);
         assert_eq!(plan.refusals.len(), 1, "{:?}", plan.refusals);
         assert!(plan.refusals[0].contains("index changed"));
+    }
+
+    #[test]
+    fn a_new_alias_asks_for_a_restart_and_a_switch_rather_than_a_rebuild() {
+        let templated = BASE.replace(
+            "table = \"public.users\"",
+            "table = \"public.users\"\nindex = \"events-{tenant}\"",
+        );
+        let old = config(&templated);
+        let new = config(&templated.replace(
+            "index = \"events-{tenant}\"",
+            "index = \"events-{tenant}\"\nalias = \"{tenant}-live\"",
+        ));
+        let plan = classify(&old, &new);
+        assert_eq!(plan.refusals.len(), 1, "{:?}", plan.refusals);
+        let refusal = &plan.refusals[0];
+        assert!(refusal.contains("[sync.users] alias changed"), "{refusal}");
+        assert!(refusal.contains("switch-alias"), "{refusal}");
+        assert!(!refusal.contains("reindex"), "{refusal}");
     }
 
     #[test]

@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// One config file, and the name everything else calls it by.
+#[derive(Clone)]
 pub struct Source {
     pub name: String,
     pub path: PathBuf,
@@ -19,6 +20,7 @@ pub struct Source {
 
 /// Every source one invocation was given, and what they share by being one
 /// process: two listeners and a log subscriber.
+#[derive(Clone)]
 pub struct Workspace {
     pub sources: Vec<Source>,
     pub metrics: MetricsConfig,
@@ -118,6 +120,30 @@ impl Workspace {
             api,
             log,
         })
+    }
+
+    /// Whether the workspace would still load with `name`'s config replaced
+    /// by `cfg`.
+    ///
+    /// A command that ends by telling the operator to edit one file has to
+    /// ask the directory too: what two files disagree about is invisible from
+    /// inside either of them.
+    pub fn admits(&self, name: &str, cfg: &AppConfig) -> Result<()> {
+        if !self.sources.iter().any(|s| s.name == name) {
+            bail!("no source is called {name:?}");
+        }
+        let sources = self
+            .sources
+            .iter()
+            .map(|s| {
+                let mut s = s.clone();
+                if s.name == name {
+                    s.cfg = cfg.clone();
+                }
+                s
+            })
+            .collect();
+        Self::assemble(sources).map(|_| ())
     }
 
     fn assemble(sources: Vec<Source>) -> Result<Self> {
@@ -356,6 +382,27 @@ mod tests {
         dir.write("notes.txt", "not a config");
         let ws = Workspace::load_dir(dir.path()).expect("two sources");
         assert_eq!(names(&ws), ["accounts", "orders"]);
+    }
+
+    #[test]
+    fn a_replacement_is_checked_against_the_other_files_and_names_a_real_source() {
+        let dir = TempDir::new("admits");
+        dir.write("orders.toml", &config("", "orders"));
+        dir.write("accounts.toml", &config("slot_name = \"a\"", "accounts"));
+        let ws = Workspace::load_dir(dir.path()).expect("two sources");
+        let accounts = ws.sources[0].cfg.clone();
+
+        let mut clash = accounts.clone();
+        clash.source.slot_name = ws.sources[1].cfg.source.slot_name.clone();
+        let why = format!("{:#}", ws.admits("accounts", &clash).expect_err("one slot"));
+        assert!(why.contains("duplicate stream identity"), "{why}");
+
+        ws.admits("accounts", &accounts)
+            .expect("the config it loaded with");
+        assert!(
+            ws.admits("typo", &accounts).is_err(),
+            "a name no file carries is a refusal, not a check of the unchanged set"
+        );
     }
 
     #[test]

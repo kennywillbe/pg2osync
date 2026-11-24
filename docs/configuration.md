@@ -167,6 +167,7 @@ One section per table. `<key>` is the index name when `index` is omitted.
 |---|---|
 | `table` | **Required.** `schema.table` for PostgreSQL, `database.table` for MySQL |
 | `index` | Target index or collection; lowercase `[a-z0-9_-]`, not starting with `_` or `.`; several sections may name the same one, see [Sharing an index](#sharing-an-index); may contain `{column}` placeholders, see [Per-row indices](#per-row-indices) |
+| `alias` | With a templated `index` only: the alias each rendered index carries, e.g. `{tenant}-events-live`; see [Aliases for per-row indices](#aliases-for-per-row-indices) |
 | `primary_key` | Overrides key detection; also the join column for nested children; contradicts `append_only` |
 | `append_only` | The table has no key and only ever gains rows; documents are filed under a content hash, see [Append-only tables](#append-only-tables) |
 | `id` | Derived document id, e.g. `tenant-{tenant_id}-{id}`; see [Document ids](#document-ids) |
@@ -380,12 +381,76 @@ and the document is then in the old index.
   deleted until every matching index has been walked, so a walk that fails
   partway removes nothing; the bulk request that follows can still fail
   partway, and running `reconcile --delete` again finishes it.
-- **`switch-alias` and `reindex` refuse a templated table.** An alias points
-  at one index, and so does a rebuild. `resnapshot` works.
+- **`switch-alias` and `reindex` need the section's `alias`,** below.
+  `resnapshot` works without it.
 - **Meilisearch, PostgreSQL and Qdrant refuse a template** at startup: none of
   them can say what a name a row renders should be created with.
 - **Bulk-load settings are not relaxed** for a templated index. An index
   created during the initial load takes the target's defaults.
+
+#### Aliases for per-row indices
+
+Readers that should not care which generation of a tenant's index they are
+reading go through an alias, and with a template the alias is a template too:
+
+```toml
+[sync.events]
+table = "public.events"
+index = "events-{tenant}"
+alias = "{tenant}-events-live"
+```
+
+- **It renders from the same row as the index,** and may only name columns
+  the `index` template names. The name follows the index name grammar, and a
+  row whose alias breaks it halts the pipeline, as an index name does: with
+  `{tenant}-events-live`, a tenant `42` does. A delete is the exception: it
+  goes through without the alias. An alias identical to the
+  `index` template is refused at load, since every index would carry its own
+  name.
+- **A new index is created with its alias,** in the same create request, so
+  a tenant that first appears after a switch is behind its alias from its
+  first document. That holds when a delete reaches it first, as a replay's
+  does, and when the index is dropped while the pipeline runs: each batch
+  looks its indices up again and recreates a missing one with its alias. An
+  index that already exists is never changed by the
+  stream: run `switch-alias` once after adding `alias` to a running config.
+- **`switch-alias --alias "{tenant}-events-live"`** (the section's `alias`,
+  verbatim) lists every index the template claims and points each one's
+  alias at it in one atomic `_aliases` request.
+- **`reindex --table public.events --alias "{tenant}-events-live"`** loads a
+  fresh generation of the template, `g<unix seconds>-events-{tenant}` (or
+  `{tenant}-events-g<unix seconds>` when the template starts with a
+  placeholder), checks the count summed over its indices against the source,
+  and then moves every alias in one atomic request. The fresh pattern may not
+  overlap the old one, the config it ends on (with `index` set to the fresh
+  generation) has to pass the same checks a load does — under `--config-dir`,
+  together with every other file in the directory — and a template with a
+  placeholder at both ends is refused because there is no literal to mark.
+  Afterwards, set `index` to the printed template and restart.
+- **An alias's values come from the name** when the template has one
+  placeholder. With several, they come from the source's distinct values of
+  the template's columns; this works on PostgreSQL and is refused on MySQL.
+- **Every index the template lists must end with an alias.** With several
+  placeholders an index whose rows are all gone renders none, and the stream
+  never adds one to an index that already exists, so both commands refuse,
+  before anything moves, and name each such index. It holds no row the source
+  still has: stop the pipeline, delete it and run the command again, and the
+  next row that chooses it creates it with its alias. Deleting it beside a
+  running pipeline would let the target create it on the next write with
+  neither mapping nor alias.
+- **A tenant with no index in the generation switched to keeps its alias**
+  where it was: a tenant with no rows left after a rebuild, or, when
+  `switch-alias` with the previous config rolls a rebuild back, a tenant that
+  first appeared in the newer generation. Both commands list each such alias
+  and the index still holding it. Once the stream creates the tenant's index
+  here, with the alias, the alias spans both generations until `switch-alias`
+  runs again. `--drop-old` is refused with a template.
+- **An alias that collides with an index name** halts the pipeline, in
+  either order: an alias named like an existing index is refused by the
+  target when the index is created, and an index named like an existing
+  alias is refused before anything is written through it. Patterns are not
+  checked for overlap: with `events-{tenant}` and `{tenant}-events-live`, only
+  tenants `events` and `events-live` together can collide.
 
 ### Rebuilding an index
 
@@ -422,8 +487,9 @@ rollback — one alias flip away.
   source is counted before and after the load; anything outside that range is
   reported with all three numbers and a non-zero exit, and the rebuilt index is
   left for you to look at.
-- **Refused for** a [templated](#per-row-indices) index, a
-  [shared](#sharing-an-index) index or a join pair, a [fanned](#fan-out)
+- **A [templated](#per-row-indices) index is rebuilt by generation,** see
+  [Aliases for per-row indices](#aliases-for-per-row-indices).
+- **Refused for** a [shared](#sharing-an-index) index or a join pair, a [fanned](#fan-out)
   table, and an `--alias` equal to the index the section already writes to.
 - **On Meilisearch the alias *is* the index,** so `--alias` there must be the
   name the section already writes to and every other value is refused. There is
@@ -475,8 +541,9 @@ config rather than by a halted pipeline an hour later:
 
 Two configurations are refused outright rather than left to fail per write:
 Meilisearch, which has no alias namespace at all — the live name there *is* an
-index uid — and a [templated](#per-row-indices) index, whose per-row index is
-created on demand and is therefore always a raw one.
+index uid — and a [templated](#per-row-indices) index. A templated section's
+`alias` puts an alias on each index as it is created, but the stream writes
+to the concrete name a row renders, never through the alias.
 
 The target enforces the flag on writes that create or replace a document.
 A delete against a plain index is not refused by either engine, so the option

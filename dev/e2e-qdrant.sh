@@ -12,7 +12,8 @@
 #
 # It also runs the sink conformance kit (crates/sink/tests/conformance.rs)
 # against the same instance, which is where the contract shared with every other
-# target is asserted, with no check skipped.
+# target is asserted, skipping only the index-template checks a target that
+# refuses templates cannot answer.
 #
 # One suite at a time per stack: the slots, the collections and the state
 # collection are fixed, so two suites against the same pair overwrite each
@@ -312,7 +313,8 @@ sync_stop
 say "9. the sink conformance kit"
 # The contract every target shares, asserted against this one. It uses a
 # collection of its own, so it can run beside the sections above, and the test
-# itself fails if any check reports itself as skipped.
+# itself fails if any check other than the index-template ones reports itself
+# as skipped.
 if PG2OSYNC_TEST_QDRANT_URL="$QDRANT" PG2OSYNC_TEST_QDRANT_KEY="$QDRANT_API_KEY" \
   cargo test --release -p pg2osync-sink --test conformance -- --nocapture >> "$LOG" 2>&1; then
   ok "the sink honours the shared contract, with nothing skipped"

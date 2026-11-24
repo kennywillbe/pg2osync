@@ -1729,6 +1729,28 @@ fn rendered_index(
     render_for_row("index", table, target, pk, doc, before)
 }
 
+/// The alias of the index `rendered_index` names for the same row, from the
+/// same values, for a delete: a versioned one can be the write that creates
+/// the index. An unversioned one never is, so it renders none.
+///
+/// One that cannot render is none as well, never a halt: the delete does
+/// not need it unless the index is missing, and a document written before
+/// the alias was configured has to stay deletable.
+fn rendered_alias(
+    target: &IndexTarget,
+    pk: &Value,
+    before: Option<&Value>,
+    version: Option<u64>,
+) -> Option<String> {
+    version?;
+    match before {
+        Some(row) => target.render_alias(row),
+        None => target.render_alias_from_pk(pk),
+    }
+    .ok()
+    .flatten()
+}
+
 /// The `(index, id)` whose stored copy completes this change, and the routing
 /// it is stored under, if one is needed.
 ///
@@ -1851,22 +1873,25 @@ fn materialize(
     // Stamped here and on nothing else: an ingest pipeline runs on index
     // actions, so a delete has nothing to carry.
     let pipeline = rules.pipelines.for_table(table.0, table.1);
-    let upsert = |index: &str, id: String, routing: Option<String>, doc: Value| {
-        mk(DocumentOp::Upsert {
-            index: index.into(),
-            id,
-            routing,
-            doc,
-            version,
-            pipeline: pipeline.map(str::to_string),
-        })
-    };
-    let delete = |index: &str, id: String, routing: Option<String>| {
+    let upsert =
+        |index: &str, alias: Option<&String>, id: String, routing: Option<String>, doc: Value| {
+            mk(DocumentOp::Upsert {
+                index: index.into(),
+                id,
+                routing,
+                doc,
+                version,
+                pipeline: pipeline.map(str::to_string),
+                alias: alias.cloned(),
+            })
+        };
+    let delete = |index: &str, alias: Option<&String>, id: String, routing: Option<String>| {
         mk(DocumentOp::Delete {
             index: index.into(),
             id,
             routing,
             version,
+            alias: alias.cloned(),
         })
     };
     let halt = |e: String| CoreError::Other(format!("{}.{}: {e}", table.0, table.1));
@@ -1941,7 +1966,11 @@ fn materialize(
     // `shaped` names the columns completed from the stored document: they
     // went through the transforms when they were first written, so they must
     // not go through them again
-    let finish = |index: &str, docs: Vec<Placed>, shaped: &[String], left: &mut Vec<String>| {
+    let finish = |index: &str,
+                  alias: Option<&String>,
+                  docs: Vec<Placed>,
+                  shaped: &[String],
+                  left: &mut Vec<String>| {
         docs.into_iter()
             .map(|placed| {
                 let Placed {
@@ -1972,7 +2001,7 @@ fn materialize(
                 {
                     map.insert(rule.field.clone(), value.clone());
                 }
-                upsert(index, id, routing, doc)
+                upsert(index, alias, id, routing, doc)
             })
             .collect()
     };
@@ -2002,7 +2031,14 @@ fn materialize(
         RowKind::Insert { pk, doc } => {
             let base = derived_id(table, pk, Some(doc), None, rules)?;
             let index = rendered_index(target, table, pk, Some(doc), None)?;
-            Ok(finish(&index, place(&base, doc)?, &[], left_as_is))
+            let alias = target.render_alias(doc).map_err(halt)?;
+            Ok(finish(
+                &index,
+                alias.as_ref(),
+                place(&base, doc)?,
+                &[],
+                left_as_is,
+            ))
         }
         RowKind::Update {
             pk,
@@ -2021,6 +2057,8 @@ fn materialize(
             // index sees the same row and the two cannot disagree
             let base = derived_id(table, pk, Some(&doc), before, rules)?;
             let index = rendered_index(target, table, pk, Some(&doc), before)?;
+            // from the same completed row as the index, so the two agree
+            let alias = target.render_alias(&doc).map_err(halt)?;
             let new_docs = place(&base, &doc)?;
             // Where the row's new state lives: one (id, shard) per document,
             // which the diff below subtracts the before-image from. Only a
@@ -2036,7 +2074,7 @@ fn materialize(
             // a row that is not fanned is one document, and its shard is what
             // the move below compares the old one against
             let routing = new_docs.first().and_then(|placed| placed.routing.clone());
-            let mut ops = finish(&index, new_docs, &completed, left_as_is);
+            let mut ops = finish(&index, alias.as_ref(), new_docs, &completed, left_as_is);
             // write first, delete second: a crash between them leaves a
             // duplicate that the replay repairs, where the reverse order would
             // leave a gap that nothing repairs
@@ -2050,6 +2088,7 @@ fn materialize(
                 if let Some(before) = before {
                     let old_base = derived_id(table, old_pk, None, Some(before), rules)?;
                     let old_index = rendered_index(target, table, old_pk, None, Some(before))?;
+                    let old_alias = rendered_alias(target, old_pk, Some(before), version);
                     // A document is still the row's own only where its id and
                     // its shard both stayed: a row that moved index or shard
                     // holds nothing it left behind, and an element parent
@@ -2060,7 +2099,12 @@ fn materialize(
                         if old_index != index
                             || !held.contains(&(placed.id.clone(), placed.routing.clone()))
                         {
-                            ops.push(delete(&old_index, placed.id, placed.routing));
+                            ops.push(delete(
+                                &old_index,
+                                old_alias.as_ref(),
+                                placed.id,
+                                placed.routing,
+                            ));
                         }
                     }
                 }
@@ -2082,14 +2126,23 @@ fn materialize(
                     Some(t) => before.and_then(|b| t.render(b).ok()),
                 }
                 .unwrap_or_else(|| base.clone());
-                let old_index = match before {
-                    Some(b) => target.render(b).ok(),
-                    None if target.is_pk_only() => target.render_from_pk(old_pk).ok(),
+                let old_named = match before {
+                    Some(b) => target.render(b).ok().map(|name| (name, Some(b))),
+                    None if target.is_pk_only() => {
+                        target.render_from_pk(old_pk).ok().map(|name| (name, None))
+                    }
                     None => None,
-                }
-                .unwrap_or_else(|| index.clone());
+                };
+                // the alias comes from the values that named the old index, so
+                // only an old name taken to be the current one borrows the
+                // current alias: an old index that rendered is another
+                // tenant's, and the new alias must never cover it
+                let (old_index, old_alias) = match old_named {
+                    Some((name, from)) => (name, rendered_alias(target, old_pk, from, version)),
+                    None => (index.clone(), version.and(alias.clone())),
+                };
                 if (&old_index, &old_id, &old_routing) != (&index, &base, &routing) {
-                    ops.push(delete(&old_index, old_id, old_routing));
+                    ops.push(delete(&old_index, old_alias.as_ref(), old_id, old_routing));
                 }
             }
             Ok(ops)
@@ -2100,10 +2153,11 @@ fn materialize(
             // the before-image names the index the document is in; a
             // template it cannot satisfy halts, as the startup check promised
             let index = rendered_index(target, table, pk, None, before)?;
+            let alias = rendered_alias(target, pk, before, version);
             match fan {
                 None => {
                     let routing = key_routing(before, pk)?;
-                    let mut ops = vec![delete(&index, base.clone(), routing)];
+                    let mut ops = vec![delete(&index, alias.as_ref(), base.clone(), routing)];
                     // A parent's children live on its shard and know nothing
                     // of its deletion; they go after the parent, at the same
                     // position, so a child written later still survives.
@@ -2132,7 +2186,7 @@ fn materialize(
                     // which for an element parent is the element's own
                     Ok(place(&base, row)?
                         .into_iter()
-                        .map(|placed| delete(&index, placed.id, placed.routing))
+                        .map(|placed| delete(&index, alias.as_ref(), placed.id, placed.routing))
                         .collect())
                 }
             }
@@ -2206,6 +2260,7 @@ mod tests {
                 id: "7".into(),
                 routing: None,
                 version: None,
+                alias: None,
             },
         };
         assert_eq!(
@@ -2388,12 +2443,18 @@ mod pipeline_tests {
                         routing,
                         version,
                         pipeline,
+                        alias,
                         ..
                     } => {
-                        let through = match pipeline {
+                        let mut through = match pipeline {
                             Some(p) if self.show_pipeline => format!("|{p}"),
                             _ => String::new(),
                         };
+                        // only ever set by a section with an alias, so
+                        // every other expectation stays byte-identical
+                        if let Some(alias) = alias {
+                            through.push_str(&format!("~{alias}"));
+                        }
                         match version {
                             Some(v) => {
                                 format!("upsert:{}@{v}{through}", target(index, id, routing))
@@ -2402,10 +2463,15 @@ mod pipeline_tests {
                         }
                     }
                     DocumentOp::Delete {
-                        index, id, routing, ..
-                    } => {
-                        format!("delete:{}", target(index, id, routing))
-                    }
+                        index,
+                        id,
+                        routing,
+                        alias,
+                        ..
+                    } => match alias {
+                        Some(alias) => format!("delete:{}~{alias}", target(index, id, routing)),
+                        None => format!("delete:{}", target(index, id, routing)),
+                    },
                     DocumentOp::DeleteChildren {
                         field,
                         parent_name,
@@ -3445,6 +3511,7 @@ mod pipeline_tests {
                 doc: json!({"id": lsn}),
                 version: Some(lsn),
                 pipeline: None,
+                alias: None,
             },
         }]
     }
@@ -4727,17 +4794,29 @@ mod pipeline_tests {
         sink: Arc<RecordingSink>,
         script: Vec<ChangeEvent>,
     ) -> Result<(), CoreError> {
+        let target = IndexTarget::Template {
+            spec: spec.into(),
+            template: crate::mapping::IdTemplate::parse(spec, &["id".to_string()])
+                .expect("valid template"),
+            alias: None,
+        };
+        drive_target(target, ids, fan, filters, sink, script).await
+    }
+
+    async fn drive_target(
+        target: IndexTarget,
+        ids: crate::mapping::IdTemplates,
+        fan: crate::mapping::FanOuts,
+        filters: crate::mapping::Filters,
+        sink: Arc<RecordingSink>,
+        script: Vec<ChangeEvent>,
+    ) -> Result<(), CoreError> {
         let (events_tx, events_rx) = mpsc::channel(1024);
         let (copy_tx, copy_rx) = mpsc::channel(1024);
         drop(copy_tx);
         let (ack_tx, _ack_rx) = watch::channel(None);
         let (load_done_tx, _load_done_rx) = watch::channel(0u64);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-        let target = IndexTarget::Template {
-            spec: spec.into(),
-            template: crate::mapping::IdTemplate::parse(spec, &["id".to_string()])
-                .expect("valid template"),
-        };
         let engine_cfg = EngineConfig {
             batch_size: 500,
             checkpoint_interval_ms: 100,
@@ -4825,6 +4904,221 @@ mod pipeline_tests {
             vec!["write[upsert:events-globex/1@512 delete:events-acme/1]"],
             "write in the new index first, remove from the old one second"
         );
+    }
+
+    #[tokio::test]
+    async fn every_write_carries_the_alias_its_row_renders() {
+        // the sink creates an index at the first write that names it, and a
+        // versioned delete is one: the target would create the index for it
+        // anyway, bare, so the delete has to say which alias it carries
+        let sink = placing_sink();
+        let target = IndexTarget::Template {
+            spec: "events-{tenant}".into(),
+            template: crate::mapping::IdTemplate::parse("events-{tenant}", &["id".to_string()])
+                .expect("valid template"),
+            alias: None,
+        }
+        .with_alias("{tenant}-events-live", &["id".to_string()])
+        .expect("a usable alias");
+        drive_target(
+            target,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            sink.clone(),
+            vec![
+                tenant_moved(1, "acme", "globex", 0x200),
+                ChangeEvent::Row(RowChange {
+                    schema: "public".into(),
+                    table: "users".into(),
+                    kind: RowKind::Delete {
+                        pk: json!(2),
+                        before: Some(json!({"id": 2, "tenant": "initech"})),
+                    },
+                    version: Some(0x200),
+                }),
+                commit(0x200),
+            ],
+        )
+        .await
+        .expect("engine ran");
+        assert_eq!(
+            sink.events(),
+            vec![
+                "write[upsert:events-globex/1@512~globex-events-live \
+                 delete:events-acme/1~acme-events-live delete:events-initech/2~initech-events-live]"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unversioned_delete_renders_no_alias_and_cannot_halt_on_one() {
+        // an unversioned delete never makes the target create an index, so
+        // an alias it would not use must not stop it: `1acme` renders a
+        // valid index and an alias that starts with a digit
+        let sink = placing_sink();
+        let target = IndexTarget::Template {
+            spec: "events-{tenant}".into(),
+            template: crate::mapping::IdTemplate::parse("events-{tenant}", &["id".to_string()])
+                .expect("valid template"),
+            alias: None,
+        }
+        .with_alias("{tenant}-events-live", &["id".to_string()])
+        .expect("a usable alias");
+        drive_target(
+            target,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            sink.clone(),
+            vec![
+                ChangeEvent::Row(RowChange {
+                    schema: "public".into(),
+                    table: "users".into(),
+                    kind: RowKind::Delete {
+                        pk: json!(2),
+                        before: Some(json!({"id": 2, "tenant": "1acme"})),
+                    },
+                    version: None,
+                }),
+                commit(0x200),
+            ],
+        )
+        .await
+        .expect("an alias the delete does not use cannot halt it");
+        assert_eq!(sink.events(), vec!["write[delete:events-1acme/2]"]);
+    }
+
+    /// `events-{tenant}` aliased `{tenant}-events-live`: a tenant `1acme`
+    /// renders a valid index and an alias that starts with a digit.
+    fn digit_aliased_target() -> IndexTarget {
+        IndexTarget::Template {
+            spec: "events-{tenant}".into(),
+            template: crate::mapping::IdTemplate::parse("events-{tenant}", &["id".to_string()])
+                .expect("valid template"),
+            alias: None,
+        }
+        .with_alias("{tenant}-events-live", &["id".to_string()])
+        .expect("a usable alias")
+    }
+
+    #[tokio::test]
+    async fn a_versioned_delete_whose_alias_cannot_render_goes_through_without_one() {
+        // the document was written before the alias was configured; deleting
+        // it never needed the alias, and before deletes carried one it went
+        // through
+        let sink = placing_sink();
+        drive_target(
+            digit_aliased_target(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            sink.clone(),
+            vec![
+                ChangeEvent::Row(RowChange {
+                    schema: "public".into(),
+                    table: "users".into(),
+                    kind: RowKind::Delete {
+                        pk: json!(2),
+                        before: Some(json!({"id": 2, "tenant": "1acme"})),
+                    },
+                    version: Some(0x200),
+                }),
+                commit(0x200),
+            ],
+        )
+        .await
+        .expect("an alias that cannot render does not halt a delete");
+        assert_eq!(sink.events(), vec!["write[delete:events-1acme/2]"]);
+    }
+
+    #[tokio::test]
+    async fn a_moved_row_never_deletes_from_its_old_index_under_the_new_alias() {
+        // events-1acme rendered, so the old document is there; its alias
+        // cannot render, and borrowing globex's would put another tenant's
+        // index behind globex's alias if the delete recreated events-1acme
+        let sink = placing_sink();
+        drive_target(
+            digit_aliased_target(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            sink.clone(),
+            vec![tenant_moved(1, "1acme", "globex", 0x200), commit(0x200)],
+        )
+        .await
+        .expect("engine ran");
+        assert_eq!(
+            sink.events(),
+            vec!["write[upsert:events-globex/1@512~globex-events-live delete:events-1acme/1]"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fanned_row_whose_old_alias_cannot_render_still_moves() {
+        let sink = placing_sink();
+        drive_target(
+            digit_aliased_target(),
+            users_ids("user-{id}", &["id"]),
+            users_fan("tags", "user-{id}-{tags}"),
+            Default::default(),
+            sink.clone(),
+            vec![
+                ChangeEvent::Row(RowChange {
+                    schema: "public".into(),
+                    table: "users".into(),
+                    kind: RowKind::Update {
+                        pk: json!(7),
+                        previous_pk: None,
+                        doc: json!({"id": 7, "tenant": "globex", "tags": ["a"]}),
+                        unchanged_toast_columns: vec![],
+                        before: Some(json!({"id": 7, "tenant": "1acme", "tags": ["a"]})),
+                    },
+                    version: Some(0x200),
+                }),
+                ChangeEvent::Row(RowChange {
+                    schema: "public".into(),
+                    table: "users".into(),
+                    kind: RowKind::Delete {
+                        pk: json!(8),
+                        before: Some(json!({"id": 8, "tenant": "1acme", "tags": ["b"]})),
+                    },
+                    version: Some(0x200),
+                }),
+                commit(0x200),
+            ],
+        )
+        .await
+        .expect("an alias that cannot render does not halt a fanned delete");
+        assert_eq!(
+            sink.events(),
+            vec![
+                "write[upsert:events-globex/user-7-a@512~globex-events-live \
+                 delete:events-1acme/user-7-a delete:events-1acme/user-8-b]"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bare_key_renders_the_alias_of_the_index_it_renders() {
+        let pk = ["id".to_string()];
+        let target = IndexTarget::Template {
+            spec: "events-{id}".into(),
+            template: crate::mapping::IdTemplate::parse("events-{id}", &pk).expect("valid"),
+            alias: None,
+        }
+        .with_alias("live-{id}", &pk)
+        .expect("a usable alias");
+        assert_eq!(
+            rendered_alias(&target, &json!(7), None, Some(1)),
+            Some("live-7".to_string())
+        );
+        assert_eq!(
+            rendered_alias(&target, &json!({"id": 8}), None, Some(1)),
+            Some("live-8".to_string())
+        );
+        let unaliased = IndexTarget::Static("events".into());
+        assert_eq!(rendered_alias(&unaliased, &json!(7), None, Some(1)), None);
     }
 
     #[tokio::test]

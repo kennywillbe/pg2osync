@@ -144,4 +144,5 @@ INSERT/UPDATE/DELETE, an embedding the source produced answering a similarity
 search, a fanned list that really deletes the elements it drops, a `kill -9`
 resuming from the state collection, `TRUNCATE` at a position, and the refusal of
 an OpenSearch-only option. The same suite runs the sink conformance kit, which
-asserts the part of the contract every target shares, with no check skipped.
+asserts the part of the contract every target shares, skipping only the
+index-template checks a target that refuses templates cannot answer.

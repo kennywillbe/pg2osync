@@ -42,12 +42,22 @@ pub enum DocumentOp {
         /// still want different pipelines — and because a quarantined
         /// document has to be replayed through the same one.
         pipeline: Option<String>,
+        /// The alias the index should carry if this write is the one that
+        /// creates it, rendered from the same row as the index. Carried on
+        /// the operation because only the row knows the values: the name
+        /// alone cannot be split back into them once a template has two
+        /// placeholders. An index that already exists is left as it is.
+        alias: Option<String>,
     },
     Delete {
         index: String,
         id: String,
         routing: Option<String>,
         version: Option<u64>,
+        /// The same as on `Upsert`, and for the same reason: a versioned
+        /// delete into a missing index makes the target create that index,
+        /// bare, so a delete can be the write that creates one too.
+        alias: Option<String>,
     },
     /// Every child document of one parent, removed at the parent's own
     /// position, after the parent itself.
@@ -311,6 +321,20 @@ pub trait Sink: Send + Sync {
         ))
     }
 
+    /// Every alias whose name `pattern` claims, by `index_matches_pattern`'s
+    /// rule, as one `(alias, index)` pair per index holding it, sorted. A
+    /// pattern that matches nothing is an empty list, not an error.
+    ///
+    /// How a switch of a templated table finds the aliases it leaves where
+    /// they are: only the target knows which tenants' aliases exist, and a
+    /// tenant missing from the generation switched to keeps its alias on
+    /// another one. Re-checked by name for the reason `list_indices` is.
+    async fn list_aliases(&self, _pattern: &str) -> Result<Vec<(String, String)>, CoreError> {
+        Err(CoreError::Sink(
+            "this target cannot list the aliases a pattern matches".into(),
+        ))
+    }
+
     /// How many documents `index` holds, or `None` when there is no such
     /// index.
     ///
@@ -358,6 +382,22 @@ pub trait Sink: Send + Sync {
     async fn switch_alias(&self, _alias: &str, _index: &str) -> Result<(), CoreError> {
         Err(CoreError::Sink(
             "this target has no aliases to switch".into(),
+        ))
+    }
+
+    /// Point each alias at exactly the indices it is paired with, in one
+    /// atomic step for all of them.
+    ///
+    /// A templated table has one alias per rendered index, and moving them
+    /// one `switch_alias` at a time would leave readers split between two
+    /// generations for as long as the loop runs. An alias is removed from
+    /// every index that holds it and is not paired with it, never from one it
+    /// is also being added to, and an alias paired with several indices ends
+    /// up on all of them. The default refuses rather than looping, because a
+    /// loop is not atomic and a caller relying on this cannot tell.
+    async fn switch_aliases(&self, _pairs: &[(String, String)]) -> Result<(), CoreError> {
+        Err(CoreError::Sink(
+            "this target cannot switch several aliases in one step".into(),
         ))
     }
 

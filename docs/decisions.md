@@ -261,6 +261,104 @@ held at all, and the run fails naming the key: moving past it would skip
 copies nobody has seen, and a walk that deletes must not report an index it
 did not read in full.
 
+**A per-row index has a per-row alias.** A template names many indices, so
+the alias readers use in front of them is a template too:
+`alias = "{tenant}-events-live"` beside `index = "events-{tenant}"`. It renders
+from the same raw row as the index, by the same rule, and may only name
+columns the index template names; an alias that could differ between two rows
+filed in one index would have no single answer. The engine renders it beside
+the index and carries it on the write, and when that write is the one that
+creates the index, the alias is part of the create body. The index and its
+alias then appear in one step, so a tenant that first shows up after a switch
+is behind its alias from its first document. A versioned delete carries it
+too, because one into a missing index makes a target that auto-creates
+indices (the default) create that index itself, with neither mapping nor
+alias, and the upsert in the next batch would find it there: a replay after
+the index was deleted reaches the row's delete first. So the sink creates an
+index for a versioned delete as it does for an upsert, whether or not the
+target would auto-create it; a deliberately dropped index comes back if
+versioned deletes still reach it, which is the price of every recreated index
+getting its mapping and alias. An unversioned one leaves a missing index missing, so the engine
+renders no alias for it and nothing is created for it. A delete's alias comes
+from the same values that named its index, and one that cannot render is no
+alias rather than a halt: a document written before the alias was configured
+stays deletable, and a row that moved never lends its new alias to the index
+it left. The sink looks every
+templated index a batch writes up again before each bulk, not only the first
+time it sees one, because an index dropped while the pipeline runs (an expired
+month, a removed tenant) is missing again, and the next write would have the
+target auto-create it bare. That costs one `HEAD` per templated index per
+batch. A drop that lands between that look and the bulk still leaves a bare
+index: `switch-alias` gives it its alias once a row in it renders one, but
+not its mapping, and an empty one is dropped by hand. The stream never touches an index that already
+exists: an alias added to the config later reaches the existing indices
+through `switch-alias`, which renders it for each of them. The alias is not
+checked against the index pattern for overlap. `events-{tenant}` and
+`{tenant}-events-live` share `events-x-events-live`, so that check would refuse
+the example above. Only an alias spec identical to its index spec is refused at
+config load, because every one of its rows collides. A collision halts the pipeline instead, whichever name
+arrives first, as a name the grammar refuses does. A row whose alias renders
+the name of an existing index is refused by the target when the create is
+sent. A row whose index renders the name of an existing alias is refused by
+the sink: the target answers an alias's name as if it were an index, so the
+create would be skipped and the write would go through the alias into another
+tenant's index. The sink therefore looks every templated name it did not
+create up in the alias namespace before the first write to it. A fixed
+`index` may still name an alias, since that is what a rebuild leaves the
+section naming.
+
+Rebuilding a templated table fills a fresh *generation* of the template rather
+than one fresh index. The generation is a literal at whichever end of the spec
+is one: `g<unix seconds>-events-{tenant}` for a leading literal,
+`{tenant}-events-g<unix seconds>` for a trailing one, with a previous
+generation replaced rather than stacked. A marker next to a placeholder would
+not do: `events-{tenant}-<ts>` is inside `events-*`, so the old configuration's
+`TRUNCATE` and `reconcile` would claim the rebuild, and readers of the glob
+would see both generations. The two patterns are compared by
+`index_patterns_overlap` before anything is written, and so is the whole
+config the operator is told to write afterwards, checked as a load would check
+it: a generation another section's template overlaps would leave the aliases on
+indices no loadable config can name. Under `--config-dir` that check is the
+directory's load check with this file's config replaced, because a template in
+another file can claim the new generation without overlapping the old one, and
+neither file shows it alone. A template with a
+placeholder at both ends has no literal to mark and is refused. The load runs
+with the alias left out, so no half-filled index joins a live alias before the
+count is checked; the count is the sum over the indices the fresh pattern
+lists. Then every alias moves in one `_aliases` request (#108). Each fresh
+index gets its alias from the values that rendered it. With one placeholder
+the name itself is that value. With several, the name is ambiguous as soon as
+a value can contain a separator, so the source's distinct values of the
+template's columns are rendered into both names instead, on PostgreSQL; a
+MySQL source with such a template is refused. An index whose rows are all
+gone renders no alias from that, and leaving it without one is not harmless:
+the stream gives an alias only to an index it creates, so the next row that
+chooses an index already there would land where no alias reads it. The switch
+also strips an alias it moves from every index it is not paired with, so an
+emptied index loses even the alias it was created with once its tenant has
+another one. Both commands therefore refuse, before anything moves, when an
+index the generation lists would be left holding no alias the template
+claims, and name each one. Such an index holds no row the source still has;
+deleted with the pipeline stopped, it is created again with its alias by the
+next row that chooses it. Deleted beside a running pipeline it is not,
+because the stream remembers the index and the target would create it on
+the next write with neither mapping nor alias. A tenant with no rows left
+keeps its alias on the old generation: removing it would turn a stale answer into an error, and that is not a choice a rebuild
+should make for the reader. The same holds in the other direction: `switch-alias`
+with the previous configuration is the rollback, and a tenant that first
+appeared in the newer generation keeps its alias there. Kept is not the same
+as silent. The stream creates a missing index with its alias, so the next row
+for such a tenant would leave the alias spanning two generations. Both
+commands therefore look up every alias the alias template's pattern claims
+(`Sink::list_aliases`, re-checked by name as `list_indices` is) before they
+switch, and name each one held only outside the generation they switch to.
+Running `switch-alias` again once its index exists here moves it off the other
+generation. `--drop-old` is refused with a template, because
+it would delete indices inferred from a pattern, and `delete_index` is only
+ever given a name someone wrote down. `--alias` must be the section's `alias`.
+One source of truth means the tenants the switch moves and the ones the
+stream creates afterwards carry the same alias.
+
 **Vectors are the target's to compute.** (`pipeline`, #68.) Semantic search
 needs an embedding per document, and the obvious design — an embedding client
 inside pg2osync — puts a network hop and a rate limit inside every batch, adds
@@ -450,7 +548,12 @@ the source sends it again when the mapping is fixed.
 rejects --replay` submits it again with its original position as its version, so a
 row the source has since changed loses to the newer value by the same rule that
 orders everything else, and the record is cleared only once the target has taken
-it.
+it. The target is prepared first exactly as a run prepares it, from the same
+config: a replay can be the first write to an index, and a per-row index it
+creates then appears with the section's mapping and alias, as the stream would
+have created it. An index the config's templates no longer claim, such as one
+of a previous generation, is created by the target alone, since putting the
+live alias on it would let readers see two generations.
 
 **A checkpoint is bound to its stream.** It records the source kind, the slot or
 `server_id`, and the publication. A checkpoint from another stream is rejected
@@ -773,8 +876,9 @@ fixed index against `/_alias/<name>` for the same reason the ingest-pipeline
 check is there — the flag would otherwise only report the mistake one refused
 batch at a time, after the pipeline had already been configured wrong for as
 long as it took to notice. A templated index is refused with it rather than
-enforced against: the index a row names is created on demand and no alias
-stands in front of a name that did not exist a moment ago. A rebuild is refused
+enforced against. A section's `alias` puts an alias on each index the moment
+it is created, but the stream still writes to the concrete name the row
+rendered, never through the alias, so every write would be refused. A rebuild is refused
 with it for the same shape of reason — the section names the alias, and
 `reindex` needs a fresh index *and* a separate name to point at it — so the
 option comes off for the rebuild and goes back on afterwards, with the section
@@ -790,6 +894,21 @@ an index uid, and its atomic operation is `POST /swap-indexes`, which exchanges
 the contents of two uids in one task. Modelling that as "this target has no
 aliases" was the easy reading and the wrong one; the contract holds there, so
 the sink implements it.
+
+A templated table moves many aliases at once, one per tenant, and N calls to
+`switch_alias` would be N atomic steps. Between two of them, half the tenants
+would read the new generation and half the old. `Sink::switch_aliases` takes
+every `(alias, index)` pair and sends one `_aliases` request. Both engines
+document that request as atomic as a whole. Each alias ends up on exactly the
+indices it was paired with: it is removed from every other index that holds
+it, it is never removed from an index it is also being added to, and an alias
+paired with several indices points at all of them. Looking up the current
+holders takes one request per alias, but only the switch has to be atomic.
+The trait default refuses instead of looping over `switch_alias`, so a target
+that cannot make the switch atomic says so. The conformance kit checks the
+switch where a target opts in and reports the check as skipped where it does
+not. Meilisearch keeps the default because templates are refused there,
+although `/swap-indexes` takes several pairs and could implement it later.
 
 Two things follow from the swap, and the command says both out loud.
 `--alias` on Meilisearch has to be the index the section already writes to,
