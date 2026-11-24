@@ -61,6 +61,7 @@ async fn the_opensearch_sink_honours_the_sink_contract() {
         |id| json!({"name": format!("row {id}"), "weight": 7}),
     )
     .with_unacceptable_document(json!({"name": "bad", "weight": "not a number"}))
+    .with_index_listing()
     .run(&sink)
     .await
     .expect("the OpenSearch sink honours the Sink contract");
@@ -112,6 +113,7 @@ async fn the_elasticsearch_sink_honours_the_sink_contract() {
         |id| json!({"name": format!("row {id}"), "weight": 7}),
     )
     .with_unacceptable_document(json!({"name": "bad", "weight": "not a number"}))
+    .with_index_listing()
     .run(&sink)
     .await
     .expect("the Elasticsearch sink honours the Sink contract");
@@ -176,9 +178,9 @@ async fn the_meilisearch_sink_honours_the_sink_contract() {
     std::fs::remove_dir_all(&state_dir).expect("this run's state directory, removed");
     assert_eq!(
         report.skipped,
-        ["versioned truncate", "partial batch"],
-        "the two checks a target without versions and without a schema cannot answer, \
-         and no others: {report:?}"
+        ["versioned truncate", "partial batch", "index listing"],
+        "the checks a target without versions, without a schema and without index \
+         templates cannot answer, and no others: {report:?}"
     );
 }
 
@@ -224,9 +226,11 @@ async fn the_qdrant_sink_honours_the_sink_contract() {
     .run(&sink)
     .await
     .expect("the Qdrant sink honours the Sink contract");
-    assert!(
-        report.skipped.is_empty(),
-        "this target can answer every check: {report:?}"
+    assert_eq!(
+        report.skipped,
+        ["index listing"],
+        "the one check a target that refuses index templates cannot answer, and no \
+         others: {report:?}"
     );
 }
 
@@ -262,8 +266,10 @@ async fn the_postgres_sink_honours_the_sink_contract() {
     .run(&sink)
     .await
     .expect("the PostgreSQL sink honours the Sink contract");
-    assert!(
-        report.skipped.is_empty(),
-        "this target can answer every check: {report:?}"
+    assert_eq!(
+        report.skipped,
+        ["index listing"],
+        "the one check a target that refuses index templates cannot answer, and no \
+         others: {report:?}"
     );
 }

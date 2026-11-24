@@ -4,7 +4,7 @@
 //! plain-text secrets in the file are accepted but warn deprecated.
 
 use anyhow::{Context, Result};
-use pg2osync_core::sink::index_matches_pattern;
+use pg2osync_core::sink::{index_matches_pattern, index_patterns_overlap};
 use pg2osync_engine::mapping::{IdTemplate, IndexTarget, TransformOp, check_index_name};
 use pg2osync_engine::pseudonym::PseudonymKey;
 use serde::Deserialize;
@@ -2047,6 +2047,27 @@ fn check_template_claims(targets: &[(&Label, &TableSync, IndexTarget)]) -> Resul
             );
         }
     }
+    // A second pass, so a pattern that contains another is reported as that
+    // rather than as whichever section happens to be compared first.
+    for (label, tbl, target) in targets {
+        let IndexTarget::Template { spec, .. } = target else {
+            continue;
+        };
+        let pattern = target.pattern();
+        if let Some((other, other_table, other_pattern)) = targets
+            .iter()
+            .map(|(k, t, target)| (k, t, target.pattern()))
+            .find(|(k, _, p)| *k != label && index_patterns_overlap(&pattern, p))
+        {
+            anyhow::bail!(
+                "{label} index {spec:?} claims {pattern:?}, and {other} index {:?} can render a \
+                 name inside it ({other_pattern:?} overlaps it); a TRUNCATE or a reconcile \
+                 --delete of {} would empty that section's documents too",
+                other_table.index_name(other.key()),
+                tbl.table
+            );
+        }
+    }
     Ok(())
 }
 
@@ -2626,6 +2647,29 @@ mapping_file = "users.json"
              index = \"archive\"\n"
         ))
         .expect("an index outside the pattern is untouched by the claim");
+    }
+
+    /// Neither pattern string matches the other here, yet a row of archive
+    /// with app = 'events-x' renders events-x-errors, which a TRUNCATE or a
+    /// `reconcile --delete` of users would treat as its own.
+    #[test]
+    fn two_index_templates_may_not_render_a_common_name() {
+        let toml_str = format!(
+            "{MINIMAL}index = \"events-{{tenant}}\"\n[sync.archive]\ntable = \"public.archive\"\n\
+             index = \"{{app}}-errors\"\n"
+        );
+        let message = refused(&toml_str, "two templates that can render one name");
+        assert!(
+            message.contains("can render a name inside it")
+                && message.contains("\"events-*\"")
+                && message.contains("\"*-errors\""),
+            "{message}"
+        );
+        parse(&format!(
+            "{MINIMAL}index = \"events-{{tenant}}\"\n[sync.archive]\ntable = \"public.archive\"\n\
+             index = \"archive-{{tenant}}-{{year}}\"\n"
+        ))
+        .expect("a template whose names can never start with events- is not claimed");
     }
 
     #[test]

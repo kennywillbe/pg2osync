@@ -1717,6 +1717,12 @@ events_cleanup() {
   pg "DROP PUBLICATION IF EXISTS ${ESLOT}_pub; DROP TABLE IF EXISTS events_probe;" > /dev/null 2>&1 || true
   curl -s -XDELETE "$OS/e2e-events-*?ignore_unavailable=true" > /dev/null 2>&1 || true
   rm -f "$ECONFIG" "$EMAPPING"
+  # the reconcile probe of the same section, torn down with it so the trap
+  # line every later section repeats does not grow
+  pg "SELECT pg_drop_replication_slot('pg2osync_e2e_evrc') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='pg2osync_e2e_evrc');" > /dev/null 2>&1 || true
+  pg "DROP PUBLICATION IF EXISTS pg2osync_e2e_evrc_pub; DROP TABLE IF EXISTS evrc_probe;" > /dev/null 2>&1 || true
+  curl -s -XDELETE "$OS/e2e-evrc-*?ignore_unavailable=true" > /dev/null 2>&1 || true
+  rm -f "${RCCONFIG:-}"
 }
 trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup; init_cleanup; fan_cleanup; bid_cleanup; shape_cleanup; where_cleanup; join_cleanup; union_cleanup; events_cleanup' EXIT
 
@@ -1806,13 +1812,97 @@ else
 fi
 check "no index was created for the refused name" "$(curl -s "$OS/_cat/indices/e2e-events-*?h=index" | wc -l | tr -d ' ')" "2"
 stop_sync
-# reconcile pages one index by its key column, and this table's documents
-# are spread over every index the template renders
-out=$($BIN reconcile -c "$ECONFIG" 2>&1 || true)
-if grep -q "chosen per row" <<< "$out"; then
-  ok "reconcile refuses a table whose index is chosen per row"
+
+# reconcile walks every index the template claims (#69): a document whose row
+# is gone is an orphan, one whose row is live but renders another index is a
+# stray, and each is deleted from the index it was found in. The table above
+# is halted on a row that renders no legal name, so this one is its own.
+RCCONFIG=$(mktemp /tmp/pg2osync-e2e-evrc.XXXXXX)
+RCSLOT=pg2osync_e2e_evrc
+drop_idle_probe_slots
+cat > "$RCCONFIG" <<TOML
+[source]
+url_env = "PG2OSYNC_SOURCE_URL"
+slot_name = "$RCSLOT"
+publication = "${RCSLOT}_pub"
+
+[target]
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
+
+[metrics]
+bind = "127.0.0.1:$((PORT_BASE + 27))"
+
+[sync.evrc]
+table = "public.evrc_probe"
+index = "e2e-evrc-{tenant}"
+TOML
+# the real key is (tenant, id) and the declared one is id alone, so key 3 is
+# two live rows filed in two indices: neither copy may read as a stray. The
+# load names each document by the real key, which is what its id is.
+rc_id() { printf 'id%%3D%s%%2Ctenant%%3D%s' "$1" "$2"; }
+pg "DROP TABLE IF EXISTS evrc_probe; CREATE TABLE evrc_probe(id bigint, tenant text, PRIMARY KEY (tenant, id)); ALTER TABLE evrc_probe REPLICA IDENTITY FULL;" > /dev/null 2>&1
+pg "INSERT INTO evrc_probe VALUES (1,'acme'),(2,'acme'),(3,'acme'),(3,'globex');" > /dev/null
+pg "DROP PUBLICATION IF EXISTS ${RCSLOT}_pub; CREATE PUBLICATION ${RCSLOT}_pub FOR TABLE evrc_probe;" > /dev/null 2>&1
+curl -s -XDELETE "$OS/e2e-evrc-*?ignore_unavailable=true" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/postgres-$RCSLOT" > /dev/null
+sync_spawn "$RCCONFIG"
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_count e2e-evrc-acme)" = "3" ] && [ "$(os_count e2e-evrc-globex)" = "1" ] && break
+  sleep 1
+done
+check "the templated table is loaded into the index each row names" \
+  "$(os_count e2e-evrc-acme)/$(os_count e2e-evrc-globex)" "3/1"
+stop_sync
+# the orphan: a row gone while nothing was watching, its document still in
+# tenant A's index
+pg "DELETE FROM evrc_probe WHERE id = 2;" > /dev/null
+# the stray: row 1 is live and renders e2e-evrc-acme, but a copy of it sits in
+# tenant B's index under the same id
+curl -s -XPUT "$OS/e2e-evrc-globex/_doc/1" -H 'Content-Type: application/json' \
+  -d '{"id":1,"tenant":"acme"}' > /dev/null
+# a hand-made index the pattern claims, with nothing in it: listed, not removed
+curl -s -XPUT "$OS/e2e-evrc-empty" > /dev/null
+refresh
+out=$($BIN reconcile -c "$RCCONFIG" 2>&1 || true)
+if grep -q "e2e-evrc-acme: 3 document(s) scanned, 1 found with no row in public.evrc_probe, 0 found whose row belongs in another index" <<< "$out"; then
+  ok "reconcile names the orphan in tenant A's index"
 else
-  bad "reconcile did not refuse the templated table"
+  bad "reconcile did not report exactly the orphan in tenant A's index: $out"
+fi
+if grep -q "e2e-evrc-globex: 2 document(s) scanned, 0 found with no row in public.evrc_probe, 1 found whose row belongs in another index" <<< "$out" \
+  && grep -q "1 (its row belongs in e2e-evrc-acme)" <<< "$out"; then
+  ok "reconcile names the stray in tenant B's index and where its row belongs"
+else
+  bad "reconcile did not report exactly the stray in tenant B's index: $out"
+fi
+if grep -q "e2e-evrc-empty: empty, left as it is" <<< "$out"; then
+  ok "an empty index the template claims is reported"
+else
+  bad "reconcile did not report the empty index: $out"
+fi
+check "reporting alone deleted nothing" \
+  "$(os_status e2e-evrc-acme "$(rc_id 2 acme)")/$(os_status e2e-evrc-globex 1)" "200/200"
+$BIN reconcile -c "$RCCONFIG" --delete > /dev/null
+refresh
+check "reconcile --delete removed the orphan" "$(os_status e2e-evrc-acme "$(rc_id 2 acme)")" "404"
+check "reconcile --delete removed the stray from the index it was found in" "$(os_status e2e-evrc-globex 1)" "404"
+check "and left the real documents alone" \
+  "$(os_status e2e-evrc-acme "$(rc_id 1 acme)")/$(os_status e2e-evrc-acme "$(rc_id 3 acme)")/$(os_status e2e-evrc-globex "$(rc_id 3 globex)")" "200/200/200"
+check "the empty index is still there" \
+  "$(curl -s -o /dev/null -w "%{http_code}" "$OS/e2e-evrc-empty")" "200"
+# a run that errors prints no "found" at all, so the clean result is asserted
+# line by line and the exit status with it
+rc_status=0
+out=$($BIN reconcile -c "$RCCONFIG" 2>&1) || rc_status=$?
+if [ "$rc_status" = "0" ] \
+  && grep -q "e2e-evrc-acme: 2 document(s) scanned, 0 found with no row in public.evrc_probe, 0 found whose row belongs in another index" <<< "$out" \
+  && grep -q "e2e-evrc-globex: 1 document(s) scanned, 0 found with no row in public.evrc_probe, 0 found whose row belongs in another index" <<< "$out" \
+  && ! grep -q "Re-run with --delete" <<< "$out"; then
+  ok "a second reconcile finds nothing"
+else
+  bad "a second reconcile did not come back clean (exit $rc_status): $out"
 fi
 
 echo -e "\n\033[1m== 27. the target runs an ingest pipeline on every document of a section ==\033[0m"

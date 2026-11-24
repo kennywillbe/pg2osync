@@ -15,14 +15,21 @@
 //!   and reports the refusal rather than raising it
 //! - a checkpoint that was written reads back, and one belonging to another
 //!   stream does not
+//! - the indices a pattern claims are listed, and a pattern that claims none
+//!   is an empty list
 //!
 //! Behind the `testkit` feature so nothing of it reaches a release binary.
 //!
-//! Two things are the caller's, because only the caller knows them: the
-//! documents its target accepts, and a document its target refuses. A target
-//! with no document it can refuse — a schema-less one — leaves the second out,
-//! and the partial-batch check is skipped rather than faked. Skipping is
-//! reported, so an opt-out is a line in the output rather than a silence.
+//! Three things are the caller's, because only the caller knows them: the
+//! documents its target accepts, a document its target refuses, and whether
+//! its target can list indices by pattern. A target with no document it can
+//! refuse — a schema-less one — leaves the second out, and the partial-batch
+//! check is skipped rather than faked; one that keeps the trait's default for
+//! `list_indices` leaves the third out, and the listing check is skipped. The
+//! default answers with an error, and an error is not something the kit can
+//! tell apart from a broken implementation, so the caller says which it is.
+//! Skipping is reported, so an opt-out is a line in the output rather than a
+//! silence.
 
 use crate::checkpoint::{Checkpoint, StreamId};
 use crate::error::CoreError;
@@ -35,6 +42,7 @@ pub struct SinkTestHarness {
     index: String,
     document: Box<dyn Fn(&str) -> Value + Send + Sync>,
     unacceptable: Option<Value>,
+    lists_indices: bool,
 }
 
 /// What ran, so a caller can print it and a reader can see what was skipped.
@@ -52,6 +60,7 @@ impl SinkTestHarness {
             index: index.to_string(),
             document: Box::new(document),
             unacceptable: None,
+            lists_indices: false,
         }
     }
 
@@ -62,6 +71,13 @@ impl SinkTestHarness {
     /// reported as skipped.
     pub fn with_unacceptable_document(mut self, doc: Value) -> Self {
         self.unacceptable = Some(doc);
+        self
+    }
+
+    /// The target implements `list_indices`. Without this the listing check
+    /// is reported as skipped.
+    pub fn with_index_listing(mut self) -> Self {
+        self.lists_indices = true;
         self
     }
 
@@ -105,6 +121,15 @@ impl SinkTestHarness {
             .await
             .map_err(named("checkpoint durability"))?;
         report.passed.push("checkpoint durability".into());
+
+        if self.lists_indices {
+            self.index_listing(sink)
+                .await
+                .map_err(named("index listing"))?;
+            report.passed.push("index listing".into());
+        } else {
+            report.skipped.push("index listing".into());
+        }
         Ok(report)
     }
 
@@ -318,6 +343,47 @@ impl SinkTestHarness {
         }
         if sink.read_checkpoint(&other).await?.is_some() {
             return fail("one stream's checkpoint was returned for another's");
+        }
+        Ok(())
+    }
+
+    /// A templated table is reconciled index by index, over exactly the
+    /// indices its pattern claims: one left out is never checked, and one
+    /// brought in that the pattern does not claim has every document reported
+    /// as somebody else's orphan.
+    async fn index_listing(&self, sink: &dyn Sink) -> Result<(), CoreError> {
+        let exact = sink.list_indices(&self.index).await?;
+        if exact != [self.index.clone()] {
+            return fail(format!(
+                "the pattern {:?} listed {exact:?} rather than the index itself",
+                self.index
+            ));
+        }
+        // a star at the end of a prefix of the name, so the expansion is the
+        // target's own and not a name passed straight through
+        let head = &self.index[..self.index.len() - 1];
+        let pattern = format!("{head}*");
+        let found = sink.list_indices(&pattern).await?;
+        if !found.contains(&self.index) {
+            return fail(format!(
+                "the pattern {pattern:?} did not list {}",
+                self.index
+            ));
+        }
+        if let Some(stray) = found
+            .iter()
+            .find(|name| !crate::sink::index_matches_pattern(&pattern, name))
+        {
+            return fail(format!(
+                "the pattern {pattern:?} listed {stray}, which it does not claim"
+            ));
+        }
+        let none = format!("{}-pg2osync-testkit-absent-*", self.index);
+        let empty = sink.list_indices(&none).await?;
+        if !empty.is_empty() {
+            return fail(format!(
+                "the pattern {none:?}, which nothing matches, listed {empty:?}"
+            ));
         }
         Ok(())
     }

@@ -165,6 +165,28 @@ pub fn index_matches_pattern(pattern: &str, name: &str) -> bool {
     true
 }
 
+/// Whether some name is claimed by both `a` and `b`: what two templates have to
+/// be compared by, since a row's values can turn either one's placeholder into
+/// the other's literals. A side with no `*` is a single name and goes through
+/// `index_matches_pattern`. Two sides with a star each overlap exactly when
+/// their heads agree as far as the shorter one goes, and so do their tails:
+/// the longer head, then every middle literal of both, then the longer tail is
+/// a name both match, each star absorbing what its side does not spell out.
+pub fn index_patterns_overlap(a: &str, b: &str) -> bool {
+    let (Some((a_head, a_tail)), Some((b_head, b_tail))) = (head_and_tail(a), head_and_tail(b))
+    else {
+        return index_matches_pattern(a, b) || index_matches_pattern(b, a);
+    };
+    (a_head.starts_with(b_head) || b_head.starts_with(a_head))
+        && (a_tail.ends_with(b_tail) || b_tail.ends_with(a_tail))
+}
+
+/// The literal before the first `*` and the one after the last, or `None`
+/// for a pattern that is a single name.
+fn head_and_tail(pattern: &str) -> Option<(&str, &str)> {
+    Some((pattern.split_once('*')?.0, pattern.rsplit_once('*')?.1))
+}
+
 /// Index settings put aside while an initial load runs, so they can be put
 /// back afterwards. Opaque to the engine: only the sink knows what it saved.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -270,6 +292,22 @@ pub trait Sink: Send + Sync {
     ) -> Result<Vec<(String, Value, Option<String>)>, CoreError> {
         Err(CoreError::Sink(
             "this target cannot page an index in key order".into(),
+        ))
+    }
+
+    /// The open indices `pattern` claims, by `index_matches_pattern`'s rule,
+    /// sorted. A pattern that matches nothing is an empty list, not an error.
+    ///
+    /// How a templated table is walked against its source: its documents are
+    /// spread over every index its rows rendered, and only the target knows
+    /// which those are. Only names the pattern itself claims are returned —
+    /// an alias that happens to match must not bring in an index the
+    /// template never wrote — because a caller acting on this deletes things.
+    /// Targets that cannot list their indices say so rather than returning a
+    /// partial answer.
+    async fn list_indices(&self, _pattern: &str) -> Result<Vec<String>, CoreError> {
+        Err(CoreError::Sink(
+            "this target cannot list the indices a pattern matches".into(),
         ))
     }
 
@@ -447,7 +485,7 @@ pub trait Sink: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::index_matches_pattern;
+    use super::{index_matches_pattern, index_patterns_overlap};
 
     #[test]
     fn a_pattern_without_a_star_matches_only_itself() {
@@ -498,5 +536,53 @@ mod tests {
         assert!(!index_matches_pattern("events-*-archive", "events-"));
         // the two literals may not share the one character the name has
         assert!(!index_matches_pattern("a*a", "a"));
+    }
+
+    #[test]
+    fn two_patterns_overlap_when_a_row_could_render_one_name_into_both() {
+        for (a, b, overlap) in [
+            ("events-*", "*-errors", true),
+            ("events-*", "events-*-*", true),
+            ("events-*", "events-archive", true),
+            ("events", "events", true),
+            ("events-*", "orders-*", false),
+            ("a-*", "ab-*", false),
+            ("*-a", "*-b", false),
+            ("events-*", "events", false),
+            ("a*a", "a", false),
+            ("events", "orders", false),
+        ] {
+            assert_eq!(index_patterns_overlap(a, b), overlap, "{a} vs {b}");
+            assert_eq!(index_patterns_overlap(b, a), overlap, "{b} vs {a}");
+        }
+    }
+
+    /// The overlap rule against its definition: a name both patterns match,
+    /// searched for among every short name. A witness is never longer than
+    /// the literals of both patterns together, so the search is complete.
+    #[test]
+    fn two_patterns_overlap_exactly_when_some_name_matches_both() {
+        fn words(alphabet: &[char], max: usize) -> Vec<String> {
+            let mut all = vec![String::new()];
+            let mut last = vec![String::new()];
+            for _ in 0..max {
+                last = last
+                    .iter()
+                    .flat_map(|w| alphabet.iter().map(move |c| format!("{w}{c}")))
+                    .collect();
+                all.extend(last.iter().cloned());
+            }
+            all
+        }
+        let patterns = words(&['a', 'b', '*'], 4);
+        let names = words(&['a', 'b'], 8);
+        for a in &patterns {
+            for b in &patterns {
+                let witnessed = names
+                    .iter()
+                    .any(|n| index_matches_pattern(a, n) && index_matches_pattern(b, n));
+                assert_eq!(index_patterns_overlap(a, b), witnessed, "{a:?} vs {b:?}");
+            }
+        }
     }
 }
