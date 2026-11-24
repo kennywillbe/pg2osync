@@ -63,7 +63,7 @@ docker run --rm \
   -e PG2OSYNC_TARGET_PASSWORD="…" \
   -v "$PWD/pg2osync.toml:/etc/pg2osync/pg2osync.toml:ro" \
   -p 9100:9100 \
-  ghcr.io/kennywillbe/pg2osync:1.5.2
+  ghcr.io/kennywillbe/pg2osync:2.0.0
 ```
 <!-- x-release-please-end -->
 
@@ -73,7 +73,7 @@ override it to use another subcommand:
 
 <!-- x-release-please-start-version -->
 ```sh
-docker run --rm … ghcr.io/kennywillbe/pg2osync:1.5.2 \
+docker run --rm … ghcr.io/kennywillbe/pg2osync:2.0.0 \
   validate -c /etc/pg2osync/pg2osync.toml
 ```
 <!-- x-release-please-end -->

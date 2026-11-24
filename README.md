@@ -36,7 +36,7 @@ each archive:
 
 <!-- x-release-please-start-version -->
 ```sh
-v=v1.5.2 t=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl,
+v=v2.0.0 t=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl,
                                        # x86_64-apple-darwin, aarch64-apple-darwin
 curl -fsSLO "https://github.com/kennywillbe/pg2osync/releases/download/$v/pg2osync-$v-$t.tar.gz"
 curl -fsSLO "https://github.com/kennywillbe/pg2osync/releases/download/$v/pg2osync-$v-$t.tar.gz.sha256"
@@ -47,7 +47,7 @@ tar -xzf "pg2osync-$v-$t.tar.gz" && sudo install pg2osync /usr/local/bin/
 
 <!-- x-release-please-start-version -->
 Or run the multi-architecture image, tagged with the version, `major.minor` and
-`latest`: `docker run ghcr.io/kennywillbe/pg2osync:1.5.2`.
+`latest`: `docker run ghcr.io/kennywillbe/pg2osync:2.0.0`.
 <!-- x-release-please-end -->
 
 The archive holds the one `pg2osync` executable and nothing else. Or build from
