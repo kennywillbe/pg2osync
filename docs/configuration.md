@@ -361,17 +361,27 @@ and the document is then in the old index.
   section's index or be shared. Each placeholder stands for `*` in what a
   `TRUNCATE` clears, so `index = "{tenant}"` — a claim on the whole cluster —
   is refused at config load; so is a template whose pattern also matches an
-  index another section writes to, and a template two sections name.
+  index another section writes to, two templates that could render one name
+  (`events-{tenant}` and `{app}-errors` both cover `events-x-errors`), and a
+  template two sections name.
 - **`TRUNCATE` clears the pattern.** Every index the template claims is
   searched, and each hit is deleted under its own index as a versioned write,
   so a row committed after the truncate is not swept away with it.
 - **A row that changes its index-choosing column moves.** It is written in
   the new index and deleted from the old — the same move `id` makes for a row
   whose id changed.
-- **`reconcile`, `switch-alias` and `reindex` refuse a templated table.**
-  Reconcile pages one index by its key column, and the table's documents are
-  spread over every index the template renders; an alias points at one index,
-  and so does a rebuild. `resnapshot` works.
+- **`reconcile` walks every index the template claims.** Each open index the
+  pattern matches is paged by key; a document whose row is gone is an orphan,
+  and one whose row is live but renders another index is a stray. `--delete`
+  removes both from the index they were found in, and the report is per
+  index. The claim is the same one a `TRUNCATE` makes: an index you created
+  by hand that matches the pattern is treated as the table's, so `--delete`
+  can empty it. An empty index is reported, never removed. Nothing is
+  deleted until every matching index has been walked, so a walk that fails
+  partway removes nothing; the bulk request that follows can still fail
+  partway, and running `reconcile --delete` again finishes it.
+- **`switch-alias` and `reindex` refuse a templated table.** An alias points
+  at one index, and so does a rebuild. `resnapshot` works.
 - **Meilisearch, PostgreSQL and Qdrant refuse a template** at startup: none of
   them can say what a name a row renders should be created with.
 - **Bulk-load settings are not relaxed** for a templated index. An index
@@ -1905,7 +1915,8 @@ with a row `1` are otherwise one document.
 **An index a template claims.** A [per-row index](#per-row-indices) claims
 every name it can render, in any file: a fixed `events-2024` inside another
 file's `events-{tenant}` is refused, because a re-snapshot of the templated
-section would clear it.
+section would clear it, and so is another file's `{app}-errors`, whose rows
+could render a name inside it.
 
 **A listener, and the log.** `[metrics]`, `[api]` and `[log]` describe the
 process, not a source: one process opens one metrics port, one `/synced` port

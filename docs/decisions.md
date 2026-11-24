@@ -220,11 +220,43 @@ The index is created on demand, at the first document that needs it, rather
 than ahead of time: pre-creating means enumerating a column's values, which
 nothing can do without querying the source for a search concern, and
 recording the glob and creating on first use keeps the mapping the operator
-configured. `reconcile` is refused because it pages one index by its key
-column, and a templated table's documents are spread over every index the
-template renders — there is no single index to page. And a template must
-carry a literal, because `TRUNCATE` clears what the template claims, and a
-claim of `*` is a claim on the cluster.
+configured. And a template must carry a literal, because `TRUNCATE` clears
+what the template claims, and a claim of `*` is a claim on the cluster.
+Nothing another section writes may sit inside that claim, and two templates
+are compared by the names each can render, not by their spelling:
+`events-{tenant}` and `{app}-errors` share `events-x-errors`, so the pair is
+refused at load even if no row would ever render it, because the column's
+values are not something the configuration can know.
+
+`reconcile` walks a templated table index by index. There is no single index
+to page, so the target lists the open indices the template's pattern claims,
+and each is paged by key exactly as a fixed index is. For each page the
+template's columns are read from the source the way the initial load reads
+them and decoded by the same type map, so the name a live row renders is the
+name the stream gave it; a document is an orphan when its row is gone,
+filtered or soft-deleted, and a stray when its row is live but renders
+another index — a copy a move left behind, or one written by hand. Deletes
+name the index the document was found in and its routing, never the pattern,
+because a stray's real document is the same id in another index. The claim
+is the TRUNCATE claim: every index the pattern matches is the table's, so
+`--delete` can empty a hand-made index that happens to match. An empty index
+is reported and left; removing an index is a decision about the cluster. A
+live row that cannot render a name is where the stream halts, and reconcile
+stops there too rather than guess where its document belongs. `--delete`
+removes nothing until every matching index has been walked, so a walk that
+stops partway deletes nothing at all; what it found then goes out as one bulk
+request, which the target can still apply only in part. The deletes are
+unversioned and idempotent, so running reconcile again finishes the job.
+
+Every index, fixed or templated, is paged with `search_after`, which resumes
+strictly after a key, and the key column need not be unique within an index:
+a composite real key with one declared key column, accepted under `REPLICA
+IDENTITY FULL`, puts (acme, 7) and (globex, 7) under key 7. A full page holds
+the documents of its last key back for the next page, so none is passed over.
+More than one page (1000) of documents under one key in one index cannot be
+held at all, and the run fails naming the key: moving past it would skip
+copies nobody has seen, and a walk that deletes must not report an index it
+did not read in full.
 
 **Vectors are the target's to compute.** (`pipeline`, #68.) Semantic search
 needs an embedding per document, and the obvious design — an embedding client

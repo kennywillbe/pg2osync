@@ -279,6 +279,24 @@ against the table. A document whose row is gone is named; with `--delete` it is
 removed. Only keys move between the two sides, which is what makes this far
 cheaper than a reindex.
 
+The key column need not be unique within an index — a composite real key with
+one declared key column puts several documents under one key — and a key's
+documents are always checked together, never split across two pages. More
+than 1000 documents sharing one key in one index do not fit in a page, so
+reconcile stops with `more than 1000 documents share key … in one index`
+rather than check only some of them; `--delete` then removes nothing from
+that table's indices.
+
+A table whose index is a template (`index = "events-{tenant}"`) is checked over
+every open index the pattern matches, one report line per index. A document
+whose row is live but renders a different index is named as well, with the
+index its row belongs in, and `--delete` removes it from the index it was found
+in. Every matching index counts as the table's, a hand-made one included; an
+empty one is listed and left alone. `--delete` waits until every matching index
+has been walked, so a walk that fails partway removes nothing. The deletes then
+go out as one bulk request, which the target can still apply only in part;
+running it again finishes the job.
+
 Reporting is the default because a wrong `primary_key` would otherwise empty an
 index, and that is not a recoverable mistake.
 

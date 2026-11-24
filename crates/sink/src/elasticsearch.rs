@@ -911,6 +911,27 @@ impl Sink for ElasticsearchSink {
             .unwrap_or_default())
     }
 
+    async fn list_indices(&self, pattern: &str) -> Result<Vec<String>, CoreError> {
+        // as on OpenSearch: one setting for its keys, index privileges only,
+        // and open indices only, since a closed one cannot be searched
+        let (status, body) = self
+            .send(
+                reqwest::Method::GET,
+                &format!(
+                    "/{pattern}/_settings/index.uuid\
+                     ?expand_wildcards=open&allow_no_indices=true&ignore_unavailable=true"
+                ),
+                None,
+            )
+            .await?;
+        if status != 200 {
+            return Err(CoreError::Sink(format!(
+                "list indices {pattern}: {status} {body}"
+            )));
+        }
+        Ok(crate::claimed_indices(pattern, &body))
+    }
+
     async fn count_documents(&self, index: &str) -> Result<Option<u64>, CoreError> {
         let (status, body) = self
             .send(reqwest::Method::GET, &format!("/{index}/_count"), None)

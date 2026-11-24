@@ -1033,17 +1033,11 @@ async fn reconcile_cmd(cfg: config::AppConfig, delete: bool) -> Result<()> {
                 table.table
             );
         }
-        // and there is no single index to page when each row chose its own
-        if table.is_templated() {
-            bail!(
-                "[sync.{key}] index {index:?} is chosen per row: reconcile pages one index by \
-                 its key column, and this table's documents are spread across every index the \
-                 template renders"
-            );
-        }
         let spec = reconcile::Table {
             qualified: table.table.clone(),
-            index: table.index_name(key),
+            target: table
+                .index_target(key, &run::pk_columns_for(table))
+                .map_err(|e| anyhow::anyhow!("[sync.{key}] {e}"))?,
             key_column: table.primary_key.clone().unwrap_or_else(|| "id".into()),
             scope: table
                 .join
@@ -1057,23 +1051,50 @@ async fn reconcile_cmd(cfg: config::AppConfig, delete: bool) -> Result<()> {
                 .transpose()
                 .map_err(|e| anyhow::anyhow!("where predicate of {}: {e}", table.table))?,
         };
-        let report = reconcile::table(&client, &sink, &spec, delete).await?;
-        total_orphans += report.orphaned.len();
-        let verb = if delete { "removed" } else { "found" };
-        println!(
-            "{}: {} document(s) scanned, {} {verb} with no row in {}",
-            spec.index,
-            report.scanned,
-            report.orphaned.len(),
-            spec.qualified
-        );
-        // enough to investigate with, without pasting a whole index into a
-        // terminal when something has gone badly wrong
-        for (id, _) in report.orphaned.iter().take(10) {
-            println!("  {id}");
+        let templated = table.is_templated();
+        let reports = reconcile::table(&client, &sink, &spec, delete).await?;
+        if templated && reports.is_empty() {
+            println!("{}: no index matches", spec.target.pattern());
         }
-        if report.orphaned.len() > 10 {
-            println!("  … and {} more", report.orphaned.len() - 10);
+        let verb = if delete { "removed" } else { "found" };
+        for report in &reports {
+            total_orphans += report.orphaned.len() + report.stray.len();
+            if templated && report.scanned == 0 {
+                // the template claims it, so it is shown; nothing in it can be
+                // wrong, and an index is never removed by reconcile
+                println!("{}: empty, left as it is", report.index);
+                continue;
+            }
+            let stray = if templated {
+                format!(
+                    ", {} {verb} whose row belongs in another index",
+                    report.stray.len()
+                )
+            } else {
+                String::new()
+            };
+            println!(
+                "{}: {} document(s) scanned, {} {verb} with no row in {}{stray}",
+                report.index,
+                report.scanned,
+                report.orphaned.len(),
+                spec.qualified
+            );
+            // enough to investigate with, without pasting a whole index into a
+            // terminal when something has gone badly wrong
+            let named = report.orphaned.iter().map(|(id, _)| id.clone()).chain(
+                report
+                    .stray
+                    .iter()
+                    .map(|(id, _, belongs_in)| format!("{id} (its row belongs in {belongs_in})")),
+            );
+            for line in named.take(10) {
+                println!("  {line}");
+            }
+            let shown = report.orphaned.len() + report.stray.len();
+            if shown > 10 {
+                println!("  … and {} more", shown - 10);
+            }
         }
     }
     if total_orphans > 0 && !delete {

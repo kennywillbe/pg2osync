@@ -980,6 +980,24 @@ pub(crate) fn claiming_template<'a>(
         .map(|(_, mapping)| mapping)
 }
 
+/// The index names a get-settings answer for `pattern` holds that the
+/// pattern itself claims, sorted. The answer is keyed by concrete index, and
+/// a wildcard that also matched an alias's name brings in that alias's
+/// indices, whatever they are called — so the names are checked again here,
+/// by the same rule a TRUNCATE uses.
+pub(crate) fn claimed_indices(pattern: &str, settings: &Value) -> Vec<String> {
+    let mut names: Vec<String> = settings
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(name, _)| name)
+        .filter(|name| index_matches_pattern(pattern, name))
+        .cloned()
+        .collect();
+    names.sort();
+    names
+}
+
 /// Whether a bulk item is a delete that found nothing to delete: the document
 /// was already gone, or the index a row's template chose was never created —
 /// creation is on demand and only an upsert asks for it. Read off the `delete`
@@ -1539,6 +1557,34 @@ impl Sink for OpenSearchSink {
             .unwrap_or_default())
     }
 
+    async fn list_indices(&self, pattern: &str) -> Result<Vec<String>, CoreError> {
+        // One setting rather than all of them: only the keys are wanted, and
+        // get-settings needs index privileges where `_cat/indices` would need
+        // a cluster one. Open only: a closed index cannot be searched, so it
+        // cannot be walked either.
+        let resp = self
+            .client
+            .indices()
+            .get_settings(opensearch::indices::IndicesGetSettingsParts::IndexName(
+                &[pattern],
+                &["index.uuid"],
+            ))
+            .expand_wildcards(&[ExpandWildcards::Open])
+            .allow_no_indices(true)
+            .ignore_unavailable(true)
+            .send()
+            .await
+            .map_err(http_err)?;
+        let status = resp.status_code();
+        let body: Value = resp.json().await.map_err(http_err)?;
+        if !status.is_success() {
+            return Err(CoreError::Sink(format!(
+                "list indices {pattern}: {status} {body}"
+            )));
+        }
+        Ok(claimed_indices(pattern, &body))
+    }
+
     async fn count_documents(&self, index: &str) -> Result<Option<u64>, CoreError> {
         let resp = self
             .client
@@ -1884,6 +1930,24 @@ impl Sink for OpenSearchSink {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn listed_indices_are_the_ones_the_pattern_claims_sorted() {
+        // `events-all` is an alias whose index the wildcard expanded to: the
+        // settings answer is keyed by the concrete index, which the template
+        // never claimed, and reconcile --delete would otherwise act on it
+        let body = serde_json::json!({
+            "events-globex": {"settings": {"index": {"uuid": "b"}}},
+            "events-acme": {"settings": {"index": {"uuid": "a"}}},
+            "unrelated": {"settings": {"index": {"uuid": "c"}}},
+        });
+        assert_eq!(
+            super::claimed_indices("events-*", &body),
+            ["events-acme", "events-globex"]
+        );
+        assert!(super::claimed_indices("events-*", &serde_json::json!({})).is_empty());
+        assert!(super::claimed_indices("events-*", &serde_json::Value::Null).is_empty());
+    }
+
     #[test]
     fn a_create_that_lost_the_race_is_not_a_failure() {
         // two sources in one process ensure the hidden indices at once, and
