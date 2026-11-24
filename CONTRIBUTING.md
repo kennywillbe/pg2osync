@@ -19,6 +19,47 @@ docker exec -i dev-postgres-1 psql -U postgres -d sourcedb < dev/seed.sql
 Rust stable is required; the MSRV is pinned in `Cargo.toml` (`rust-version`)
 and enforced by CI.
 
+Run it against that stack:
+
+```sh
+cargo build --release
+export PG2OSYNC_SOURCE_URL="postgres://postgres:postgres@localhost:15432/sourcedb"
+./target/release/pg2osync init --table users
+./target/release/pg2osync validate
+./target/release/pg2osync run
+```
+
+In another shell, watch a change land:
+
+```sh
+docker exec dev-postgres-1 psql -U postgres -d sourcedb \
+  -c "UPDATE users SET name = 'renamed' WHERE id = 1;"
+curl -s localhost:9200/users/_doc/1 | jq .
+```
+
+The individual checks, while you work:
+
+```sh
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+./dev/e2e-test.sh          # PostgreSQL -> OpenSearch, full pipeline (needs a release build)
+./dev/e2e-mysql-test.sh    # MySQL/MariaDB source
+```
+
+Workspace layout:
+
+```
+crates/
+├── core/          ChangeEvent model, Sink trait, checkpoint types, errors
+├── source/        PostgreSQL: pgoutput decoder, catalog, poll fallback
+├── source-mysql/  MySQL/MariaDB: wire protocol, binlog decoder, catalog
+├── engine/        transaction buffering, batching, projections, metrics
+├── sink/          OpenSearch / Elasticsearch / Meilisearch / PostgreSQL / Qdrant writers
+├── tls/           TLS settings shared by every source
+├── bin/           CLI and pipeline wiring
+└── operator/      the Kubernetes operator, a separate binary
+```
+
 ## Before every push
 
 ```sh

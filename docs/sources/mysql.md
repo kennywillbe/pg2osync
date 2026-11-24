@@ -25,6 +25,8 @@ not — it needs `log_bin` in the configuration file (or `--log-bin` on the
 command line) and a restart. `binlog_format`/`binlog_row_image` are usually
 already `ROW`/`FULL`. Put the settings in `my.cnf` as well — `SET GLOBAL` does
 not survive a restart.
+`binlog_row_value_options = PARTIAL_JSON` is refused; see
+[JSON columns](#json-columns).
 
 `pg2osync setup-sql -c pg2osync.toml` prints the whole script for your config —
 the `my.cnf` block, the user and the grants — so it can be handed to whoever

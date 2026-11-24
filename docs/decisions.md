@@ -1408,8 +1408,9 @@ repoint your readers" recipe the PostgreSQL target gives.
 **Sinks are search targets, and nothing else.** pgstream and Conduit fan the
 same change stream out to webhooks, and the request here was a `webhook` sink
 for cache invalidation and integrations. It is the first step toward the
-general CDC bus the README declines to be — "no fan-out to multiple consumers,
-no message replay … you want Kafka" — and the step is hard to take back once a
+general CDC bus the [overview](index.md#why-this-instead-of-the-usual-stack)
+declines to be — "no fan-out to multiple consumers, no message replay … you
+want Kafka" — and the step is hard to take back once a
 second kind of consumer exists.
 
 The correctness argument is the stronger one. Every non-search sink brings its
