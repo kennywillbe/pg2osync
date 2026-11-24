@@ -2,14 +2,14 @@
 
 ## Supported versions
 
-`1.0.x` — latest patch is supported. There are no other versions.
+The latest `2.x` release is supported. Fixes do not go back to 1.x.
 
 ## Reporting a vulnerability
 
 Please **do not open a public issue** for security problems.
 
-Use GitHub's [private vulnerability reporting](https://github.com/kennywillbe/pg2osync/security/advisories/new),
-or email the maintainers at `security@pg2osync.dev`. Include:
+Use GitHub's [private vulnerability reporting](https://github.com/kennywillbe/pg2osync/security/advisories/new).
+Include:
 
 - affected version (`pg2osync --version`) and deployment shape
 - what an attacker can achieve, and the smallest reproduction you have

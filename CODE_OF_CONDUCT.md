@@ -20,10 +20,11 @@ discussion.
 
 ## Enforcement
 
-Report unacceptable behaviour to `conduct@pg2osync.dev`. Reports are handled
-confidentially. Maintainers may warn, temporarily block, or permanently ban
-anyone whose behaviour they consider unacceptable, and will explain the reason
-for the decision.
+Report unacceptable behaviour with GitHub's **Report content** option on the
+issue, pull request or comment, which reaches GitHub's support team privately.
+Maintainers may warn, temporarily block, or permanently ban anyone whose
+behaviour they consider unacceptable, and will explain the reason for the
+decision.
 
 This Code of Conduct is adapted from the
 [Contributor Covenant](https://www.contributor-covenant.org), version 2.1.
