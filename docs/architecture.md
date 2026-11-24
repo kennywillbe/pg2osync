@@ -29,6 +29,17 @@ Owns one replication connection and turns the wire protocol into
 Everything protocol-specific stays here. PostgreSQL pgoutput decoding lives in
 `crates/source`, MySQL binlog decoding in `crates/source-mysql`.
 
+Nested children are resolved here too, so a parent document reaches the engine
+already carrying its arrays. A changed child row is not a document: it names
+the parent to re-read, held until commit so a transaction costs one read per
+collection rather than one per row. A second-level row names the child row it
+is nested in, and at commit those child rows are looked up once per collection
+to find their parents, which are then re-read with both levels attached. How a
+collection is shaped — its order, its cap, `_truncated`/`_total`, a one-to-one
+element, the second level inside each element — lives once in
+`core::children`, so the two sources cannot build the same document
+differently.
+
 A source error tears the pipeline down and rebuilds it from the last
 checkpoint — new channels, a new engine task, a fresh connection. Rebuilding
 fully is the point rather than the cost: a partially buffered transaction is

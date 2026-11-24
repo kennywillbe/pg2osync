@@ -13,8 +13,9 @@
 //! answer it differently.
 
 pub use pg2osync_core::children::{
-    ChildSpec, Duplicates, Pending, Through, UNBOUNDED_ARRAY_WARNING, apply_collection, key_lookup,
-    keys_needing_refetch,
+    ChildSpec, Duplicates, ELEMENT_KEY, NestedTally, Pending, Route, Through,
+    UNBOUNDED_ARRAY_WARNING, apply_collection, attach_nested, distinct_element_keys, element_keys,
+    key_lookup, keys_needing_refetch, route,
 };
 
 use crate::error::{Context as _, Result, SourceError};
@@ -60,6 +61,22 @@ pub async fn resolve_order(spec: &mut ChildSpec, client: &Client) -> Result<()> 
         through.child_key = child_key.clone();
     }
     spec.order_by = info.pk_columns;
+    if spec.children.is_empty() {
+        return Ok(());
+    }
+    // Every element is matched to its own collections by this one key, and it
+    // is what the second level's foreign_key points at.
+    let Some(key) = spec.element_key_column().map(str::to_string) else {
+        return Err(SourceError::Config(format!(
+            "[[sync.*.children]] {qualified} holds a second level, so it needs a \
+             single-column primary key for that level's foreign_key to point at; it has {}",
+            spec.order_by.len()
+        )));
+    };
+    for grand in &mut spec.children {
+        grand.parent_column = key.clone();
+        Box::pin(resolve_order(grand, client)).await?;
+    }
     Ok(())
 }
 
@@ -129,6 +146,20 @@ pub fn agg_subquery(spec: &ChildSpec, filter: Option<&str>) -> String {
 /// construction; PostgreSQL also never reads a column the expression does not
 /// name, which for a TOASTed one is the whole point.
 fn element_expr(spec: &ChildSpec) -> String {
+    let element = projected_element(spec);
+    // An intermediate's key rides beside the projection, which may leave it
+    // out, until the second level is attached and core drops it again.
+    match spec.element_key_column() {
+        Some(key) => format!(
+            "(jsonb_build_object({}, t.{}) || {element})",
+            pg_quote_literal(ELEMENT_KEY),
+            pg_quote_ident(key)
+        ),
+        None => element,
+    }
+}
+
+fn projected_element(spec: &ChildSpec) -> String {
     if let Some(columns) = &spec.columns {
         let pairs: Vec<String> = columns
             .iter()
@@ -144,7 +175,7 @@ fn element_expr(spec: &ChildSpec) -> String {
         .iter()
         .map(|c| pg_quote_literal(c))
         .collect();
-    format!("to_jsonb(t) - ARRAY[{}]::text[]", names.join(", "))
+    format!("(to_jsonb(t) - ARRAY[{}]::text[])", names.join(", "))
 }
 
 /// Every listed parent's child array, in one query.
@@ -276,6 +307,11 @@ pub async fn attach_children_batch(
         if let Some(message) = duplicates.message(spec) {
             tracing::warn!(target: "pg2osync::source", "{message}");
         }
+        let mut collections: Vec<&mut Value> = docs
+            .iter_mut()
+            .filter_map(|(_, doc)| doc.get_mut(&spec.field))
+            .collect();
+        attach_second_level(spec, client, &mut collections).await?;
         match largest {
             Some((key, total)) if cut > 0 => tracing::warn!(target: "pg2osync::source",
                 "{cut} document(s) embed only max_rows of {}, and say so in {} and {}; \
@@ -295,6 +331,77 @@ pub async fn attach_children_batch(
         }
     }
     Ok(())
+}
+
+/// Attach `spec`'s second level to every element of a group of its
+/// collections, in one query per second-level collection.
+///
+/// Shared by the initial load and the streamed re-fetch, so a second-level
+/// array is the same whichever of the two wrote the document. A collection
+/// with no second level is left alone, and so pays nothing.
+pub async fn attach_second_level(
+    spec: &ChildSpec,
+    client: &Client,
+    collections: &mut [&mut Value],
+) -> Result<()> {
+    if spec.children.is_empty() {
+        return Ok(());
+    }
+    let keys = distinct_element_keys(collections.iter().map(|c| &**c));
+    let mut fetched = Vec::with_capacity(spec.children.len());
+    for grand in &spec.children {
+        fetched.push(fetch_many(grand, client, &keys).await?);
+    }
+    let mut tallies = vec![NestedTally::default(); spec.children.len()];
+    for collection in collections.iter_mut() {
+        attach_nested(collection, spec, &fetched, &mut tallies);
+    }
+    for (grand, tally) in spec.children.iter().zip(&tallies) {
+        if let Some(message) = tally.duplicates.message(grand) {
+            tracing::warn!(target: "pg2osync::source", "{message}");
+        }
+        if let Some(message) = tally.cut_message(spec, grand) {
+            tracing::warn!(target: "pg2osync::source", "{message}");
+        }
+    }
+    Ok(())
+}
+
+/// The roots a group of changed intermediate rows belongs to, in one query.
+///
+/// A second-level row names the intermediate row it is nested in, not a
+/// document, so the transaction's distinct intermediate keys are turned into
+/// root keys at commit, the way a many-to-many child's keys are. The current
+/// state is the right one to ask: an intermediate row that moved in the same
+/// transaction names its old and new root through its own change. An
+/// intermediate whose foreign key is NULL belongs to no document and names
+/// nobody.
+pub async fn parents_of_children(
+    client: &Client,
+    spec: &ChildSpec,
+    child_keys: &[Value],
+) -> Result<Vec<Value>> {
+    if spec.through.is_some() {
+        return parents_through(client, spec, child_keys).await;
+    }
+    if child_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(key) = spec.element_key_column() else {
+        return Ok(Vec::new());
+    };
+    let fk = pg_quote_ident(&spec.foreign_key);
+    let (predicate, param) = any_predicate(&format!("c.{}", pg_quote_ident(key)), child_keys);
+    let sql = format!(
+        "SELECT DISTINCT to_jsonb(c.{fk}) FROM {}.{} c WHERE {predicate} AND c.{fk} IS NOT NULL",
+        pg_quote_ident(&spec.schema),
+        pg_quote_ident(&spec.table),
+    );
+    let rows = client
+        .query(&sql, &[param.as_ref()])
+        .await
+        .catalog_ctx(|| format!("walk-up to the parent failed for {}", spec.qualified()))?;
+    Ok(rows.into_iter().map(|r| r.get(0)).collect())
 }
 
 /// Re-read a group of parent rows as native-typed JSON documents.
@@ -474,10 +581,40 @@ mod tests {
         spec.exclude_columns = vec!["internal_notes".into()];
         let excluded = agg_subquery(&spec, None);
         assert!(
-            excluded.contains("to_jsonb(t) - ARRAY['internal_notes']::text[] AS doc"),
+            excluded.contains("(to_jsonb(t) - ARRAY['internal_notes']::text[]) AS doc"),
             "{excluded}"
         );
         assert!(excluded.contains("count(*) OVER (PARTITION BY t.\"customer_id\")"));
+    }
+
+    #[test]
+    fn an_intermediate_carries_its_key_beside_its_projection() {
+        let mut spec = ChildSpec::new("public.orders", "orders", "customer_id", "id").unwrap();
+        spec.order_by = vec!["order_id".into()];
+        spec.columns = Some(vec!["total".into()]);
+        assert!(
+            !agg_subquery(&spec, None).contains(ELEMENT_KEY),
+            "no second level, no key"
+        );
+        spec.children
+            .push(ChildSpec::new("public.lines", "lines", "order_id", "order_id").unwrap());
+        let sql = agg_subquery(&spec, None);
+        assert!(
+            sql.contains(&format!(
+                "(jsonb_build_object('{ELEMENT_KEY}', t.\"order_id\") || \
+                 jsonb_build_object('total', t.\"total\")) AS doc"
+            )),
+            "the projection leaves the key out, so it rides beside it: {sql}"
+        );
+        spec.columns = None;
+        spec.exclude_columns = vec!["order_id".into()];
+        assert!(
+            agg_subquery(&spec, None).contains(&format!(
+                "(jsonb_build_object('{ELEMENT_KEY}', t.\"order_id\") || \
+                 (to_jsonb(t) - ARRAY['order_id']::text[])) AS doc"
+            )),
+            "an exclusion is grouped before the key joins it"
+        );
     }
 
     fn through_spec() -> ChildSpec {

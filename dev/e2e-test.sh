@@ -3930,6 +3930,219 @@ check "and it is counted as refused" \
 check "the process survived that too" "$(kill -0 "$ADPID" 2> /dev/null && echo alive)" "alive"
 stop_sync
 
+echo -e "\n\033[1m== 41. a second level of children, nested inside each element ==\033[0m"
+# A grandchild collection lives inside the element of its intermediate row.
+# What has to hold: the load attaches it with its cap reported inside the
+# element, the intermediate's key rides along only until it is used even when
+# the projection drops it, and a grandchild change walks up to the root it
+# belongs to — including a move between intermediates in two documents, which
+# only the before-image can name.
+drop_idle_probe_slots
+NCONFIG=$(mktemp /tmp/pg2osync-e2e-nested.XXXXXX)
+NSLOT=pg2osync_e2e_nested
+cat > "$NCONFIG" <<TOML
+[source]
+url_env = "PG2OSYNC_SOURCE_URL"
+slot_name = "$NSLOT"
+publication = "${NSLOT}_pub"
+
+[target]
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
+
+[metrics]
+bind = "127.0.0.1:$((PORT_BASE + 43))"
+
+[sync.orders]
+table = "public.nest_order"
+index = "e2e_nested"
+
+[[sync.orders.children]]
+table = "public.nest_line"
+field = "lines"
+foreign_key = "order_id"
+exclude_columns = ["id", "secret"]
+
+[[sync.orders.children.children]]
+table = "public.nest_option"
+field = "options"
+foreign_key = "line_id"
+max_rows = 2
+
+[sync.orders.children.children.fields]
+color = "colour"
+
+[[sync.orders.children]]
+table = "public.nest_ship"
+field = "shipment"
+foreign_key = "order_id"
+single = true
+
+[[sync.orders.children.children]]
+table = "public.nest_event"
+field = "events"
+foreign_key = "ship_id"
+TOML
+nested_cleanup() {
+  sync_kill
+  pg "SELECT pg_drop_replication_slot('$NSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$NSLOT');" > /dev/null 2>&1 || true
+  pg "DROP PUBLICATION IF EXISTS ${NSLOT}_pub; DROP TABLE IF EXISTS nest_event, nest_ship, nest_option, nest_line, nest_order;" > /dev/null 2>&1 || true
+  curl -s -XDELETE "$OS/e2e_nested?ignore_unavailable=true" > /dev/null 2>&1 || true
+  rm -f "$NCONFIG"
+}
+trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup; init_cleanup; fan_cleanup; bid_cleanup; shape_cleanup; where_cleanup; join_cleanup; union_cleanup; events_cleanup; pipe_cleanup; append_cleanup; routing_cleanup; reindex_cleanup; rate_cleanup; through_cleanup; ra_cleanup; pseudo_cleanup; rl_cleanup; otel_cleanup; agg_cleanup; element_cleanup; flatten_cleanup; add_cleanup; nested_cleanup' EXIT
+
+pg "DROP TABLE IF EXISTS nest_event, nest_ship, nest_option, nest_line, nest_order;" > /dev/null 2>&1
+# The same tables and rows as section 31 of the MySQL suite, which compares its
+# loaded documents against the same file.
+pg "CREATE TABLE nest_order(id bigint primary key, name text);
+    CREATE TABLE nest_line(id bigint primary key, order_id bigint, sku text, secret text);
+    CREATE TABLE nest_option(id bigint primary key,
+                             line_id bigint REFERENCES nest_line(id) ON DELETE CASCADE, color text);
+    CREATE TABLE nest_ship(id bigint primary key, order_id bigint, carrier text);
+    CREATE TABLE nest_event(id bigint primary key, ship_id bigint, status text);
+    ALTER TABLE nest_line REPLICA IDENTITY FULL;
+    ALTER TABLE nest_option REPLICA IDENTITY FULL;
+    ALTER TABLE nest_ship REPLICA IDENTITY FULL;
+    ALTER TABLE nest_event REPLICA IDENTITY FULL;" > /dev/null
+pg "INSERT INTO nest_order VALUES (1,'first'),(2,'second');
+    INSERT INTO nest_line VALUES (10,1,'a','x'),(11,1,'b','x'),(20,2,'c','x');
+    INSERT INTO nest_option VALUES (100,10,'red'),(101,10,'blue'),(102,10,'green'),(200,20,'black');
+    INSERT INTO nest_ship VALUES (30,1,'post');
+    INSERT INTO nest_event VALUES (300,30,'sent'),(301,30,'delivered');" > /dev/null
+pg "DROP PUBLICATION IF EXISTS ${NSLOT}_pub;" > /dev/null 2>&1
+curl -s -XDELETE "$OS/e2e_nested?ignore_unavailable=true" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/postgres-$NSLOT" > /dev/null
+
+nested() { curl -s "$OS/e2e_nested/_doc/$1" | jqf "$2"; }
+# what a loaded document is beside the one both suites expect, or "same"
+nested_parity() {
+  curl -s "$OS/e2e_nested/_doc/$1" | python3 -c "import sys,json
+d=json.load(sys.stdin).get('_source')
+want=json.load(open('dev/nested-parity.json'))['$1']
+print('same' if d==want else json.dumps(d, sort_keys=True))"
+}
+line_of() { echo "next(l for l in d['_source']['lines'] if l['sku']=='$1')"; }
+
+vout=$($BIN validate -c "$NCONFIG" 2>&1 || true)
+if grep -q "all checks passed" <<< "$vout" && grep -q "second level public.nest_option inside public.nest_line" <<< "$vout"; then
+  ok "validate accepts and names the second level"
+else
+  bad "validate on a second level: $vout"
+fi
+
+sync_spawn "$NCONFIG"
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_count e2e_nested)" = "2" ] && break
+  sleep 1
+done
+check "the second level joined the publication" \
+  "$(pg "SELECT count(*) FROM pg_publication_tables WHERE pubname='${NSLOT}_pub' AND tablename='nest_option';")" "1"
+check "the load embeds the first level" "$(os_len e2e_nested 1 lines)" "2"
+check "and the second inside each element, capped" \
+  "$(nested 1 "[o['colour'] for o in $(line_of a)['options']]")" "['red', 'blue']"
+check "the cap is reported inside the element it cut" \
+  "$(nested 1 "($(line_of a)['options_truncated'], $(line_of a)['options_total'])")" "(True, 3)"
+check "and not on the root" "$(os_has e2e_nested 1 options_truncated)" "False"
+check "an element with no second-level rows still holds the field" \
+  "$(nested 1 "$(line_of b)['options']")" "[]"
+check "the element key is gone and the projection held" \
+  "$(nested 1 "sorted($(line_of a).keys())")" \
+  "['options', 'options_total', 'options_truncated', 'order_id', 'sku']"
+check "a loaded two-level document is the one MySQL writes too" "$(nested_parity 1)" "same"
+check "and so is one with no one-to-one intermediate" "$(nested_parity 2)" "same"
+
+pg "INSERT INTO nest_option VALUES (110,11,'white');" > /dev/null
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(nested 1 "len($(line_of b)['options'])")" = "1" ] && break
+  sleep 1
+done
+check "a second-level INSERT reaches its root" "$(nested 1 "len($(line_of b)['options'])")" "1"
+
+pg "UPDATE nest_option SET color='grey' WHERE id=200;" > /dev/null
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(nested 2 "$(line_of c)['options'][0]['colour']")" = "grey" ] && break
+  sleep 1
+done
+check "a second-level UPDATE reaches its root" "$(nested 2 "$(line_of c)['options'][0]['colour']")" "grey"
+
+pg "UPDATE nest_option SET line_id=11 WHERE id=200;" > /dev/null
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(nested 2 "len($(line_of c)['options'])")" = "0" ] && break
+  sleep 1
+done
+check "a second-level row moved away leaves the root it left" "$(nested 2 "len($(line_of c)['options'])")" "0"
+check "and joins the one it moved to" "$(nested 1 "sorted(o['colour'] for o in $(line_of b)['options'])")" "['grey', 'white']"
+
+pg "DELETE FROM nest_option WHERE id=110;" > /dev/null
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(nested 1 "len($(line_of b)['options'])")" = "1" ] && break
+  sleep 1
+done
+check "a second-level DELETE reaches its root" "$(nested 1 "len($(line_of b)['options'])")" "1"
+
+pg "UPDATE nest_line SET order_id=2 WHERE id=11;" > /dev/null
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_len e2e_nested 2 lines)" = "2" ] && break
+  sleep 1
+done
+check "an intermediate row moved to another root takes its second level along" \
+  "$(nested 2 "[o['colour'] for o in $(line_of b)['options']]")" "['grey']"
+check "and leaves the root it left" "$(os_len e2e_nested 1 lines)" "1"
+
+pg "INSERT INTO nest_option VALUES (201,11,'pink'),(202,11,'cyan');" > /dev/null
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(nested 2 "$(line_of b).get('options_total')")" = "3" ] && break
+  sleep 1
+done
+check "a streamed second level past max_rows is cut inside its element" \
+  "$(nested 2 "([o['colour'] for o in $(line_of b)['options']], $(line_of b).get('options_truncated'), $(line_of b).get('options_total'))")" \
+  "(['grey', 'pink'], True, 3)"
+pg "DELETE FROM nest_option WHERE id=202;" > /dev/null
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(nested 2 "'options_total' in $(line_of b)")" = "False" ] && break
+  sleep 1
+done
+check "and back under it, the element stops saying so" \
+  "$(nested 2 "sorted(k for k in $(line_of b) if k.startswith('options_'))")" "[]"
+
+pg "INSERT INTO nest_event VALUES (302,30,'returned');" > /dev/null
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(nested 1 "len(d['_source']['shipment']['events'])")" = "3" ] && break
+  sleep 1
+done
+check "a second level under a one-to-one intermediate streams too" \
+  "$(nested 1 "[e['status'] for e in d['_source']['shipment']['events']]")" "['sent', 'delivered', 'returned']"
+
+pg "DELETE FROM nest_line WHERE id=10;" > /dev/null
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(os_len e2e_nested 1 lines)" = "0" ] && break
+  sleep 1
+done
+check "an intermediate deleted with a cascade takes its second level with it" \
+  "$(os_len e2e_nested 1 lines),$(pg "SELECT count(*) FROM nest_option WHERE line_id=10;")" "0,0"
+# the cascaded second-level deletes name an intermediate row that is gone, so
+# their walk-up finds no root; what follows has to arrive all the same
+pg "INSERT INTO nest_option VALUES (210,20,'teal');" > /dev/null
+for _ in $(seq 1 30); do
+  refresh
+  [ "$(nested 2 "len($(line_of c)['options'])")" = "1" ] && break
+  sleep 1
+done
+check "the stream carried on past the cascade" \
+  "$(nested 2 "[o['colour'] for o in $(line_of c)['options']]")" "['teal']"
+stop_sync
+
 
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

@@ -318,6 +318,12 @@ builds a parent document means a value inside an array is the same JSON as the
 same value on its own. The cost is unchanged: one query per collection per batch,
 with the server still doing the ordering, the cap and the count.
 
+A [second level](../configuration.md#a-second-level) is read the same way, one
+level at a time, so a second-level element is built by the same code as well
+and the two sources write the same document. The intermediate table's keys are
+sent as literals, in slices of 5,000 per statement, because a first-level
+group's elements can be many times the group itself.
+
 ## Surviving a failover
 
 A binlog file name and offset only mean anything on the server they were read

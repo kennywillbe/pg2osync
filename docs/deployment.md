@@ -159,6 +159,11 @@ extraConfig: |
   table = "public.orders"
   field = "orders"
   foreign_key = "customer_id"
+
+  [[sync.customers.children.children]]
+  table = "public.order_lines"
+  field = "lines"
+  foreign_key = "order_id"
 ```
 
 ### Several sources in one release

@@ -208,6 +208,13 @@ index can be used, but if none exists PostgreSQL still has to scan.
 CREATE INDEX ON public.orders (customer_id);
 ```
 
+A table with a [second level](../configuration.md#a-second-level) is still read
+by one `COPY`, but its rows are held back in chunks of 5,000 while one query per
+second-level collection reads that chunk's second level, on a connection of its
+own: the reader is mid-`COPY` and cannot answer it. Index the second level's foreign key as
+well, and give it `REPLICA IDENTITY FULL` like the first; see
+[operations](../operations.md#nested-children-and-replica-identity).
+
 ## Truncates and deletes
 
 `TRUNCATE` on a synced table clears the target index. It is ordered against

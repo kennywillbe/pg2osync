@@ -25,7 +25,9 @@
 use crate::catalog::{self, TableSchema};
 use crate::connection::MySqlConnection;
 use crate::error::{Context as _, MySqlError, Result};
-use pg2osync_core::children::{ChildSpec, key_lookup};
+use pg2osync_core::children::{
+    ChildSpec, ELEMENT_KEY, NestedTally, attach_nested, distinct_element_keys, key_lookup,
+};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -67,6 +69,22 @@ pub async fn resolve_order(spec: &mut ChildSpec, conn: &mut MySqlConnection) -> 
         through.child_key = child_key.clone();
     }
     spec.order_by = resolved.pk_columns;
+    if spec.children.is_empty() {
+        return Ok(());
+    }
+    // Every element is matched to its own collections by this one key, and it
+    // is what the second level's foreign_key points at.
+    let Some(key) = spec.element_key_column().map(str::to_string) else {
+        return Err(MySqlError::Config(format!(
+            "[[sync.*.children]] {qualified} holds a second level, so it needs a \
+             single-column primary key for that level's foreign_key to point at; it has {}",
+            spec.order_by.len()
+        )));
+    };
+    for grand in &mut spec.children {
+        grand.parent_column = key.clone();
+        Box::pin(resolve_order(grand, conn)).await?;
+    }
     Ok(())
 }
 
@@ -85,6 +103,7 @@ pub async fn fetch_many(
     let resolved = catalog::table_schema(conn, &spec.schema, &spec.table, false).await?;
     let junction = junction_schema(spec, conn).await?;
     let fk_shape = fk_shape(spec, &resolved, junction.as_ref());
+    let element_key = element_key_shape(spec, &resolved);
     let projected = project(spec, &resolved);
     let sql = fetch_statement(spec, &projected, keys);
     let mut rows = conn
@@ -92,12 +111,13 @@ pub async fn fetch_many(
         .await
         .catalog_ctx(|| format!("child fetch failed for {}", spec.qualified()))?;
 
-    // The foreign key and the total ride after the child's own columns, so the
-    // row prefix is exactly what build_document expects.
+    // The foreign key, the total and an intermediate's element key ride after
+    // the child's own columns, so the row prefix is exactly what
+    // build_document expects.
     let columns = projected.columns.len();
     let mut out: HashMap<String, (Value, i64)> = HashMap::new();
     while let Some(row) = rows.next().await? {
-        let (doc, _) = catalog::build_document(&projected, &row);
+        let (mut doc, _) = catalog::build_document(&projected, &row);
         let key_raw = row.get(columns).and_then(|v| v.as_deref());
         let key = crate::typemap::convert(&fk_shape, key_raw);
         let total: i64 = row
@@ -105,6 +125,10 @@ pub async fn fetch_many(
             .and_then(|v| v.as_deref())
             .map(|b| String::from_utf8_lossy(b).parse().unwrap_or(0))
             .unwrap_or(0);
+        if let (Some(shape), Value::Object(map)) = (&element_key, &mut doc) {
+            let raw = row.get(columns + 2).and_then(|v| v.as_deref());
+            map.insert(ELEMENT_KEY.into(), crate::typemap::convert(shape, raw));
+        }
         let entry = out
             .entry(key_lookup(&key))
             .or_insert_with(|| (Value::Array(Vec::new()), total));
@@ -201,6 +225,27 @@ fn fk_shape(
         .unwrap_or(crate::typemap::ValueShape::Text)
 }
 
+/// How to read an intermediate's element key, when this collection has a
+/// second level.
+///
+/// From the whole child table, never the projection, for the reason the
+/// foreign key's shape is: an excluded integer key read as text would match
+/// `"10"` against `10`, and every second-level array would come back empty.
+fn element_key_shape(
+    spec: &ChildSpec,
+    resolved: &TableSchema,
+) -> Option<crate::typemap::ValueShape> {
+    let key = spec.element_key_column()?;
+    Some(
+        resolved
+            .columns
+            .iter()
+            .find(|c| c.name == key)
+            .map(|c| c.shape.clone())
+            .unwrap_or(crate::typemap::ValueShape::Text),
+    )
+}
+
 /// The child's columns as the element is to carry them.
 ///
 /// MySQL aggregates in Rust, so the projection is the select list: the same
@@ -257,12 +302,21 @@ fn fetch_statement(spec: &ChildSpec, resolved: &TableSchema, keys: &[Value]) -> 
         None => String::new(),
     };
     let fk = fk_ref(spec);
+    // An intermediate's key rides beside the projection, which may leave it
+    // out, until the second level is attached and core drops it again.
+    let (inner_key, outer_key) = match spec.element_key_column() {
+        Some(key) => (
+            format!(", t.{} AS pg2osync_ek", catalog::quote_ident(key)),
+            ", r.pg2osync_ek",
+        ),
+        None => (String::new(), ""),
+    };
     // The key filter belongs to the innermost read: applied outside the window it
     // would rank the whole child table and only then discard it.
     let ranked = format!(
         "SELECT {}, {fk} AS pg2osync_fk, \
          ROW_NUMBER() OVER (PARTITION BY {fk}{ordered}) AS pg2osync_rn, \
-         COUNT(*) OVER (PARTITION BY {fk}) AS pg2osync_total \
+         COUNT(*) OVER (PARTITION BY {fk}) AS pg2osync_total{inner_key} \
          FROM {}.{} t{join} WHERE {fk} IN ({})",
         columns.join(", "),
         catalog::quote_ident(&spec.schema),
@@ -276,12 +330,12 @@ fn fetch_statement(spec: &ChildSpec, resolved: &TableSchema, keys: &[Value]) -> 
         .collect();
     match spec.max_rows {
         Some(n) => format!(
-            "SELECT {}, r.pg2osync_fk, r.pg2osync_total FROM ({ranked}) r \
+            "SELECT {}, r.pg2osync_fk, r.pg2osync_total{outer_key} FROM ({ranked}) r \
              WHERE r.pg2osync_rn <= {n} ORDER BY r.pg2osync_fk, r.pg2osync_rn",
             selected.join(", ")
         ),
         None => format!(
-            "SELECT {}, r.pg2osync_fk, r.pg2osync_total FROM ({ranked}) r \
+            "SELECT {}, r.pg2osync_fk, r.pg2osync_total{outer_key} FROM ({ranked}) r \
              ORDER BY r.pg2osync_fk, r.pg2osync_rn",
             selected.join(", ")
         ),
@@ -293,6 +347,101 @@ fn fetch_statement(spec: &ChildSpec, resolved: &TableSchema, keys: &[Value]) -> 
 fn fk_ref(spec: &ChildSpec) -> String {
     let alias = if spec.through.is_some() { "j" } else { "t" };
     format!("{alias}.{}", catalog::quote_ident(&spec.foreign_key))
+}
+
+/// How many element keys one second-level read names.
+///
+/// A first-level group is bounded by the chunk or the flush, but its elements
+/// are that times however many children each parent has, and MySQL takes the
+/// keys as literals in the statement rather than as one array parameter. The
+/// window partitions by the key, so reading in slices returns exactly what one
+/// read would.
+const ELEMENT_KEYS_PER_READ: usize = 5_000;
+
+/// Attach `spec`'s second level to every element of a group of its
+/// collections, one query per second-level collection per slice of keys.
+///
+/// Shared by the initial load and the streamed re-fetch, so a second-level
+/// array is the same whichever of the two wrote the document. A collection
+/// with no second level is left alone, and so pays nothing.
+pub async fn attach_second_level(
+    spec: &ChildSpec,
+    conn: &mut MySqlConnection,
+    collections: &mut [&mut Value],
+) -> Result<()> {
+    if spec.children.is_empty() {
+        return Ok(());
+    }
+    let keys = distinct_element_keys(collections.iter().map(|c| &**c));
+    let mut fetched = Vec::with_capacity(spec.children.len());
+    for grand in &spec.children {
+        let mut by_key = HashMap::new();
+        for slice in keys.chunks(ELEMENT_KEYS_PER_READ) {
+            by_key.extend(fetch_many(grand, conn, slice).await?);
+        }
+        fetched.push(by_key);
+    }
+    let mut tallies = vec![NestedTally::default(); spec.children.len()];
+    for collection in collections.iter_mut() {
+        attach_nested(collection, spec, &fetched, &mut tallies);
+    }
+    for (grand, tally) in spec.children.iter().zip(&tallies) {
+        if let Some(message) = tally.duplicates.message(grand) {
+            tracing::warn!(target: "pg2osync::source", "{message}");
+        }
+        if let Some(message) = tally.cut_message(spec, grand) {
+            tracing::warn!(target: "pg2osync::source", "{message}");
+        }
+    }
+    Ok(())
+}
+
+/// The roots a group of changed intermediate rows belongs to, in one query.
+///
+/// A second-level row names the intermediate row it is nested in, not a
+/// document, so the transaction's distinct intermediate keys are turned into
+/// root keys at commit, the way a many-to-many child's keys are. The current
+/// state is the right one to ask: an intermediate row that moved in the same
+/// transaction names its old and new root through its own change. An
+/// intermediate whose foreign key is NULL belongs to no document and names
+/// nobody.
+pub async fn parents_of_children(
+    spec: &ChildSpec,
+    conn: &mut MySqlConnection,
+    child_keys: &[Value],
+) -> Result<Vec<Value>> {
+    if spec.through.is_some() {
+        return parents_through(spec, conn, child_keys).await;
+    }
+    let Some(key) = spec.element_key_column() else {
+        return Ok(Vec::new());
+    };
+    if child_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let resolved = catalog::table_schema(conn, &spec.schema, &spec.table, false).await?;
+    let shape = fk_shape(spec, &resolved, None);
+    let mut rows = conn
+        .text_query(&walk_up_statement(spec, key, child_keys))
+        .await
+        .catalog_ctx(|| format!("walk-up to the parent failed for {}", spec.qualified()))?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let raw = row.first().and_then(|v| v.as_deref());
+        out.push(crate::typemap::convert(&shape, raw));
+    }
+    Ok(out)
+}
+
+fn walk_up_statement(spec: &ChildSpec, key: &str, child_keys: &[Value]) -> String {
+    let fk = catalog::quote_ident(&spec.foreign_key);
+    format!(
+        "SELECT DISTINCT c.{fk} FROM {}.{} c WHERE c.{} IN ({}) AND c.{fk} IS NOT NULL",
+        catalog::quote_ident(&spec.schema),
+        catalog::quote_ident(&spec.table),
+        catalog::quote_ident(key),
+        key_list(child_keys),
+    )
 }
 
 /// The parents a group of changed child rows belongs to, in one query.
@@ -524,6 +673,63 @@ mod tests {
             fk_shape(&spec, &schema(), Some(&junction())),
             ValueShape::Int
         ));
+    }
+
+    fn intermediate() -> ChildSpec {
+        let mut spec = spec();
+        spec.children
+            .push(ChildSpec::new("shop.options", "options", "item_id", "id").expect("qualified"));
+        spec
+    }
+
+    #[test]
+    fn an_intermediate_reads_its_key_beside_its_projection() {
+        assert!(
+            !fetch_statement(&spec(), &schema(), &[json!(1)]).contains("pg2osync_ek"),
+            "no second level, no key"
+        );
+        let mut spec = intermediate();
+        spec.exclude_columns = vec!["id".into()];
+        spec.max_rows = Some(2);
+        let projected = project(&spec, &schema());
+        let sql = fetch_statement(&spec, &projected, &[json!(1)]);
+        assert!(
+            sql.contains("SELECT t.`parent_id`, t.`parent_id` AS pg2osync_fk"),
+            "the projection still leaves the key out: {sql}"
+        );
+        assert!(
+            sql.contains("AS pg2osync_total, t.`id` AS pg2osync_ek FROM"),
+            "the key rides after the total, so the offsets before it hold: {sql}"
+        );
+        assert!(
+            sql.contains(
+                "SELECT r.`parent_id`, r.pg2osync_fk, r.pg2osync_total, r.pg2osync_ek FROM"
+            ),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn an_excluded_element_key_still_reads_as_the_column_it_is() {
+        // The same trap as the foreign key's: a key read as text matches "10"
+        // against 10, and every second-level array silently comes back empty.
+        let mut spec = intermediate();
+        spec.exclude_columns = vec!["id".into()];
+        assert!(matches!(
+            element_key_shape(&spec, &schema()),
+            Some(ValueShape::Int)
+        ));
+        assert!(element_key_shape(&self::spec(), &schema()).is_none());
+    }
+
+    #[test]
+    fn the_walk_up_reads_the_intermediate_by_its_key() {
+        let sql = walk_up_statement(&intermediate(), "id", &[json!(10), json!(11)]);
+        assert_eq!(
+            sql,
+            "SELECT DISTINCT c.`parent_id` FROM `shop`.`items` c \
+             WHERE c.`id` IN (10, 11) AND c.`parent_id` IS NOT NULL"
+        );
     }
 
     #[test]

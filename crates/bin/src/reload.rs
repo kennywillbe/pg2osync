@@ -918,6 +918,38 @@ table = "public.users"
     }
 
     #[test]
+    fn a_change_at_the_second_level_is_a_children_change() {
+        let section = |grand: &str| {
+            config(&format!(
+                "{BASE}\n[sync.orders]\ntable = \"public.orders\"\n\
+                 [[sync.orders.children]]\ntable = \"public.lines\"\nfield = \"lines\"\n\
+                 foreign_key = \"order_id\"\n\
+                 [[sync.orders.children.children]]\ntable = \"public.options\"\n\
+                 field = \"options\"\nforeign_key = \"line_id\"\n{grand}"
+            ))
+        };
+        let old = section("");
+        for (what, grand) in [
+            ("a cap", "max_rows = 3\n"),
+            ("a projection", "columns = [\"color\"]\n"),
+            (
+                "a rename",
+                "[sync.orders.children.children.fields]\ncolor = \"colour\"\n",
+            ),
+        ] {
+            let plan = classify(&old, &section(grand));
+            assert!(plan.sections.is_empty(), "{what}: {:?}", plan.sections);
+            assert_eq!(plan.refusals.len(), 1, "{what}: {:?}", plan.refusals);
+            assert!(
+                plan.refusals[0].contains("[sync.orders] children changed")
+                    && plan.refusals[0].contains("pg2osync reindex"),
+                "{what} below the first level is still a re-index: {}",
+                plan.refusals[0]
+            );
+        }
+    }
+
+    #[test]
     fn a_new_section_whose_shape_the_stream_was_built_with_asks_for_a_restart() {
         let old = config(BASE);
         for (what, body) in [

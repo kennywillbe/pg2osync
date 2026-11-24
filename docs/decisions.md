@@ -1085,6 +1085,46 @@ unchanged, so one parent read and one aggregation per collection per transaction
 still hold; folding that lookup into the parent re-fetch instead would read a
 parent twice whenever a junction row and one of its child rows changed together.
 
+**A grandchild level is read level by level, in Rust.** `[[sync.x.children.children]]`
+embeds a second level inside each element of the first, and it is read the way
+the first one is: one aggregation per collection for the whole group, keyed by
+the intermediate rows' primary keys, attached to each element by the same core
+`apply_collection` that attaches the first level to the document. A grandchild
+array's `<field>_truncated`/`<field>_total` therefore live inside the element
+they describe. Folding the second level into the first level's SQL (a nested
+`jsonb_agg`) was the alternative; it would have needed a second builder on
+MySQL, where the aggregation is already done in Rust, and the two sources would
+then have shaped a level differently. On PostgreSQL a table without a second
+level keeps its single `COPY`; only a table that has one pays a follow-up query
+per chunk of loaded rows, on a connection that is not mid-`COPY`.
+
+The intermediate level needs a single-column primary key: it is what the
+grandchild's `foreign_key` points at and what each element is matched by, and
+it rides in the element under a reserved name until the second level is
+attached, so `columns`/`exclude_columns` can still leave it out of the document.
+At the second level `columns`, `exclude_columns`, `fields`, `max_rows` and
+`single` work as they do at the first; `through`, `flatten` and aggregates are
+refused, since each would need its own route back to the root.
+
+A changed grandchild row names an intermediate row, not a document. Its distinct
+intermediate keys are held like a many-to-many child's keys and, at commit,
+turned into root keys by one `SELECT DISTINCT c.<foreign_key> FROM child c WHERE
+c.<pk> = ANY(…)` per collection: the current state, which is right because an
+intermediate row that itself moved in the same transaction names its old and
+new root through its own change. Both images of a grandchild row are read where
+the source sends them, so a grandchild moved between intermediate rows refreshes
+both roots; that needs the same `REPLICA IDENTITY FULL` a first-level child's
+delete already does. A table appears once across every section and depth, and
+never under itself, so one streamed row has exactly one route to its root.
+
+The cost is amplification: one grandchild row rewrites a root document that
+holds every sibling subtree. Startup warns when `max_rows` (or an unbounded
+level) can put more than 10,000 nested objects on one document, which is where
+OpenSearch starts refusing a `nested` mapping. The bound is the product of
+`max_rows` along each chain, summed over every collection of the section, flat
+siblings included, because the limit counts the whole document rather than one
+chain. A hot or large subtree belongs in its own index via `join`.
+
 **An aggregate is one more shape of child, not a computation.** `children`
 embeds a child table's rows; `[[sync.x.aggregates]]` embeds a single number
 derived from them. That is the whole claim, and it is what decides where the
@@ -1526,11 +1566,17 @@ rather than the resulting shape starts to matter.
 **No relational sources beyond PostgreSQL and MySQL/MariaDB**, and no
 non-relational sources. The value is depth on these, not breadth.
 
-**Nested children stay one level deep.** Anything deeper is the application's
-to shape before it reaches the database, and there is no view route around
-that: only base tables are eligible (`relkind = 'r'` on PostgreSQL,
-`table_type = 'BASE TABLE'` on MySQL) because the WAL and the binlog carry
-base-table rows, and a view has none to stream.
+**Nested children stop at two levels.** A root, a child and a grandchild is
+the shape order, line items, line options needs, and it is where the cost model
+still holds: a second level is read level by level ("A grandchild level is read
+level by level", above), one query per level per group. A third level multiplies
+the amplification again (one grandchild row rewrites one root document holding
+every sibling subtree) and lengthens the walk-up from a changed row once more,
+for a shape better served by `join` or by shaping it in the application before
+it reaches the database. There is no view route around that either: only base
+tables are eligible (`relkind = 'r'` on PostgreSQL, `table_type = 'BASE TABLE'`
+on MySQL) because the WAL and the binlog carry base-table rows, and a view has
+none to stream.
 
 **Tables are named one by one; there is no pattern.** Debezium takes a regex in
 `table.include.list` and Airbyte discovers its streams, so a table created

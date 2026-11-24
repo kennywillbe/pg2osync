@@ -326,6 +326,12 @@ async fn attach_to_chunk(
                 "{cut} document(s) embed only max_rows of {}, and say so in {} and {}",
                 spec.qualified(), spec.truncated_field(), spec.total_field());
         }
+        let mut collections: Vec<&mut serde_json::Value> = held
+            .iter_mut()
+            .filter_map(|change| change.doc_mut())
+            .filter_map(|doc| doc.get_mut(&spec.field))
+            .collect();
+        crate::children::attach_second_level(spec, conn, &mut collections).await?;
     }
     Ok(())
 }
