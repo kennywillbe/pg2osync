@@ -192,7 +192,8 @@ server rather than the marketing page.
 The workflow opens one issue labelled `nightly-compat` and comments the run
 URL and the failed cells on it every night it stays red, rather than opening a
 new issue each time. Fix the cell or, if the version genuinely is not
-supported, say so here and in the README — a claim no job checks is the thing
+supported, say so here, in the [feature list](index.md#features) and in the
+README — a claim no job checks is the thing
 this page exists to prevent. Re-run the failed cell once first: the known
 timing flakes, and the etiquette around them, are listed in
 [CONTRIBUTING.md](https://github.com/kennywillbe/pg2osync/blob/main/CONTRIBUTING.md#before-every-push).

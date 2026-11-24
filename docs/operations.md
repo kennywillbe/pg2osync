@@ -178,6 +178,24 @@ than continuing into a gap.
 
 ## Day-to-day commands
 
+Every one takes `-c <file>` and defaults to `pg2osync.toml`, so the common case
+needs no flag at all.
+
+| Command | What it does |
+|---|---|
+| `init --table T` | Write a starter config, qualifying `T` and checking the source has it |
+| `validate` | Config, connectivity and server prerequisites, one line each |
+| `run` | Initial load plus continuous streaming (main mode) |
+| `bootstrap` | Create the slot, publication and target indices, then exit |
+| `status` | Checkpoint position versus the source's, and what each slot retains |
+| `setup-sql` | Print the SQL a DBA needs, derived from your config |
+| `resnapshot --table T` | Read one table again into its index, without reloading the rest |
+| `reconcile` | Name index documents whose row is gone; `--delete` removes them |
+| `rejects` | What the target refused, and `--replay` to submit it again |
+| `reindex --table T --alias A` | Rebuild the table's index under a fresh name and flip the alias onto it (a swap of the two names on Meilisearch, which has no aliases) |
+| `switch-alias --alias A` | Point an alias at this config's index, atomically |
+| `drop-slot` | Drop the slot and publication when decommissioning |
+
 ```sh
 pg2osync init --table users          # write a starter config, checked against the source
 pg2osync setup-sql -c pg2osync.toml  # the SQL a DBA needs, from your config
@@ -617,6 +635,71 @@ Checkpoints are forward-compatible: a newer binary reads what an older one
 wrote. Rolling back across a format change makes the older binary ignore the
 checkpoint and re-run the initial load, which is safe but expensive.
 
+## Performance
+
+Measured with `dev/benchmark.sh` on an Apple M2 laptop (8 cores, 16 GB) against
+dockerized PostgreSQL 17.11 and OpenSearch 2.19 — a single-node dev stack, so
+read this as an order of magnitude, not a capacity plan:
+
+| Metric | Value |
+|---|---|
+| Initial load | 200K docs in ~5.8 s (**~35,000 docs/s**) |
+| Initial load, 2M rows | ~43,000 rows/s with one write request open, **~87,000 with four** (`[engine] write_concurrency`) |
+| Initial load, 10M rows | ~43,000 rows/s at one, **~90,000 at four** — the ratio holds at scale |
+| Initial load with nested children | 27,400 parents/s with one reader, **42,100 with four** (`[source] load_workers`) |
+| Pipeline latency, commit to indexed | **p50 2 ms**, p99 3 ms |
+| Commit to searchable, single row | ~80 ms including the client round-trip and a forced index refresh |
+| One 50K-row transaction | propagated in ~1.4 s |
+| Resident memory under load | ~90 MB |
+| Cores the pipeline needs | **1** — 51,900 rows/s capped at one core, 54,500 at two, and 9 MB of memory when starved to a quarter |
+| What the **source database** pays while replicated | **−0.4% throughput, 0.19 of a core** at ~14,000 tps ([how that was separated from co-location](database-impact.md#load-while-streaming)) |
+
+Under sustained concurrent writers (`dev/load-test.sh`, 8 clients on the same
+machine), where the limits actually sit:
+
+| Metric | Value |
+|---|---|
+| Single-row transactions | **~11,800 rows/s** with WAL lag at zero — the writers ran out of speed first |
+| 100-row transactions | **~57,700 rows/s** |
+| Target paused for 15 s at 2,000 rows/s | memory stayed at 38 MB, the slot retained ~510 MB of WAL |
+| Recovery after `kill -9` at load | caught up in ~2 s, source and index counts equal |
+
+A commit is what forces a batch, so a stream of single-row transactions used to
+cost one request each and topped out near 1,100 rows/s. Whole transactions now
+accumulate for up to 10 ms before the batch is written, which is where the rest
+of that number comes from; end-to-end latency moved from p50 1 ms to 2 ms.
+
+The initial load is bounded by the target, not by the source: one `COPY` produces
+rows more than twenty times faster than the pipeline can index them, and the
+figure above is what a single open write request buys. `write_concurrency` opens
+more of them, which is why it roughly doubles the load and does almost nothing
+past four.
+
+Every figure here is what the load does when nothing holds it back.
+`[engine] load_max_rows_per_sec` is the ceiling for when that is not what you
+want on a production primary — load rows only, never the stream.
+
+The two latency rows measure different things on purpose. "Commit to indexed" is
+what pg2osync controls, taken from its own `pg2osync_latency_ms`. "Commit to
+searchable" adds your client's round-trip and the target's refresh interval,
+which is what a reader actually waits for — and is dominated by the search
+engine, not by this tool.
+
+Reproduce it yourself:
+
+```sh
+docker compose -f dev/docker-compose.yml up -d
+cargo build --release
+ROWS=200000 ./dev/benchmark.sh
+./dev/load-test.sh          # sustained writers, backpressure, recovery
+```
+
+Tuning knobs live under `[engine]`: batch size, byte ceiling, transaction
+buffer cap, retry policy, checkpoint interval.
+
+Measured on a laptop, from starting `pg2osync run` to the first document being
+searchable: 1.1 seconds.
+
 ## Capacity notes
 
 - Memory is bounded by the channel depths and `batch_max_bytes`; measured at
@@ -630,8 +713,8 @@ checkpoint and re-run the initial load, which is safe but expensive.
   instance is one stream and one write path, so the number to compare against is
   the sustained rate in the section above, not how many tables you have.
 - The initial load's cost is dominated by the target's indexing throughput, not
-  by pg2osync. `dev/benchmark.sh` reproduces the numbers in the README against a
-  local stack.
+  by pg2osync. `dev/benchmark.sh` reproduces the numbers in
+  [Performance](#performance) against a local stack.
 - **Give the pipeline one core.** Measured with `dev/resource-limits.sh`, which
   runs it in its own container under a `--cpus` cap against a 500,000-row load:
 

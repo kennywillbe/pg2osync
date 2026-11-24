@@ -193,6 +193,12 @@ values: before projection and before transforms. `fields` renames run after
 projection and transforms, and `constants` are added after that; every other
 option names the column as the source knows it.
 
+A column added, dropped or retyped under a running pipeline is reported, never
+applied: new documents take the new shape, and every document written before it
+keeps the old one until the index is rebuilt (see
+[Rebuilding an index](#rebuilding-an-index)). `validate` refuses a `columns`
+list naming a column that no longer exists.
+
 ### Document ids
 
 By default a document's `_id` is its row's primary key, exactly as it always
@@ -2027,6 +2033,14 @@ where = "deleted_at IS NULL"
 [sync.users.transform]
 email = "redact"
 interests = { op = "split", by = "," }
+status = { op = "lookup", map = { "1" = "active", "2" = "closed" } }
+
+[sync.users.fields]
+signup_dt = "signed_up_at"              # stored under this name
+
+[sync.users.constants]
+entity = "user"                         # every document carries it
+origin = "{schema}.{table}"             # rendered once at startup
 
 [sync.customers]
 table = "public.customers"

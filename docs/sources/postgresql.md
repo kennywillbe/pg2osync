@@ -178,8 +178,11 @@ poll_interval_secs = 30
 
 Limitations:
 
-- **Upsert-only**: deletes are invisible to polling. A soft-delete column plus
-  a filter in your queries is the usual workaround.
+- **Upsert-only**: a hard delete is invisible to polling, which has no access
+  to the replication log. A soft delete it can see: name the predicate in
+  [`soft_delete`](../configuration.md#soft-deletes) and the document is removed.
+  `pg2osync reconcile --delete` removes index documents whose row is gone; see
+  [Reconciling an index](../operations.md#reconciling-an-index-against-its-source).
 - **Primary key changes are invisible too.** Polling only ever sees the row as
   it is now, never the key it had before, so the document left behind at the old
   key stays in the index. WAL mode handles this correctly; in poll mode, avoid
