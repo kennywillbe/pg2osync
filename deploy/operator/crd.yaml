@@ -42,7 +42,8 @@ spec:
                   extraConfig:
                     description: |-
                       Raw TOML appended to this file, for constructs the tree cannot express
-                      — repeated `[[sync.x.children]]` blocks above all.
+                      — repeated `[[sync.x.children]]` blocks above all, and the
+                      `[[sync.x.children.children]]` blocks nested inside them.
                     nullable: true
                     type: string
                   log:
@@ -75,7 +76,8 @@ spec:
                     extraConfig:
                       description: |-
                         Raw TOML appended to this file, for constructs the tree cannot express
-                        — repeated `[[sync.x.children]]` blocks above all.
+                        — repeated `[[sync.x.children]]` blocks above all, and the
+                        `[[sync.x.children.children]]` blocks nested inside them.
                       nullable: true
                       type: string
                     log:

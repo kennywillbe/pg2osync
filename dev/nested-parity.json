@@ -1,0 +1,40 @@
+{
+  "1": {
+    "id": 1,
+    "name": "first",
+    "lines": [
+      {
+        "order_id": 1,
+        "sku": "a",
+        "options": [
+          {"id": 100, "line_id": 10, "colour": "red"},
+          {"id": 101, "line_id": 10, "colour": "blue"}
+        ],
+        "options_truncated": true,
+        "options_total": 3
+      },
+      {"order_id": 1, "sku": "b", "options": []}
+    ],
+    "shipment": {
+      "id": 30,
+      "order_id": 1,
+      "carrier": "post",
+      "events": [
+        {"id": 300, "ship_id": 30, "status": "sent"},
+        {"id": 301, "ship_id": 30, "status": "delivered"}
+      ]
+    }
+  },
+  "2": {
+    "id": 2,
+    "name": "second",
+    "lines": [
+      {
+        "order_id": 2,
+        "sku": "c",
+        "options": [{"id": 200, "line_id": 20, "colour": "black"}]
+      }
+    ],
+    "shipment": null
+  }
+}

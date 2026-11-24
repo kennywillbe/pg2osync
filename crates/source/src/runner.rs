@@ -308,11 +308,15 @@ impl WalSource {
                                         pending.name_parent(parent.clone(), key);
                                     }
                                 }
-                                Classified::NamesThrough {
+                                Classified::NamesByChild {
                                     parent,
                                     field,
-                                    child_key,
-                                } => pending.name_through(parent, &field, child_key),
+                                    child_keys,
+                                } => {
+                                    for key in child_keys {
+                                        pending.name_by_child(parent.clone(), &field, key);
+                                    }
+                                }
                                 Classified::Skip => {}
                             }
                             // A transaction large enough to matter is resolved in
@@ -423,8 +427,12 @@ impl WalSource {
         // CHILD table: it names a parent to re-read, and carries nothing else
         if let Some(parent) = self.cfg.child_parents.get(&table) {
             let specs = self.cfg.children.get(parent).cloned().unwrap_or_default();
-            let Some(cspec) = specs.iter().find(|s| s.reads(&rel.schema, &rel.name)) else {
-                return self.names_aggregate_parent(rel, parent, &incoming);
+            let cspec = match crate::children::route(&specs, &rel.schema, &rel.name) {
+                Some(crate::children::Route::Child(spec)) => spec,
+                Some(crate::children::Route::Grandchild { parent: via, spec }) => {
+                    return names_intermediate(rel, parent, via, spec, &incoming);
+                }
+                None => return self.names_aggregate_parent(rel, parent, &incoming),
             };
             // Which half of a many-to-many relation this row is. The junction
             // carries the parent's key and takes the direct path; the child
@@ -461,10 +469,10 @@ impl WalSource {
                 if child_key.is_null() {
                     return Err(SourceError::protocol(missing()));
                 }
-                return Ok(Classified::NamesThrough {
+                return Ok(Classified::NamesByChild {
                     parent: parent.clone(),
                     field: cspec.field.clone(),
-                    child_key,
+                    child_keys: vec![child_key],
                 });
             }
             return Ok(Classified::NamesParent {
@@ -552,6 +560,44 @@ impl WalSource {
     }
 }
 
+/// A second-level row: the intermediate rows it is nested in, by its own
+/// foreign key, across both images.
+///
+/// Both images for the same reason a first-level row reads both: a row moved
+/// from one intermediate row to another has left one element as surely as it
+/// joined another, and the two may sit in different documents.
+fn names_intermediate(
+    rel: &crate::pgoutput::Relation,
+    root: &(String, String),
+    via: &crate::children::ChildSpec,
+    spec: &crate::children::ChildSpec,
+    incoming: &crate::docbuild::Incoming,
+) -> Result<Classified> {
+    let idx = super::docbuild::column_index(rel, &spec.foreign_key).ok_or_else(|| {
+        SourceError::protocol(format!(
+            "column {} missing on {}.{}",
+            spec.foreign_key, rel.schema, rel.name
+        ))
+    })?;
+    let child_keys = keys_in(rel, idx, incoming, || {
+        format!(
+            "row of {}.{} carries NULL {}; cannot locate the {} row it is nested in. \
+             Consider ALTER TABLE {}.{} REPLICA IDENTITY FULL",
+            rel.schema,
+            rel.name,
+            spec.foreign_key,
+            via.qualified(),
+            rel.schema,
+            rel.name
+        )
+    })?;
+    Ok(Classified::NamesByChild {
+        parent: root.clone(),
+        field: via.field.clone(),
+        child_keys,
+    })
+}
+
 /// The distinct parents one foreign key names across a row's images, newest
 /// first.
 ///
@@ -602,11 +648,12 @@ enum Classified {
         keys: Vec<serde_json::Value>,
     },
     /// Not a document either, and it names no parent: a row of a many-to-many
-    /// child, whose parents the junction knows and the commit asks for.
-    NamesThrough {
+    /// child, whose parents the junction knows, or a second-level row, whose
+    /// root the intermediate rows it names know. The commit asks either.
+    NamesByChild {
         parent: (String, String),
         field: String,
-        child_key: serde_json::Value,
+        child_keys: Vec<serde_json::Value>,
     },
     Skip,
 }
@@ -683,19 +730,20 @@ async fn flush_pending(
     Ok(())
 }
 
-/// Turn the group's changed many-to-many child rows into the parents they
-/// belong to, before anything else is resolved.
+/// Turn the group's child keys into the parents they belong to, before
+/// anything else is resolved.
 ///
-/// One `SELECT DISTINCT` per through collection, whatever the transaction
-/// touched, and the answer merges into the parents the group already names — so
-/// a parent named by both a junction row and one of its child rows is still
-/// read once and its collections aggregated once.
+/// One `SELECT DISTINCT` per collection, whatever the transaction touched:
+/// against the junction for a many-to-many child's own rows, against the
+/// intermediate table for second-level rows. The answer merges into the
+/// parents the group already names — so a parent named from two directions is
+/// still read once and its collections aggregated once.
 async fn resolve_through(
     cfg: &WalSourceConfig,
     pending: &mut crate::children::Pending,
     admin: &tokio_postgres::Client,
 ) -> Result<()> {
-    for ((table, field), child_keys) in pending.take_through() {
+    for ((table, field), child_keys) in pending.take_by_child() {
         let Some(spec) = cfg
             .children
             .get(&table)
@@ -703,7 +751,7 @@ async fn resolve_through(
         else {
             continue;
         };
-        for key in crate::children::parents_through(admin, spec, &child_keys).await? {
+        for key in crate::children::parents_of_children(admin, spec, &child_keys).await? {
             pending.name_parent(table.clone(), key);
         }
     }
@@ -874,6 +922,98 @@ mod tests {
             Classified::NamesParent { keys, .. } => keys,
             _ => panic!("a child row names its parents"),
         }
+    }
+
+    /// customers <- orders <- lines, where lines also carries a column named
+    /// like the intermediate's own foreign key.
+    fn lines_source() -> (WalSource, HashMap<u32, crate::pgoutput::Relation>) {
+        let (mut src, mut relations) = orders_child_source(ReplicaIdentity::Full);
+        let customers = ("public".to_string(), "customers".to_string());
+        let mut lines =
+            pg2osync_core::children::ChildSpec::new("public.lines", "lines", "order_id", "id")
+                .expect("a qualified child");
+        lines.order_by = vec!["id".into()];
+        let orders = &mut src.cfg.children.get_mut(&customers).expect("orders")[0];
+        orders.order_by = vec!["id".into()];
+        orders.children.push(lines);
+        src.cfg
+            .child_parents
+            .insert(("public".into(), "lines".into()), customers);
+        let column = |name: &str| crate::pgoutput::RelationColumn {
+            name: name.into(),
+            type_oid: 20,
+            typmod: -1,
+            in_replica_identity: true,
+        };
+        relations.insert(
+            8,
+            crate::pgoutput::Relation {
+                rel_id: 8,
+                schema: "public".into(),
+                name: "lines".into(),
+                columns: vec![column("id"), column("customer_id"), column("order_id")],
+                replica_identity: ReplicaIdentity::Full,
+            },
+        );
+        (src, relations)
+    }
+
+    fn line(id: &str, order: &str) -> crate::pgoutput::Tuple {
+        use crate::pgoutput::TupleValue;
+        crate::pgoutput::Tuple(vec![
+            TupleValue::Text(id.as_bytes().to_vec()),
+            TupleValue::Text(b"99".to_vec()),
+            TupleValue::Text(order.as_bytes().to_vec()),
+        ])
+    }
+
+    #[test]
+    fn a_second_level_row_names_the_intermediate_rows_it_moved_between() {
+        let (mut src, relations) = lines_source();
+        assert!(src.is_configured("public", "lines"));
+        let moved = Message::Update(crate::pgoutput::Update {
+            rel_id: 8,
+            old_tuple: Some(OldTuple::Full(line("5", "10"))),
+            new_tuple: line("5", "11"),
+        });
+        match src.classify(&moved, &relations).expect("classified") {
+            Classified::NamesByChild {
+                parent,
+                field,
+                child_keys,
+            } => {
+                assert_eq!(parent, ("public".to_string(), "customers".to_string()));
+                assert_eq!(field, "orders", "held under the collection it nests in");
+                assert_eq!(
+                    child_keys,
+                    vec![json!(11), json!(10)],
+                    "read by its own foreign key, both images, never by the \
+                     intermediate's customer_id"
+                );
+            }
+            _ => panic!("a second-level row names intermediate rows, not a document"),
+        }
+        let deleted = Message::Delete(crate::pgoutput::Delete {
+            rel_id: 8,
+            key_tuple: OldTuple::Full(line("5", "10")),
+        });
+        assert!(matches!(
+            src.classify(&deleted, &relations).expect("classified"),
+            Classified::NamesByChild { child_keys, .. } if child_keys == vec![json!(10)]
+        ));
+    }
+
+    #[test]
+    fn the_intermediate_row_still_names_its_root() {
+        let (mut src, relations) = lines_source();
+        let moved = update(
+            Some(OldTuple::Full(row("10", Some("1")))),
+            row("10", Some("2")),
+        );
+        assert_eq!(
+            named_parents(src.classify(&moved, &relations).expect("classified")),
+            vec![json!(2), json!(1)]
+        );
     }
 
     #[test]

@@ -139,6 +139,34 @@ mod tests {
     }
 
     #[test]
+    fn a_second_level_of_children_reaches_the_file_nested_in_its_first() {
+        // The operator never parses extraConfig, so what has to hold is that
+        // appending it after the tree leaves the second level inside the
+        // element of the first, where the pipeline reads it from.
+        let spec = spec_from(serde_json::json!({
+            "config": {
+                "sync": { "orders": { "table": "public.orders" } },
+                "extraConfig": "[[sync.orders.children]]\ntable = \"public.lines\"\n\
+                                field = \"lines\"\nforeign_key = \"order_id\"\n\
+                                [[sync.orders.children.children]]\n\
+                                table = \"public.options\"\nfield = \"options\"\n\
+                                foreign_key = \"line_id\"\n"
+            }
+        }));
+        let body = &render_files(&spec).expect("a valid spec")["pg2osync.toml"];
+        let parsed: toml::Value = toml::from_str(body).expect("TOML");
+        let orders = &parsed["sync"]["orders"];
+        assert_eq!(orders["table"].as_str(), Some("public.orders"));
+        let lines = &orders["children"][0];
+        assert_eq!(lines["table"].as_str(), Some("public.lines"));
+        assert_eq!(
+            lines["children"][0]["table"].as_str(),
+            Some("public.options"),
+            "{body}"
+        );
+    }
+
+    #[test]
     fn an_unknown_option_reaches_the_file_untouched() {
         // The operator is not a second place an option has to be added: a key
         // it has never heard of renders the way the config file spells it.

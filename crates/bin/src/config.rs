@@ -353,7 +353,7 @@ pub struct TableSync {
     /// render once at startup.
     #[serde(default)]
     pub constants: std::collections::HashMap<String, Constant>,
-    /// One-to-many children embedded as JSON arrays (single level, 0.3).
+    /// Child tables embedded in the document, up to two levels deep.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<ChildJoin>,
     /// Numbers derived from a child table: one field per entry, kept live by
@@ -726,7 +726,15 @@ pub struct ChildJoin {
     /// checkable against everything else the parent document writes.
     #[serde(default)]
     pub flatten: bool,
+    /// Collections embedded inside each element of this one: the second and
+    /// last level. Their `foreign_key` references this child's own
+    /// single-column primary key.
+    #[serde(default)]
+    pub children: Vec<ChildJoin>,
 }
+
+/// How many levels of `[[children]]` a document may nest.
+const MAX_CHILD_DEPTH: usize = 2;
 
 /// A number derived from a child table, carried on the parent document.
 ///
@@ -1462,19 +1470,8 @@ impl AppConfig {
                         );
                     }
                 }
-                check_field_map(
-                    &format!("sync.{key}.children({}).fields", child.table),
-                    &child.fields,
-                )?;
                 let child_key = format!("sync.{key}.children({})", child.table);
-                if child.columns.is_some() && !child.exclude_columns.is_empty() {
-                    anyhow::bail!(
-                        "[{child_key}] columns and exclude_columns are mutually exclusive"
-                    );
-                }
-                if child.columns.as_ref().is_some_and(|c| c.is_empty()) {
-                    anyhow::bail!("[{child_key}] columns must not be empty");
-                }
+                check_child_shape(&child_key, child)?;
                 match (&child.through, &child.through_key) {
                     (Some(through), Some(_)) => {
                         if !is_qualified_table(through) {
@@ -1506,12 +1503,6 @@ impl AppConfig {
                          is nothing for it to name"
                     ),
                     (None, None) => {}
-                }
-                if child.single && child.max_rows.is_some() {
-                    anyhow::bail!(
-                        "[{child_key}] single and max_rows contradict each other: a relation \
-                         declared one-to-one has nothing to cap"
-                    );
                 }
                 if child.flatten && !child.single {
                     anyhow::bail!(
@@ -1545,33 +1536,13 @@ impl AppConfig {
                         );
                     }
                 }
-                for (col, target) in &child.fields {
-                    // a rename is a promise that the column reaches the target;
-                    // projection dropping it would break that promise silently
-                    if child.exclude_columns.contains(col) {
-                        anyhow::bail!(
-                            "[{child_key}.fields] {col} is renamed but also excluded; \
-                             an excluded column never reaches the target"
-                        );
-                    }
-                    if let Some(cols) = &child.columns
-                        && !cols.contains(col)
-                    {
-                        anyhow::bail!(
-                            "[{child_key}.fields] {col} is renamed but not in columns; \
-                             it would never reach the target"
-                        );
-                    }
-                    if let Some(cols) = &child.columns
-                        && cols.contains(target)
-                        && !child.fields.contains_key(target)
-                    {
-                        anyhow::bail!(
-                            "[{child_key}.fields] {col} = {target:?} would overwrite column \
-                             {target}"
-                        );
-                    }
+                if child.table == tbl.table {
+                    anyhow::bail!(
+                        "[{child_key}] embeds {} into itself; a table is never its own child",
+                        tbl.table
+                    );
                 }
+                check_grandchildren(&child_key, &tbl.table, child)?;
             }
             // Two children writing the same name leave whichever landed last,
             // which is no answer at all. A flattened child makes this reachable
@@ -1722,6 +1693,7 @@ impl AppConfig {
             sections.push((Label::section(key), tbl));
         }
         check_junctions(self)?;
+        check_embedded_once(self)?;
         check_child_tables(self)?;
         check_index_overlap(&sections)?;
         for (key, table) in &self.sync {
@@ -1916,6 +1888,15 @@ fn check_child_tables(cfg: &AppConfig) -> Result<()> {
                 }
                 None => uses.push((&child.table, by_key, place)),
             }
+            // a second-level row reaches this parent through the row it is
+            // nested in, which is a route of its own
+            for grand in &child.children {
+                uses.push((
+                    &grand.table,
+                    format!("{} by foreign_key {}", child.table, grand.foreign_key),
+                    format!("[sync.{key}.children.children] {}", grand.field),
+                ));
+            }
         }
         for agg in &tbl.aggregates {
             uses.push((
@@ -1937,6 +1918,47 @@ fn check_child_tables(cfg: &AppConfig) -> Result<()> {
                 Some(_) => {}
                 None => {
                     seen.insert(watched, (&tbl.table, how, place));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// An embedded table is embedded once, across every section and depth.
+///
+/// One streamed row of it has to name one route to one root document, and a
+/// table embedded twice — under two sections, two parents or two levels —
+/// would leave one of the two uses stale or read a second level's key off a
+/// first-level row. The table an aggregate counts may still be embedded by the
+/// same parent: [`check_child_tables`] holds that to the same route.
+fn check_embedded_once(cfg: &AppConfig) -> Result<()> {
+    let mut seen: HashMap<&str, String> = HashMap::new();
+    let mut keys: Vec<&String> = cfg.sync.keys().collect();
+    keys.sort();
+    for key in keys {
+        let tbl = &cfg.sync[key];
+        for child in &tbl.children {
+            let levels = std::iter::once((
+                &child.table,
+                format!("[sync.{key}.children] {}", child.field),
+            ))
+            .chain(child.children.iter().map(|grand| {
+                (
+                    &grand.table,
+                    format!(
+                        "[sync.{key}.children.children] {}.{}",
+                        child.field, grand.field
+                    ),
+                )
+            }));
+            for (table, place) in levels {
+                if let Some(first) = seen.insert(table.as_str(), place.clone()) {
+                    anyhow::bail!(
+                        "{place} embeds {table}, which {first} already embeds; a table is \
+                         embedded once across every section and level, or a streamed row \
+                         of it cannot say which document it belongs to"
+                    );
                 }
             }
         }
@@ -2217,6 +2239,127 @@ fn check_shared_index(index: &str, members: &[(Label, &TableSync)]) -> Result<()
 /// The shape checks a rename map needs regardless of what it applies to.
 /// A target that is another key of the same map is allowed: that column is
 /// itself renamed away, so nothing is overwritten.
+/// What a child entry must get right on its own, at either level: its
+/// projection, its cap and its renames.
+fn check_child_shape(child_key: &str, child: &ChildJoin) -> Result<()> {
+    check_field_map(&format!("{child_key}.fields"), &child.fields)?;
+    if child.columns.is_some() && !child.exclude_columns.is_empty() {
+        anyhow::bail!("[{child_key}] columns and exclude_columns are mutually exclusive");
+    }
+    if child.columns.as_ref().is_some_and(|c| c.is_empty()) {
+        anyhow::bail!("[{child_key}] columns must not be empty");
+    }
+    if child.single && child.max_rows.is_some() {
+        anyhow::bail!(
+            "[{child_key}] single and max_rows contradict each other: a relation \
+             declared one-to-one has nothing to cap"
+        );
+    }
+    for (col, target) in &child.fields {
+        // a rename is a promise that the column reaches the target;
+        // projection dropping it would break that promise silently
+        if child.exclude_columns.contains(col) {
+            anyhow::bail!(
+                "[{child_key}.fields] {col} is renamed but also excluded; \
+                 an excluded column never reaches the target"
+            );
+        }
+        if let Some(cols) = &child.columns
+            && !cols.contains(col)
+        {
+            anyhow::bail!(
+                "[{child_key}.fields] {col} is renamed but not in columns; \
+                 it would never reach the target"
+            );
+        }
+        if let Some(cols) = &child.columns
+            && cols.contains(target)
+            && !child.fields.contains_key(target)
+        {
+            anyhow::bail!(
+                "[{child_key}.fields] {col} = {target:?} would overwrite column {target}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The second level under one child: what it may be, and what it may not
+/// collide with inside the element it lands in.
+///
+/// `through`, `flatten` and aggregates stop at the first level because each
+/// needs a route of its own from a streamed row back to the root, and the
+/// second level has exactly one: the intermediate row's key.
+fn check_grandchildren(child_key: &str, root: &str, child: &ChildJoin) -> Result<()> {
+    if child.children.is_empty() {
+        return Ok(());
+    }
+    if child.flatten {
+        anyhow::bail!(
+            "[{child_key}] a flattened child cannot hold [[children]] of its own: flatten \
+             lifts a fixed list of columns, and a nested collection is not one of them"
+        );
+    }
+    let mut written: HashMap<String, String> = HashMap::new();
+    for grand in &child.children {
+        let grand_key = format!("{child_key}.children({})", grand.table);
+        if !grand.children.is_empty() {
+            anyhow::bail!(
+                "[{grand_key}] nested children stop at {MAX_CHILD_DEPTH} levels; embed a \
+                 deeper table through join, or as its own section"
+            );
+        }
+        if !is_qualified_table(&grand.table) {
+            anyhow::bail!("[{grand_key}] child table must be schema-qualified");
+        }
+        if grand.through.is_some() || grand.through_key.is_some() {
+            anyhow::bail!(
+                "[{grand_key}] through is a first-level option: a second-level row finds \
+                 its root through the row it is nested in, and a junction would be a \
+                 second route"
+            );
+        }
+        if grand.flatten {
+            anyhow::bail!(
+                "[{grand_key}] flatten is a first-level option: it lifts columns onto the \
+                 document, and a second-level row is not on the document"
+            );
+        }
+        if grand.table == child.table || grand.table == root {
+            anyhow::bail!(
+                "[{grand_key}] embeds {} inside itself; a table is never its own child",
+                grand.table
+            );
+        }
+        check_child_shape(&grand_key, grand)?;
+        // the element holds the intermediate row's columns under the names its
+        // own fields chose, so the second level is checked against both
+        for name in grand.claimed_fields() {
+            if child.fields.contains_key(&name) || child.fields.values().any(|t| t == &name) {
+                anyhow::bail!(
+                    "[{child_key}.fields] {name:?} is {}; rename the second level's \
+                     columns in its own fields instead",
+                    grand.claim()
+                );
+            }
+            if child.columns.as_ref().is_some_and(|c| c.contains(&name)) {
+                anyhow::bail!(
+                    "[{grand_key}] {name:?} is also a column of {} embedded beside it",
+                    child.table
+                );
+            }
+            if let Some(first) = written.insert(name.clone(), grand.table.clone()) {
+                anyhow::bail!(
+                    "[{child_key}] {name:?} is written by child {first} and by child {}; \
+                     one field holds one value",
+                    grand.table
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn check_field_map(
     section: &str,
     fields: &std::collections::HashMap<String, String>,
@@ -3379,6 +3522,192 @@ id = "user-{id}"
         assert!(err.to_string().contains("[[aggregates]]"), "{err}");
         parse(&format!("{MINIMAL}{aggregate}"))
             .expect("the replication log counts the parent again");
+    }
+
+    /// A root, an intermediate and a second level, in TOML.
+    const LINES: &str = "[[sync.users.children]]\ntable = \"public.orders\"\nfield = \"orders\"\n\
+                         foreign_key = \"user_id\"\n\
+                         [[sync.users.children.children]]\ntable = \"public.lines\"\n\
+                         field = \"lines\"\nforeign_key = \"order_id\"\n";
+
+    #[test]
+    fn a_second_level_nests_inside_its_child() {
+        let cfg = parse(&format!(
+            "{MINIMAL}{LINES}max_rows = 3\ncolumns = [\"sku\", \"qty\"]\n\
+             [sync.users.children.children.fields]\nqty = \"quantity\"\n"
+        ))
+        .expect("a two-level chain with a projected, capped, renamed second level");
+        let lines = &cfg.sync["users"].children[0].children[0];
+        assert_eq!(lines.table, "public.lines");
+        assert_eq!(lines.max_rows, Some(3));
+        assert_eq!(lines.fields["qty"], "quantity");
+        parse(&format!("{MINIMAL}{LINES}single = true\n")).expect("a one-to-one second level");
+        parse(&format!(
+            "{MINIMAL}[[sync.users.children]]\ntable = \"public.tags\"\nfield = \"tags\"\n\
+             foreign_key = \"user_id\"\nthrough = \"public.user_tag\"\nthrough_key = \"tag_id\"\n\
+             [[sync.users.children.children]]\ntable = \"public.tag_notes\"\n\
+             field = \"notes\"\nforeign_key = \"tag_id\"\n"
+        ))
+        .expect("a many-to-many intermediate keys its second level by its own key");
+        parse(&format!(
+            "{}{LINES}",
+            MINIMAL.replace("[source]", "[source]\nflavor = \"mysql\"")
+        ))
+        .expect("MySQL reads a second level the same way");
+    }
+
+    #[test]
+    fn a_second_level_refuses_what_needs_a_route_of_its_own() {
+        let refused = [
+            (
+                format!(
+                    "{LINES}[[sync.users.children.children.children]]\n\
+                     table = \"public.options\"\nfield = \"options\"\nforeign_key = \"line_id\"\n"
+                ),
+                "levels",
+                "a third level",
+            ),
+            (
+                format!("{LINES}through = \"public.line_sku\"\nthrough_key = \"sku_id\"\n"),
+                "through is a first-level option",
+                "a junction at the second level",
+            ),
+            (
+                format!("{LINES}single = true\nflatten = true\ncolumns = [\"sku\"]\n"),
+                "flatten is a first-level option",
+                "flatten at the second level",
+            ),
+            (
+                format!(
+                    "{LINES}[[sync.users.children.children.aggregates]]\n\
+                     table = \"public.options\"\nfield = \"n\"\nforeign_key = \"line_id\"\n"
+                ),
+                "unknown field",
+                "an aggregate at the second level",
+            ),
+            (
+                format!("{LINES}single = true\nmax_rows = 2\n"),
+                "contradict",
+                "the first level's own rules hold at the second",
+            ),
+            (
+                LINES.replace("public.lines", "lines"),
+                "schema-qualified",
+                "an unqualified second level",
+            ),
+            (
+                LINES.replace("table = \"public.lines\"", "table = \"public.orders\""),
+                "never its own child",
+                "a second level that is its intermediate",
+            ),
+            (
+                LINES.replace("table = \"public.lines\"", "table = \"public.users\""),
+                "never its own child",
+                "a second level that is its root",
+            ),
+            (
+                LINES.replace(
+                    "[[sync.users.children]]\ntable = \"public.orders\"",
+                    "[[sync.users.children]]\ntable = \"public.users\"",
+                ),
+                "never its own child",
+                "a first level that is its root",
+            ),
+            (
+                format!(
+                    "{}columns = [\"id\", \"lines\"]\n{}",
+                    &LINES[..LINES.find("[[sync.users.children.children]]").unwrap()],
+                    &LINES[LINES.find("[[sync.users.children.children]]").unwrap()..]
+                ),
+                "also a column",
+                "a second-level field that is a listed column of its intermediate",
+            ),
+            (
+                format!(
+                    "{LINES}[[sync.users.children.children]]\ntable = \"public.returns\"\n\
+                     field = \"lines\"\nforeign_key = \"order_id\"\n"
+                ),
+                "one field holds one value",
+                "two second-level collections under one name",
+            ),
+            (
+                format!(
+                    "{}single = true\nflatten = true\ncolumns = [\"id\"]\n{}",
+                    &LINES[..LINES.find("[[sync.users.children.children]]").unwrap()],
+                    &LINES[LINES.find("[[sync.users.children.children]]").unwrap()..]
+                ),
+                "flattened child cannot hold",
+                "a flattened intermediate",
+            ),
+        ];
+        for (extra, needle, why) in refused {
+            let err = parse(&format!("{MINIMAL}{extra}"))
+                .expect_err(why)
+                .to_string();
+            assert!(err.contains(needle), "{why}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_second_level_rename_onto_its_field_is_refused() {
+        let err = parse(&format!(
+            "{MINIMAL}[[sync.users.children]]\ntable = \"public.orders\"\nfield = \"orders\"\n\
+             foreign_key = \"user_id\"\n[sync.users.children.fields]\nnote = \"lines\"\n\
+             [[sync.users.children.children]]\ntable = \"public.lines\"\n\
+             field = \"lines\"\nforeign_key = \"order_id\"\n"
+        ))
+        .expect_err("an intermediate rename burying the second level");
+        assert!(
+            err.to_string().contains("the field of child public.lines"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_table_is_embedded_once_across_sections_and_levels() {
+        let refused = [
+            (
+                format!(
+                    "{LINES}[sync.posts]\ntable = \"public.posts\"\n\
+                     [[sync.posts.children]]\ntable = \"public.lines\"\nfield = \"lines\"\n\
+                     foreign_key = \"post_id\"\n"
+                ),
+                "a second level embedded again under another section",
+            ),
+            (
+                format!(
+                    "{LINES}[[sync.users.children]]\ntable = \"public.lines\"\nfield = \"lines\"\n\
+                     foreign_key = \"user_id\"\n"
+                ),
+                "a second level embedded again at the first, under the same root",
+            ),
+            (
+                format!(
+                    "{MINIMAL}[[sync.users.children]]\ntable = \"public.orders\"\n\
+                     field = \"orders\"\nforeign_key = \"user_id\"\n\
+                     [[sync.users.children]]\ntable = \"public.orders\"\n\
+                     field = \"recent\"\nforeign_key = \"user_id\"\nmax_rows = 1\n"
+                )[MINIMAL.len()..]
+                    .to_string(),
+                "one table embedded twice by one parent, through one key",
+            ),
+            (
+                format!(
+                    "{LINES}[[sync.users.aggregates]]\ntable = \"public.lines\"\n\
+                     field = \"line_count\"\nforeign_key = \"user_id\"\n"
+                ),
+                "a second level counted for its root by another key",
+            ),
+        ];
+        for (extra, why) in refused {
+            let err = parse(&format!("{MINIMAL}{extra}"))
+                .expect_err(why)
+                .to_string();
+            assert!(
+                err.contains("already"),
+                "{why}: the first use is named: {err}"
+            );
+        }
     }
 
     #[test]

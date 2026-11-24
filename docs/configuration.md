@@ -1259,7 +1259,8 @@ that is refused at startup rather than silently dropping the rename. The
 the element, so leaving it out of the array changes nothing but the array.
 
 - PostgreSQL and MySQL/MariaDB alike.
-- One level deep only.
+- Two levels at most: a child may hold collections of its own, one level
+  further down (see [A second level](#a-second-level)), and no deeper.
 - Children are fetched during the initial load and re-fetched whenever the
   parent or any of its children changes, so the array is never stale.
 - Child tables are added to the publication automatically.
@@ -1321,12 +1322,13 @@ startup for the same reason.
   `binlog_row_image = FULL` (already required) is what lets a child DELETE
   carry its foreign key and a re-parented child name the parent it left, so
   there is no REPLICA IDENTITY caveat.
-- **One table, one parent.** A child, junction or aggregated table may appear
+- **One table, one place.** A child, junction or aggregated table may appear
   under only one parent and be read by one `foreign_key` (or, for a
   many-to-many child, through one junction); a second use that resolves another
   way is refused when the config is read, because a streamed row can only name
-  one parent. A child and an aggregate over the same table, by the same key,
-  under the same parent are fine.
+  one parent. A table named in `[[children]]` appears once across every section
+  and both levels, and never under itself. A child and an aggregate over the
+  same table, by the same key, under the same parent are fine.
 - **Not under `mode = "poll"`.** A polled parent row is written as the whole
   document, which would drop the arrays, and nothing polls the child tables;
   the combination is refused when the config is read.
@@ -1364,7 +1366,9 @@ changes its home: with `through` set it is a column of the junction, not of the
 child. Everything else on a child works unchanged: `fields`, `columns`,
 `exclude_columns`, `max_rows` with its `_truncated`/`_total` fields, and
 `single` for a one-to-one relation that happens to be recorded in a junction.
-The junction contributes no field of its own, and this is still one level deep.
+The junction contributes no field of its own. A many-to-many child may hold a
+second level of its own, keyed by the child's primary key; the junction is
+never part of that level.
 
 - The aggregation is the same one, with one join added, so the initial load and
   a streamed re-fetch cannot embed different arrays.
@@ -1480,6 +1484,75 @@ name that is also a `constants` entry, an aggregate `field`, a name written by
 another child (flattened or not), a parent rename key or target, or a
 surviving entry of the parent's `columns`. `validate` additionally refuses a
 lifted name that equals a live column of the parent that is not renamed away.
+
+#### A second level
+
+An order's lines have options of their own. `[[sync.x.children.children]]`
+embeds a collection inside each element of the child above it:
+
+```toml
+[sync.orders]
+table = "public.orders"
+index = "orders"
+
+[[sync.orders.children]]
+table = "public.order_lines"
+field = "lines"
+foreign_key = "order_id"      # on order_lines, referencing orders
+max_rows = 100
+
+[[sync.orders.children.children]]
+table = "public.line_options"
+field = "options"
+foreign_key = "line_id"       # on line_options, referencing order_lines
+max_rows = 20
+
+[sync.orders.children.children.fields]
+color = "colour"
+```
+
+```json
+{ "id": 1, "lines": [
+  { "sku": "a", "options": [ { "colour": "red" }, { "colour": "blue" } ],
+    "options_truncated": true, "options_total": 3 },
+  { "sku": "b", "options": [] } ] }
+```
+
+The second level's `foreign_key` references the primary key of the child above
+it, which therefore needs a **single-column primary key**; a composite one is
+refused at startup and by `validate`. That key is read for the second level
+whatever the child's `columns` or `exclude_columns` say, so the child may still
+leave it out of the document.
+
+- `columns`, `exclude_columns`, `fields`, `max_rows` and `single` work as they
+  do on the first level. A cut array's `<field>_truncated` and `<field>_total`
+  sit **inside the element** they describe, never on the root.
+- Refused at the second level: `through`, `flatten`, aggregates, and a third
+  level. A first-level child with `flatten` cannot hold a second level.
+- A second-level field may not collide with a column the child above it keeps:
+  the element would quietly disagree with its row.
+- The load reads the second level level by level: one query per second-level
+  collection per chunk of parents, so its cost does not grow with the number of
+  child rows. A table with no second level pays nothing for the feature.
+- A changed second-level row names the child row it is nested in. At commit the
+  transaction's distinct child rows are looked up once per collection
+  (`SELECT DISTINCT <foreign_key> … WHERE <key> IN (…)`) and their parents
+  re-read. **Index the second level's `foreign_key`** for the same reason as the
+  first's.
+- A second-level row moved to another child row re-reads both parents, from the
+  before-image. On PostgreSQL that is the same `REPLICA IDENTITY FULL` the first
+  level needs, now on the second-level table as well; see
+  [operations](operations.md#nested-children-and-replica-identity).
+- Deleting a child row removes its element and everything nested in it, with or
+  without an `ON DELETE CASCADE` below it: the child row's own delete is what
+  re-reads the parent.
+
+**Every changed row below the root rewrites the whole root document**, with all
+of its sibling subtrees. Startup and `validate` warn when the `max_rows` along a
+chain — or an unbounded level — let one document hold more than 10,000 nested
+objects, where a `nested` mapping is refused. A large or busy subtree belongs in
+an index of its own, related through a [join field](#join-fields), rather than
+one level deeper.
 
 ### Aggregates
 

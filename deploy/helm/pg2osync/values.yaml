@@ -38,7 +38,8 @@ config:
   #      email: redact
 
 # Raw TOML appended to the rendered config. Use it for constructs the values
-# tree cannot express, such as repeated [[sync.x.children]] blocks.
+# tree cannot express, such as repeated [[sync.x.children]] blocks and the
+# [[sync.x.children.children]] blocks nested inside them.
 extraConfig: ""
 
 # Several source databases in one process. Each entry is a whole config tree,

@@ -479,51 +479,24 @@ impl MySqlSource {
                     let set = binlog::parse_rows(h.event_type, body, &rt.meta)?;
                     let version = version_at(&current_file, end_pos);
                     let table = (rt.schema.clone(), rt.table.clone());
-                    // A child row is not a document: it names a parent to re-read.
-                    // Naming it rather than emitting it is what lets a thousand
-                    // children of one parent cost one query and one document.
                     if let Some(parent) = self.cfg.child_parents.get(&table).cloned() {
-                        match child_spec(&self.cfg, &parent, &table) {
-                            Some(spec) => {
-                                let spec = spec.clone();
-                                // Which half of a many-to-many relation this row is: the
-                                // junction carries the parent's key, the child only its
-                                // own, and the junction is asked for the rest at commit.
-                                let through = spec
-                                    .through
-                                    .as_ref()
-                                    .filter(|_| spec.schema == table.0 && spec.table == table.1);
-                                for row in &set.rows {
-                                    let column = match through {
-                                        Some(through) => &through.child_key,
-                                        None => &spec.foreign_key,
-                                    };
-                                    match through {
-                                        Some(_) => {
-                                            let key = row_column(rt, &table, row, column)?;
-                                            pending.name_through(parent.clone(), &spec.field, key)
-                                        }
-                                        None => {
-                                            for key in parent_keys(rt, &table, row, column)? {
-                                                pending.name_parent(parent.clone(), key);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            // A row of a table an aggregate counts names the
-                            // parents to count again — both of them where the
-                            // foreign key moved, since the parent the row left
-                            // is as wrong as the one it joined.
-                            None => {
-                                let spec = aggregate_spec(&self.cfg, &parent, &table)?.clone();
-                                for row in &set.rows {
-                                    for key in parent_keys(rt, &table, row, &spec.foreign_key)? {
-                                        pending.name_parent(parent.clone(), key);
-                                    }
-                                }
-                            }
-                        }
+                        name_parents_of_rows(
+                            self.cfg
+                                .children
+                                .get(&parent)
+                                .map(Vec::as_slice)
+                                .unwrap_or_default(),
+                            self.cfg
+                                .aggregates
+                                .get(&parent)
+                                .map(Vec::as_slice)
+                                .unwrap_or_default(),
+                            &parent,
+                            rt,
+                            &table,
+                            &set.rows,
+                            &mut pending,
+                        )?;
                     } else if self.cfg.children.contains_key(&table)
                         || self.cfg.aggregates.contains_key(&table)
                     {
@@ -614,26 +587,79 @@ async fn report_drift(
     .map_err(|_| MySqlError::ChannelClosed)
 }
 
-/// The collection a streamed row belongs to, as either of the tables it reads.
-fn child_spec<'a>(
-    cfg: &'a MySqlSourceConfig,
+/// Note what a group of rows of a watched, non-document table names.
+///
+/// A child row is not a document: it names a parent to re-read. Naming it
+/// rather than emitting it is what lets a thousand children of one parent cost
+/// one query and one document.
+fn name_parents_of_rows(
+    specs: &[pg2osync_core::children::ChildSpec],
+    aggregates: &[pg2osync_core::aggregate::AggregateSpec],
     parent: &(String, String),
+    rt: &RegisteredTable,
     table: &(String, String),
-) -> Option<&'a pg2osync_core::children::ChildSpec> {
-    cfg.children
-        .get(parent)
-        .and_then(|specs| specs.iter().find(|s| s.reads(&table.0, &table.1)))
+    rows: &[binlog::RowsRow],
+    pending: &mut pg2osync_core::children::Pending,
+) -> Result<()> {
+    use pg2osync_core::children::Route;
+    match pg2osync_core::children::route(specs, &table.0, &table.1) {
+        Some(Route::Child(spec)) => {
+            // Which half of a many-to-many relation this row is: the junction
+            // carries the parent's key, the child only its own, and the
+            // junction is asked for the rest at commit.
+            let through = spec
+                .through
+                .as_ref()
+                .filter(|_| spec.schema == table.0 && spec.table == table.1);
+            for row in rows {
+                match through {
+                    Some(through) => {
+                        let key = row_column(rt, table, row, &through.child_key)?;
+                        pending.name_by_child(parent.clone(), &spec.field, key)
+                    }
+                    None => {
+                        for key in parent_keys(rt, table, row, &spec.foreign_key)? {
+                            pending.name_parent(parent.clone(), key);
+                        }
+                    }
+                }
+            }
+        }
+        // A second-level row names the intermediate rows it sits in, by its
+        // own foreign key and from both images: one moved between two of them
+        // has left one element as surely as it joined another, and the two may
+        // be in different documents. The intermediate table is asked for
+        // their roots at commit.
+        Some(Route::Grandchild { parent: via, spec }) => {
+            for row in rows {
+                for key in parent_keys(rt, table, row, &spec.foreign_key)? {
+                    pending.name_by_child(parent.clone(), &via.field, key);
+                }
+            }
+        }
+        // A row of a table an aggregate counts names the parents to count
+        // again — both of them where the foreign key moved, since the parent
+        // the row left is as wrong as the one it joined.
+        None => {
+            let spec = aggregate_spec(aggregates, table)?;
+            for row in rows {
+                for key in parent_keys(rt, table, row, &spec.foreign_key)? {
+                    pending.name_parent(parent.clone(), key);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The aggregate a streamed row counts towards.
 fn aggregate_spec<'a>(
-    cfg: &'a MySqlSourceConfig,
-    parent: &(String, String),
+    aggregates: &'a [pg2osync_core::aggregate::AggregateSpec],
     table: &(String, String),
 ) -> Result<&'a pg2osync_core::aggregate::AggregateSpec> {
-    cfg.aggregates
-        .get(parent)
-        .and_then(|specs| specs.iter().find(|s| s.reads(&table.0, &table.1)))
+    aggregates
+        .iter()
+        .find(|s| s.reads(&table.0, &table.1))
         .ok_or_else(|| {
             MySqlError::protocol(format!(
                 "child {}.{} has no matching children entry",
@@ -714,19 +740,20 @@ fn image_column(
     })
 }
 
-/// Turn the group's changed many-to-many child rows into the parents they
-/// belong to, before anything else is resolved.
+/// Turn the group's child keys into the parents they belong to, before
+/// anything else is resolved.
 ///
-/// One `SELECT DISTINCT` per through collection, whatever the transaction
-/// touched, and the answer merges into the parents the group already names — so
-/// a parent named by both a junction row and one of its child rows is still read
-/// once and its collections aggregated once.
+/// One `SELECT DISTINCT` per collection, whatever the transaction touched:
+/// against the junction for a many-to-many child's own rows, against the
+/// intermediate table for second-level rows. The answer merges into the
+/// parents the group already names — so a parent named from two directions is
+/// still read once and its collections aggregated once.
 async fn resolve_through(
     cfg: &MySqlSourceConfig,
     pending: &mut pg2osync_core::children::Pending,
     conn: &mut MySqlConnection,
 ) -> Result<()> {
-    for ((table, field), child_keys) in pending.take_through() {
+    for ((table, field), child_keys) in pending.take_by_child() {
         let Some(spec) = cfg
             .children
             .get(&table)
@@ -735,7 +762,7 @@ async fn resolve_through(
         else {
             continue;
         };
-        for key in crate::children::parents_through(&spec, conn, &child_keys).await? {
+        for key in crate::children::parents_of_children(&spec, conn, &child_keys).await? {
             pending.name_parent(table.clone(), key);
         }
     }
@@ -808,6 +835,12 @@ async fn flush_pending(
                     "{cut} document(s) embed only max_rows of {}, and say so in {} and {}",
                     spec.qualified(), spec.truncated_field(), spec.total_field());
             }
+            let mut collections: Vec<&mut serde_json::Value> = emitted
+                .iter_mut()
+                .filter_map(|change| change.doc_mut())
+                .filter_map(|doc| doc.get_mut(&spec.field))
+                .collect();
+            crate::children::attach_second_level(spec, conn, &mut collections).await?;
         }
         let aggregates = cfg.aggregates.get(&table).cloned().unwrap_or_default();
         crate::aggregate::attach_aggregates(conn, &aggregates, &mut emitted).await?;
@@ -1020,6 +1053,78 @@ mod tests {
             vec![json!(2)],
             "one parent is named once"
         );
+    }
+
+    /// shop.orders <- kid_item <- kid_option, where kid_option also carries
+    /// a column named like the intermediate's own foreign key.
+    fn options_route() -> (
+        Vec<pg2osync_core::children::ChildSpec>,
+        RegisteredTable,
+        (String, String),
+    ) {
+        use pg2osync_core::children::ChildSpec;
+        let mut items = ChildSpec::new("shop.kid_item", "items", "parent_id", "id").unwrap();
+        items.order_by = vec!["id".into()];
+        let mut options = ChildSpec::new("shop.kid_option", "options", "item_id", "id").unwrap();
+        options.order_by = vec!["id".into()];
+        items.children.push(options);
+        let rt = RegisteredTable {
+            table: "kid_option".into(),
+            columns: vec!["id".into(), "parent_id".into(), "item_id".into()],
+            ..table()
+        };
+        (vec![items], rt, ("shop".into(), "kid_option".into()))
+    }
+
+    #[test]
+    fn a_second_level_row_names_the_intermediate_rows_it_moved_between() {
+        let (specs, rt, t) = options_route();
+        let root = ("shop".to_string(), "orders".to_string());
+        let mut pending = pg2osync_core::children::Pending::default();
+        let moved = binlog::RowsRow {
+            before: Some(vec![Some(json!(5)), Some(json!(99)), Some(json!(10))]),
+            after: Some(vec![Some(json!(5)), Some(json!(99)), Some(json!(11))]),
+        };
+        let deleted = binlog::RowsRow {
+            before: Some(vec![Some(json!(6)), Some(json!(99)), Some(json!(12))]),
+            after: None,
+        };
+        name_parents_of_rows(&specs, &[], &root, &rt, &t, &[moved, deleted], &mut pending)
+            .expect("routed");
+        assert!(
+            pending.named.is_empty(),
+            "a second-level row names no document, and never by the intermediate's parent_id"
+        );
+        let taken = pending.take_by_child();
+        assert_eq!(taken.len(), 1);
+        let ((table, field), keys) = &taken[0];
+        assert_eq!(table, &root);
+        assert_eq!(field, "items", "held under the collection it nests in");
+        assert_eq!(
+            keys,
+            &vec![json!(11), json!(10), json!(12)],
+            "both images of the move, and a delete's before-image"
+        );
+    }
+
+    #[test]
+    fn the_intermediate_row_still_names_its_root() {
+        let (specs, _, _) = options_route();
+        let (rt, t) = kid_item();
+        let root = ("shop".to_string(), "orders".to_string());
+        let mut pending = pg2osync_core::children::Pending::default();
+        name_parents_of_rows(
+            &specs,
+            &[],
+            &root,
+            &rt,
+            &t,
+            &[moved(Some(1), Some(2))],
+            &mut pending,
+        )
+        .expect("routed");
+        assert_eq!(pending.named[&root], vec![json!(2), json!(1)]);
+        assert!(pending.take_by_child().is_empty());
     }
 
     #[test]

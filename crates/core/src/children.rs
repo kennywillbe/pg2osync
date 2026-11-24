@@ -89,6 +89,12 @@ pub struct ChildSpec {
     /// With it set, `foreign_key` is a column of the junction rather than of
     /// the child: the junction is what carries the parent's key.
     pub through: Option<Through>,
+    /// Collections embedded inside each element of this one, one level deep.
+    ///
+    /// Each one's `parent_column` is this child's own single-column key,
+    /// resolved from the catalogue, because that is what every element is
+    /// matched by when the second level is attached.
+    pub children: Vec<ChildSpec>,
 }
 
 impl ChildSpec {
@@ -115,6 +121,7 @@ impl ChildSpec {
             exclude_columns: Vec::new(),
             single: false,
             through: None,
+            children: Vec::new(),
         })
     }
 
@@ -145,6 +152,201 @@ impl ChildSpec {
     pub fn truncated_field(&self) -> String {
         format!("{}_truncated", self.field)
     }
+
+    /// The column each element of this collection is matched to its own
+    /// children by, when it has any.
+    ///
+    /// A through child's key was resolved onto its junction; a direct one's is
+    /// the single-column primary key the order is taken from.
+    pub fn element_key_column(&self) -> Option<&str> {
+        if self.children.is_empty() {
+            return None;
+        }
+        match &self.through {
+            Some(through) => Some(through.child_key.as_str()),
+            None => match self.order_by.as_slice() {
+                [key] => Some(key.as_str()),
+                _ => None,
+            },
+        }
+    }
+}
+
+/// Where a streamed row of a watched table belongs among a parent's
+/// collections.
+#[derive(Debug, Clone, Copy)]
+pub enum Route<'a> {
+    /// A first-level collection, or its junction.
+    Child(&'a ChildSpec),
+    /// A second-level collection: its rows name an element of `parent`, not a
+    /// document.
+    Grandchild {
+        parent: &'a ChildSpec,
+        spec: &'a ChildSpec,
+    },
+}
+
+/// Find the collection a table feeds among one parent's collections.
+///
+/// The first level is asked first only for determinism: configuration refuses
+/// a table that appears twice across sections and depths, so at most one
+/// answer exists. Matching a second-level table by name rather than through
+/// [`ChildSpec::reads`] is deliberate, because it is that spec's own
+/// `foreign_key` the row is read by, never its parent's.
+pub fn route<'a>(specs: &'a [ChildSpec], schema: &str, table: &str) -> Option<Route<'a>> {
+    if let Some(spec) = specs.iter().find(|s| s.reads(schema, table)) {
+        return Some(Route::Child(spec));
+    }
+    specs.iter().find_map(|parent| {
+        parent
+            .children
+            .iter()
+            .find(|g| g.schema == schema && g.table == table)
+            .map(|spec| Route::Grandchild { parent, spec })
+    })
+}
+
+/// The name an element carries its own key under until its children are
+/// attached.
+///
+/// Read beside the element rather than out of it, because `columns` or
+/// `exclude_columns` may leave the key out of what the document embeds; it is
+/// removed again by [`attach_nested`] whatever happens, so no document ever
+/// carries it.
+pub const ELEMENT_KEY: &str = "__pg2osync_element_key";
+
+/// Every element key one embedded collection holds, as read for its children.
+///
+/// A `single` collection is the element itself, or null; an array is any
+/// number of them. Both are walked, since a one-to-one intermediate can still
+/// have a collection of its own.
+pub fn element_keys(collection: &Value) -> Vec<Value> {
+    elements(collection)
+        .filter_map(|e| e.get(ELEMENT_KEY).cloned())
+        .filter(|k| !k.is_null())
+        .collect()
+}
+
+fn elements(collection: &Value) -> Box<dyn Iterator<Item = &Value> + '_> {
+    match collection {
+        Value::Array(rows) => Box::new(rows.iter()),
+        Value::Object(_) => Box::new(std::iter::once(collection)),
+        _ => Box::new(std::iter::empty()),
+    }
+}
+
+fn elements_mut(collection: &mut Value) -> Box<dyn Iterator<Item = &mut Value> + '_> {
+    match collection {
+        Value::Array(rows) => Box::new(rows.iter_mut()),
+        Value::Object(_) => Box::new(std::iter::once(collection)),
+        _ => Box::new(std::iter::empty()),
+    }
+}
+
+/// What one second-level collection turned into across a group, so the
+/// caller can say it once rather than per element.
+#[derive(Debug, Default, Clone)]
+pub struct NestedTally {
+    /// Elements whose array was cut by `max_rows`.
+    pub cut: usize,
+    /// The element holding the most rows, and how many.
+    pub largest: Option<(Value, i64)>,
+    pub duplicates: Duplicates,
+}
+
+impl NestedTally {
+    /// The line a cut second level logs, or nothing when no element was cut.
+    ///
+    /// Worded here so both sources say it the same way: one line per
+    /// collection per group, naming the worst element rather than each one.
+    pub fn cut_message(&self, via: &ChildSpec, grand: &ChildSpec) -> Option<String> {
+        let (key, total) = self.largest.as_ref().filter(|_| self.cut > 0)?;
+        Some(format!(
+            "{} element(s) of {} embed only max_rows of {}, and say so in {} and {}; \
+             the largest is {} row {key} with {total} rows",
+            self.cut,
+            via.field,
+            grand.qualified(),
+            grand.truncated_field(),
+            grand.total_field(),
+            via.qualified()
+        ))
+    }
+}
+
+/// The distinct element keys across a group of one collection's values, in
+/// the order first seen.
+///
+/// One question per key rather than per element: a many-to-many intermediate
+/// row sits in every document that links it, and asking for it once per
+/// document would read its second level that many times.
+pub fn distinct_element_keys<'a>(collections: impl IntoIterator<Item = &'a Value>) -> Vec<Value> {
+    let mut seen = HashSet::new();
+    let mut keys = Vec::new();
+    for collection in collections {
+        for key in element_keys(collection) {
+            if seen.insert(key_lookup(&key)) {
+                keys.push(key);
+            }
+        }
+    }
+    keys
+}
+
+/// Put each of `spec`'s second-level collections on every element of one
+/// embedded collection, then drop the element key.
+///
+/// `fetched` holds, per second-level collection in `spec.children` order, the
+/// arrays and totals the source read keyed by [`key_lookup`] of an element key.
+/// The shaping is [`apply_collection`]'s, so a second-level array's
+/// `_truncated`/`_total` land inside the element it belongs to exactly as a
+/// first-level one's land on the document.
+pub fn attach_nested(
+    collection: &mut Value,
+    spec: &ChildSpec,
+    fetched: &[HashMap<String, (Value, i64)>],
+    tallies: &mut [NestedTally],
+) {
+    for element in elements_mut(collection) {
+        let Value::Object(map) = element else {
+            continue;
+        };
+        let key = map.remove(ELEMENT_KEY).unwrap_or(Value::Null);
+        for ((grand, by_key), tally) in spec.children.iter().zip(fetched).zip(tallies.iter_mut()) {
+            let (array, total) = by_key
+                .get(&key_lookup(&key))
+                .cloned()
+                .unwrap_or((Value::Array(Vec::new()), 0));
+            let applied = apply_collection(element, grand, array, total);
+            if applied.truncated {
+                tally.cut += 1;
+            }
+            tally.duplicates.record(grand, &key, applied.matched);
+            if tally.largest.as_ref().is_none_or(|(_, most)| total > *most) {
+                tally.largest = Some((key.clone(), total));
+            }
+        }
+    }
+}
+
+/// How many nested objects one document can hold under `spec`, or `None`
+/// when a level is unbounded.
+///
+/// Only meaningful for a chain with a second level: every first-level element
+/// is one object and carries up to the product of the caps below it.
+pub fn nested_object_bound(spec: &ChildSpec) -> Option<u64> {
+    let width = |s: &ChildSpec| -> Option<u64> {
+        if s.single {
+            Some(1)
+        } else {
+            s.max_rows.map(u64::from)
+        }
+    };
+    let per_element = spec
+        .children
+        .iter()
+        .try_fold(1u64, |acc, g| Some(acc.saturating_add(width(g)?)))?;
+    Some(width(spec)?.saturating_mul(per_element))
 }
 
 /// What one collection turned into, so the caller can summarise a batch.
@@ -252,9 +454,13 @@ pub fn key_lookup(key: &Value) -> String {
     key.to_string()
 }
 
-/// One through collection's changed child rows: the parent table and field they
-/// belong to, and the distinct keys they were filed under.
-pub type ThroughKeys = (((String, String), String), Vec<Value>);
+/// Child keys still to be turned into parent keys: the parent table and the
+/// first-level field they belong to, and the distinct keys.
+///
+/// Two kinds of row land here and resolve the same way at commit: a changed
+/// row of a many-to-many child, whose parents the junction knows, and a
+/// changed second-level row, whose root the intermediate row knows.
+pub type ChildKeys = (((String, String), String), Vec<Value>);
 
 /// Rows held back until their children can be resolved for the whole group.
 ///
@@ -269,7 +475,7 @@ pub struct Pending {
     pub named: HashMap<(String, String), Vec<Value>>,
     through: HashMap<((String, String), String), Vec<Value>>,
     seen: HashSet<(String, String, String)>,
-    seen_through: HashSet<((String, String), String, String)>,
+    seen_by_child: HashSet<((String, String), String, String)>,
 }
 
 impl Pending {
@@ -284,14 +490,15 @@ impl Pending {
         }
     }
 
-    /// A changed row of a through collection's CHILD table, which names no
-    /// parent: it is the junction that knows which parents it belongs to.
+    /// A child key that names no parent by itself: a many-to-many child's own
+    /// key, whose parents the junction knows, or the intermediate key a
+    /// second-level row names, whose root that intermediate row knows.
     ///
     /// Deduplicated the same way a named parent is, per collection, so a
     /// transaction touching one child a thousand times asks about one key.
-    pub fn name_through(&mut self, table: (String, String), field: &str, child_key: Value) {
+    pub fn name_by_child(&mut self, table: (String, String), field: &str, child_key: Value) {
         let id = (table.clone(), field.to_string(), key_lookup(&child_key));
-        if self.seen_through.insert(id) {
+        if self.seen_by_child.insert(id) {
             self.through
                 .entry((table, field.to_string()))
                 .or_default()
@@ -299,12 +506,12 @@ impl Pending {
         }
     }
 
-    /// Every through collection's distinct child keys, to resolve to parents.
+    /// Every collection's distinct child keys, to resolve to parents.
     ///
     /// Taken all at once and before anything else, because resolving them is
     /// what turns them into named parents — after which the group is read
     /// exactly as a group of changed junction rows would have been.
-    pub fn take_through(&mut self) -> Vec<ThroughKeys> {
+    pub fn take_by_child(&mut self) -> Vec<ChildKeys> {
         self.through.drain().collect()
     }
 
@@ -341,7 +548,7 @@ impl Pending {
 
     pub fn clear_seen(&mut self) {
         self.seen.clear();
-        self.seen_through.clear();
+        self.seen_by_child.clear();
     }
 }
 
@@ -391,6 +598,168 @@ mod tests {
             ChildSpec::new("public.profiles", "profile", "customer_id", "id").expect("qualified");
         spec.single = true;
         spec
+    }
+
+    fn lines_with_options() -> ChildSpec {
+        let mut lines = ChildSpec::new("public.lines", "lines", "order_id", "id").expect("q");
+        lines.order_by = vec!["line_id".into()];
+        let mut options =
+            ChildSpec::new("public.options", "options", "line_id", "line_id").expect("q");
+        options.max_rows = Some(1);
+        lines.children.push(options);
+        lines
+    }
+
+    #[test]
+    fn a_second_level_lands_inside_the_element_it_belongs_to() {
+        let lines = lines_with_options();
+        let mut doc = json!({"id": 1});
+        apply_collection(
+            &mut doc,
+            &lines,
+            json!([
+                {ELEMENT_KEY: 10, "sku": "a"},
+                {ELEMENT_KEY: 11, "sku": "b"},
+                {ELEMENT_KEY: 12, "sku": "c"}
+            ]),
+            3,
+        );
+        assert_eq!(
+            element_keys(&doc["lines"]),
+            vec![json!(10), json!(11), json!(12)]
+        );
+        let fetched = vec![HashMap::from([
+            (key_lookup(&json!(10)), (json!([{"color": "red"}]), 3)),
+            (key_lookup(&json!(11)), (json!([{"color": "blue"}]), 1)),
+        ])];
+        let mut tallies = vec![NestedTally::default()];
+        attach_nested(&mut doc["lines"], &lines, &fetched, &mut tallies);
+        assert_eq!(
+            doc["lines"],
+            json!([
+                {"sku": "a", "options": [{"color": "red"}],
+                 "options_truncated": true, "options_total": 3},
+                {"sku": "b", "options": [{"color": "blue"}]},
+                {"sku": "c", "options": []}
+            ]),
+            "the cap is reported inside the element it cut, the key is gone, \
+             and an element with no rows still holds the field"
+        );
+        assert!(doc.get("options_truncated").is_none(), "not on the root");
+        assert_eq!(tallies[0].cut, 1);
+        assert_eq!(tallies[0].largest, Some((json!(10), 3)));
+    }
+
+    #[test]
+    fn an_element_shared_by_two_documents_is_asked_for_once() {
+        let first = json!([{ELEMENT_KEY: 7}, {ELEMENT_KEY: 8}]);
+        let second = json!([{ELEMENT_KEY: 8}, {ELEMENT_KEY: null}]);
+        let single = json!({ELEMENT_KEY: 9});
+        assert_eq!(
+            distinct_element_keys([&first, &second, &single, &Value::Null]),
+            vec![json!(7), json!(8), json!(9)]
+        );
+    }
+
+    #[test]
+    fn a_cut_second_level_says_so_once_naming_the_worst_element() {
+        let lines = lines_with_options();
+        let options = &lines.children[0];
+        let mut tally = NestedTally::default();
+        assert!(tally.cut_message(&lines, options).is_none());
+        tally.largest = Some((json!(10), 3));
+        assert!(
+            tally.cut_message(&lines, options).is_none(),
+            "a largest element that was not cut is not news"
+        );
+        tally.cut = 2;
+        let message = tally.cut_message(&lines, options).expect("cut");
+        assert!(message.starts_with("2 element(s) of lines"), "{message}");
+        assert!(
+            message.contains("options_truncated and options_total"),
+            "{message}"
+        );
+        assert!(
+            message.contains("public.lines row 10 with 3 rows"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_one_to_one_intermediate_holds_its_collection_too() {
+        let mut lines = lines_with_options();
+        lines.single = true;
+        lines.children[0].max_rows = None;
+        let mut doc = json!({"id": 1});
+        apply_collection(&mut doc, &lines, json!([{ELEMENT_KEY: 10, "sku": "a"}]), 1);
+        let fetched = vec![HashMap::from([(
+            key_lookup(&json!(10)),
+            (json!([{"color": "red"}, {"color": "blue"}]), 2),
+        )])];
+        attach_nested(
+            &mut doc["lines"],
+            &lines,
+            &fetched,
+            &mut [NestedTally::default()],
+        );
+        assert_eq!(
+            doc["lines"],
+            json!({"sku": "a", "options": [{"color": "red"}, {"color": "blue"}]})
+        );
+
+        // a parent with no intermediate row has nothing to attach to
+        let mut empty = json!({"id": 2});
+        apply_collection(&mut empty, &lines, json!([]), 0);
+        assert!(element_keys(&empty["lines"]).is_empty());
+        attach_nested(
+            &mut empty["lines"],
+            &lines,
+            &fetched,
+            &mut [NestedTally::default()],
+        );
+        assert_eq!(empty["lines"], json!(null));
+    }
+
+    #[test]
+    fn a_second_level_table_is_routed_by_its_own_name() {
+        let mut through = ChildSpec::new("public.tags", "tags", "user_id", "id").expect("q");
+        through.through = Some(Through::new("public.user_tag", "tag_id").expect("q"));
+        let specs = vec![through, lines_with_options()];
+        assert!(matches!(
+            route(&specs, "public", "user_tag"),
+            Some(Route::Child(s)) if s.field == "tags"
+        ));
+        match route(&specs, "public", "options") {
+            Some(Route::Grandchild { parent, spec }) => {
+                assert_eq!(parent.field, "lines");
+                assert_eq!(spec.foreign_key, "line_id", "read by its own key");
+            }
+            other => panic!("a grandchild routes through its parent: {other:?}"),
+        }
+        assert!(route(&specs, "public", "nobody").is_none());
+    }
+
+    #[test]
+    fn the_nested_object_bound_multiplies_down_a_chain() {
+        let mut lines = lines_with_options();
+        lines.max_rows = Some(100);
+        lines.children[0].max_rows = Some(200);
+        assert_eq!(nested_object_bound(&lines), Some(100 * 201));
+        lines.children[0].max_rows = None;
+        assert_eq!(nested_object_bound(&lines), None, "an unbounded level");
+        lines.children[0].single = true;
+        assert_eq!(nested_object_bound(&lines), Some(200));
+        lines.max_rows = None;
+        assert_eq!(nested_object_bound(&lines), None);
+    }
+
+    #[test]
+    fn only_an_intermediate_has_an_element_key() {
+        let mut lines = lines_with_options();
+        assert_eq!(lines.element_key_column(), Some("line_id"));
+        lines.order_by.push("other".into());
+        assert_eq!(lines.element_key_column(), None, "composite has none");
+        assert_eq!(spec().element_key_column(), None, "no children, no key");
     }
 
     #[test]
@@ -492,16 +861,16 @@ mod tests {
         // transaction touching one author a hundred times asks about one.
         let mut pending = Pending::default();
         for _ in 0..100 {
-            pending.name_through(table(), "authors", json!(7));
+            pending.name_by_child(table(), "authors", json!(7));
         }
-        pending.name_through(table(), "authors", json!(8));
+        pending.name_by_child(table(), "authors", json!(8));
         // the same key on another collection of the same parent is another
         // question, and another junction to ask it of
-        pending.name_through(table(), "editors", json!(7));
+        pending.name_by_child(table(), "editors", json!(7));
         assert_eq!(pending.len(), 3);
         assert!(!pending.is_empty(), "nothing has been resolved yet");
 
-        let mut taken = pending.take_through();
+        let mut taken = pending.take_by_child();
         taken.sort_by_key(|((_, field), _)| field.clone());
         assert_eq!(taken.len(), 2, "one lookup per collection");
         assert_eq!(taken[0].0.1, "authors");
@@ -517,8 +886,8 @@ mod tests {
         // the same named set, so the parent is still read once.
         let mut pending = Pending::default();
         pending.name_parent(table(), json!(1));
-        pending.name_through(table(), "authors", json!(9));
-        for (_, child_keys) in pending.take_through() {
+        pending.name_by_child(table(), "authors", json!(9));
+        for (_, child_keys) in pending.take_by_child() {
             assert_eq!(child_keys, vec![json!(9)]);
             // what the junction lookup answers, merged in as any other key
             pending.name_parent(table(), json!(1));

@@ -410,6 +410,8 @@ gate a write.
 | `… changed shape: added/removed/retyped …` | A column changed under the running pipeline | Nothing breaks, but documents written earlier keep the old shape. Re-index when you want them to agree. Also counted as `pg2osync_schema_drift_total{table}`, on both sources |
 | `table … has REPLICA IDENTITY NOTHING` | Updates/deletes cannot be replicated | Run the `ALTER TABLE … REPLICA IDENTITY FULL` from the message |
 | `child row carries NULL <fk>` | Child table lacks `REPLICA IDENTITY FULL` | Set it; a delete without the key cannot find its parent |
+| `row of … carries NULL <fk>; cannot locate the … row it is nested in` | A second-level table lacks `REPLICA IDENTITY FULL` | Set it on that table too; see [below](#nested-children-and-replica-identity) |
+| `… and the levels below can embed … nested objects in one document` | A section with a second level allows more than 10,000 nested objects per document, counting every collection together, or a level is unbounded | Cap each level, or index the subtree on its own with a join field; every changed row below the root rewrites the whole document |
 | `halting pipeline: permanent rejection …` | The target refuses the document (usually a mapping conflict) | Fix the mapping or exclude the column; the retry then gets through. Or quarantine it — see below |
 | `halting pipeline: … reached the max_rejects limit` | Enough documents were refused that it is systematic | Fix the mapping, then `pg2osync rejects --replay` |
 | `… were refused and could not be quarantined` | The quarantine store is unwritable | The batch is unacknowledged, so nothing is lost. Fix target access and restart |
@@ -459,6 +461,28 @@ it does not carry on for ever: past `max_rejects` it halts anyway, because that
 many refusals is a mapping problem rather than a bad row. Nothing is lost when it
 does — whatever is not recorded is also not acknowledged, so the source sends it
 again once you have fixed the mapping.
+
+### Nested children and replica identity
+
+PostgreSQL sends the old values of an updated or deleted row only as far as the
+table's replica identity goes, and the default identity is the primary key. A
+child row's foreign key is what names its parent, so every table embedded under
+`[[children]]` needs `REPLICA IDENTITY FULL`, **at each level**:
+
+| Table | Without `FULL` |
+|---|---|
+| a first-level child | a DELETE cannot find its parent and fails; an UPDATE that moves it to another parent leaves the old one stale |
+| a second-level child | the same, one level down: a DELETE cannot find the child row it was nested in, and a move between two child rows leaves the first one's parent stale |
+| a junction | only needed when its key does not contain `foreign_key` |
+
+```sql
+ALTER TABLE public.order_lines  REPLICA IDENTITY FULL;
+ALTER TABLE public.line_options REPLICA IDENTITY FULL;
+```
+
+The run warns at startup about each embedded table that lacks it. MySQL and
+MariaDB need nothing here: `binlog_row_image = FULL`, already required, puts
+every column in both images.
 
 ## What retries and what does not
 

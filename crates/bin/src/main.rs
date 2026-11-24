@@ -947,6 +947,22 @@ fn starter_config(tables: &[SourceTable], target: &str, mysql: bool) -> String {
 ///
 /// Offline on purpose: the point is to hand something to whoever holds the
 /// privileges, which is usually not whoever is running this.
+/// The MySQL databases the source user has to read.
+///
+/// An embedded table at any depth is read by the load and every re-fetch, and
+/// may live in a database no section names.
+fn mysql_setup_databases(cfg: &config::AppConfig) -> Vec<String> {
+    let mut databases: Vec<String> = cfg
+        .sync
+        .values()
+        .flat_map(|t| std::iter::once(&t.table).chain(run::embedded_tables(t)))
+        .filter_map(|table| table.split_once('.').map(|(db, _)| db.to_string()))
+        .collect();
+    databases.sort();
+    databases.dedup();
+    databases
+}
+
 fn setup_sql(cfg: config::AppConfig) -> Result<()> {
     let secrets = cfg.resolve_secrets()?;
     let url = url::Url::parse(&secrets.source_url).context("source url is not a valid URL")?;
@@ -956,16 +972,9 @@ fn setup_sql(cfg: config::AppConfig) -> Result<()> {
     };
 
     if cfg.source.flavor == "mysql" {
-        let mut databases: Vec<String> = cfg
-            .sync
-            .values()
-            .filter_map(|t| t.table.split_once('.').map(|(db, _)| db.to_string()))
-            .collect();
-        databases.sort();
-        databases.dedup();
         print!(
             "{}",
-            pg2osync_source_mysql::catalog::setup_script(user, &databases)
+            pg2osync_source_mysql::catalog::setup_script(user, &mysql_setup_databases(&cfg))
         );
         return Ok(());
     }
@@ -974,11 +983,8 @@ fn setup_sql(cfg: config::AppConfig) -> Result<()> {
     // child tables are read by the initial load too, and a junction is read by
     // every aggregation over the collection it joins, so both need the grant
     for table in cfg.sync.values() {
-        for name in table
-            .children
-            .iter()
-            .flat_map(|child| [Some(&child.table), child.through.as_ref()])
-            .flatten()
+        for name in run::embedded_tables(table)
+            .into_iter()
             // an aggregated table is read by the load and by every re-count
             .chain(table.aggregates.iter().map(|agg| &agg.table))
         {
@@ -1546,7 +1552,10 @@ async fn validate_source(cfg: config::AppConfig) -> Result<()> {
         println!("✓ require_alias: every configured index is an alias");
     }
     run::check_rejection_policy(&cfg, sink.as_ref())?;
-    for note in run::embedded_children_with_own_section(&cfg) {
+    for note in run::embedded_children_with_own_section(&cfg)
+        .into_iter()
+        .chain(run::nested_amplification(&cfg))
+    {
         println!("! {note}");
     }
     if cfg.engine.on_permanent_rejection == pg2osync_engine::RejectionPolicy::Quarantine {
@@ -1989,6 +1998,118 @@ fn check_child_columns(
     Ok(())
 }
 
+/// The second level under one PostgreSQL child: that its tables exist and
+/// carry what the configuration names, and that the intermediate has the one
+/// key each of its elements is matched by.
+async fn pg_check_second_level(
+    client: &tokio_postgres::Client,
+    child: &config::ChildJoin,
+    child_live: &[String],
+) -> Result<()> {
+    if child.children.is_empty() {
+        return Ok(());
+    }
+    let (schema, name) = backfill::split_qualified(&child.table);
+    let info = pg2osync_source::catalog::table_info(client, schema, name).await?;
+    let mut grand_live = Vec::with_capacity(child.children.len());
+    for grand in &child.children {
+        grand_live.push(
+            pg_columns(client, &grand.table)
+                .await?
+                .into_iter()
+                .map(|c| c.name)
+                .collect(),
+        );
+    }
+    check_second_level(child, info.pk_columns.len(), child_live, &grand_live)
+}
+
+/// The same checks on MySQL, against its own catalogue.
+async fn mysql_check_second_level(
+    admin: &mut pg2osync_source_mysql::connection::MySqlConnection,
+    child: &config::ChildJoin,
+    child_live: &pg2osync_source_mysql::catalog::TableSchema,
+) -> Result<()> {
+    if child.children.is_empty() {
+        return Ok(());
+    }
+    let mut grand_live = Vec::with_capacity(child.children.len());
+    for grand in &child.children {
+        let (schema, name) = grand
+            .table
+            .split_once('.')
+            .context("child table must be written as database.table for MySQL")?;
+        grand_live.push(
+            pg2osync_source_mysql::catalog::table_schema(admin, schema, name, false)
+                .await?
+                .column_names(),
+        );
+    }
+    check_second_level(
+        child,
+        child_live.pk_columns.len(),
+        &child_live.column_names(),
+        &grand_live,
+    )
+}
+
+/// What both sources check of a second level, once each has read the
+/// catalogue: `grand_live` holds each second-level table's columns in
+/// `child.children` order, empty for a table that does not exist.
+fn check_second_level(
+    child: &config::ChildJoin,
+    child_pk_columns: usize,
+    child_live: &[String],
+    grand_live: &[Vec<String>],
+) -> Result<()> {
+    if child.through.is_none() && child_pk_columns != 1 {
+        bail!(
+            "child {} holds a second level, so it needs a single-column primary key for \
+             that level's foreign_key to point at; it has {child_pk_columns}",
+            child.table,
+        );
+    }
+    for (grand, live) in child.children.iter().zip(grand_live) {
+        if live.is_empty() {
+            bail!("child table {} does not exist", grand.table);
+        }
+        if !live.iter().any(|c| c == &grand.foreign_key) {
+            bail!(
+                "child {} has no column {}, the foreign_key naming its {} row",
+                grand.table,
+                grand.foreign_key,
+                child.table
+            );
+        }
+        check_child_columns(grand, live, None)?;
+        // the second level lands in the element beside the intermediate's own
+        // columns, so one of those surviving under that name would be buried
+        let survives = |c: &String| {
+            !child.fields.contains_key(c)
+                && !child.exclude_columns.contains(c)
+                && child.columns.as_ref().is_none_or(|cols| cols.contains(c))
+        };
+        for name in [
+            grand.field.clone(),
+            format!("{}_truncated", grand.field),
+            format!("{}_total", grand.field),
+        ] {
+            if let Some(c) = child_live
+                .iter()
+                .find(|c| c.eq_ignore_ascii_case(&name) && survives(c))
+            {
+                bail!(
+                    "child {} has a column {c}; its second level {} would overwrite it",
+                    child.table,
+                    grand.table
+                );
+            }
+        }
+        println!("✓ second level {} inside {}", grand.table, child.table);
+    }
+    Ok(())
+}
+
 /// One table's columns as `check_through` compares them.
 async fn pg_columns(client: &tokio_postgres::Client, qualified: &str) -> Result<Vec<JoinColumn>> {
     Ok(client
@@ -2168,6 +2289,10 @@ async fn validate_postgres(cfg: &config::AppConfig, source_url: &str) -> Result<
             }
             let junction = pg_junction(&client, table, child).await?;
             check_child_columns(child, &child_live, junction.as_ref())?;
+            pg_check_second_level(&client, child, &child_live).await?;
+            for grand in &child.children {
+                tables.push(grand.table.clone());
+            }
             tables.push(child.table.clone());
             if let Some(through) = &child.through {
                 tables.push(through.clone());
@@ -2389,6 +2514,7 @@ async fn validate_mysql(cfg: &config::AppConfig, source_url: &str) -> Result<()>
                     .await?;
             let junction = mysql_junction(&mut admin, table, child, &child_live).await?;
             check_child_columns(child, &child_live.column_names(), junction.as_ref())?;
+            mysql_check_second_level(&mut admin, child, &child_live).await?;
         }
         for agg in &table.aggregates {
             // the grouped read itself, bounded to nothing: it checks the
@@ -2704,6 +2830,59 @@ mod tests {
     fn parse(args: &[&str]) -> Result<Command, clap::Error> {
         Cli::try_parse_from(std::iter::once("pg2osync").chain(args.iter().copied()))
             .map(|cli| cli.command)
+    }
+
+    fn two_levels(extra: &str) -> config::AppConfig {
+        toml::from_str(&format!(
+            "[source]\nurl = \"mysql://u@h/shop\"\nflavor = \"mysql\"\n[target]\nurl = \"http://t\"\n\
+             [sync.orders]\ntable = \"shop.orders\"\n\
+             [[sync.orders.children]]\ntable = \"shop.lines\"\nfield = \"lines\"\n\
+             foreign_key = \"order_id\"\n{extra}\
+             [[sync.orders.children.children]]\ntable = \"catalog.options\"\n\
+             field = \"options\"\nforeign_key = \"line_id\"\n"
+        ))
+        .expect("parses")
+    }
+
+    #[test]
+    fn the_mysql_grant_covers_a_second_level_in_another_database() {
+        assert_eq!(
+            mysql_setup_databases(&two_levels("")),
+            vec!["catalog".to_string(), "shop".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_second_level_is_checked_against_both_catalogues_alike() {
+        let cfg = two_levels("");
+        let lines = &cfg.sync["orders"].children[0];
+        let child_live = vec!["id".to_string(), "order_id".to_string()];
+        let options = vec!["id".to_string(), "line_id".to_string()];
+        check_second_level(lines, 1, &child_live, std::slice::from_ref(&options))
+            .expect("a single key, a foreign_key that exists, nothing buried");
+        let err = check_second_level(lines, 2, &child_live, std::slice::from_ref(&options))
+            .expect_err("a composite intermediate key");
+        assert!(
+            err.to_string().contains("single-column primary key"),
+            "{err}"
+        );
+        let err = check_second_level(lines, 1, &child_live, &[vec![]]).expect_err("missing");
+        assert!(err.to_string().contains("does not exist"), "{err}");
+        let err = check_second_level(lines, 1, &child_live, &[vec!["id".into()]])
+            .expect_err("no foreign key");
+        assert!(err.to_string().contains("no column line_id"), "{err}");
+        let buried = vec!["id".to_string(), "options_total".to_string()];
+        let err = check_second_level(lines, 1, &buried, std::slice::from_ref(&options))
+            .expect_err("a column the second level writes over");
+        assert!(err.to_string().contains("column options_total"), "{err}");
+        let excluded = two_levels("exclude_columns = [\"options_total\"]\n");
+        check_second_level(
+            &excluded.sync["orders"].children[0],
+            1,
+            &buried,
+            std::slice::from_ref(&options),
+        )
+        .expect("an excluded column is not buried");
     }
 
     #[test]

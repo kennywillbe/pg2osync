@@ -438,10 +438,11 @@ pub struct Renames {
 pub struct Rename {
     /// Source column → target field on the document itself.
     pub columns: HashMap<String, String>,
-    /// Child field on the parent document → (child column → target field),
+    /// Child field on the parent document → that child's own renames,
     /// applied to every object of that embedded array, or to the element
-    /// itself when the child is `single`.
-    pub nested: HashMap<String, HashMap<String, String>>,
+    /// itself when the child is `single`. The same shape one level down is
+    /// what reaches a second level inside each element.
+    pub nested: HashMap<String, Rename>,
 }
 
 impl Renames {
@@ -468,23 +469,34 @@ impl Renames {
         let Some(rule) = self.map.get(&(schema.to_string(), table.to_string())) else {
             return;
         };
+        rule.apply(doc);
+    }
+}
+
+impl Rename {
+    /// Rename one object, then every element of each collection it embeds.
+    ///
+    /// A collection is renamed before its field is: the field is a name on
+    /// this object, the renames below it are names inside the elements, and
+    /// configuration keeps the two from meeting.
+    fn apply(&self, doc: &mut serde_json::Value) {
         let Some(obj) = doc.as_object_mut() else {
             return;
         };
-        rename_keys(obj, &rule.columns);
-        for (field, columns) in &rule.nested {
+        for (field, rule) in &self.nested {
             match obj.get_mut(field) {
                 Some(serde_json::Value::Array(rows)) => {
-                    for row in rows.iter_mut().filter_map(serde_json::Value::as_object_mut) {
-                        rename_keys(row, columns);
+                    for row in rows.iter_mut() {
+                        rule.apply(row);
                     }
                 }
                 // a `single` child is the element itself, and an absent one is
                 // null: the rename has to reach the object either way
-                Some(serde_json::Value::Object(row)) => rename_keys(row, columns),
+                Some(row @ serde_json::Value::Object(_)) => rule.apply(row),
                 _ => {}
             }
         }
+        rename_keys(obj, &self.columns);
     }
 }
 
@@ -1971,10 +1983,54 @@ mod tests {
                 columns: pairs(columns),
                 nested: nested
                     .iter()
-                    .map(|(field, m)| (field.to_string(), pairs(m)))
+                    .map(|(field, m)| {
+                        (
+                            field.to_string(),
+                            Rename {
+                                columns: pairs(m),
+                                nested: HashMap::new(),
+                            },
+                        )
+                    })
                     .collect(),
             },
         )])
+    }
+
+    #[test]
+    fn a_second_level_is_renamed_inside_each_element() {
+        let pairs = |m: &[(&str, &str)]| -> HashMap<String, String> {
+            m.iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect()
+        };
+        let options = Rename {
+            columns: pairs(&[("clr", "color")]),
+            nested: HashMap::new(),
+        };
+        let lines = Rename {
+            columns: pairs(&[("qty", "quantity")]),
+            nested: HashMap::from([("options".to_string(), options)]),
+        };
+        let r = Renames::from_pairs([(
+            ("public".into(), "orders".into()),
+            Rename {
+                columns: HashMap::new(),
+                nested: HashMap::from([("lines".to_string(), lines)]),
+            },
+        )]);
+        let mut doc = json!({"id": 1, "lines": [
+            {"qty": 2, "options": [{"clr": "red"}, {"clr": "blue"}]},
+            {"qty": 1, "options": {"clr": "green"}}
+        ]});
+        r.apply("public", "orders", &mut doc);
+        assert_eq!(
+            doc,
+            json!({"id": 1, "lines": [
+                {"quantity": 2, "options": [{"color": "red"}, {"color": "blue"}]},
+                {"quantity": 1, "options": {"color": "green"}}
+            ]})
+        );
     }
 
     #[test]

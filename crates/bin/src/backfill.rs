@@ -410,6 +410,7 @@ pub async fn run(
                 }
             }
             cols.push(child_column(child));
+            check_second_level_fields(admin, child).await?;
         }
         for agg in agg_specs {
             // shadowing a real column would produce a document that quietly
@@ -502,6 +503,7 @@ pub async fn run(
             append_only: tbl.append_only,
             filter: scope.filter.as_deref(),
             table_filter: scope.table_filter(&tbl.table),
+            second_level: admin,
         };
         // Ranges are read in waves, one per reader, with a barrier at the end of
         // each. A free-running pool would be faster by the width of the skew
@@ -585,6 +587,20 @@ struct RangePlan<'a> {
     append_only: bool,
     filter: Option<&'a str>,
     table_filter: Option<&'a pg2osync_core::filter::Filter>,
+    /// Where a second level is read for a chunk of loaded rows. Never the
+    /// range's own reader: that connection is mid-`COPY` until the range ends,
+    /// and a query behind it would wait on a stream nobody is draining.
+    second_level: &'a tokio_postgres::Client,
+}
+
+impl RangePlan<'_> {
+    /// Whether any collection of this table has a second level, which is what
+    /// makes a chunk of rows wait for one more query before it goes out.
+    fn nests(&self) -> bool {
+        self.child_specs
+            .iter()
+            .any(|spec| !spec.children.is_empty())
+    }
 }
 
 /// Read one range on one connection, and return how many rows it produced.
@@ -636,6 +652,11 @@ async fn read_range(
             duplicates: pg2osync_core::children::Duplicates::default(),
         })
         .collect();
+    // A table with a second level holds one chunk of rows back, bounded by
+    // the boundary interval rather than by the range, which can be the whole
+    // table when it is read in one piece.
+    let nests = plan.nests();
+    let mut held: Vec<pg2osync_core::event::RowChange> = Vec::new();
     let mut stream = std::pin::pin!(copy_stream);
     while let Some(chunk) = stream.next().await {
         let chunk: bytes::Bytes = chunk.context("copy stream failed")?;
@@ -664,22 +685,86 @@ async fn read_range(
                     plan.append_only,
                 )?
             };
-            if tx.send(ChangeEvent::Row(change)).await.is_err() {
+            if nests {
+                held.push(change);
+            } else if tx.send(ChangeEvent::Row(change)).await.is_err() {
                 bail!("engine closed during backfill");
             }
             if count.is_multiple_of(ROWS_PER_BOUNDARY) {
+                send_nested(plan, &mut held, tx).await?;
                 send_boundary(tx).await?;
             }
         }
         // one compaction per network chunk, not one per row
         pending.drain(..consumed);
     }
+    send_nested(plan, &mut held, tx).await?;
     for collection in &collections {
         if let Some(message) = collection.duplicates.message(collection.spec) {
             tracing::warn!(target: "pg2osync::backfill", "{message}");
         }
     }
     Ok(count)
+}
+
+/// Attach the second level to a chunk of loaded rows and send them.
+///
+/// One query per second-level collection for the whole chunk, through the
+/// same reader a streamed re-fetch uses, so a loaded second-level array is the
+/// one the stream would have embedded.
+async fn send_nested(
+    plan: &RangePlan<'_>,
+    held: &mut Vec<pg2osync_core::event::RowChange>,
+    tx: &Sender<ChangeEvent>,
+) -> Result<()> {
+    if held.is_empty() {
+        return Ok(());
+    }
+    for spec in plan.child_specs.iter().filter(|s| !s.children.is_empty()) {
+        let mut collections: Vec<&mut serde_json::Value> = held
+            .iter_mut()
+            .filter_map(|r| r.doc_mut())
+            .filter_map(|doc| doc.get_mut(&spec.field))
+            .collect();
+        pg2osync_source::children::attach_second_level(spec, plan.second_level, &mut collections)
+            .await?;
+    }
+    for change in held.drain(..) {
+        if tx.send(ChangeEvent::Row(change)).await.is_err() {
+            bail!("engine closed during backfill");
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a second-level field that a column of the intermediate table would
+/// share a name with, the way a first-level field is refused against the
+/// parent's columns: the element would quietly disagree with its row.
+async fn check_second_level_fields(
+    admin: &tokio_postgres::Client,
+    child: &ChildSpec,
+) -> Result<()> {
+    if child.children.is_empty() {
+        return Ok(());
+    }
+    let cols = columns_of(admin, &child.qualified()).await?;
+    for grand in &child.children {
+        let mut claimed = vec![grand.field.clone()];
+        if grand.max_rows.is_some() {
+            claimed.push(grand.truncated_field());
+            claimed.push(grand.total_field());
+        }
+        for name in claimed {
+            if cols.iter().any(|c| c.name == name) {
+                bail!(
+                    "[sync] second-level field {name:?} collides with a column of {}; \
+                     choose another field name",
+                    child.qualified()
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Hold the copy back while the replication slot is beyond the WAL the server

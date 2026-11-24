@@ -111,7 +111,7 @@ not expressions) — if you need those, you want Kafka.
 | **MySQL 8.0 / MariaDB 10.6+ → any of the above** | ✅ MySQL 8.0 on every pull request; MySQL 8.4 and MariaDB 10.6/11.8 nightly |
 | Consistent initial load, then live streaming | ✅ |
 | Crash recovery with no data loss (`kill -9` safe) | ✅ verified by the e2e suite |
-| Nested child collections (one level) | ✅ PostgreSQL and MySQL/MariaDB; the parent document embeds child arrays, resolved once per collection per transaction, with their own `columns` / `exclude_columns` projection, or `single = true` to embed a 1:1 relation as an object, or `flatten = true` with it to lift the element's columns onto the parent document |
+| Nested child collections (two levels) | ✅ PostgreSQL and MySQL/MariaDB; the parent document embeds child arrays, and each element may embed one more level of its own, resolved once per collection per transaction, with their own `columns` / `exclude_columns` projection, or `single = true` to embed a 1:1 relation as an object, or `flatten = true` with it to lift the element's columns onto the parent document |
 | Many-to-many children (`through`) | ✅ PostgreSQL and MySQL/MariaDB; a junction table is joined inside the same aggregation, and both the junction and the child are streamed |
 | Aggregate children (`aggregates`) | ✅ PostgreSQL and MySQL/MariaDB; a count from a child table lands on the parent document and is kept live by the same machinery, one grouped query per aggregate per transaction |
 | Vector columns on a pgvector target | ✅ bring-your-own-embedding: a vector the source database or the application produced is carried like any other column and orders a nearest-neighbour query in the target; the sink computes nothing |

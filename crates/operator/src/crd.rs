@@ -57,7 +57,8 @@ pub struct ConfigTree {
     #[schemars(schema_with = "opaque_table")]
     pub sync: Option<BTreeMap<String, Table>>,
     /// Raw TOML appended to this file, for constructs the tree cannot express
-    /// — repeated `[[sync.x.children]]` blocks above all.
+    /// — repeated `[[sync.x.children]]` blocks above all, and the
+    /// `[[sync.x.children.children]]` blocks nested inside them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra_config: Option<String>,
 }

@@ -162,7 +162,10 @@ pub async fn run_pipeline(
 ) -> Result<()> {
     let sink = build_sink(&cfg, secrets.target_password)?;
     check_rejection_policy(&cfg, sink.as_ref())?;
-    for note in embedded_children_with_own_section(&cfg) {
+    for note in embedded_children_with_own_section(&cfg)
+        .into_iter()
+        .chain(nested_amplification(&cfg))
+    {
         tracing::warn!(target: "pg2osync::run", "{note}");
     }
     let index_specs = index_specs(&cfg)?;
@@ -197,11 +200,8 @@ pub fn embedded_children_with_own_section(cfg: &AppConfig) -> Vec<String> {
     for (owner, tbl) in &cfg.sync {
         // the junction of a many-to-many collection and the table an aggregate
         // counts are read as somebody's child in exactly the same way
-        let watched_tables = tbl
-            .children
-            .iter()
-            .flat_map(|child| [Some(&child.table), child.through.as_ref()])
-            .flatten()
+        let watched_tables = embedded_tables(tbl)
+            .into_iter()
             .chain(tbl.aggregates.iter().map(|agg| &agg.table));
         for watched in watched_tables {
             if let Some((key, own)) = cfg.sync.iter().find(|(_, t)| &t.table == watched) {
@@ -438,14 +438,30 @@ fn transforms(cfg: &AppConfig) -> Result<Transforms> {
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
+/// A child's renames and those of its second level, or nothing when neither
+/// renames anything.
+fn child_renames(children: &[crate::config::ChildJoin]) -> HashMap<String, Rename> {
+    children
+        .iter()
+        .filter_map(|child| {
+            let nested = child_renames(&child.children);
+            if child.fields.is_empty() && nested.is_empty() {
+                return None;
+            }
+            Some((
+                child.field.clone(),
+                Rename {
+                    columns: child.fields.clone(),
+                    nested,
+                },
+            ))
+        })
+        .collect()
+}
+
 fn renames(cfg: &AppConfig) -> Renames {
     Renames::from_pairs(cfg.sync.values().filter_map(|tbl| {
-        let nested: HashMap<String, HashMap<String, String>> = tbl
-            .children
-            .iter()
-            .filter(|child| !child.fields.is_empty())
-            .map(|child| (child.field.clone(), child.fields.clone()))
-            .collect();
+        let nested = child_renames(&tbl.children);
         if tbl.fields.is_empty() && nested.is_empty() {
             return None;
         }
@@ -1324,14 +1340,9 @@ async fn run_postgres(
         // us, and so must a junction: each of the two carries half of what a
         // many-to-many collection is made of.
         for tbl in cfg.sync.values() {
-            for child in &tbl.children {
-                for table in [Some(&child.table), child.through.as_ref()]
-                    .into_iter()
-                    .flatten()
-                {
-                    if !tables.contains(table) {
-                        tables.push(table.clone());
-                    }
+            for table in embedded_tables(tbl) {
+                if !tables.contains(table) {
+                    tables.push(table.clone());
                 }
             }
         }
@@ -1802,19 +1813,14 @@ fn wal_config(
             (ps.to_string(), pt.to_string()),
             tbl.primary_key.clone().unwrap_or_else(|| "id".into()),
         );
-        for child in &tbl.children {
-            // the junction as well as the child: a row of either one is not a
-            // document, and both resolve to this parent
-            for table in [Some(&child.table), child.through.as_ref()]
-                .into_iter()
-                .flatten()
-            {
-                let (cs, ct) = split_qualified(table);
-                child_parents.insert(
-                    (cs.to_string(), ct.to_string()),
-                    (ps.to_string(), pt.to_string()),
-                );
-            }
+        // the junction and the second level as well as the child: a row of
+        // any of them is not a document, and each resolves to this parent
+        for table in embedded_tables(tbl) {
+            let (cs, ct) = split_qualified(table);
+            child_parents.insert(
+                (cs.to_string(), ct.to_string()),
+                (ps.to_string(), pt.to_string()),
+            );
         }
         // An aggregated table takes the same route: its rows are not documents
         // either, and they resolve to this parent.
@@ -1917,28 +1923,111 @@ pub fn child_specs_for(
     for tbl in cfg.sync.values() {
         let (schema, table) = split_qualified(&tbl.table);
         for child in &tbl.children {
-            let mut spec = pg2osync_source::children::ChildSpec::new(
-                &child.table,
-                &child.field,
-                &child.foreign_key,
+            let spec = child_spec(
+                child,
                 &tbl.primary_key.clone().unwrap_or_else(|| "id".into()),
             )?;
-            spec.max_rows = child.max_rows;
-            spec.columns = child.columns.clone();
-            spec.exclude_columns = child.exclude_columns.clone();
-            spec.single = child.single;
-            if let (Some(through), Some(through_key)) = (&child.through, &child.through_key) {
-                spec.through = Some(pg2osync_source::children::Through::new(
-                    through,
-                    through_key,
-                )?);
-            }
             map.entry((schema.to_string(), table.to_string()))
                 .or_default()
                 .push(spec);
         }
     }
     Ok(map)
+}
+
+/// One configured child as the sources read it, with its own second level.
+///
+/// A second level's `parent_column` is left empty here: it is the
+/// intermediate's primary key, which only the catalogue knows, and resolving
+/// the order is what fills it in.
+fn child_spec(
+    child: &crate::config::ChildJoin,
+    parent_column: &str,
+) -> Result<pg2osync_source::children::ChildSpec> {
+    let mut spec = pg2osync_source::children::ChildSpec::new(
+        &child.table,
+        &child.field,
+        &child.foreign_key,
+        parent_column,
+    )?;
+    spec.max_rows = child.max_rows;
+    spec.columns = child.columns.clone();
+    spec.exclude_columns = child.exclude_columns.clone();
+    spec.single = child.single;
+    if let (Some(through), Some(through_key)) = (&child.through, &child.through_key) {
+        spec.through = Some(pg2osync_source::children::Through::new(
+            through,
+            through_key,
+        )?);
+    }
+    spec.children = child
+        .children
+        .iter()
+        .map(|grand| child_spec(grand, ""))
+        .collect::<Result<_>>()?;
+    Ok(spec)
+}
+
+/// Every table a section's children are read from, at either level, with the
+/// junctions among them.
+///
+/// Each one has to join the publication or the streamed set, be granted to the
+/// source user and be watched: a row of any of them changes a document.
+pub fn embedded_tables(tbl: &crate::config::TableSync) -> Vec<&String> {
+    tbl.children
+        .iter()
+        .flat_map(|child| {
+            [Some(&child.table), child.through.as_ref()]
+                .into_iter()
+                .flatten()
+                .chain(child.children.iter().map(|grand| &grand.table))
+        })
+        .collect()
+}
+
+/// Sections with a second level whose collections together can put more
+/// nested objects on one document than a `nested` mapping accepts.
+///
+/// Said once at startup rather than per document, because it is a property of
+/// the configuration: one changed second-level row rewrites the whole root
+/// document, so a chain this wide is a write amplification as much as a
+/// mapping limit. The limit counts the whole document, so every collection of
+/// the section is added up, flat siblings included. A section without a
+/// second level is left to the per-document warning it already has.
+pub fn nested_amplification(cfg: &AppConfig) -> Vec<String> {
+    use pg2osync_core::children::UNBOUNDED_ARRAY_WARNING;
+    let mut notes = Vec::new();
+    let mut keys: Vec<&String> = cfg.sync.keys().collect();
+    keys.sort();
+    for key in keys {
+        let tbl = &cfg.sync[key];
+        if tbl.children.iter().all(|c| c.children.is_empty()) {
+            continue;
+        }
+        let bound = tbl
+            .children
+            .iter()
+            .filter_map(|c| child_spec(c, "").ok())
+            .try_fold(0u64, |acc, spec| {
+                Some(acc.saturating_add(pg2osync_core::children::nested_object_bound(&spec)?))
+            });
+        let reach = match bound {
+            Some(n) if n <= UNBOUNDED_ARRAY_WARNING as u64 => continue,
+            Some(n) => format!("up to {n}"),
+            None => "an unbounded number of".to_string(),
+        };
+        let fields: Vec<&str> = tbl.children.iter().map(|c| c.field.as_str()).collect();
+        notes.push(format!(
+            "[sync.{key}.children] {} and the levels below can embed {reach} nested objects \
+             in one document of {}; a target mapping them `nested` refuses more than \
+             {UNBOUNDED_ARRAY_WARNING}, and every changed row below it rewrites the whole \
+             document. Set max_rows on each level, or index a large or busy subtree on its \
+             own with join",
+            fields.join(", "),
+            tbl.table
+        ));
+    }
+    notes
 }
 
 /// Every configured aggregate, keyed by the parent whose document carries it.
@@ -2003,12 +2092,25 @@ async fn warn_on_child_replica_identity(
     admin: &tokio_postgres::Client,
 ) -> Result<()> {
     for tbl in cfg.sync.values() {
-        for child in &tbl.children {
-            let located_by = match &child.through {
-                Some(through) => (through.clone(), child.foreign_key.clone()),
-                None => (child.table.clone(), child.foreign_key.clone()),
-            };
-            let (qualified, column) = located_by;
+        // a second-level row is located by its own foreign key, exactly as a
+        // direct child is, and moves between intermediate rows the same way
+        let located: Vec<(String, String)> = tbl
+            .children
+            .iter()
+            .flat_map(|child| {
+                let own = match &child.through {
+                    Some(through) => (through.clone(), child.foreign_key.clone()),
+                    None => (child.table.clone(), child.foreign_key.clone()),
+                };
+                std::iter::once(own).chain(
+                    child
+                        .children
+                        .iter()
+                        .map(|grand| (grand.table.clone(), grand.foreign_key.clone())),
+                )
+            })
+            .collect();
+        for (qualified, column) in located {
             let (schema, table) = split_qualified(&qualified);
             let info = pg2osync_source::catalog::table_info(admin, schema, table)
                 .await
@@ -2722,23 +2824,19 @@ pub fn mysql_config_for(
         })
         .collect();
     // A child table has to be streamed or its changes never reach us, which is
-    // the counterpart of adding it to the publication on PostgreSQL. Its rows
-    // resolve to a parent instead of becoming documents.
-    for (parent, specs) in &children {
-        for spec in specs {
-            let junction = spec
-                .through
-                .as_ref()
-                .map(|t| (t.schema.clone(), t.table.clone()));
-            for watched in [Some((spec.schema.clone(), spec.table.clone())), junction]
-                .into_iter()
-                .flatten()
-            {
-                if !tables_admitted.contains(&watched) {
-                    tables_admitted.push(watched.clone());
-                }
-                child_parents.insert(watched, parent.clone());
+    // the counterpart of adding it to the publication on PostgreSQL — and so
+    // does a junction and a second level, each of which changes a document.
+    // Their rows resolve to a parent instead of becoming documents.
+    for tbl in cfg.sync.values() {
+        let (ps, pt) = split_qualified(&tbl.table);
+        let parent = (ps.to_string(), pt.to_string());
+        for table in embedded_tables(tbl) {
+            let (cs, ct) = split_qualified(table);
+            let watched = (cs.to_string(), ct.to_string());
+            if !tables_admitted.contains(&watched) {
+                tables_admitted.push(watched.clone());
             }
+            child_parents.insert(watched, parent.clone());
         }
     }
     // an aggregated table is streamed for the same reason a child table is: its
@@ -3455,6 +3553,212 @@ mod tests {
         assert_eq!(percent_decode("p%40ss%3Aword"), "p@ss:word");
         assert_eq!(percent_decode("plain"), "plain");
         assert_eq!(percent_decode("trailing%"), "trailing%");
+    }
+
+    /// customers -> orders -> lines, with what a test adds to the second level.
+    fn two_levels(orders: &str, lines: &str) -> AppConfig {
+        toml::from_str(&format!(
+            r#"
+[source]
+url = "postgres://u:p@localhost/db"
+[target]
+url = "http://localhost:9200"
+[sync.customers]
+table = "public.customers"
+[[sync.customers.children]]
+table = "public.orders"
+field = "orders"
+foreign_key = "customer_id"
+{orders}
+[[sync.customers.children.children]]
+table = "public.lines"
+field = "lines"
+foreign_key = "order_id"
+{lines}
+"#
+        ))
+        .expect("parses")
+    }
+
+    #[test]
+    fn a_second_level_is_watched_read_and_renamed_like_the_first() {
+        let cfg = two_levels(
+            "",
+            "max_rows = 4\n[sync.customers.children.children.fields]\nqty = \"quantity\"",
+        );
+        assert_eq!(
+            embedded_tables(&cfg.sync["customers"]),
+            ["public.orders", "public.lines"],
+            "the publication, the grants and the routing all need the second level"
+        );
+        let specs = child_specs_for(&cfg).expect("specs");
+        let orders = &specs[&("public".to_string(), "customers".to_string())][0];
+        assert_eq!(orders.children.len(), 1);
+        let lines = &orders.children[0];
+        assert_eq!(lines.max_rows, Some(4));
+        assert_eq!(lines.foreign_key, "order_id");
+        assert!(
+            lines.parent_column.is_empty(),
+            "the intermediate's key comes from the catalogue, never a default"
+        );
+        let mut doc = serde_json::json!({"orders": [{"lines": [{"qty": 2}]}]});
+        renames(&cfg).apply("public", "customers", &mut doc);
+        assert_eq!(
+            doc,
+            serde_json::json!({"orders": [{"lines": [{"quantity": 2}]}]})
+        );
+    }
+
+    #[test]
+    fn mysql_streams_a_second_level_and_routes_it_to_the_root() {
+        let mut cfg = two_levels("", "");
+        cfg.source.flavor = "mysql".into();
+        let src = mysql_config_for(&cfg, "mysql://u:p@localhost:3306/shop", None).expect("config");
+        let root = ("public".to_string(), "customers".to_string());
+        let lines = ("public".to_string(), "lines".to_string());
+        assert!(
+            src.tables.snapshot().tables.contains(&lines),
+            "a second-level row has to be streamed to change anything"
+        );
+        assert_eq!(src.child_parents.get(&lines), Some(&root));
+        assert_eq!(
+            src.child_parents
+                .get(&("public".to_string(), "orders".to_string())),
+            Some(&root)
+        );
+    }
+
+    #[test]
+    fn a_wide_chain_is_said_at_startup() {
+        let unbounded = nested_amplification(&two_levels("", ""));
+        assert_eq!(unbounded.len(), 1, "{unbounded:?}");
+        assert!(
+            unbounded[0].contains("an unbounded number of"),
+            "{unbounded:?}"
+        );
+        assert!(
+            unbounded[0].contains("join"),
+            "steered to join: {unbounded:?}"
+        );
+        let wide = nested_amplification(&two_levels("max_rows = 100", "max_rows = 200"));
+        assert!(wide[0].contains("up to 20100"), "{wide:?}");
+        assert!(
+            nested_amplification(&two_levels("max_rows = 50", "max_rows = 100")).is_empty(),
+            "5,050 objects fit"
+        );
+        assert!(
+            nested_amplification(&two_levels("single = true", "single = true")).is_empty(),
+            "one-to-one all the way down is two objects"
+        );
+    }
+
+    fn lines_with_options(extra: &str) -> AppConfig {
+        toml::from_str(&format!(
+            r#"
+[source]
+url = "postgres://u:p@localhost/db"
+[target]
+url = "http://localhost:9200"
+[sync.orders]
+table = "public.orders"
+[[sync.orders.children]]
+table = "public.lines"
+field = "lines"
+foreign_key = "order_id"
+max_rows = 50
+[[sync.orders.children.children]]
+table = "public.options"
+field = "options"
+foreign_key = "line_id"
+max_rows = 100
+{extra}
+"#
+        ))
+        .expect("parses")
+    }
+
+    #[test]
+    fn sibling_chains_are_added_up_to_one_document() {
+        let notes = nested_amplification(&lines_with_options(
+            r#"
+[[sync.orders.children]]
+table = "public.shipments"
+field = "shipments"
+foreign_key = "order_id"
+max_rows = 50
+[[sync.orders.children.children]]
+table = "public.events"
+field = "events"
+foreign_key = "shipment_id"
+max_rows = 100
+"#,
+        ));
+        assert_eq!(notes.len(), 1, "one note per document: {notes:?}");
+        assert!(notes[0].contains("up to 10100"), "{notes:?}");
+        assert!(
+            notes[0].contains("lines") && notes[0].contains("shipments"),
+            "names every collection that adds up: {notes:?}"
+        );
+        assert!(
+            nested_amplification(&lines_with_options("")).is_empty(),
+            "one chain of 5,050 fits"
+        );
+    }
+
+    #[test]
+    fn a_flat_sibling_shares_the_document_of_a_chain() {
+        let bounded = nested_amplification(&lines_with_options(
+            r#"
+[[sync.orders.children]]
+table = "public.notes"
+field = "notes"
+foreign_key = "order_id"
+max_rows = 5000
+"#,
+        ));
+        assert!(
+            bounded.len() == 1 && bounded[0].contains("up to 10050"),
+            "{bounded:?}"
+        );
+        let unbounded = nested_amplification(&lines_with_options(
+            r#"
+[[sync.orders.children]]
+table = "public.notes"
+field = "notes"
+foreign_key = "order_id"
+"#,
+        ));
+        assert!(
+            unbounded.len() == 1 && unbounded[0].contains("an unbounded number of"),
+            "{unbounded:?}"
+        );
+    }
+
+    #[test]
+    fn a_one_level_section_keeps_its_per_document_warning() {
+        let cfg: AppConfig = toml::from_str(
+            r#"
+[source]
+url = "postgres://u:p@localhost/db"
+[target]
+url = "http://localhost:9200"
+[sync.orders]
+table = "public.orders"
+[[sync.orders.children]]
+table = "public.lines"
+field = "lines"
+foreign_key = "order_id"
+[[sync.orders.children]]
+table = "public.notes"
+field = "notes"
+foreign_key = "order_id"
+"#,
+        )
+        .expect("parses");
+        assert!(
+            nested_amplification(&cfg).is_empty(),
+            "unbounded flat arrays are warned per document as they always were"
+        );
     }
 
     #[test]
