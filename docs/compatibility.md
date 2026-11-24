@@ -23,7 +23,7 @@ so a regression there would ship unnoticed.
 | Elasticsearch | 7.x | not tested, known gaps |
 | pgvector | pg17 (PostgreSQL 17) | every pull request |
 | pgvector | other PostgreSQL majors | not tested |
-| Meilisearch | v1.53.1 | nightly, smoke suite only — advisory until [#122](https://github.com/kennywillbe/pg2osync/issues/122) |
+| Meilisearch | v1.53.1 | nightly, smoke suite only |
 | Qdrant | v1.15.1 | nightly, suite of its own |
 | Qdrant | other 1.x | not tested |
 
@@ -65,13 +65,13 @@ compiles once here. With OpenSearch and pgvector answering it on every pull
 request and Qdrant inside its own cell, all five targets answer the same
 contract.
 
-One cell is marked advisory. The Meilisearch smoke suite reaches the restart,
-which fails because that sink cannot start twice against one index
-([#122](https://github.com/kennywillbe/pg2osync/issues/122)); the cell is kept
-red rather than trimmed, because the gap is the finding. The Elasticsearch cell
-was advisory for the same reason until the last write it could not make went
-green: a section pointed at an alias, which `require_alias` makes the normal
-shape, halted before its first write
+No cell is marked advisory. One with a known gap would be, and kept red
+rather than trimmed, because the gap is the finding. The Meilisearch cell was advisory
+until the sink could start twice against one index
+([#122](https://github.com/kennywillbe/pg2osync/issues/122)), and the
+Elasticsearch cell until the last write it could not make went green: a
+section pointed at an alias, which `require_alias` makes the normal shape,
+halted before its first write
 ([#178](https://github.com/kennywillbe/pg2osync/issues/178)).
 
 The matrix also runs on a pull request that touches the workflow, those

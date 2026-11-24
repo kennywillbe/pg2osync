@@ -293,11 +293,15 @@ impl Sink for MeilisearchSink {
                 "engine must never send empty batches".into(),
             ));
         }
-        // group by index: meili endpoints are per-index
-        let mut by_index: HashMap<String, (Vec<Value>, Vec<String>)> = HashMap::new();
+        // Meilisearch endpoints are per index and per kind, so consecutive ops
+        // of one kind on one index share a request. Runs keep batch order
+        // because the engine coalesces transactions without collapsing them
+        // per id: a delete followed by a re-insert must land in that order.
+        let mut runs: Vec<(String, bool, Vec<Value>)> = Vec::new();
         for op in &batch {
-            let index = match &op.op {
-                DocumentOp::Upsert { index, .. } | DocumentOp::Delete { index, .. } => index,
+            let (index, upsert, item) = match &op.op {
+                DocumentOp::Upsert { index, doc, .. } => (index, true, doc.clone()),
+                DocumentOp::Delete { index, id, .. } => (index, false, Value::String(id.clone())),
                 DocumentOp::DeleteChildren { .. } => {
                     // an error and not a no-op: a cascade dropped here would be
                     // indistinguishable from one that ran
@@ -309,51 +313,31 @@ impl Sink for MeilisearchSink {
                     ));
                 }
             };
-            let entry = by_index
-                .entry(index.clone())
-                .or_insert_with(|| (vec![], vec![]));
-            match &op.op {
-                DocumentOp::Upsert { doc, .. } => entry.0.push(doc.clone()),
-                DocumentOp::Delete { id, .. } => entry.1.push(id.clone()),
-                DocumentOp::DeleteChildren { .. } => {}
+            match runs.last_mut() {
+                Some((last, kind, items)) if last == index && *kind == upsert => items.push(item),
+                _ => runs.push((index.clone(), upsert, vec![item])),
             }
         }
-        for (index, (docs, del_ids)) in by_index {
-            if !docs.is_empty() {
-                let (status, body) = self
-                    .send(
-                        reqwest::Method::POST,
-                        &format!("/indexes/{index}/documents?primaryKey=id"),
-                        Some(Value::Array(docs)),
-                    )
-                    .await?;
-                if status != 202 {
-                    return Err(CoreError::Sink(format!(
-                        "add documents to {index}: {status}"
-                    )));
-                }
-                if let Some(uid) = body["taskUid"].as_u64() {
-                    self.wait_task(uid).await?;
-                }
+        for (index, upsert, items) in runs {
+            let (path, what) = if upsert {
+                (
+                    format!("/indexes/{index}/documents?primaryKey=id"),
+                    "add documents to",
+                )
+            } else {
+                (
+                    format!("/indexes/{index}/documents/delete-batch"),
+                    "delete documents from",
+                )
+            };
+            let (status, body) = self
+                .send(reqwest::Method::POST, &path, Some(Value::Array(items)))
+                .await?;
+            if status != 202 {
+                return Err(CoreError::Sink(format!("{what} {index}: {status}")));
             }
-            if !del_ids.is_empty() {
-                let (status, body) = self
-                    .send(
-                        reqwest::Method::POST,
-                        &format!("/indexes/{index}/documents/delete-batch"),
-                        Some(Value::Array(
-                            del_ids.into_iter().map(Value::String).collect(),
-                        )),
-                    )
-                    .await?;
-                if status != 202 {
-                    return Err(CoreError::Sink(format!(
-                        "delete documents from {index}: {status}"
-                    )));
-                }
-                if let Some(uid) = body["taskUid"].as_u64() {
-                    self.wait_task(uid).await?;
-                }
+            if let Some(uid) = body["taskUid"].as_u64() {
+                self.wait_task(uid).await?;
             }
         }
         Ok(SinkAck::written(batch.last().expect("nonempty").lsn))
@@ -525,8 +509,6 @@ impl Sink for MeilisearchSink {
         }
     }
 }
-
-use std::collections::HashMap;
 
 #[cfg(test)]
 mod tests {
@@ -732,6 +714,70 @@ mod tests {
         };
         assert!(message.contains("users"), "{message}");
         assert!(message.contains("users-1756512345"), "{message}");
+    }
+
+    fn op(lsn: u64, op: DocumentOp) -> LsnOp {
+        LsnOp {
+            lsn: pg2osync_core::lsn::Lsn(lsn),
+            op,
+        }
+    }
+
+    fn upsert(id: &str) -> DocumentOp {
+        DocumentOp::Upsert {
+            index: "users".into(),
+            id: id.into(),
+            routing: None,
+            doc: json!({"id": id}),
+            version: None,
+            pipeline: None,
+        }
+    }
+
+    fn delete(id: &str) -> DocumentOp {
+        DocumentOp::Delete {
+            index: "users".into(),
+            id: id.into(),
+            routing: None,
+            version: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reinsert_after_a_delete_in_one_batch_lands_last() {
+        // the engine coalesces transactions into one batch without collapsing
+        // them per id, so a row deleted and inserted again arrives as both ops
+        let target = FakeTarget::start(|line| match line {
+            "POST /indexes/users/documents?primaryKey=id"
+            | "POST /indexes/users/documents/delete-batch" => {
+                (202, r#"{"taskUid":1,"status":"enqueued"}"#)
+            }
+            "GET /tasks/1" => (200, r#"{"status":"succeeded"}"#),
+            _ => (500, r#"{"code":"internal"}"#),
+        })
+        .await;
+        target
+            .sink()
+            .write(vec![
+                op(1, upsert("7")),
+                op(2, delete("7")),
+                op(3, upsert("7")),
+            ])
+            .await
+            .expect("a batch the target accepted");
+        let writes: Vec<String> = target
+            .seen()
+            .into_iter()
+            .filter(|line| line.starts_with("POST"))
+            .collect();
+        assert_eq!(
+            writes,
+            vec![
+                "POST /indexes/users/documents?primaryKey=id".to_string(),
+                "POST /indexes/users/documents/delete-batch".to_string(),
+                "POST /indexes/users/documents?primaryKey=id".to_string(),
+            ]
+        );
     }
 
     #[tokio::test]

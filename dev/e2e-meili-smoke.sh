@@ -95,6 +95,13 @@ stop_sync() {
 }
 # Meilisearch applies a write as an asynchronous task, so a document appears
 # some time after the sink acknowledged it; every assertion polls for it.
+#
+# After a restart, poll for the documents an assertion names before any count:
+# the stream resumes from the slot, which trails the checkpoint, so the replay
+# writes back rows deleted long ago and may apply one transaction at a time.
+# A count alone reaches the expected number on a state the replay has not
+# finished with; once the named documents are there, it can only mean the
+# replayed deletes landed too.
 await_count() {
   for _ in $(seq 1 60); do
     [ "$(mi_count)" = "$1" ] && break
@@ -194,11 +201,19 @@ fi
 # anyway, so the log line below is what separates a resume from a reload
 pg "INSERT INTO users (id,name,email) VALUES (5,'erin','erin@test.io');" > /dev/null
 pg "UPDATE users SET name='bob-while-down' WHERE id=2;" > /dev/null
+# two transactions on one id: the replay coalesces them into one batch, where
+# the re-insert has to land after the delete
+pg "DELETE FROM users WHERE id=3;" > /dev/null
+pg "INSERT INTO users (id,name,email) VALUES (3,'carol-again','carol@test.io');" > /dev/null
 : > "$LOG"
 start_sync
+await_field 5 name erin
+await_field 2 name bob-while-down
+await_field 3 name carol-again
 await_count 4
 check "a row added while down arrived" "$(mi_field 5 name)" "erin"
 check "a row updated while down is current" "$(mi_field 2 name)" "bob-while-down"
+check "a row deleted and inserted again while down is present" "$(mi_field 3 name)" "carol-again"
 if grep -q "resuming from checkpoint" "$LOG"; then
   ok "the pipeline resumed from the file checkpoint"
 else
@@ -238,7 +253,7 @@ await_count 3
 check "the live name holds the rebuilt documents" "$(mi_count)" "3"
 check "a row changed before the rebuild is in the live name" "$(mi_field 3 name)" "carol-rebuilt"
 check "the previous documents are under the timestamped uid" "$(mi_count_of "$PREVIOUS")" "4"
-check "and they are the ones from before the rebuild" "$(mi_field_of "$PREVIOUS" 3 name)" "carol"
+check "and they are the ones from before the rebuild" "$(mi_field_of "$PREVIOUS" 3 name)" "carol-again"
 check "the checkpoint file is byte-identical" "$(shasum "$CHECKPOINT" | awk '{print $1}')" "$BEFORE"
 
 # the count only proves how many; what proves the contents is the replay, and
@@ -247,10 +262,14 @@ pg "INSERT INTO users (id,name,email) VALUES (6,'frank','frank@test.io');" > /de
 pg "UPDATE users SET name='alice-after-rebuild' WHERE id=1;" > /dev/null
 : > "$LOG"
 start_sync
-await_count 4
+await_field 6 name frank
 check "a row inserted after the rebuild is replayed in" "$(mi_field 6 name)" "frank"
 await_field 1 name alice-after-rebuild
 check "a row updated after the rebuild is replayed in" "$(mi_field 1 name)" "alice-after-rebuild"
+# the replay starts before rows deleted long ago, so it writes them back and
+# then deletes them again; the last write is the one that has to hold
+await_count 4
+check "rows the replay passed through are deleted again" "$(mi_status 4)/$(mi_status 5)" "404/404"
 stop_sync
 
 say "6. --drop-old removes the documents from before the rebuild"

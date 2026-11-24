@@ -222,11 +222,6 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Advisory: the smoke suite's restart section fails because a Meilisearch
-    # pipeline cannot start twice against the same index
-    # (kennywillbe/pg2osync#122). The cell stays so the gap keeps being
-    # reported rather than forgotten.
-    continue-on-error: true
     services:
       meilisearch:
         image: getmeili/meilisearch:v1.53.1
