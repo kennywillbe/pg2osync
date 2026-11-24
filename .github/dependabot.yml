@@ -19,6 +19,14 @@ updates:
       # one PR for patch bumps keeps review focused on real upgrades
       patch-updates:
         update-types: ["patch"]
+    ignore:
+      # kube 5.1 needs Rust 1.95, above our MSRV of 1.90, and k8s-openapi
+      # 0.29 only builds against kube 5; held until the MSRV moves for a
+      # reason of its own
+      - dependency-name: kube
+        versions: [">= 5.1"]
+      - dependency-name: k8s-openapi
+        versions: [">= 0.29"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
