@@ -638,11 +638,18 @@ q_body '[engine]
 on_permanent_rejection = "quarantine"
 max_rejects = 100' > "$QCONFIG"
 q_body '' > "$HCONFIG"
+QTCONFIG=$(mktemp /tmp/pg2osync-reject-tenants.XXXXXX)
+q_body '[engine]
+on_permanent_rejection = "quarantine"
+max_rejects = 100' \
+  | sed 's#^table = "public.reject_probe"$#table = "public.reject_tenants"#; s#^index = "e2e_reject"$#index = "e2e_reject_t-{tenant}"#' \
+  > "$QTCONFIG"
+printf 'alias = "{tenant}-e2e-reject-live"\n' >> "$QTCONFIG"
 reject_cleanup() {
   sync_kill
   pg "SELECT pg_drop_replication_slot('$QSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$QSLOT');" > /dev/null 2>&1 || true
-  pg "DROP PUBLICATION IF EXISTS ${QSLOT}_pub; DROP TABLE IF EXISTS reject_probe;" > /dev/null 2>&1 || true
-  rm -f "$QCONFIG" "$HCONFIG"
+  pg "DROP PUBLICATION IF EXISTS ${QSLOT}_pub; DROP TABLE IF EXISTS reject_probe; DROP TABLE IF EXISTS reject_tenants;" > /dev/null 2>&1 || true
+  rm -f "$QCONFIG" "$HCONFIG" "$QTCONFIG"
 }
 trap 'cleanup; resume_cleanup; reject_cleanup' EXIT
 
@@ -725,6 +732,40 @@ check "the once-refused row is indexed" "$(os_field e2e_reject 2 amount)" "not-a
 curl -s -XPOST "$OS/.pg2osync_rejects/_refresh" > /dev/null
 check "and the quarantine store is empty" \
   "$(curl -s "$OS/.pg2osync_rejects/_count" | jqf "d.get('count', 0)")" "0"
+
+# A replay can be the first write to a per-row index: the one the refused
+# document was meant for is gone by then, so the replay creates it, and it
+# has to appear behind its alias as the stream would have made it. The same
+# slot starts over on a table of its own, so no section adds a slot.
+pg "SELECT pg_drop_replication_slot('$QSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$QSLOT');" > /dev/null 2>&1
+pg "DROP TABLE IF EXISTS reject_tenants; CREATE TABLE reject_tenants(id bigint primary key, amount text, tenant text not null); ALTER TABLE reject_tenants REPLICA IDENTITY FULL;" > /dev/null 2>&1
+pg "ALTER PUBLICATION ${QSLOT}_pub SET TABLE reject_tenants;" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/postgres-$QSLOT" > /dev/null
+curl -s -XDELETE "$OS/e2e_reject_t-acme?ignore_unavailable=true" > /dev/null
+# made by hand, so the stream finds it and writes into it as it is
+curl -s -XPUT "$OS/e2e_reject_t-acme" -H 'Content-Type: application/json' \
+  -d '{"mappings":{"properties":{"amount":{"type":"long"}}}}' > /dev/null
+sync_spawn "$QTCONFIG"
+sleep 5
+pg "INSERT INTO reject_tenants VALUES (1, 'not-a-number', 'acme');" > /dev/null
+for _ in $(seq 1 30); do
+  curl -s -XPOST "$OS/.pg2osync_rejects/_refresh" > /dev/null
+  [ "$(curl -s "$OS/.pg2osync_rejects/_count" | jqf "d.get('count', 0)")" = "1" ] && break
+  sleep 1
+done
+stop_sync
+check "a per-row index's refused document is quarantined" \
+  "$(curl -s "$OS/.pg2osync_rejects/_count" | jqf "d.get('count', 0)")" "1"
+curl -s -XDELETE "$OS/e2e_reject_t-acme" > /dev/null
+out=$($BIN rejects -c "$QTCONFIG" --replay 2>&1 || true)
+echo "$out" >> "$LOG"
+case "$out" in
+  *"replayed 1, still refused 0"*) ok "the replay recreated the per-row index and wrote into it" ;;
+  *) bad "the replay into a missing per-row index failed: $out" ;;
+esac
+check "the index a replay creates carries its alias" \
+  "$(curl -s "$OS/_alias/acme-e2e-reject-live" | jqf "','.join(sorted(d.keys()))")" "e2e_reject_t-acme"
+curl -s -XDELETE "$OS/e2e_reject_t-acme?ignore_unavailable=true" > /dev/null
 
 say "15. re-snapshot one table on demand"
 # resume_probe is still here from section 12, streaming under $RCONFIG, with a
@@ -2268,12 +2309,35 @@ drop_reindex_indices() {
     curl -s -XDELETE "$OS/$name" > /dev/null 2>&1 || true
   done
 }
+TCONFIG=$(mktemp /tmp/pg2osync-e2e-reindex-tenants.XXXXXX)
+TSLOT=pg2osync_e2e_rt
+TALIAS="{tenant}-e2e-rt-live"
+# every generation of the tenant template, one name at a time for the same
+# reason as above
+drop_tenant_indices() {
+  for name in $(curl -s "$OS/_cat/indices/*e2e_rt-*?h=index" 2> /dev/null); do
+    curl -s -XDELETE "$OS/$name" > /dev/null 2>&1 || true
+  done
+}
+YCONFIG=$(mktemp /tmp/pg2osync-e2e-reindex-years.XXXXXX)
+YSLOT=pg2osync_e2e_ry
+drop_year_indices() {
+  for name in $(curl -s "$OS/_cat/indices/e2e_ry-*?h=index" 2> /dev/null); do
+    curl -s -XDELETE "$OS/$name" > /dev/null 2>&1 || true
+  done
+}
 reindex_cleanup() {
   sync_kill
   pg "SELECT pg_drop_replication_slot('$XSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$XSLOT');" > /dev/null 2>&1 || true
   pg "DROP PUBLICATION IF EXISTS ${XSLOT}_pub; DROP TABLE IF EXISTS reindex_probe;" > /dev/null 2>&1 || true
   drop_reindex_indices
-  rm -f "$XCONFIG" "$XMAPPING" "${XCONFIG}.new"
+  pg "SELECT pg_drop_replication_slot('$TSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$TSLOT');" > /dev/null 2>&1 || true
+  pg "DROP PUBLICATION IF EXISTS ${TSLOT}_pub; DROP TABLE IF EXISTS reindex_tenants;" > /dev/null 2>&1 || true
+  drop_tenant_indices
+  pg "SELECT pg_drop_replication_slot('$YSLOT') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='$YSLOT');" > /dev/null 2>&1 || true
+  pg "DROP PUBLICATION IF EXISTS ${YSLOT}_pub; DROP TABLE IF EXISTS reindex_years;" > /dev/null 2>&1 || true
+  drop_year_indices
+  rm -f "$XCONFIG" "$XMAPPING" "${XCONFIG}.new" "$TCONFIG" "${TCONFIG}.new" "$YCONFIG" "${YCONFIG}.new" "${YCONFIG}.none"
 }
 trap 'cleanup; resume_cleanup; reject_cleanup; conc_cleanup; rename_cleanup; workers_cleanup; init_cleanup; fan_cleanup; bid_cleanup; shape_cleanup; where_cleanup; join_cleanup; union_cleanup; events_cleanup; pipe_cleanup; append_cleanup; routing_cleanup; reindex_cleanup' EXIT
 
@@ -2347,13 +2411,250 @@ check "the restart replays what changed while the pipeline was stopped" \
 check "and what was inserted while it was stopped" "$(os_field "$new_index" 4 v)" "added-while-stopped"
 stop_sync
 
-# an alias points at one index, and a rebuild reads one table
+# A templated table is rebuilt as a fresh generation of its template, and the
+# alias of every tenant moves in one request. A tenant that first appears
+# after the switch has to be behind its alias from its first document, which
+# only holds if the stream creates its index with the alias.
+cat > "$TCONFIG" <<TOML
+[source]
+url_env = "PG2OSYNC_SOURCE_URL"
+slot_name = "$TSLOT"
+publication = "${TSLOT}_pub"
+
+[target]
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
+
+[metrics]
+bind = "127.0.0.1:$((PORT_BASE + 32))"
+
+[sync.tenants]
+table = "public.reindex_tenants"
+index = "e2e_rt-{tenant}"
+alias = "$TALIAS"
+TOML
+pg "DROP TABLE IF EXISTS reindex_tenants; CREATE TABLE reindex_tenants(id bigint primary key, tenant text not null, v text); ALTER TABLE reindex_tenants REPLICA IDENTITY FULL;" > /dev/null 2>&1
+pg "INSERT INTO reindex_tenants VALUES (1,'acme','a1'),(2,'acme','a2'),(3,'globex','g1');" > /dev/null
+pg "DROP PUBLICATION IF EXISTS ${TSLOT}_pub; CREATE PUBLICATION ${TSLOT}_pub FOR TABLE reindex_tenants;" > /dev/null 2>&1
+drop_tenant_indices
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/postgres-$TSLOT" > /dev/null
+drop_idle_probe_slots
+
+sync_spawn "$TCONFIG"
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_count e2e_rt-acme)" = "2" ] && [ "$(os_count e2e_rt-globex)" = "1" ] && break
+  sleep 1
+done
+check "each tenant's index is created with its alias" "$(os_count acme-e2e-rt-live)" "2"
+check "and so is the second tenant's" "$(os_count globex-e2e-rt-live)" "1"
+stop_sync
+
+refusal=$($BIN reindex -c "$TCONFIG" --table public.reindex_tenants --alias "live" 2>&1 || true)
+case "$refusal" in
+  *"$TALIAS"*) ok "a templated rebuild refuses an alias that is not the section's" ;;
+  *) bad "a templated rebuild took another alias: $refusal" ;;
+esac
+refusal=$($BIN reindex -c "$TCONFIG" --table public.reindex_tenants --alias "$TALIAS" --drop-old 2>&1 || true)
+case "$refusal" in
+  *"--drop-old"*) ok "a templated rebuild refuses --drop-old" ;;
+  *) bad "a templated rebuild accepted --drop-old: $refusal" ;;
+esac
+
+out=$($BIN reindex -c "$TCONFIG" --table public.reindex_tenants --alias "$TALIAS" 2>&1)
+echo "$out" >> "$LOG"
+fresh_spec=$(grep -o 'set index = "[^"]*"' <<< "$out" | sed 's/^set index = "//; s/"$//')
+case "$fresh_spec" in
+  g*-"e2e_rt-{tenant}") ok "the rebuild names a fresh generation, $fresh_spec" ;;
+  *) bad "no fresh generation was named: $out" ;;
+esac
+acme_now=$(curl -s "$OS/_alias/acme-e2e-rt-live" | jqf "','.join(sorted(d.keys()))")
+globex_now=$(curl -s "$OS/_alias/globex-e2e-rt-live" | jqf "','.join(sorted(d.keys()))")
+check "the first tenant's alias moved to the fresh generation" "$acme_now" "${fresh_spec%%\{tenant\}}acme"
+check "and the second tenant's with it" "$globex_now" "${fresh_spec%%\{tenant\}}globex"
+refresh
+check "the moved alias reads every row of its tenant" "$(os_count acme-e2e-rt-live)" "2"
+check "the previous generation is kept" "$(curl -s -o /dev/null -w '%{http_code}' "$OS/e2e_rt-acme")" "200"
+
+# a tenant inserted while the pipeline is stopped, replayed into the fresh
+# generation, lands in an index that already carries its alias
+pg "INSERT INTO reindex_tenants VALUES (4,'initech','i1');" > /dev/null
+sed "s#^index = \"e2e_rt-{tenant}\"\$#index = \"$fresh_spec\"#" "$TCONFIG" > "${TCONFIG}.new"
+sync_spawn "${TCONFIG}.new"
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_count "${fresh_spec%%\{tenant\}}initech")" = "1" ] && break
+  sleep 1
+done
+check "a new tenant after the switch is behind its alias at once" "$(os_count initech-e2e-rt-live)" "1"
+stop_sync
+
+# switch-alias with the old config is the rollback: every alias the old
+# generation has an index for moves back, in one request
+out=$($BIN switch-alias -c "$TCONFIG" --alias "$TALIAS" 2>&1)
+echo "$out" >> "$LOG"
+check "switch-alias moves a templated table's aliases back" \
+  "$(curl -s "$OS/_alias/acme-e2e-rt-live" | jqf "','.join(sorted(d.keys()))")" "e2e_rt-acme"
+check "and the second tenant's with it" \
+  "$(curl -s "$OS/_alias/globex-e2e-rt-live" | jqf "','.join(sorted(d.keys()))")" "e2e_rt-globex"
+# initech has no index in the old generation, so its alias stays on the
+# fresh one rather than turning into an error, and the switch says so
+check "a tenant only the fresh generation has keeps its alias there" \
+  "$(curl -s "$OS/_alias/initech-e2e-rt-live" | jqf "','.join(sorted(d.keys()))")" \
+  "${fresh_spec%%\{tenant\}}initech"
+case "$out" in
+  *"1 alias(es) stayed where they were"*"initech-e2e-rt-live -> ${fresh_spec%%\{tenant\}}initech"*)
+    ok "the rollback names the alias it left on the fresh generation" ;;
+  *) bad "the rollback did not name the alias it left behind: $out" ;;
+esac
+# the stream creates initech's index here with the alias, which then reads
+# both generations until switch-alias runs again
+sync_spawn "$TCONFIG"
+pg "INSERT INTO reindex_tenants VALUES (5,'initech','i2');" > /dev/null
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_count e2e_rt-initech)" = "1" ] && break
+  sleep 1
+done
+stop_sync
+check "the old generation's new index joins the alias the fresh one still holds" \
+  "$(curl -s "$OS/_alias/initech-e2e-rt-live" | jqf "','.join(sorted(d.keys()))")" \
+  "e2e_rt-initech,${fresh_spec%%\{tenant\}}initech"
+out=$($BIN switch-alias -c "$TCONFIG" --alias "$TALIAS" 2>&1)
+echo "$out" >> "$LOG"
+check "switch-alias again leaves it on the old generation alone" \
+  "$(curl -s "$OS/_alias/initech-e2e-rt-live" | jqf "','.join(sorted(d.keys()))")" "e2e_rt-initech"
+case "$out" in
+  *"stayed where they were"*) bad "a complete switch still reported aliases left behind: $out" ;;
+  *) ok "and reports nothing left behind" ;;
+esac
+
+# With two placeholders a name cannot be split back into its values, so the
+# switch reads them from the source: the columns in another order than the
+# template's, an integer one among them, a value holding the separator, an
+# alias that pairs one tenant with several indices, a row with no index yet,
+# and an index whose rows are all gone.
+cat > "$YCONFIG" <<TOML
+[source]
+url_env = "PG2OSYNC_SOURCE_URL"
+slot_name = "$YSLOT"
+publication = "${YSLOT}_pub"
+
+[target]
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
+
+[metrics]
+bind = "127.0.0.1:$((PORT_BASE + 42))"
+
+[sync.years]
+table = "public.reindex_years"
+index = "e2e_ry-{tenant}-{year}"
+TOML
+pg "DROP TABLE IF EXISTS reindex_years; CREATE TABLE reindex_years(id bigint primary key, year int not null, v text, tenant text not null); ALTER TABLE reindex_years REPLICA IDENTITY FULL;" > /dev/null 2>&1
+pg "INSERT INTO reindex_years VALUES (1,2024,'a','acme'),(2,2025,'b','acme'),(3,2024,'c','big-co'),(4,2023,'d','globex');" > /dev/null
+pg "DROP PUBLICATION IF EXISTS ${YSLOT}_pub; CREATE PUBLICATION ${YSLOT}_pub FOR TABLE reindex_years;" > /dev/null 2>&1
+drop_year_indices
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/postgres-$YSLOT" > /dev/null
+drop_idle_probe_slots
+
+# indices created before the section had an alias, so only the switch can
+# give them one
+sync_spawn "$YCONFIG"
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_count e2e_ry-acme-2025)" = "1" ] && [ "$(os_count e2e_ry-big-co-2024)" = "1" ] \
+    && [ "$(os_count e2e_ry-globex-2023)" = "1" ] && break
+  sleep 1
+done
+pg "DELETE FROM reindex_years WHERE id = 4;" > /dev/null
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_count e2e_ry-globex-2023)" = "0" ] && break
+  sleep 1
+done
+stop_sync
+check "the emptied tenant's index is still there" \
+  "$(curl -s -o /dev/null -w '%{http_code}' "$OS/e2e_ry-globex-2023")" "200"
+pg "INSERT INTO reindex_years VALUES (5,2026,'e','initech');" > /dev/null
+printf 'alias = "{tenant}-e2e-ry-live"\n' | cat "$YCONFIG" - > "${YCONFIG}.new"
+# the stream never adds an alias to an index that exists, so a switch leaving
+# the emptied one bare would hide the next row that chooses it
+out=$($BIN switch-alias -c "${YCONFIG}.new" --alias "{tenant}-e2e-ry-live" 2>&1 || true)
+echo "$out" >> "$LOG"
+case "$out" in
+  *"left with no alias"*"e2e_ry-globex-2023"*"Nothing was switched"*) ok "a switch that would leave an index bare names it and refuses" ;;
+  *) bad "a switch left an index with no alias, or said something else: $out" ;;
+esac
+check "and moved nothing" \
+  "$(curl -s -o /dev/null -w '%{http_code}' "$OS/_alias/acme-e2e-ry-live")" "404"
+# a template that matches nothing has no alias to render
+sed 's#^index = "e2e_ry-{tenant}-{year}"$#index = "e2e_ry_none-{tenant}-{year}"#' \
+  "${YCONFIG}.new" > "${YCONFIG}.none"
+out=$($BIN switch-alias -c "${YCONFIG}.none" --alias "{tenant}-e2e-ry-live" 2>&1 || true)
+echo "$out" >> "$LOG"
+rm -f "${YCONFIG}.none"
+case "$out" in
+  *"nothing was switched"*) ok "a switch with no index to give an alias says so" ;;
+  *) bad "a switch with no index to give an alias said something else: $out" ;;
+esac
+# the recovery the refusal names, with the pipeline stopped
+curl -s -XDELETE "$OS/e2e_ry-globex-2023" > /dev/null
+out=$($BIN switch-alias -c "${YCONFIG}.new" --alias "{tenant}-e2e-ry-live" 2>&1 || true)
+echo "$out" >> "$LOG"
+check "a two-placeholder alias reaches every index its tenant renders" \
+  "$(curl -s "$OS/_alias/acme-e2e-ry-live" | jqf "','.join(sorted(d.keys()))")" \
+  "e2e_ry-acme-2024,e2e_ry-acme-2025"
+check "a value holding the separator renders its own alias" \
+  "$(curl -s "$OS/_alias/big-co-e2e-ry-live" | jqf "','.join(sorted(d.keys()))")" "e2e_ry-big-co-2024"
+check "a tenant with no index yet gets none" \
+  "$(curl -s -o /dev/null -w '%{http_code}' "$OS/_alias/initech-e2e-ry-live")" "404"
+case "$out" in
+  "2 alias(es) now point at the 3 index(es)"*) ok "the two-placeholder switch counts aliases, and the indices that got one" ;;
+  *) bad "the two-placeholder switch reported something else: $out" ;;
+esac
+# the deleted index comes back with its alias on the next row that chooses
+# it, as does the index of the tenant inserted while the pipeline was stopped.
+# The replay reaches the delete of row 4 first, and a versioned delete makes
+# the target create a missing index on its own, so row 6 goes in only once the
+# replayed batch is written: in the same batch its upsert would hide that
+sync_spawn "${YCONFIG}.new"
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_count initech-e2e-ry-live)" = "1" ] && break
+  sleep 1
+done
+pg "INSERT INTO reindex_years VALUES (6,2023,'f','globex');" > /dev/null
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_count globex-e2e-ry-live)" = "1" ] && break
+  sleep 1
+done
+check "a row for the recreated index is read through its alias" "$(os_count globex-e2e-ry-live)" "1"
+check "and so is a tenant that appeared after the switch" "$(os_count initech-e2e-ry-live)" "1"
+# an index dropped while the pipeline runs: the sink has already seen it, and
+# the target would auto-create it bare for the next row unless it is looked up
+curl -s -XDELETE "$OS/e2e_ry-initech-2026" > /dev/null
+pg "INSERT INTO reindex_years VALUES (7,2026,'g','initech');" > /dev/null
+for _ in $(seq 1 60); do
+  refresh
+  [ "$(os_count initech-e2e-ry-live)" = "1" ] && break
+  sleep 1
+done
+stop_sync
+check "an index dropped while the pipeline ran comes back behind its alias" \
+  "$(curl -s "$OS/_alias/initech-e2e-ry-live" | jqf "','.join(sorted(d.keys()))")" "e2e_ry-initech-2026"
+check "holding the row written after the drop" "$(os_count initech-e2e-ry-live)" "1"
+
+# a templated section with no alias of its own has nothing to move
 sed "s#^index = \"e2e_reindex\"\$#index = \"e2e_reindex_{id}\"#" "$XCONFIG" > "${XCONFIG}.new"
 refusal=$($BIN reindex -c "${XCONFIG}.new" --table public.reindex_probe --alias "$XALIAS" 2>&1 || true)
 case "$refusal" in
-  *"per row"*) ok "a rebuild refuses a templated index" ;;
-  *) bad "a templated index was accepted: $refusal" ;;
+  *"per row"*"no alias"*) ok "a rebuild refuses a templated index without an alias" ;;
+  *) bad "a templated index without an alias was accepted: $refusal" ;;
 esac
+
+# a rebuild reads one table
 cat "$XCONFIG" > "${XCONFIG}.new"
 cat >> "${XCONFIG}.new" <<'TOML'
 id = "p-{id}"

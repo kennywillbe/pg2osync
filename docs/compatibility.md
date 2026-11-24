@@ -48,7 +48,8 @@ every cell. Three scripts do the work:
   embedding the source produced answering a similarity search, a fanned list
   that really deletes the elements it drops, a `kill -9` resuming from the state
   collection, `TRUNCATE` at a position, the refusal of an OpenSearch-only
-  option, and the sink conformance kit with no check skipped. That last section
+  option, and the sink conformance kit with only the index-template checks
+  skipped. That last section
   is a `cargo test`, which is why this cell needs a toolchain where the others
   need only the binary.
 

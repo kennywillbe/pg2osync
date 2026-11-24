@@ -941,6 +941,10 @@ pub enum IndexTarget {
     Template {
         spec: String,
         template: IdTemplate,
+        /// The alias each rendered index carries, from the same row. Never
+        /// on a fixed index: an alias in front of one is the rebuild's to
+        /// move, not the stream's to create.
+        alias: Option<IdTemplate>,
     },
 }
 
@@ -950,7 +954,7 @@ impl IndexTarget {
     pub fn render(&self, doc: &serde_json::Value) -> Result<String, String> {
         match self {
             Self::Static(name) => Ok(name.clone()),
-            Self::Template { spec, template } => {
+            Self::Template { spec, template, .. } => {
                 Self::usable(spec, template, template.render(doc)?)
             }
         }
@@ -961,7 +965,7 @@ impl IndexTarget {
     pub fn render_from_pk(&self, pk: &serde_json::Value) -> Result<String, String> {
         match self {
             Self::Static(name) => Ok(name.clone()),
-            Self::Template { spec, template } => {
+            Self::Template { spec, template, .. } => {
                 Self::usable(spec, template, template.render_from_pk(pk)?)
             }
         }
@@ -978,6 +982,148 @@ impl IndexTarget {
         Ok(name)
     }
 
+    /// This template with `spec` as the alias of every index it renders.
+    ///
+    /// The alias may only name columns the index names: one index holds the
+    /// rows of exactly one value of those, so it has exactly one alias, and
+    /// the alias can be recovered from wherever the index's values can.
+    pub fn with_alias(self, spec: &str, pk_columns: &[String]) -> Result<Self, String> {
+        let Self::Template {
+            spec: index,
+            template,
+            alias: _,
+        } = self
+        else {
+            return Err(format!(
+                "alias {spec:?} is only for a templated index; a fixed index is aliased by \
+                 reindex and switch-alias"
+            ));
+        };
+        let alias = IdTemplate::parse(spec, pk_columns)
+            .map_err(|e| format!("alias {spec:?} is not a usable alias template: {e}"))?;
+        if let Some(column) = alias
+            .columns()
+            .into_iter()
+            .find(|c| !template.columns().contains(c))
+        {
+            return Err(format!(
+                "alias {spec:?} names {column}, which the index template {index:?} does not; \
+                 every row filed in one index has to render the same alias"
+            ));
+        }
+        // the target refuses an alias that shares its index's name, so this
+        // spec halts on the first row of every value; an overlap that is only
+        // possible stays unchecked, as it does between index templates
+        if alias.parts == template.parts {
+            return Err(format!(
+                "alias {spec:?} renders the same name as the index template {index:?} for \
+                 every row, and an index cannot carry an alias of its own name"
+            ));
+        }
+        // the same stand-in check the index's literals get: a placeholder is
+        // one legal character, so only a literal can fail here
+        let stand_in: serde_json::Map<String, serde_json::Value> = alias
+            .columns()
+            .into_iter()
+            .map(|col| (col.to_string(), serde_json::Value::String("x".into())))
+            .collect();
+        check_index_name(&alias.render(&serde_json::Value::Object(stand_in))?)
+            .map_err(|e| format!("alias {spec:?} {e}"))?;
+        Ok(Self::Template {
+            spec: index,
+            template,
+            alias: Some(alias),
+        })
+    }
+
+    /// The alias the index this row renders carries, or `None` when there is
+    /// no alias to carry. Checked by the index grammar, which aliases share.
+    pub fn render_alias(&self, doc: &serde_json::Value) -> Result<Option<String>, String> {
+        let Self::Template {
+            spec,
+            alias: Some(alias),
+            ..
+        } = self
+        else {
+            return Ok(None);
+        };
+        let name = alias.render(doc)?;
+        check_index_name(&name).map_err(|why| {
+            format!(
+                "the alias of the index template {spec:?} rendered {name:?} from {}, which is \
+                 not a usable alias name: {why}",
+                alias.columns().join(", ")
+            )
+        })?;
+        Ok(Some(name))
+    }
+
+    /// The alias from a primary-key value alone, under the rule
+    /// `render_from_pk` applies to the index: a delete without a before-image
+    /// names its index from the key, and the alias has to come from the same
+    /// values or the two could disagree.
+    pub fn render_alias_from_pk(&self, pk: &serde_json::Value) -> Result<Option<String>, String> {
+        let Self::Template {
+            template,
+            alias: Some(_),
+            ..
+        } = self
+        else {
+            return Ok(None);
+        };
+        let row = match pk {
+            serde_json::Value::Object(_) => pk.clone(),
+            serde_json::Value::Null => return Err("the key tuple is NULL".into()),
+            scalar => {
+                let columns = template.columns();
+                if columns.len() != 1 || !template.is_pk_only() {
+                    return Err(format!(
+                        "the index template names {} but the key is a single value",
+                        columns.join(", ")
+                    ));
+                }
+                serde_json::json!({ columns[0]: scalar })
+            }
+        };
+        self.render_alias(&row)
+    }
+
+    /// Whether `alias_from_name` can answer: an alias, and a template with a
+    /// single placeholder between its literals, so a name is that value with
+    /// the literals around it. With two placeholders `e-a-b-c` is (a, b-c) or
+    /// (a-b, c), and the name cannot say which.
+    pub fn alias_is_in_the_name(&self) -> bool {
+        matches!(self, Self::Template { template, alias: Some(_), .. }
+            if template.parts.iter().filter(|p| matches!(p, IdPart::Column(_))).count() == 1)
+    }
+
+    /// The alias of an index this template rendered, read back out of its
+    /// name. `None` when `alias_is_in_the_name` is false or the name is not
+    /// one this template renders.
+    pub fn alias_from_name(&self, name: &str) -> Option<Result<String, String>> {
+        if !self.alias_is_in_the_name() {
+            return None;
+        }
+        let Self::Template { template, .. } = self else {
+            return None;
+        };
+        let (head, column, tail) = match template.parts.as_slice() {
+            [IdPart::Column(c)] => ("", c, ""),
+            [IdPart::Literal(h), IdPart::Column(c)] => (h.as_str(), c, ""),
+            [IdPart::Column(c), IdPart::Literal(t)] => ("", c, t.as_str()),
+            [IdPart::Literal(h), IdPart::Column(c), IdPart::Literal(t)] => {
+                (h.as_str(), c, t.as_str())
+            }
+            _ => return None,
+        };
+        let value = name.strip_prefix(head)?.strip_suffix(tail)?;
+        if value.is_empty() {
+            return None;
+        }
+        self.render_alias(&serde_json::json!({ column.as_str(): value }))
+            .transpose()
+    }
+
     /// Whether a bare key can render this. A fixed index needs nothing at all.
     pub fn is_pk_only(&self) -> bool {
         match self {
@@ -992,17 +1138,18 @@ impl IndexTarget {
     pub fn pattern(&self) -> String {
         match self {
             Self::Static(name) => name.clone(),
-            Self::Template { template, .. } => {
-                let mut out = String::new();
-                for part in &template.parts {
-                    match part {
-                        IdPart::Literal(s) => out.push_str(s),
-                        IdPart::Column(_) if out.ends_with('*') => {}
-                        IdPart::Column(_) => out.push('*'),
-                    }
-                }
-                out
-            }
+            Self::Template { template, .. } => glob(&template.parts),
+        }
+    }
+
+    /// The wildcard every alias this template renders matches, by the same
+    /// rule as `pattern`; `None` without an alias template.
+    pub fn alias_pattern(&self) -> Option<String> {
+        match self {
+            Self::Template {
+                alias: Some(alias), ..
+            } => Some(glob(&alias.parts)),
+            _ => None,
         }
     }
 
@@ -1013,6 +1160,19 @@ impl IndexTarget {
             Self::Template { spec, .. } => spec,
         }
     }
+}
+
+/// A template's parts with each placeholder as `*`, adjacent stars collapsed.
+fn glob(parts: &[IdPart]) -> String {
+    let mut out = String::new();
+    for part in parts {
+        match part {
+            IdPart::Literal(s) => out.push_str(s),
+            IdPart::Column(_) if out.ends_with('*') => {}
+            IdPart::Column(_) => out.push('*'),
+        }
+    }
+    out
 }
 
 impl From<String> for IndexTarget {
@@ -2001,6 +2161,7 @@ mod tests {
         IndexTarget::Template {
             spec: spec.into(),
             template: pk(spec, pk_columns),
+            alias: None,
         }
     }
 
@@ -2014,6 +2175,97 @@ mod tests {
         ]);
         assert!(!m.is_shared("e-x"));
         assert!(!m.is_shared("e-*"));
+    }
+
+    #[test]
+    fn an_alias_renders_from_the_row_that_rendered_its_index() {
+        let target = indexed("events-{tenant}", &[])
+            .with_alias("{tenant}-events-live", &[])
+            .expect("a usable alias");
+        let row = json!({"tenant": "acme", "id": 1});
+        assert_eq!(target.render(&row).expect("index"), "events-acme");
+        assert_eq!(
+            target.render_alias(&row).expect("alias").as_deref(),
+            Some("acme-events-live")
+        );
+        // a row the grammar refuses halts here, as it does for the index
+        let err = target
+            .render_alias(&json!({"tenant": "Acme"}))
+            .expect_err("an uppercase alias");
+        assert!(
+            err.contains("alias") && err.contains("\"Acme-events-live\""),
+            "{err}"
+        );
+        assert_eq!(
+            indexed("events-{tenant}", &[])
+                .render_alias(&row)
+                .expect("no alias"),
+            None,
+            "a section without an alias renders none"
+        );
+        assert_eq!(IndexTarget::from("users").render_alias(&row), Ok(None));
+    }
+
+    #[test]
+    fn an_alias_may_only_name_what_the_index_names() {
+        let err = indexed("events-{tenant}", &[])
+            .with_alias("{region}-live", &[])
+            .expect_err("a column the index does not render from");
+        assert!(err.contains("region"), "{err}");
+        let err = IndexTarget::from("users")
+            .with_alias("users-live", &[])
+            .expect_err("a fixed index");
+        assert!(err.contains("templated"), "{err}");
+        let err = indexed("events-{tenant}", &[])
+            .with_alias("_{tenant}", &[])
+            .expect_err("a literal the grammar refuses");
+        assert!(err.contains("_{tenant}"), "{err}");
+        let err = indexed("events-{tenant}", &[])
+            .with_alias("events-{tenant}", &[])
+            .expect_err("an alias named as its own index");
+        assert!(
+            err.contains("same name") && err.contains("events-{tenant}"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_single_placeholder_name_gives_its_alias_back() {
+        let target = indexed("g1-events-{tenant}", &[])
+            .with_alias("{tenant}-events-live", &[])
+            .expect("a usable alias");
+        assert_eq!(
+            target.alias_from_name("g1-events-acme-eu"),
+            Some(Ok("acme-eu-events-live".into())),
+            "a value that holds the separator is still the whole value"
+        );
+        assert_eq!(target.alias_from_name("orders-acme"), None);
+        let tailed = indexed("{tenant}-events-g1", &[])
+            .with_alias("{tenant}-live", &[])
+            .expect("a usable alias");
+        assert_eq!(
+            tailed.alias_from_name("acme-events-g1"),
+            Some(Ok("acme-live".into()))
+        );
+        // two placeholders: `a-b-c` is (a, b-c) or (a-b, c), and the name
+        // cannot say which
+        let two = indexed("e-{tenant}-{year}", &[])
+            .with_alias("{tenant}-live", &[])
+            .expect("a usable alias");
+        assert!(!two.alias_is_in_the_name());
+        assert_eq!(two.alias_from_name("e-a-b-c"), None);
+        assert!(target.alias_is_in_the_name());
+    }
+
+    #[test]
+    fn an_alias_template_has_a_pattern_as_its_index_does() {
+        let target = indexed("events-{tenant}-{year}", &[])
+            .with_alias("{tenant}-{year}-live", &[])
+            .expect("a usable alias");
+        assert_eq!(target.alias_pattern().as_deref(), Some("*-*-live"));
+        assert_eq!(target.pattern(), "events-*-*");
+        assert_eq!(indexed("events-{tenant}", &[]).alias_pattern(), None);
+        assert_eq!(IndexTarget::from("users").alias_pattern(), None);
     }
 
     #[test]

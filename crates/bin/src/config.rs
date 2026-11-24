@@ -329,6 +329,11 @@ pub struct TableSync {
     /// still takes the one write path. OpenSearch and Elasticsearch only.
     #[serde(default)]
     pub pipeline: Option<String>,
+    /// With a templated `index` only: the alias each rendered index is
+    /// created with, rendered from the same row, e.g. `{tenant}-events-live`.
+    /// It is also what `reindex` and `switch-alias` move for this section.
+    #[serde(default)]
+    pub alias: Option<String>,
     /// Column whose value routes this section's documents, e.g. a tenant id,
     /// so one tenant's documents share a shard. Co-location only: routing
     /// does not name the document, and the column stays an ordinary field.
@@ -831,7 +836,13 @@ impl TableSync {
         let spec = self.index_name(key);
         if !self.is_templated() {
             check_index_name(&spec).map_err(|e| format!("index {spec:?} {e}"))?;
-            return Ok(IndexTarget::Static(spec));
+            let target = IndexTarget::Static(spec);
+            return match &self.alias {
+                // refused through the same rule a template's alias is
+                // checked by, so the reason is written once
+                Some(alias) => target.with_alias(alias, pk_columns),
+                None => Ok(target),
+            };
         }
         let template = IdTemplate::parse(&spec, pk_columns)
             .map_err(|e| format!("index {spec:?} is not a usable index template: {e}"))?;
@@ -858,7 +869,15 @@ impl TableSync {
             .render(&serde_json::Value::Object(stand_in))
             .map_err(|e| format!("index {spec:?} is not a usable index template: {e}"))?;
         check_index_name(&sample).map_err(|e| format!("index {spec:?} {e}"))?;
-        Ok(IndexTarget::Template { spec, template })
+        let target = IndexTarget::Template {
+            spec,
+            template,
+            alias: None,
+        };
+        match &self.alias {
+            Some(alias) => target.with_alias(alias, pk_columns),
+            None => Ok(target),
+        }
     }
 }
 
@@ -1138,17 +1157,17 @@ impl AppConfig {
             let target = tbl
                 .index_target(key, &[])
                 .map_err(|e| anyhow::anyhow!("[sync.{key}] {e}"))?;
-            // A templated section creates the index a row names on demand, and
-            // an index created on demand is a raw one — no alias points at a
-            // name that did not exist a moment ago. Every write would be
-            // refused, so the combination is refused here instead.
+            // A templated section's `alias` puts an alias on each index as it
+            // is created, but the stream writes to the concrete name the row
+            // rendered. Every write would be refused, so the combination is
+            // refused here instead.
             if self.target.require_alias
                 && let IndexTarget::Template { spec, .. } = &target
             {
                 anyhow::bail!(
-                    "[sync.{key}] index {spec:?} is rendered per row and the index it names is \
-                     created on demand, which never has an alias; require_alias and a templated \
-                     index cannot be combined"
+                    "[sync.{key}] index {spec:?} is rendered per row and every write goes to the \
+                     index the row names, never through the alias; require_alias and a \
+                     templated index cannot be combined"
                 );
             }
             if let Some(join) = &tbl.join {
@@ -1339,7 +1358,7 @@ impl AppConfig {
                 // every document a row fans out into goes to one index, so the
                 // template renders from the row, where the array is a value
                 // no name can be made of
-                if let IndexTarget::Template { spec, template } = &target
+                if let IndexTarget::Template { spec, template, .. } = &target
                     && template.columns().contains(&fan.field.as_str())
                 {
                     anyhow::bail!(
@@ -2443,7 +2462,43 @@ mapping_file = "users.json"
                 ),
         )
         .expect_err("refused");
-        assert!(err.to_string().contains("created on demand"), "{err}");
+        assert!(err.to_string().contains("never through the alias"), "{err}");
+    }
+
+    #[test]
+    fn a_templated_section_names_the_alias_each_rendered_index_carries() {
+        let cfg = parse(&format!(
+            "{MINIMAL}index = \"events-{{tenant}}\"\nalias = \"{{tenant}}-events-live\"\n"
+        ))
+        .expect("an alias from the column the index renders from");
+        let target = cfg.sync["users"]
+            .index_target("users", &["id".to_string()])
+            .expect("a target");
+        assert_eq!(
+            target
+                .render_alias(&serde_json::json!({"tenant": "acme"}))
+                .expect("renders"),
+            Some("acme-events-live".to_string())
+        );
+    }
+
+    #[test]
+    fn an_alias_is_refused_where_it_could_not_be_one_per_index() {
+        let message = refused(
+            &format!("{MINIMAL}index = \"users\"\nalias = \"users-live\"\n"),
+            "an alias on a fixed index",
+        );
+        assert!(message.contains("only for a templated index"), "{message}");
+        let message = refused(
+            &format!("{MINIMAL}index = \"events-{{tenant}}\"\nalias = \"{{region}}-live\"\n"),
+            "an alias that names a column the index does not",
+        );
+        assert!(message.contains("region"), "{message}");
+        let message = refused(
+            &format!("{MINIMAL}index = \"events-{{tenant}}\"\nalias = \"events-{{tenant}}\"\n"),
+            "an alias named as its own index",
+        );
+        assert!(message.contains("same name"), "{message}");
     }
 
     #[test]

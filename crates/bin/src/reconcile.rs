@@ -120,7 +120,7 @@ pub async fn table(
                 .with_context(|| format!("cannot list the indices {pattern} matches"))?;
             (
                 indices,
-                template_columns(client, table, &template.columns()).await?,
+                template_columns(client, &table.qualified, &template.columns()).await?,
             )
         }
     };
@@ -217,6 +217,7 @@ fn doomed(report: &Report) -> impl Iterator<Item = LsnOp> + '_ {
             // copy stopped being right, and a guessed version could lose
             // to a stale document
             version: None,
+            alias: None,
         },
     })
 }
@@ -314,14 +315,14 @@ fn settle_page(
 
 /// The template's columns with the type each has in the source, which is
 /// what decides how its text is decoded.
-async fn template_columns(
+pub(crate) async fn template_columns(
     client: &tokio_postgres::Client,
-    table: &Table,
+    qualified: &str,
     names: &[&str],
 ) -> Result<Vec<(String, u32)>> {
-    let catalog = crate::backfill::columns_of(client, &table.qualified)
+    let catalog = crate::backfill::columns_of(client, qualified)
         .await
-        .with_context(|| format!("cannot read the columns of {}", table.qualified))?;
+        .with_context(|| format!("cannot read the columns of {qualified}"))?;
     names
         .iter()
         .map(|name| {
@@ -331,8 +332,7 @@ async fn template_columns(
                 .map(|col| (col.name.clone(), col.type_oid))
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "the index template names {name}, which {} does not have",
-                        table.qualified
+                        "the index template names {name}, which {qualified} does not have"
                     )
                 })
         })
@@ -400,15 +400,20 @@ fn render_row(
     columns: &[(String, u32)],
     values: &[Option<String>],
 ) -> Result<String> {
+    target
+        .render(&decode_row(columns, values)?)
+        .map_err(|e| anyhow::anyhow!(e))
+}
+
+/// A row's template columns as the stream sees them, from their text.
+pub(crate) fn decode_row(columns: &[(String, u32)], values: &[Option<String>]) -> Result<Value> {
     let mut doc = serde_json::Map::new();
     for ((name, oid), value) in columns.iter().zip(values) {
         let decoded = pg2osync_source::typemap::convert(*oid, value.as_deref().map(str::as_bytes))
             .map_err(|e| anyhow::anyhow!("column {name}: {e}"))?;
         doc.insert(name.clone(), decoded);
     }
-    target
-        .render(&Value::Object(doc))
-        .map_err(|e| anyhow::anyhow!(e))
+    Ok(Value::Object(doc))
 }
 
 /// The index's form of a key as text, matching what `::text` produces.
@@ -419,11 +424,11 @@ fn render_key(key: &Value) -> String {
     }
 }
 
-fn quote_ident(name: &str) -> String {
+pub(crate) fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-fn qualify(qualified: &str) -> String {
+pub(crate) fn qualify(qualified: &str) -> String {
     match qualified.split_once('.') {
         Some((schema, table)) => format!("{}.{}", quote_ident(schema), quote_ident(table)),
         None => quote_ident(qualified),
@@ -494,6 +499,7 @@ mod tests {
             spec: spec.into(),
             template: pg2osync_engine::mapping::IdTemplate::parse(spec, &["id".into()])
                 .expect("a usable template"),
+            alias: None,
         }
     }
 

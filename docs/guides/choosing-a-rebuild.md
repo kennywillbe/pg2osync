@@ -77,9 +77,11 @@ the gap they leave.
 | [`reindex`](../configuration.md#rebuilding-an-index) | one command: create `users-<unix seconds>` from the section's `mapping_file`, load it, check the count, move the alias | the length of the load — the pipeline is stopped for it | the pipeline stopped; it refuses to run beside a live stream, and there is no `--force` |
 | a second instance | a second config with its own `index` and `slot_name`, run to catch-up, then the alias moved | none | a second slot, and two lots of retained WAL until the old one is dropped |
 
-`reindex` is the usual answer. It refuses a
-[templated](../configuration.md#per-row-indices) index, a
-[shared](../configuration.md#sharing-an-index) index or a join pair, a
+`reindex` is the usual answer. A
+[templated](../configuration.md#per-row-indices) index is rebuilt as a fresh
+generation of its template, with every tenant's alias moved in one request;
+see [Aliases for per-row indices](../configuration.md#aliases-for-per-row-indices).
+It refuses a [shared](../configuration.md#sharing-an-index) index or a join pair, a
 [fanned](../configuration.md#fan-out) table, and an `--alias` equal to the
 index the section already writes to; for those, the second instance is the way.
 The checkpoint does not move during it, so everything committed while the

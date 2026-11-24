@@ -731,6 +731,7 @@ mod tests {
             doc: json!({"id": id}),
             version: None,
             pipeline: None,
+            alias: None,
         }
     }
 
@@ -740,6 +741,7 @@ mod tests {
             id: id.into(),
             routing: None,
             version: None,
+            alias: None,
         }
     }
 

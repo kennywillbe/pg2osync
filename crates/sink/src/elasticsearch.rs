@@ -385,13 +385,14 @@ impl ElasticsearchSink {
         &self,
         name: &str,
         mapping: Option<&Value>,
+        alias: Option<&str>,
     ) -> Result<bool, CoreError> {
         if self.index_exists(name).await? {
             return Ok(false);
         }
         // without a body the index takes whatever Elasticsearch infers, or
         // whatever index template the operator already manages
-        let create = mapping.map(|m| crate::mapping::create_body(m).to_string());
+        let create = crate::create_body_for(mapping, alias).map(|body| body.to_string());
         let (status, body) = self
             .send(reqwest::Method::PUT, &format!("/{name}"), create)
             .await?;
@@ -411,41 +412,29 @@ impl ElasticsearchSink {
     /// known until the rows are: pre-creating every index a template *could*
     /// render means enumerating a column's values, which nothing can do.
     ///
-    /// Upserts only: creating an index to delete from it is work with no
-    /// document to show for it, and a delete against a missing index is
-    /// tolerated by the bulk triage instead.
+    /// A versioned delete counts as much as an upsert: the target creates a
+    /// missing index for one either way, and only creating it here gives it
+    /// its mapping and alias. An unversioned delete leaves a missing index
+    /// missing, and the bulk triage tolerates the miss.
     async fn ensure_batch_indexes(&self, batch: &[LsnOp]) -> Result<(), CoreError> {
         // neither guard is held across an await: the mutexes are std, and
         // the creates below are the slow part
-        let unknown: HashSet<&str> = {
-            let known = crate::lock(&self.known_indexes);
-            batch
-                .iter()
-                .filter_map(|op| match &op.op {
-                    DocumentOp::Upsert { index, .. } if !known.contains(index) => {
-                        Some(index.as_str())
-                    }
-                    _ => None,
-                })
-                .collect()
-        };
-        if unknown.is_empty() {
-            return Ok(());
-        }
-        let claimed: Vec<(String, Option<Value>)> = {
-            let templates = crate::lock(&self.templates);
-            unknown
-                .into_iter()
-                .filter_map(|name| {
-                    crate::claiming_template(&templates, name)
-                        .map(|m| (name.to_string(), m.clone()))
-                })
-                .collect()
-        };
-        for (name, mapping) in claimed {
-            if self.create_index_if_absent(&name, mapping.as_ref()).await? {
+        let claimed = crate::indices_written(batch, &crate::lock(&self.templates));
+        for (name, mapping, alias) in claimed {
+            // a name already seen was already told apart from an alias; it is
+            // still looked up, because it may have been dropped since
+            let known = crate::lock(&self.known_indexes).contains(&name);
+            if self
+                .create_index_if_absent(&name, mapping.as_ref(), alias.as_deref())
+                .await?
+            {
                 tracing::info!(target: "pg2osync::sink",
-                    "created index {name} for the first row that chose it");
+                    "created index {name} for a row that chose it");
+            } else if !known && self.is_alias(&name).await? {
+                // the existence check answers for an alias as for an index, so
+                // without this the row would be filed through the alias into
+                // whichever index it points at, another tenant's included
+                return Err(crate::alias_not_index(&name));
             }
             crate::lock(&self.known_indexes).insert(name);
         }
@@ -598,6 +587,7 @@ fn ndjson_body(batch: &[LsnOp], require_alias: bool) -> Result<String, CoreError
                 doc,
                 version,
                 pipeline,
+                alias: _,
             } => {
                 ndjson.push_str(&action_header(
                     "index",
@@ -616,6 +606,7 @@ fn ndjson_body(batch: &[LsnOp], require_alias: bool) -> Result<String, CoreError
                 id,
                 routing,
                 version,
+                alias: _,
             } => {
                 ndjson.push_str(&action_header(
                     "delete",
@@ -678,7 +669,7 @@ impl Sink for ElasticsearchSink {
                 continue;
             }
             let created = self
-                .create_index_if_absent(&spec.name, spec.mapping.as_ref())
+                .create_index_if_absent(&spec.name, spec.mapping.as_ref(), None)
                 .await?;
             crate::lock(&self.known_indexes).insert(spec.name.clone());
             if !created && let Some(mapping) = &spec.mapping {
@@ -932,6 +923,21 @@ impl Sink for ElasticsearchSink {
         Ok(crate::claimed_indices(pattern, &body))
     }
 
+    async fn list_aliases(&self, pattern: &str) -> Result<Vec<(String, String)>, CoreError> {
+        let (status, body) = self
+            .send(reqwest::Method::GET, &alias_path(pattern), None)
+            .await?;
+        match status {
+            200 => Ok(crate::held_aliases(pattern, &body)),
+            // nothing matching, with an error body whose keys are not index
+            // names
+            404 => Ok(Vec::new()),
+            other => Err(CoreError::Sink(format!(
+                "list aliases {pattern}: {other} {body}"
+            ))),
+        }
+    }
+
     async fn count_documents(&self, index: &str) -> Result<Option<u64>, CoreError> {
         let (status, body) = self
             .send(reqwest::Method::GET, &format!("/{index}/_count"), None)
@@ -973,36 +979,36 @@ impl Sink for ElasticsearchSink {
     }
 
     async fn switch_alias(&self, alias: &str, index: &str) -> Result<(), CoreError> {
-        // where it points now, so the remove names real indices: a remove
-        // against a wildcard errors when the alias does not exist yet
-        let (status, current) = self
-            .send(reqwest::Method::GET, &format!("/_alias/{alias}"), None)
-            .await?;
-        let current = match status {
-            // the body of a 404 is an error document whose keys are not index
-            // names; reading them would ask the target to remove the alias
-            // from an index called "error"
-            200 => current,
-            404 => json!({}),
-            other => {
-                return Err(CoreError::Sink(format!(
-                    "read alias {alias}: {other} {current}"
-                )));
+        self.switch_aliases(&[(alias.to_string(), index.to_string())])
+            .await
+    }
+
+    async fn switch_aliases(&self, pairs: &[(String, String)]) -> Result<(), CoreError> {
+        // as on OpenSearch: one lookup per alias so each remove names a real
+        // index, then the whole switch in one request
+        let mut holders = std::collections::HashMap::new();
+        for (alias, _) in pairs {
+            if holders.contains_key(alias) {
+                continue;
             }
-        };
-
-        let mut actions: Vec<Value> = current
-            .as_object()
-            .map(|indices| {
-                indices
-                    .keys()
-                    .filter(|name| name.as_str() != index)
-                    .map(|name| json!({"remove": {"index": name, "alias": alias}}))
-                    .collect()
-            })
-            .unwrap_or_default();
-        actions.push(json!({"add": {"index": index, "alias": alias}}));
-
+            let (status, current) = self
+                .send(reqwest::Method::GET, &alias_path(alias), None)
+                .await?;
+            let held = match status {
+                200 => crate::alias_holders(&current),
+                404 => Vec::new(),
+                other => {
+                    return Err(CoreError::Sink(format!(
+                        "read alias {alias}: {other} {current}"
+                    )));
+                }
+            };
+            holders.insert(alias.clone(), held);
+        }
+        let actions = crate::alias_actions(pairs, &holders);
+        if actions.is_empty() {
+            return Ok(());
+        }
         let (status, body) = self
             .send(
                 reqwest::Method::POST,
@@ -1012,7 +1018,8 @@ impl Sink for ElasticsearchSink {
             .await?;
         if !(200..300).contains(&status) {
             return Err(CoreError::Sink(format!(
-                "point alias {alias} at {index}: {status} {body}"
+                "switch {} alias(es): {status} {body}",
+                holders.len()
             )));
         }
         Ok(())
@@ -1051,7 +1058,7 @@ impl Sink for ElasticsearchSink {
                 "document": {"type": "object", "enabled": false}
             }}
         });
-        self.create_index_if_absent(crate::REJECTS_INDEX, Some(&body))
+        self.create_index_if_absent(crate::REJECTS_INDEX, Some(&body), None)
             .await?;
         for r in rejected {
             let id = crate::reject_doc_id(&r.index, &r.doc_id);
@@ -1287,6 +1294,7 @@ mod tests {
                     doc: json!({"amount": 3}),
                     version: Some(0x2A),
                     pipeline: None,
+                    alias: None,
                 },
             },
             LsnOp {
@@ -1296,6 +1304,7 @@ mod tests {
                     id: "order-8".into(),
                     routing: Some("7".into()),
                     version: Some(0x2A),
+                    alias: None,
                 },
             },
         ];
@@ -1341,6 +1350,7 @@ mod tests {
                     doc: json!({"name": "lamp"}),
                     version: Some(0x2A),
                     pipeline: Some("embed-products".into()),
+                    alias: None,
                 },
             },
             LsnOp {
@@ -1350,6 +1360,7 @@ mod tests {
                     id: "8".into(),
                     routing: None,
                     version: Some(0x2A),
+                    alias: None,
                 },
             },
         ];
@@ -1374,6 +1385,7 @@ mod tests {
                 id: "1".into(),
                 routing: None,
                 version: None,
+                alias: None,
             },
         }];
         assert_eq!(
@@ -1394,6 +1406,7 @@ mod tests {
                     doc: json!({"id": 1}),
                     version: None,
                     pipeline: None,
+                    alias: None,
                 },
             },
             LsnOp {
@@ -1403,6 +1416,7 @@ mod tests {
                     id: "2".into(),
                     routing: None,
                     version: None,
+                    alias: None,
                 },
             },
         ];
@@ -1623,6 +1637,7 @@ mod tests {
                 doc: json!({"amount": 3}),
                 version: Some(0x2A),
                 pipeline: None,
+                alias: None,
             },
         }
     }
@@ -1744,6 +1759,203 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_alias_moves_in_one_request() {
+        let target = FakeTarget::start(|line, _sent| match line {
+            "GET /_alias/acme-live" => (200, r#"{"events-acme":{"aliases":{"acme-live":{}}}}"#),
+            "GET /_alias/globex-live" => (404, r#"{"error":{"type":"alias_not_found_exception"}}"#),
+            _ => (200, r#"{"acknowledged":true}"#),
+        })
+        .await;
+        target
+            .sink()
+            .switch_aliases(&[
+                ("acme-live".into(), "g2-events-acme".into()),
+                ("globex-live".into(), "g2-events-globex".into()),
+            ])
+            .await
+            .expect("both aliases move");
+        assert_eq!(
+            target.bodies("POST /_aliases"),
+            vec![json!({"actions": [
+                {"remove": {"index": "events-acme", "alias": "acme-live"}},
+                {"add": {"index": "g2-events-acme", "alias": "acme-live"}},
+                {"add": {"index": "g2-events-globex", "alias": "globex-live"}}
+            ]})],
+            "one atomic request for every tenant: {:?}",
+            target.seen()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_index_a_row_chooses_is_created_with_its_alias() {
+        let target = FakeTarget::start(|line, _sent| match line {
+            "HEAD /events-acme" => (404, ""),
+            "POST /_bulk" => (
+                200,
+                r#"{"errors":false,"items":[{"index":{"status":201}}]}"#,
+            ),
+            _ => (200, r#"{"acknowledged":true}"#),
+        })
+        .await;
+        let sink = target.sink();
+        sink.ensure_ready(&[IndexSpec {
+            name: "events-*".into(),
+            mapping: None,
+            pattern: true,
+        }])
+        .await
+        .expect("a template is recorded");
+        sink.write(vec![LsnOp {
+            lsn: Lsn(1),
+            op: DocumentOp::Upsert {
+                index: "events-acme".into(),
+                id: "1".into(),
+                routing: None,
+                doc: json!({"n": 1}),
+                version: None,
+                pipeline: None,
+                alias: Some("acme-live".into()),
+            },
+        }])
+        .await
+        .expect("written");
+        assert_eq!(
+            target.bodies("PUT /events-acme"),
+            vec![json!({"aliases": {"acme-live": {}}})],
+            "the index and its alias appear in one step: {:?}",
+            target.seen()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_index_deleted_while_the_pipeline_runs_is_created_again_with_its_alias() {
+        // every look finds events-acme missing: it was dropped after the
+        // first batch created it, and the second upsert would otherwise make
+        // the target auto-create it bare
+        let target = FakeTarget::start(|line, _sent| match line {
+            "HEAD /events-acme" => (404, ""),
+            "POST /_bulk" => (
+                200,
+                r#"{"errors":false,"items":[{"index":{"status":201}}]}"#,
+            ),
+            _ => (200, r#"{"acknowledged":true}"#),
+        })
+        .await;
+        let sink = target.sink();
+        sink.ensure_ready(&[IndexSpec {
+            name: "events-*".into(),
+            mapping: None,
+            pattern: true,
+        }])
+        .await
+        .expect("a template is recorded");
+        for _ in 0..2 {
+            sink.write(vec![LsnOp {
+                lsn: Lsn(1),
+                op: DocumentOp::Upsert {
+                    index: "events-acme".into(),
+                    id: "1".into(),
+                    routing: None,
+                    doc: json!({"n": 1}),
+                    version: None,
+                    pipeline: None,
+                    alias: Some("acme-live".into()),
+                },
+            }])
+            .await
+            .expect("written");
+        }
+        assert_eq!(
+            target.bodies("PUT /events-acme"),
+            vec![
+                json!({"aliases": {"acme-live": {}}}),
+                json!({"aliases": {"acme-live": {}}})
+            ],
+            "{:?}",
+            target.seen()
+        );
+    }
+
+    /// A templated name an alias already holds: `HEAD` answers 200 for it
+    /// as for an index, so only `/_alias/<name>` tells the two apart.
+    fn a_templated_name_held_by(alias_lookup: u16) -> fn(&str, &str) -> (u16, &'static str) {
+        match alias_lookup {
+            200 => |line, _| match line {
+                "GET /_alias/events-events-live" => (
+                    200,
+                    r#"{"events-events":{"aliases":{"events-events-live":{}}}}"#,
+                ),
+                "POST /_bulk" => (
+                    200,
+                    r#"{"errors":false,"items":[{"index":{"status":200}}]}"#,
+                ),
+                _ => (200, r#"{"acknowledged":true}"#),
+            },
+            _ => |line, _| match line {
+                "GET /_alias/events-events-live" => (404, r#"{"status":404}"#),
+                "POST /_bulk" => (
+                    200,
+                    r#"{"errors":false,"items":[{"index":{"status":200}}]}"#,
+                ),
+                _ => (200, r#"{"acknowledged":true}"#),
+            },
+        }
+    }
+
+    async fn write_a_tenant_events_live(target: &FakeTarget) -> Result<SinkAck, CoreError> {
+        let sink = target.sink();
+        sink.ensure_ready(&[IndexSpec {
+            name: "events-*".into(),
+            mapping: None,
+            pattern: true,
+        }])
+        .await
+        .expect("a template is recorded");
+        sink.write(vec![LsnOp {
+            lsn: Lsn(1),
+            op: DocumentOp::Upsert {
+                index: "events-events-live".into(),
+                id: "1".into(),
+                routing: None,
+                doc: json!({"n": 1}),
+                version: None,
+                pipeline: None,
+                alias: Some("events-live-events-live".into()),
+            },
+        }])
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_row_whose_index_is_the_name_of_an_alias_halts_before_writing_through_it() {
+        // tenant `events` made `events-events` with the alias
+        // `events-events-live`; tenant `events-live` renders that alias's name
+        let target = FakeTarget::start(a_templated_name_held_by(200)).await;
+        let err = write_a_tenant_events_live(&target)
+            .await
+            .expect_err("an alias is not an index the row may be filed in");
+        assert!(err.to_string().contains("events-events-live"), "{err}");
+        assert!(
+            !target.seen().iter().any(|line| line == "POST /_bulk"),
+            "nothing reached the index behind the alias: {:?}",
+            target.seen()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_row_whose_index_already_exists_is_written_to_it() {
+        let target = FakeTarget::start(a_templated_name_held_by(404)).await;
+        write_a_tenant_events_live(&target)
+            .await
+            .expect("an existing index is the row's own");
+        assert!(
+            target.seen().iter().any(|line| line == "POST /_bulk"),
+            "{:?}",
+            target.seen()
+        );
+    }
+
+    #[tokio::test]
     async fn a_scan_walks_every_page_and_keeps_the_routing_of_each_hit() {
         let target = FakeTarget::start(|_line, sent| {
             if sent.contains("search_after") {
@@ -1828,6 +2040,7 @@ mod tests {
                     doc: json!({"id": 1}),
                     version: Some(0x2A),
                     pipeline: None,
+                    alias: None,
                 },
             }])
             .await

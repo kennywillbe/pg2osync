@@ -62,6 +62,7 @@ async fn the_opensearch_sink_honours_the_sink_contract() {
     )
     .with_unacceptable_document(json!({"name": "bad", "weight": "not a number"}))
     .with_index_listing()
+    .with_alias_switching()
     .run(&sink)
     .await
     .expect("the OpenSearch sink honours the Sink contract");
@@ -114,6 +115,7 @@ async fn the_elasticsearch_sink_honours_the_sink_contract() {
     )
     .with_unacceptable_document(json!({"name": "bad", "weight": "not a number"}))
     .with_index_listing()
+    .with_alias_switching()
     .run(&sink)
     .await
     .expect("the Elasticsearch sink honours the Sink contract");
@@ -178,7 +180,12 @@ async fn the_meilisearch_sink_honours_the_sink_contract() {
     std::fs::remove_dir_all(&state_dir).expect("this run's state directory, removed");
     assert_eq!(
         report.skipped,
-        ["versioned truncate", "partial batch", "index listing"],
+        [
+            "versioned truncate",
+            "partial batch",
+            "index listing",
+            "alias switching"
+        ],
         "the checks a target without versions, without a schema and without index \
          templates cannot answer, and no others: {report:?}"
     );
@@ -228,8 +235,8 @@ async fn the_qdrant_sink_honours_the_sink_contract() {
     .expect("the Qdrant sink honours the Sink contract");
     assert_eq!(
         report.skipped,
-        ["index listing"],
-        "the one check a target that refuses index templates cannot answer, and no \
+        ["index listing", "alias switching"],
+        "the checks a target that refuses index templates cannot answer, and no \
          others: {report:?}"
     );
 }
@@ -268,8 +275,8 @@ async fn the_postgres_sink_honours_the_sink_contract() {
     .expect("the PostgreSQL sink honours the Sink contract");
     assert_eq!(
         report.skipped,
-        ["index listing"],
-        "the one check a target that refuses index templates cannot answer, and no \
+        ["index listing", "alias switching"],
+        "the checks a target that refuses index templates cannot answer, and no \
          others: {report:?}"
     );
 }

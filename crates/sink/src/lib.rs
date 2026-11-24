@@ -609,6 +609,7 @@ impl OpenSearchSink {
         &self,
         name: &str,
         mapping: Option<&Value>,
+        alias: Option<&str>,
     ) -> Result<bool, CoreError> {
         let exists = self
             .client
@@ -622,7 +623,7 @@ impl OpenSearchSink {
         }
         // an empty body leaves the index to whatever the target infers, or to
         // whatever index template the operator already manages
-        let body = mapping.map_or_else(|| json!({}), crate::mapping::create_body);
+        let body = create_body_for(mapping, alias).unwrap_or_else(|| json!({}));
         let resp = self
             .client
             .indices()
@@ -651,40 +652,29 @@ impl OpenSearchSink {
     /// known until the rows are: pre-creating every index a template *could*
     /// render means enumerating a column's values, which nothing can do.
     ///
-    /// Upserts only: creating an index to delete from it is work with no
-    /// document to show for it, and a delete against a missing index is
-    /// tolerated by the bulk triage instead.
+    /// A versioned delete counts as much as an upsert: the target creates a
+    /// missing index for one either way, and only creating it here gives it
+    /// its mapping and alias. An unversioned delete leaves a missing index
+    /// missing, and the bulk triage tolerates the miss.
     async fn ensure_batch_indexes(&self, batch: &[LsnOp]) -> Result<(), CoreError> {
         // neither guard is held across an await: the mutexes are std, and
         // the creates below are the slow part
-        let unknown: HashSet<&str> = {
-            let known = lock(&self.known_indexes);
-            batch
-                .iter()
-                .filter_map(|op| match &op.op {
-                    DocumentOp::Upsert { index, .. } if !known.contains(index) => {
-                        Some(index.as_str())
-                    }
-                    _ => None,
-                })
-                .collect()
-        };
-        if unknown.is_empty() {
-            return Ok(());
-        }
-        let claimed: Vec<(String, Option<Value>)> = {
-            let templates = lock(&self.templates);
-            unknown
-                .into_iter()
-                .filter_map(|name| {
-                    claiming_template(&templates, name).map(|m| (name.to_string(), m.clone()))
-                })
-                .collect()
-        };
-        for (name, mapping) in claimed {
-            if self.create_index_if_absent(&name, mapping.as_ref()).await? {
+        let claimed = indices_written(batch, &lock(&self.templates));
+        for (name, mapping, alias) in claimed {
+            // a name already seen was already told apart from an alias; it is
+            // still looked up, because it may have been dropped since
+            let known = lock(&self.known_indexes).contains(&name);
+            if self
+                .create_index_if_absent(&name, mapping.as_ref(), alias.as_deref())
+                .await?
+            {
                 tracing::info!(target: "pg2osync::sink",
-                    "created index {name} for the first row that chose it");
+                    "created index {name} for a row that chose it");
+            } else if !known && self.is_alias(&name).await? {
+                // the existence check answers for an alias as for an index, so
+                // without this the row would be filed through the alias into
+                // whichever index it points at, another tenant's included
+                return Err(alias_not_index(&name));
             }
             lock(&self.known_indexes).insert(name);
         }
@@ -873,6 +863,7 @@ fn bulk_action(op: &DocumentOp) -> Result<BulkOperation<Value>, CoreError> {
             doc,
             version,
             pipeline,
+            alias: _,
         } => {
             let mut action = BulkOperation::index(doc.clone())
                 .id(id.clone())
@@ -899,6 +890,7 @@ fn bulk_action(op: &DocumentOp) -> Result<BulkOperation<Value>, CoreError> {
             id,
             routing,
             version,
+            alias: _,
         } => {
             let mut action = BulkOperation::delete(id.clone()).index(index.clone());
             if let Some(routing) = routing {
@@ -951,6 +943,18 @@ pub(crate) fn already_exists(body: &Value) -> bool {
     body["error"]["type"] == "resource_already_exists_exception"
 }
 
+/// The refusal for a row whose templated index renders the name of an alias.
+///
+/// Permanent: the alias will still be there on a retry, and the row has no
+/// index of its own to land in until one of the two names changes.
+pub(crate) fn alias_not_index(name: &str) -> CoreError {
+    CoreError::Sink(format!(
+        "a row chose the index {name}, but {name} is an alias; writing through it \
+         would file the row in the index behind it. The index template and an alias \
+         render the same name here: rename one of the two"
+    ))
+}
+
 async fn check_status(resp: Response, what: &str) -> Result<(), CoreError> {
     if !resp.status_code().is_success() {
         let status = resp.status_code();
@@ -980,6 +984,120 @@ pub(crate) fn claiming_template<'a>(
         .map(|(_, mapping)| mapping)
 }
 
+/// The indices a batch writes to that a recorded template claims: each
+/// once, with the mapping its template carries and the alias its first write
+/// names. Only an unversioned delete is left out, because only that one the
+/// target refuses to create an index for.
+///
+/// Every batch, not only the first to name an index: an index dropped while
+/// the pipeline runs is missing again, and the next write would otherwise
+/// have the target auto-create it bare.
+pub(crate) fn indices_written(
+    batch: &[LsnOp],
+    templates: &[(String, Option<Value>)],
+) -> Vec<(String, Option<Value>, Option<String>)> {
+    let mut wanted: Vec<(String, Option<Value>, Option<String>)> = Vec::new();
+    for op in batch {
+        let (index, alias) = match &op.op {
+            DocumentOp::Upsert { index, alias, .. } => (index, alias),
+            // a versioned delete is the one the target lets create a
+            // missing index, and it creates it with no mapping and no alias;
+            // a later upsert would find it there and leave it that way
+            DocumentOp::Delete {
+                index,
+                alias,
+                version,
+                ..
+            } if external_version(*version).is_some() => (index, alias),
+            _ => continue,
+        };
+        if wanted.iter().any(|(name, _, _)| name == index) {
+            continue;
+        }
+        if let Some(mapping) = claiming_template(templates, index) {
+            wanted.push((index.clone(), mapping.clone(), alias.clone()));
+        }
+    }
+    wanted
+}
+
+/// What an index is created with: the configured mapping and, for one a row
+/// chose, its alias, so the two appear in a single step. `None` when there
+/// is neither, which leaves the index to the target's inference or to an
+/// index template the operator manages.
+pub(crate) fn create_body_for(mapping: Option<&Value>, alias: Option<&str>) -> Option<Value> {
+    let mut body = mapping.map(crate::mapping::create_body);
+    if let Some(alias) = alias {
+        body.get_or_insert_with(|| json!({}))["aliases"] = json!({ alias: {} });
+    }
+    body
+}
+
+/// The indices a get-alias answer says hold the alias. A 404's error body is
+/// never passed here: its keys are not index names, and reading them would
+/// ask the target to remove the alias from an index called "error".
+pub(crate) fn alias_holders(answer: &Value) -> Vec<String> {
+    answer
+        .as_object()
+        .map(|indices| indices.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// The `(alias, index)` pairs a get-alias answer for `pattern` holds whose
+/// alias the pattern itself claims, sorted. The target matches the wildcard
+/// itself; the names are checked again so a caller only ever sees aliases
+/// the template could have rendered.
+pub(crate) fn held_aliases(pattern: &str, answer: &Value) -> Vec<(String, String)> {
+    let mut held: Vec<(String, String)> = answer
+        .as_object()
+        .into_iter()
+        .flatten()
+        .flat_map(|(index, entry)| {
+            entry["aliases"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(move |(alias, _)| (alias.clone(), index.clone()))
+        })
+        .filter(|(alias, _)| index_matches_pattern(pattern, alias))
+        .collect();
+    held.sort();
+    held
+}
+
+/// The `_aliases` actions that leave each alias on exactly the indices it is
+/// paired with: removed from every holder it is not paired with, added to
+/// each one it is, aliases in the order they were first named.
+pub(crate) fn alias_actions(
+    pairs: &[(String, String)],
+    holders: &std::collections::HashMap<String, Vec<String>>,
+) -> Vec<Value> {
+    let mut aliases: Vec<&str> = Vec::new();
+    for (alias, _) in pairs {
+        if !aliases.contains(&alias.as_str()) {
+            aliases.push(alias);
+        }
+    }
+    let mut actions = Vec::new();
+    for alias in aliases {
+        let mut targets: Vec<&str> = Vec::new();
+        for (_, index) in pairs.iter().filter(|(a, _)| a == alias) {
+            if !targets.contains(&index.as_str()) {
+                targets.push(index);
+            }
+        }
+        for held in holders.get(alias).into_iter().flatten() {
+            if !targets.contains(&held.as_str()) {
+                actions.push(json!({"remove": {"index": held, "alias": alias}}));
+            }
+        }
+        for index in targets {
+            actions.push(json!({"add": {"index": index, "alias": alias}}));
+        }
+    }
+    actions
+}
+
 /// The index names a get-settings answer for `pattern` holds that the
 /// pattern itself claims, sorted. The answer is keyed by concrete index, and
 /// a wildcard that also matched an alias's name brings in that alias's
@@ -1000,7 +1118,7 @@ pub(crate) fn claimed_indices(pattern: &str, settings: &Value) -> Vec<String> {
 
 /// Whether a bulk item is a delete that found nothing to delete: the document
 /// was already gone, or the index a row's template chose was never created —
-/// creation is on demand and only an upsert asks for it. Read off the `delete`
+/// creation is on demand, and an unversioned delete never asks for it. Read off the `delete`
 /// action only, so an upsert into a missing index stays the rejection it is.
 pub(crate) fn is_absent(item: &Value) -> bool {
     let entry = &item["delete"];
@@ -1084,15 +1202,22 @@ pub fn reject_doc(r: &Rejection) -> Value {
     });
     match &r.op {
         DocumentOp::Upsert {
-            routing, pipeline, ..
+            routing,
+            pipeline,
+            alias,
+            ..
         } => {
             // a replay has to land on the shard the original write named,
-            // and go through the pipeline the section named
+            // and go through the pipeline the section named; it can also be
+            // the write that first creates a per-row index, which then needs
+            // its alias as much as the original would have
             doc["routing"] = json!(routing);
             doc["pipeline"] = json!(pipeline);
+            doc["alias"] = json!(alias);
         }
-        DocumentOp::Delete { routing, .. } => {
+        DocumentOp::Delete { routing, alias, .. } => {
             doc["routing"] = json!(routing);
+            doc["alias"] = json!(alias);
         }
         DocumentOp::DeleteChildren {
             field,
@@ -1122,12 +1247,14 @@ pub fn reject_from_doc(id: &str, src: &Value) -> Option<StoredReject> {
             doc: src["document"].clone(),
             version,
             pipeline: src["pipeline"].as_str().map(str::to_string),
+            alias: src["alias"].as_str().map(str::to_string),
         },
         "delete" => DocumentOp::Delete {
             index: index.clone(),
             id: doc_id.clone(),
             routing,
             version,
+            alias: src["alias"].as_str().map(str::to_string),
         },
         "delete_children" => DocumentOp::DeleteChildren {
             index: index.clone(),
@@ -1274,7 +1401,7 @@ impl Sink for OpenSearchSink {
             }
             fixed.push(&spec.name);
             let created = self
-                .create_index_if_absent(&spec.name, spec.mapping.as_ref())
+                .create_index_if_absent(&spec.name, spec.mapping.as_ref(), None)
                 .await?;
             lock(&self.known_indexes).insert(spec.name.clone());
             if created {
@@ -1583,6 +1710,29 @@ impl Sink for OpenSearchSink {
         Ok(claimed_indices(pattern, &body))
     }
 
+    async fn list_aliases(&self, pattern: &str) -> Result<Vec<(String, String)>, CoreError> {
+        let resp = self
+            .client
+            .indices()
+            .get_alias(opensearch::indices::IndicesGetAliasParts::Name(&[pattern]))
+            .send()
+            .await
+            .map_err(http_err)?;
+        // nothing matching answers 404 with an error body, whose keys are
+        // not index names
+        if resp.status_code() == 404 {
+            return Ok(Vec::new());
+        }
+        let status = resp.status_code();
+        let body: Value = resp.json().await.map_err(http_err)?;
+        if !status.is_success() {
+            return Err(CoreError::Sink(format!(
+                "list aliases {pattern}: {status} {body}"
+            )));
+        }
+        Ok(held_aliases(pattern, &body))
+    }
+
     async fn count_documents(&self, index: &str) -> Result<Option<u64>, CoreError> {
         let resp = self
             .client
@@ -1627,36 +1777,46 @@ impl Sink for OpenSearchSink {
     }
 
     async fn switch_alias(&self, alias: &str, index: &str) -> Result<(), CoreError> {
-        // where it points now, so the remove names real indices: a remove
-        // against a wildcard errors when the alias does not exist yet
-        let resp = self
-            .client
-            .indices()
-            .get_alias(opensearch::indices::IndicesGetAliasParts::Name(&[alias]))
-            .send()
+        self.switch_aliases(&[(alias.to_string(), index.to_string())])
             .await
-            .map_err(http_err)?;
-        // an alias that does not exist yet answers 404 with an error body, and
-        // its keys are not index names — reading them would ask the target to
-        // remove the alias from an index called "error"
-        let current: Value = if resp.status_code().is_success() {
-            resp.json().await.map_err(http_err)?
-        } else {
-            json!({})
-        };
+    }
 
-        let mut actions: Vec<Value> = current
-            .as_object()
-            .map(|indices| {
-                indices
-                    .keys()
-                    .filter(|name| name.as_str() != index)
-                    .map(|name| json!({"remove": {"index": name, "alias": alias}}))
-                    .collect()
-            })
-            .unwrap_or_default();
-        actions.push(json!({"add": {"index": index, "alias": alias}}));
-
+    async fn switch_aliases(&self, pairs: &[(String, String)]) -> Result<(), CoreError> {
+        // where each points now, so every remove names a real index: a
+        // remove against a wildcard errors when the alias does not exist
+        // yet. One lookup per alias; only the switch below has to be atomic.
+        let mut holders = std::collections::HashMap::new();
+        for (alias, _) in pairs {
+            if holders.contains_key(alias) {
+                continue;
+            }
+            let resp = self
+                .client
+                .indices()
+                .get_alias(opensearch::indices::IndicesGetAliasParts::Name(&[alias]))
+                .send()
+                .await
+                .map_err(http_err)?;
+            // an alias nobody holds yet answers 404 with an error body; any
+            // other refusal says nothing about who holds it, and guessing
+            // "nobody" would add the alias without removing it anywhere
+            let status = resp.status_code();
+            let held = if status.is_success() {
+                alias_holders(&resp.json().await.map_err(http_err)?)
+            } else if status == 404 {
+                Vec::new()
+            } else {
+                let body: Value = resp.json().await.unwrap_or(Value::Null);
+                return Err(CoreError::Sink(format!(
+                    "read alias {alias}: {status} {body}"
+                )));
+            };
+            holders.insert(alias.clone(), held);
+        }
+        let actions = alias_actions(pairs, &holders);
+        if actions.is_empty() {
+            return Ok(());
+        }
         let resp = self
             .client
             .indices()
@@ -1665,7 +1825,7 @@ impl Sink for OpenSearchSink {
             .send()
             .await
             .map_err(http_err)?;
-        check_status(resp, &format!("point alias {alias} at {index}")).await
+        check_status(resp, &format!("switch {} alias(es)", holders.len())).await
     }
 
     fn can_quarantine(&self) -> bool {
@@ -1947,6 +2107,31 @@ mod tests {
     }
 
     #[test]
+    fn held_aliases_are_the_ones_the_pattern_claims_with_each_holder_sorted() {
+        // the answer lists every alias of a matching index, `ops-live` among
+        // them, so only the name check keeps it from looking like a tenant's
+        let body = serde_json::json!({
+            "g2-events-acme": {"aliases": {"acme-events-live": {}, "ops-live": {}}},
+            "events-acme": {"aliases": {"acme-events-live": {}}},
+            "events-initech": {"aliases": {}},
+            "g2-events-globex": {"aliases": {"globex-events-live": {}}},
+        });
+        assert_eq!(
+            super::held_aliases("*-events-live", &body),
+            [
+                ("acme-events-live".to_string(), "events-acme".to_string()),
+                ("acme-events-live".to_string(), "g2-events-acme".to_string()),
+                (
+                    "globex-events-live".to_string(),
+                    "g2-events-globex".to_string()
+                ),
+            ]
+        );
+        assert!(super::held_aliases("*-events-live", &serde_json::json!({})).is_empty());
+        assert!(super::held_aliases("*-events-live", &serde_json::Value::Null).is_empty());
+    }
+
+    #[test]
     fn a_create_that_lost_the_race_is_not_a_failure() {
         // two sources in one process ensure the hidden indices at once, and
         // the second one halting on it would be a pipeline lost to a startup
@@ -1994,6 +2179,112 @@ mod tests {
         assert_eq!(claiming_template(&templates, "orders-archive"), Some(&None));
         assert_eq!(claiming_template(&templates, "orders-live"), None);
         assert_eq!(claiming_template(&[], "events-acme"), None);
+    }
+
+    fn upsert_into(index: &str, alias: Option<&str>) -> LsnOp {
+        LsnOp {
+            lsn: Lsn(1),
+            op: DocumentOp::Upsert {
+                index: index.into(),
+                id: "1".into(),
+                routing: None,
+                doc: json!({}),
+                version: None,
+                pipeline: None,
+                alias: alias.map(str::to_string),
+            },
+        }
+    }
+
+    #[test]
+    fn an_index_a_template_claims_is_created_with_the_alias_its_first_write_names() {
+        let mapping = Some(json!({"properties": {"at": {"type": "date"}}}));
+        let templates = vec![("events-*".to_string(), mapping.clone())];
+        let delete_from = |index: &str, alias: Option<&str>, version: Option<u64>| LsnOp {
+            lsn: Lsn(1),
+            op: DocumentOp::Delete {
+                index: index.into(),
+                id: "1".into(),
+                routing: None,
+                version,
+                alias: alias.map(str::to_string),
+            },
+        };
+        let batch = vec![
+            upsert_into("events-acme", Some("acme-live")),
+            upsert_into("events-acme", Some("acme-live")),
+            upsert_into("orders", None),
+            // a versioned delete into a missing index makes the target create
+            // it with neither mapping nor alias, and an upsert in a later
+            // batch would then find it there
+            delete_from("events-gone", Some("gone-live"), Some(7)),
+            // an unversioned one leaves a missing index missing
+            delete_from("events-never", Some("never-live"), None),
+        ];
+        assert_eq!(
+            indices_written(&batch, &templates),
+            vec![
+                (
+                    "events-acme".to_string(),
+                    mapping.clone(),
+                    Some("acme-live".to_string())
+                ),
+                (
+                    "events-gone".to_string(),
+                    mapping.clone(),
+                    Some("gone-live".to_string())
+                ),
+            ],
+            "once per name, only where a template claims it and the write would create it"
+        );
+        assert_eq!(
+            create_body_for(mapping.as_ref(), Some("acme-live")),
+            Some(json!({
+                "mappings": {"properties": {"at": {"type": "date"}}},
+                "aliases": {"acme-live": {}}
+            }))
+        );
+        assert_eq!(
+            create_body_for(None, Some("acme-live")),
+            Some(json!({"aliases": {"acme-live": {}}}))
+        );
+        assert_eq!(create_body_for(None, None), None);
+    }
+
+    #[test]
+    fn every_alias_lands_on_exactly_the_indices_it_is_paired_with_in_one_body() {
+        let pairs = vec![
+            ("acme-live".to_string(), "g2-events-acme".to_string()),
+            ("globex-live".to_string(), "g2-events-globex".to_string()),
+            ("all-live".to_string(), "g2-events-acme".to_string()),
+            ("all-live".to_string(), "g2-events-globex".to_string()),
+        ];
+        let holders: std::collections::HashMap<String, Vec<String>> = [
+            ("acme-live".to_string(), vec!["events-acme".to_string()]),
+            ("globex-live".to_string(), vec![]),
+            (
+                "all-live".to_string(),
+                vec!["events-acme".to_string(), "g2-events-acme".to_string()],
+            ),
+        ]
+        .into();
+        assert_eq!(
+            alias_actions(&pairs, &holders),
+            vec![
+                json!({"remove": {"index": "events-acme", "alias": "acme-live"}}),
+                json!({"add": {"index": "g2-events-acme", "alias": "acme-live"}}),
+                json!({"add": {"index": "g2-events-globex", "alias": "globex-live"}}),
+                // never removed from an index it is also added to
+                json!({"remove": {"index": "events-acme", "alias": "all-live"}}),
+                json!({"add": {"index": "g2-events-acme", "alias": "all-live"}}),
+                json!({"add": {"index": "g2-events-globex", "alias": "all-live"}}),
+            ]
+        );
+        assert_eq!(
+            alias_holders(&json!({"events-acme": {"aliases": {"acme-live": {}}}})),
+            ["events-acme"]
+        );
+        assert!(alias_holders(&json!(null)).is_empty());
     }
 
     #[test]
@@ -2109,6 +2400,7 @@ mod tests {
                 doc,
                 version: Some(0x100),
                 pipeline: None,
+                alias: None,
             },
         };
         let batch = vec![op("1", json!({"v": 1})), op("2", json!({"v": 2}))];
@@ -2137,6 +2429,7 @@ mod tests {
                 id: "7".into(),
                 routing: None,
                 version: Some(0x2A),
+                alias: None,
             },
         };
         let stored = reject_from_doc("orders-7", &reject_doc(&r)).expect("readable");
@@ -2162,6 +2455,7 @@ mod tests {
             doc: json!({"amount": "lots"}),
             version: Some(0x2A),
             pipeline: None,
+            alias: None,
         });
         let doc = reject_doc(&upsert);
         assert_eq!(doc["routing"], "customer-1");
@@ -2173,6 +2467,7 @@ mod tests {
             id: "order-7".into(),
             routing: Some("customer-1".into()),
             version: Some(0x2A),
+            alias: None,
         });
         let stored = reject_from_doc("shop-order-7", &reject_doc(&delete)).expect("readable");
         assert_eq!(stored.rejection, delete);
@@ -2213,6 +2508,7 @@ mod tests {
             doc: json!({"amount": 3}),
             version: Some(0x2A),
             pipeline: None,
+            alias: None,
         });
         assert_eq!(
             lines[0],
@@ -2229,6 +2525,7 @@ mod tests {
             id: "order-7".into(),
             routing: Some("customer-1".into()),
             version: None,
+            alias: None,
         });
         assert_eq!(
             lines,
@@ -2246,6 +2543,7 @@ mod tests {
             doc: json!({"id": 1}),
             version: None,
             pipeline: None,
+            alias: None,
         });
         assert_eq!(lines[0], json!({"index": {"_index": "users", "_id": "1"}}));
     }
@@ -2259,6 +2557,7 @@ mod tests {
             doc: json!({"id": 1}),
             version: None,
             pipeline: Some("embed-products".into()),
+            alias: None,
         });
         assert_eq!(
             lines[0],
@@ -2273,6 +2572,7 @@ mod tests {
             id: "1".into(),
             routing: None,
             version: None,
+            alias: None,
         });
         assert_eq!(
             lines,
@@ -2296,12 +2596,58 @@ mod tests {
                 doc: json!({"name": "lamp"}),
                 version: Some(0x2A),
                 pipeline: Some("embed-products".into()),
+                alias: None,
             },
         };
         let doc = reject_doc(&upsert);
         assert_eq!(doc["pipeline"], "embed-products");
         let stored = reject_from_doc("products-7", &doc).expect("readable");
         assert_eq!(stored.rejection, upsert);
+    }
+
+    #[test]
+    fn a_quarantined_document_keeps_the_alias_its_index_is_created_with() {
+        // its replay may be the first write to a per-row index, which then
+        // has to appear with its alias exactly as the original write would
+        let upsert = Rejection {
+            index: "events-acme".into(),
+            doc_id: "7".into(),
+            reason: "mapper_parsing_exception: at".into(),
+            lsn: Lsn(0x2A),
+            op: DocumentOp::Upsert {
+                index: "events-acme".into(),
+                id: "7".into(),
+                routing: None,
+                doc: json!({"at": "x"}),
+                version: Some(0x2A),
+                pipeline: None,
+                alias: Some("acme-live".into()),
+            },
+        };
+        let doc = reject_doc(&upsert);
+        let stored = reject_from_doc("events-acme-7", &doc).expect("readable");
+        assert_eq!(stored.rejection, upsert);
+        // one quarantined before the field existed reads back without one
+        let mut older = doc.clone();
+        older.as_object_mut().expect("an object").remove("alias");
+        let stored = reject_from_doc("events-acme-7", &older).expect("readable");
+        assert!(matches!(
+            stored.rejection.op,
+            DocumentOp::Upsert { alias: None, .. }
+        ));
+        // a versioned delete can create the index as well
+        let delete = Rejection {
+            op: DocumentOp::Delete {
+                index: "events-acme".into(),
+                id: "7".into(),
+                routing: None,
+                version: Some(0x2A),
+                alias: Some("acme-live".into()),
+            },
+            ..upsert
+        };
+        let stored = reject_from_doc("events-acme-7", &reject_doc(&delete)).expect("readable");
+        assert_eq!(stored.rejection, delete);
     }
 
     #[test]
@@ -2369,12 +2715,13 @@ mod tests {
         assert_eq!(require_alias_refusal(&json!({"status": 201})), None);
     }
 
-    /// The request lines an `OpenSearchSink` sends to a loopback listener that
-    /// answers every one of them with an empty, error-free bulk response.
-    ///
-    /// The flag goes on the request rather than on each action here, so a
-    /// serialised action cannot show it and only the URL can.
-    async fn request_lines_of_a_write(require_alias: bool, batch: Vec<LsnOp>) -> Vec<String> {
+    /// A loopback listener standing in for OpenSearch: `answer` maps each
+    /// request line (`"GET /_alias/acme-live"`) to the status and body it
+    /// replies with, and the returned list records every line in the order
+    /// it arrived.
+    async fn loopback_target(
+        answer: fn(&str) -> (u16, &'static str),
+    ) -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -2393,14 +2740,15 @@ mod tests {
                     };
                     let head = String::from_utf8_lossy(&buf[..n]).into_owned();
                     let mut words = head.lines().next().unwrap_or_default().split_whitespace();
-                    lock(&record).push(format!(
+                    let line = format!(
                         "{} {}",
                         words.next().unwrap_or_default(),
                         words.next().unwrap_or_default()
-                    ));
-                    let body = r#"{"errors":false,"items":[]}"#;
+                    );
+                    let (status, body) = answer(&line);
+                    lock(&record).push(line);
                     let response = format!(
-                        "HTTP/1.1 200 Fake\r\nContent-Type: application/json\r\n\
+                        "HTTP/1.1 {status} Fake\r\nContent-Type: application/json\r\n\
                          Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     );
@@ -2409,8 +2757,11 @@ mod tests {
                 });
             }
         });
+        (url, seen)
+    }
 
-        let sink = OpenSearchSink::new(OpenSearchSinkConfig {
+    fn loopback_sink(url: String, require_alias: bool) -> OpenSearchSink {
+        OpenSearchSink::new(OpenSearchSinkConfig {
             url,
             username: None,
             password: None,
@@ -2418,9 +2769,192 @@ mod tests {
             retry: RetryPolicy::default(),
             require_alias,
         })
-        .expect("a sink over plain http");
+        .expect("a sink over plain http")
+    }
+
+    /// The request lines an `OpenSearchSink` sends to a loopback listener that
+    /// answers every one of them with an empty, error-free bulk response.
+    ///
+    /// The flag goes on the request rather than on each action here, so a
+    /// serialised action cannot show it and only the URL can.
+    async fn request_lines_of_a_write(require_alias: bool, batch: Vec<LsnOp>) -> Vec<String> {
+        let (url, seen) = loopback_target(|_| (200, r#"{"errors":false,"items":[]}"#)).await;
+        let sink = loopback_sink(url, require_alias);
         sink.write(batch).await.expect("the fake accepts the batch");
         lock(&seen).clone()
+    }
+
+    #[tokio::test]
+    async fn an_alias_lookup_the_target_refuses_stops_the_switch_before_anything_moves() {
+        // a 403 is not "nobody holds it": reading it that way would add the
+        // alias to the new index and leave it on the old one, so readers
+        // would see both generations while the command reported success
+        let (url, seen) = loopback_target(|line| {
+            if line.starts_with("GET /_alias/") {
+                (
+                    403,
+                    r#"{"error":{"type":"security_exception"},"status":403}"#,
+                )
+            } else {
+                (200, r#"{"acknowledged":true}"#)
+            }
+        })
+        .await;
+        let sink = loopback_sink(url, false);
+        let err = sink
+            .switch_aliases(&[("acme-live".into(), "g2-events-acme".into())])
+            .await
+            .expect_err("a refused lookup is an error");
+        assert!(err.to_string().contains("acme-live"), "{err}");
+        assert!(err.to_string().contains("403"), "{err}");
+        let seen = lock(&seen).clone();
+        assert!(
+            !seen.iter().any(|line| line.starts_with("POST /_aliases")),
+            "nothing was switched: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_alias_nobody_holds_yet_is_only_added() {
+        let (url, seen) = loopback_target(|line| {
+            if line.starts_with("GET /_alias/") {
+                (404, r#"{"error":"alias [acme-live] missing","status":404}"#)
+            } else {
+                (200, r#"{"acknowledged":true}"#)
+            }
+        })
+        .await;
+        let sink = loopback_sink(url, false);
+        sink.switch_aliases(&[("acme-live".into(), "g2-events-acme".into())])
+            .await
+            .expect("a missing alias is the first switch, not a failure");
+        assert_eq!(
+            lock(&seen).clone(),
+            vec![
+                "GET /_alias/acme-live".to_string(),
+                "POST /_aliases".to_string()
+            ]
+        );
+    }
+
+    async fn write_a_tenant_events_live(
+        answer: fn(&str) -> (u16, &'static str),
+    ) -> (Result<SinkAck, CoreError>, Vec<String>) {
+        let (url, seen) = loopback_target(answer).await;
+        let sink = loopback_sink(url, false);
+        sink.ensure_ready(&[IndexSpec {
+            name: "events-*".into(),
+            mapping: None,
+            pattern: true,
+        }])
+        .await
+        .expect("a template is recorded");
+        let written = sink
+            .write(vec![LsnOp {
+                lsn: Lsn(1),
+                op: DocumentOp::Upsert {
+                    index: "events-events-live".into(),
+                    id: "1".into(),
+                    routing: None,
+                    doc: json!({"n": 1}),
+                    version: None,
+                    pipeline: None,
+                    alias: Some("events-live-events-live".into()),
+                },
+            }])
+            .await;
+        let seen = lock(&seen).clone();
+        (written, seen)
+    }
+
+    #[tokio::test]
+    async fn a_row_whose_index_is_the_name_of_an_alias_halts_before_writing_through_it() {
+        // tenant `events` made `events-events` with the alias
+        // `events-events-live`; `HEAD` answers 200 for that alias as for an
+        // index, so tenant `events-live` would be filed in the other tenant's
+        let (written, seen) = write_a_tenant_events_live(|line| match line {
+            "GET /_alias/events-events-live" => (
+                200,
+                r#"{"events-events":{"aliases":{"events-events-live":{}}}}"#,
+            ),
+            "POST /_bulk" => (
+                200,
+                r#"{"errors":false,"items":[{"index":{"status":200}}]}"#,
+            ),
+            _ => (200, r#"{"acknowledged":true}"#),
+        })
+        .await;
+        let err = written.expect_err("an alias is not an index the row may be filed in");
+        assert!(err.to_string().contains("events-events-live"), "{err}");
+        assert!(
+            !seen.iter().any(|line| line.starts_with("POST /_bulk")),
+            "nothing reached the index behind the alias: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_index_deleted_while_the_pipeline_runs_is_created_again_with_its_alias() {
+        // the target answers 404 for events-acme at every look: it was
+        // dropped after the first batch created it, and the target would
+        // otherwise auto-create it bare for the second batch's upsert
+        let (url, seen) = loopback_target(|line| match line {
+            "HEAD /events-acme" => (404, ""),
+            "POST /_bulk" => (
+                200,
+                r#"{"errors":false,"items":[{"index":{"status":201}}]}"#,
+            ),
+            _ => (200, r#"{"acknowledged":true}"#),
+        })
+        .await;
+        let sink = loopback_sink(url, false);
+        sink.ensure_ready(&[IndexSpec {
+            name: "events-*".into(),
+            mapping: None,
+            pattern: true,
+        }])
+        .await
+        .expect("a template is recorded");
+        for _ in 0..2 {
+            sink.write(vec![upsert_into("events-acme", Some("acme-live"))])
+                .await
+                .expect("written");
+        }
+        let seen = lock(&seen).clone();
+        let after_ready = seen
+            .iter()
+            .skip_while(|line| !line.starts_with("HEAD /events-acme"))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            after_ready,
+            [
+                "HEAD /events-acme",
+                "PUT /events-acme",
+                "POST /_bulk",
+                "HEAD /events-acme",
+                "PUT /events-acme",
+                "POST /_bulk"
+            ],
+            "{seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_row_whose_index_already_exists_is_written_to_it() {
+        let (written, seen) = write_a_tenant_events_live(|line| match line {
+            "GET /_alias/events-events-live" => (404, r#"{"status":404}"#),
+            "POST /_bulk" => (
+                200,
+                r#"{"errors":false,"items":[{"index":{"status":200}}]}"#,
+            ),
+            _ => (200, r#"{"acknowledged":true}"#),
+        })
+        .await;
+        written.expect("an existing index is the row's own");
+        assert!(
+            seen.iter().any(|line| line.starts_with("POST /_bulk")),
+            "{seen:?}"
+        );
     }
 
     fn an_upsert_and_a_delete() -> Vec<LsnOp> {
@@ -2434,6 +2968,7 @@ mod tests {
                     doc: json!({"id": 1}),
                     version: Some(0x2A),
                     pipeline: None,
+                    alias: None,
                 },
             },
             LsnOp {
@@ -2443,6 +2978,7 @@ mod tests {
                     id: "2".into(),
                     routing: None,
                     version: Some(0x2A),
+                    alias: None,
                 },
             },
         ]

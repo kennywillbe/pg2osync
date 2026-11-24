@@ -17,24 +17,28 @@
 //!   stream does not
 //! - the indices a pattern claims are listed, and a pattern that claims none
 //!   is an empty list
+//! - an index created for a row carries the alias the row names, even when a
+//!   versioned delete reaches it first; several aliases move to another index
+//!   in one switch, and a pattern lists them
 //!
 //! Behind the `testkit` feature so nothing of it reaches a release binary.
 //!
-//! Three things are the caller's, because only the caller knows them: the
-//! documents its target accepts, a document its target refuses, and whether
-//! its target can list indices by pattern. A target with no document it can
-//! refuse — a schema-less one — leaves the second out, and the partial-batch
-//! check is skipped rather than faked; one that keeps the trait's default for
-//! `list_indices` leaves the third out, and the listing check is skipped. The
-//! default answers with an error, and an error is not something the kit can
-//! tell apart from a broken implementation, so the caller says which it is.
+//! Four things are the caller's, because only the caller knows them: the
+//! documents its target accepts, a document its target refuses, whether its
+//! target can list indices by pattern, and whether it can switch aliases. A
+//! target with no document it can refuse — a schema-less one — leaves the
+//! second out, and the partial-batch check is skipped rather than faked; one
+//! that keeps the trait's default for `list_indices` or `switch_aliases`
+//! leaves the third or fourth out, and that check is skipped. The default
+//! answers with an error, and an error is not something the kit can tell
+//! apart from a broken implementation, so the caller says which it is.
 //! Skipping is reported, so an opt-out is a line in the output rather than a
 //! silence.
 
 use crate::checkpoint::{Checkpoint, StreamId};
 use crate::error::CoreError;
 use crate::lsn::Lsn;
-use crate::sink::{DocumentOp, LsnOp, Sink};
+use crate::sink::{DocumentOp, IndexSpec, LsnOp, Sink};
 use serde_json::Value;
 
 /// The suite, bound to one index of one target.
@@ -43,6 +47,7 @@ pub struct SinkTestHarness {
     document: Box<dyn Fn(&str) -> Value + Send + Sync>,
     unacceptable: Option<Value>,
     lists_indices: bool,
+    switches_aliases: bool,
 }
 
 /// What ran, so a caller can print it and a reader can see what was skipped.
@@ -61,6 +66,7 @@ impl SinkTestHarness {
             document: Box::new(document),
             unacceptable: None,
             lists_indices: false,
+            switches_aliases: false,
         }
     }
 
@@ -78,6 +84,15 @@ impl SinkTestHarness {
     /// is reported as skipped.
     pub fn with_index_listing(mut self) -> Self {
         self.lists_indices = true;
+        self
+    }
+
+    /// The target implements `switch_aliases` and `list_aliases`, and
+    /// creates an index a row chose with the alias the row names, and refuses
+    /// a row whose index is the name of an alias. Without this the alias
+    /// check is reported as skipped.
+    pub fn with_alias_switching(mut self) -> Self {
+        self.switches_aliases = true;
         self
     }
 
@@ -129,6 +144,15 @@ impl SinkTestHarness {
             report.passed.push("index listing".into());
         } else {
             report.skipped.push("index listing".into());
+        }
+
+        if self.switches_aliases {
+            self.alias_switching(sink)
+                .await
+                .map_err(named("alias switching"))?;
+            report.passed.push("alias switching".into());
+        } else {
+            report.skipped.push("alias switching".into());
         }
         Ok(report)
     }
@@ -189,6 +213,7 @@ impl SinkTestHarness {
                 doc: read.clone(),
                 version: Some(150),
                 pipeline: None,
+                alias: None,
             },
         }])
         .await?;
@@ -267,6 +292,7 @@ impl SinkTestHarness {
                     doc: unacceptable,
                     version: Some(601),
                     pipeline: None,
+                    alias: None,
                 },
             },
             self.upsert("kit-after", 602),
@@ -388,6 +414,168 @@ impl SinkTestHarness {
         Ok(())
     }
 
+    /// A tenant that first appears after a rebuild's switch is behind its
+    /// alias only if its index is created with it, and a rebuild that moved
+    /// its tenants' aliases one at a time would let readers see two
+    /// generations at once. Both, against indices of the kit's own.
+    async fn alias_switching(&self, sink: &dyn Sink) -> Result<(), CoreError> {
+        let pattern = format!("{}-kit-tpl-*", self.index);
+        let created = format!("{}-kit-tpl-x", self.index);
+        let other = format!("{}-kit-other", self.index);
+        let deleted_first = format!("{}-kit-tpl-deleted-first", self.index);
+        let deleted_alias = format!("{}-kit-deleted-first", self.index);
+        let (first, second) = (
+            format!("{}-kit-alias-a", self.index),
+            format!("{}-kit-alias-b", self.index),
+        );
+        // whatever a run that died partway left behind
+        sink.delete_index(&created).await?;
+        sink.delete_index(&other).await?;
+        sink.delete_index(&deleted_first).await?;
+        let checked = async {
+            sink.ensure_ready(&[
+                IndexSpec {
+                    name: pattern,
+                    mapping: None,
+                    pattern: true,
+                },
+                IndexSpec {
+                    name: other.clone(),
+                    mapping: None,
+                    pattern: false,
+                },
+            ])
+            .await?;
+            sink.write(vec![LsnOp {
+                lsn: Lsn(1),
+                op: DocumentOp::Upsert {
+                    index: created.clone(),
+                    id: "kit-alias".into(),
+                    routing: None,
+                    doc: (self.document)("kit-alias"),
+                    version: None,
+                    pipeline: None,
+                    alias: Some(first.clone()),
+                },
+            }])
+            .await?;
+            sink.refresh(std::slice::from_ref(&created)).await?;
+            if sink.count_documents(&first).await? != Some(1) {
+                return fail(format!(
+                    "{created} was created for a row naming the alias {first}, which does not \
+                     resolve to it"
+                ));
+            }
+            // A versioned delete is the first write a recreated index sees
+            // when a replay reaches it, and the target creates a missing index
+            // for one; the upsert in the next batch then finds it there.
+            for (lsn, op) in [
+                (
+                    3,
+                    DocumentOp::Delete {
+                        index: deleted_first.clone(),
+                        id: "kit-alias-gone".into(),
+                        routing: None,
+                        version: Some(3),
+                        alias: Some(deleted_alias.clone()),
+                    },
+                ),
+                (
+                    4,
+                    DocumentOp::Upsert {
+                        index: deleted_first.clone(),
+                        id: "kit-alias-back".into(),
+                        routing: None,
+                        doc: (self.document)("kit-alias-back"),
+                        version: Some(4),
+                        pipeline: None,
+                        alias: Some(deleted_alias.clone()),
+                    },
+                ),
+            ] {
+                sink.write(vec![LsnOp { lsn: Lsn(lsn), op }]).await?;
+            }
+            sink.refresh(std::slice::from_ref(&deleted_first)).await?;
+            if sink.count_documents(&deleted_alias).await? != Some(1) {
+                return fail(format!(
+                    "{deleted_first} was first written by a delete naming the alias \
+                     {deleted_alias}, and a row written to it later does not resolve through it"
+                ));
+            }
+            sink.switch_aliases(&[
+                (first.clone(), other.clone()),
+                (second.clone(), other.clone()),
+            ])
+            .await?;
+            for alias in [&first, &second] {
+                if !sink.is_alias(alias).await? {
+                    return fail(format!("{alias} is not an alias after the switch"));
+                }
+                // the other index is empty, so a count of one is the alias
+                // still reaching the index it was moved off
+                if sink.count_documents(alias).await? != Some(0) {
+                    return fail(format!(
+                        "{alias} was switched to {other} alone and still reaches {created}"
+                    ));
+                }
+            }
+            let aliases = format!("{}-kit-alias-*", self.index);
+            let listed = sink.list_aliases(&aliases).await?;
+            let want = vec![
+                (first.clone(), other.clone()),
+                (second.clone(), other.clone()),
+            ];
+            if listed != want {
+                return fail(format!(
+                    "{aliases} lists {listed:?} after the switch; expected {want:?}"
+                ));
+            }
+            let none = format!("{}-kit-no-alias-*", self.index);
+            let empty = sink.list_aliases(&none).await?;
+            if !empty.is_empty() {
+                return fail(format!("{none} matches no alias and lists {empty:?}"));
+            }
+            // a row whose index renders the name of an alias that already
+            // exists: the target answers that name as if it were an index, so
+            // a sink that took its word would file the row behind the alias
+            let taken = format!("{}-kit-tpl-taken", self.index);
+            sink.switch_aliases(&[(taken.clone(), other.clone())])
+                .await?;
+            let through = sink
+                .write(vec![LsnOp {
+                    lsn: Lsn(2),
+                    op: DocumentOp::Upsert {
+                        index: taken.clone(),
+                        id: "kit-alias-taken".into(),
+                        routing: None,
+                        doc: (self.document)("kit-alias-taken"),
+                        version: None,
+                        pipeline: None,
+                        alias: None,
+                    },
+                }])
+                .await;
+            if through.is_ok() {
+                return fail(format!(
+                    "a row chose {taken}, which is an alias of {other}, and was written \
+                     through it instead of being refused"
+                ));
+            }
+            sink.refresh(std::slice::from_ref(&other)).await?;
+            if sink.count_documents(&other).await? != Some(0) {
+                return fail(format!(
+                    "a row chose the alias {taken} and landed in {other}"
+                ));
+            }
+            Ok(())
+        }
+        .await;
+        sink.delete_index(&created).await?;
+        sink.delete_index(&other).await?;
+        sink.delete_index(&deleted_first).await?;
+        checked
+    }
+
     /// Every document this suite writes, gone, whatever position it carried.
     async fn clear(&self, sink: &dyn Sink) -> Result<(), CoreError> {
         sink.truncate_index(&self.index, None, None).await?;
@@ -411,6 +599,7 @@ impl SinkTestHarness {
                 doc: (self.document)(id),
                 version: Some(version),
                 pipeline: None,
+                alias: None,
             },
         }
     }
