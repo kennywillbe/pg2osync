@@ -289,6 +289,18 @@ pg "DELETE FROM orders WHERE id=13;" > /dev/null
 synced
 check "child DELETE refreshes parent" "$(os_len e2e_customers 2 orders)" "1"
 
+# A re-parented child is in the parent it joined and gone from the one it
+# left; only the before-image names the second, which REPLICA IDENTITY FULL on
+# orders (dev/seed.sql) is what carries.
+pg "UPDATE orders SET customer_id=2 WHERE id=11;" > /dev/null
+synced
+check "a moved child joins its new parent" "$(os_len e2e_customers 2 orders)" "2"
+check "and leaves the old one" "$(os_len e2e_customers 1 orders)" "1"
+pg "UPDATE orders SET customer_id=1 WHERE id=11;" > /dev/null
+synced
+check "moved back, both arrays are what they were" \
+  "$(os_len e2e_customers 1 orders),$(os_len e2e_customers 2 orders)" "2,1"
+
 # the re-fetch shares the load's element expression, so the projection holds on
 # the streamed path too — a change to the excluded column may not leak it
 pg "UPDATE orders SET internal_notes='still secret' WHERE id=12;" > /dev/null

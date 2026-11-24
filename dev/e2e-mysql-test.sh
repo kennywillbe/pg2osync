@@ -647,6 +647,29 @@ sleep 3; refresh
 # parent is always locatable — no REPLICA IDENTITY caveat as on PostgreSQL
 check "child DELETE refreshes the parent" "$(os_len e2e_mysql_kid 1 items)" "2"
 
+# a re-parented child is in the parent it joined and gone from the one it left,
+# which only the before-image names
+my "UPDATE kid_item SET parent_id = 2 WHERE id = 11;"
+sleep 3; refresh
+check "a moved child joins its new parent" "$(os_len e2e_mysql_kid 2 items)" "1"
+check "and leaves the old one" "$(os_len e2e_mysql_kid 1 items)" "1"
+my "UPDATE kid_item SET parent_id = 1 WHERE id = 11;"
+sleep 3; refresh
+check "moved back, both arrays are what they were" \
+  "$(os_len e2e_mysql_kid 1 items),$(os_len e2e_mysql_kid 2 items)" "2,0"
+
+# a NULL foreign key is a row with no parent, not a fault: detaching re-reads
+# the parent it left, and a parentless row coming and going names nobody. The
+# re-attach after them is what shows the stream never stopped on one.
+my "UPDATE kid_item SET parent_id = NULL WHERE id = 11;"
+sleep 3; refresh
+check "a detached child leaves its parent" "$(os_len e2e_mysql_kid 1 items)" "1"
+my "INSERT INTO kid_item VALUES (19,NULL,0x04,1.00,b'1','a','i19','orphan');"
+my "DELETE FROM kid_item WHERE id = 19;"
+my "UPDATE kid_item SET parent_id = 1 WHERE id = 11;"
+sleep 3; refresh
+check "past parentless rows, a re-attached child is back" "$(os_len e2e_mysql_kid 1 items)" "2"
+
 # the same projected schema builds the load's and the re-fetch's select list, so
 # a change to the excluded column may not leak it into the array
 my "UPDATE kid_item SET internal_notes = 'still secret' WHERE id = 10;"

@@ -501,12 +501,16 @@ impl MySqlSource {
                                         Some(through) => &through.child_key,
                                         None => &spec.foreign_key,
                                     };
-                                    let key = row_column(rt, &table, row, column)?;
                                     match through {
                                         Some(_) => {
+                                            let key = row_column(rt, &table, row, column)?;
                                             pending.name_through(parent.clone(), &spec.field, key)
                                         }
-                                        None => pending.name_parent(parent.clone(), key),
+                                        None => {
+                                            for key in parent_keys(rt, &table, row, column)? {
+                                                pending.name_parent(parent.clone(), key);
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -517,9 +521,7 @@ impl MySqlSource {
                             None => {
                                 let spec = aggregate_spec(&self.cfg, &parent, &table)?.clone();
                                 for row in &set.rows {
-                                    for image in [&row.after, &row.before].into_iter().flatten() {
-                                        let key =
-                                            image_column(rt, &table, image, &spec.foreign_key)?;
+                                    for key in parent_keys(rt, &table, row, &spec.foreign_key)? {
                                         pending.name_parent(parent.clone(), key);
                                     }
                                 }
@@ -662,20 +664,51 @@ fn row_column(
     image_column(rt, table, values, column)
 }
 
-/// The same column read out of one named image, so a row that moved between
-/// parents can be read twice: once as it is, once as it was.
+/// Every parent a child row belongs to in one change, the current one first.
+///
+/// A row whose foreign key moved belongs to two, and the before-image is the
+/// only place the one it left is named. `binlog_row_image = FULL` puts every
+/// column in every image, so a NULL here is the value the row holds: a row with
+/// no parent on that side, which names nobody rather than halting the stream.
+fn parent_keys(
+    rt: &RegisteredTable,
+    table: &(String, String),
+    row: &binlog::RowsRow,
+    column: &str,
+) -> Result<Vec<serde_json::Value>> {
+    let idx = column_position(rt, table, column)?;
+    if row.after.is_none() && row.before.is_none() {
+        return Err(MySqlError::protocol("child row carries no image"));
+    }
+    let mut keys: Vec<serde_json::Value> = Vec::new();
+    for image in [&row.after, &row.before].into_iter().flatten() {
+        if let Some(Some(key)) = image.get(idx)
+            && !keys.contains(key)
+        {
+            keys.push(key.clone());
+        }
+    }
+    Ok(keys)
+}
+
+fn column_position(rt: &RegisteredTable, table: &(String, String), column: &str) -> Result<usize> {
+    rt.columns.iter().position(|c| c == column).ok_or_else(|| {
+        MySqlError::protocol(format!(
+            "column {column} missing on {}.{}",
+            table.0, table.1
+        ))
+    })
+}
+
+/// The same column read out of one named image, where a NULL is an error: the
+/// image it is asked of is the one that has to say where the row belongs.
 fn image_column(
     rt: &RegisteredTable,
     table: &(String, String),
     values: &[Option<serde_json::Value>],
     column: &str,
 ) -> Result<serde_json::Value> {
-    let idx = rt.columns.iter().position(|c| c == column).ok_or_else(|| {
-        MySqlError::protocol(format!(
-            "column {column} missing on {}.{}",
-            table.0, table.1
-        ))
-    })?;
+    let idx = column_position(rt, table, column)?;
     values.get(idx).and_then(|v| v.clone()).ok_or_else(|| {
         MySqlError::protocol(format!(
             "child row of {}.{} carries no {column}; cannot locate its parent",
@@ -959,6 +992,80 @@ mod tests {
             pk_columns: vec!["id".into()],
             append_only: false,
         }
+    }
+
+    fn kid_item() -> (RegisteredTable, (String, String)) {
+        let rt = RegisteredTable {
+            table: "kid_item".into(),
+            columns: vec!["id".into(), "parent_id".into()],
+            ..table()
+        };
+        (rt, ("shop".into(), "kid_item".into()))
+    }
+
+    fn moved(from: Option<i64>, to: Option<i64>) -> binlog::RowsRow {
+        binlog::RowsRow {
+            before: Some(vec![Some(json!(10)), from.map(|p| json!(p))]),
+            after: Some(vec![Some(json!(10)), to.map(|p| json!(p))]),
+        }
+    }
+
+    #[test]
+    fn a_child_moved_to_another_parent_names_the_one_it_left_too() {
+        let (rt, t) = kid_item();
+        assert_eq!(
+            parent_keys(&rt, &t, &moved(Some(1), Some(2)), "parent_id").unwrap(),
+            vec![json!(2), json!(1)],
+            "the parent the row left still embeds it until it is re-read"
+        );
+        assert_eq!(
+            parent_keys(&rt, &t, &moved(Some(2), Some(2)), "parent_id").unwrap(),
+            vec![json!(2)],
+            "one parent is named once"
+        );
+    }
+
+    #[test]
+    fn a_child_with_no_parent_names_nobody() {
+        let (rt, t) = kid_item();
+        let inserted = binlog::RowsRow {
+            before: None,
+            after: Some(vec![Some(json!(10)), None]),
+        };
+        assert_eq!(
+            parent_keys(&rt, &t, &inserted, "parent_id").unwrap(),
+            Vec::<serde_json::Value>::new()
+        );
+        let deleted = binlog::RowsRow {
+            before: Some(vec![Some(json!(10)), None]),
+            after: None,
+        };
+        assert_eq!(
+            parent_keys(&rt, &t, &deleted, "parent_id").unwrap(),
+            Vec::<serde_json::Value>::new()
+        );
+    }
+
+    #[test]
+    fn a_child_that_had_no_parent_names_the_one_it_joined() {
+        let (rt, t) = kid_item();
+        assert_eq!(
+            parent_keys(&rt, &t, &moved(None, Some(2)), "parent_id").unwrap(),
+            vec![json!(2)]
+        );
+        assert_eq!(
+            parent_keys(&rt, &t, &moved(Some(1), None), "parent_id").unwrap(),
+            vec![json!(1)],
+            "a detached row belongs to no parent, and the one it left still embeds it"
+        );
+        let deleted = binlog::RowsRow {
+            before: Some(vec![Some(json!(10)), Some(json!(1))]),
+            after: None,
+        };
+        assert_eq!(
+            parent_keys(&rt, &t, &deleted, "parent_id").unwrap(),
+            vec![json!(1)]
+        );
     }
 
     #[test]

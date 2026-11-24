@@ -1232,9 +1232,27 @@ startup for the same reason.
   (`ALTER TABLE public.orders REPLICA IDENTITY FULL`). Without it a DELETE
   carries no foreign key, so the parent cannot be located; pg2osync warns at
   startup and fails on such a delete rather than silently going stale.
+- **An UPDATE that moves a child to another parent re-reads both.** The parent
+  it left is named only by the row's before-image, which PostgreSQL sends with
+  the foreign key under `REPLICA IDENTITY FULL` — the same setting as above.
+  Without it only the new parent is re-read, and the old one keeps the child in
+  its array until something else changes it. A child whose foreign key is set
+  to NULL belongs to no parent from then on: the one it left is re-read under
+  the same condition, and a row inserted or deleted with a NULL foreign key
+  touches no parent at all.
 - MySQL/MariaDB: the child table is streamed from the binlog automatically;
   `binlog_row_image = FULL` (already required) is what lets a child DELETE
-  carry its foreign key, so there is no REPLICA IDENTITY caveat.
+  carry its foreign key and a re-parented child name the parent it left, so
+  there is no REPLICA IDENTITY caveat.
+- **One table, one parent.** A child, junction or aggregated table may appear
+  under only one parent and be read by one `foreign_key` (or, for a
+  many-to-many child, through one junction); a second use that resolves another
+  way is refused when the config is read, because a streamed row can only name
+  one parent. A child and an aggregate over the same table, by the same key,
+  under the same parent are fine.
+- **Not under `mode = "poll"`.** A polled parent row is written as the whole
+  document, which would drop the arrays, and nothing polls the child tables;
+  the combination is refused when the config is read.
 - **A `TRUNCATE` of a child table — or of a junction — is not applied to the
   parents.** A truncate clears the index of the table it names, and a child has
   no index of its own; the parents keep the arrays they had until something
@@ -1453,6 +1471,9 @@ takes and rendered through the same parser for both dialects.
   initial load and no streamed change.
 - Map the field as a `long`. Nothing else about the target changes: it is one
   more number on the document.
+- **Not under `mode = "poll"`**, exactly as for a child: a polled parent row is
+  written as the whole document, which would drop the number, and nothing polls
+  the counted table; the combination is refused when the config is read.
 - A `TRUNCATE` of the aggregated table is not applied to the parents, exactly as
   for a child table; `pg2osync resnapshot --table public.contacts` rebuilds them.
 
