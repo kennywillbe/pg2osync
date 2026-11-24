@@ -703,6 +703,33 @@ to run on a MySQL stream, since the generation is not settled yet. On
 PostgreSQL an initial load 1.x left unfinished carries on from where
 it stopped, and the stream resumes from the slot.
 
+The MySQL load only upserts, and the stream starts at the server's position
+now, so a row deleted, truncated or moved to another index while 1.x was
+stopped stays in an index 1.x wrote, and `reconcile` does not read MySQL. So on
+MySQL, **before the first 2.0 start**, point every `[sync]` section at an index
+name 1.x never wrote to. The first start loads every table into the new names;
+once the load is done, move readers onto them (`pg2osync switch-alias`, if they
+query an alias) and delete the old indices. This works for every kind of
+section.
+
+Renaming the indices only *after* that first start does not work: it writes its
+checkpoint before the first chunk, under an id that names the stream rather
+than the indices, so a restart onto new names resumes from it and the new
+indices miss rows. If 2.0 has already started on the 1.x names, it logs a
+`WARN` naming the repairs that still work:
+
+- `pg2osync reindex` for each table it accepts, with the pipeline stopped.
+  Readers have to query the name passed as `--alias`, since that is what moves
+  onto the rebuilt index.
+- For the rest — shared or join indices, fanned tables, templates without an
+  alias — or where readers cannot move to an alias: stop the pipeline, give
+  `[source]` a `server_id` nothing else uses and point `[sync]` at fresh index
+  names, then start it. A new `server_id` is a new stream with no checkpoint, so
+  every table loads into the new names.
+
+PostgreSQL needs none of this: the slot replays every change since 1.x last
+confirmed, deletes included.
+
 Rolling *back* to 1.x is not supported, and on MySQL it can lose writes
 silently. On PostgreSQL 1.x reads the current checkpoint's LSN and resumes from
 it. On MySQL it cannot parse the current checkpoint, so it starts a full initial

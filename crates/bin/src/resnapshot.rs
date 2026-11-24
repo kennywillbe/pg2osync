@@ -68,6 +68,11 @@ pub async fn run_for(
     }
 
     let sink = run::build_sink(cfg, target_password)?;
+    // The load asks the same question later; asked here, a refusal comes before
+    // the command has created a mapping or said it is re-reading anything.
+    if cfg.source.flavor == "mysql" {
+        mysql_version_base(sink.as_ref(), &cfg.stream_id()).await?;
+    }
     // So a config pointed at a *new* index name gets its mapping first, which is
     // what the re-index recipe does before switching an alias onto it. The
     // mapping may belong to a different section feeding this index, so the

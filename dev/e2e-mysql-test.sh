@@ -433,6 +433,9 @@ curl -s -XPUT "$OS/.pg2osync_meta/_doc/$PROG?refresh=true" -H 'Content-Type: app
   -d '{"after":["999999"],"finished":true}' > /dev/null
 my "UPDATE resume_probe SET v='changed-before-the-upgrade' WHERE id = 78;"
 skips_before=$(grep -c "sourcedb.resume_probe was fully loaded by an earlier run" "$LOG" || true)
+# The load only upserts and the stream starts from now, so a row deleted while
+# 1.x was stopped is in neither: the run has to say so, and name the rebuild.
+gap_warnings_before=$(grep -c "WARN.*last checkpointed by 1.x" "$LOG" || true)
 sync_spawn "$RCONFIG"
 for _ in $(seq 1 120); do
   refresh
@@ -443,6 +446,13 @@ check "a refused checkpoint loads again, past finished load records" \
   "$(os_field e2e_mysql_resume 78 v)" "changed-before-the-upgrade"
 check "no table is skipped as already loaded" \
   "$(grep -c "sourcedb.resume_probe was fully loaded by an earlier run" "$LOG" || true)" "$skips_before"
+gap_warnings=$(grep "WARN.*last checkpointed by 1.x" "$LOG" || true)
+if [ "$(grep -c . <<< "$gap_warnings")" -gt "$gap_warnings_before" ] \
+  && tail -n 1 <<< "$gap_warnings" | grep -qF "pg2osync reindex --table sourcedb.resume_probe"; then
+  ok "the upgrade warns that deletes since 1.x are not in its load, and names the rebuild"
+else
+  bad "the upgrade did not warn of the deletes its load cannot see"
+fi
 stop_sync
 
 say "13. the load and the stream agree on every column type"
@@ -2124,15 +2134,21 @@ curl -s -XPUT "$OS/e2e_mysql_users/_doc/1?version=$LEGACY_VERSION&version_type=e
   -H 'Content-Type: application/json' -d '{"id":1,"name":"indexed-by-1x"}' > /dev/null
 check "1.x's document is in place" "$(os_field e2e_mysql_users 1 name)" "indexed-by-1x"
 my "UPDATE shop_users SET name='loaded-after-upgrade' WHERE id=1;"
-if $BIN resnapshot -c "$CONFIG" --table sourcedb.shop_users >> "$LOG" 2>&1; then
+if resnapshot_refusal=$($BIN resnapshot -c "$CONFIG" --table sourcedb.shop_users 2>&1); then
   bad "a re-snapshot with only the 1.x checkpoint was accepted"
 else
   ok "a re-snapshot with only the 1.x checkpoint is refused"
 fi
-if tail -n 20 "$LOG" | grep -qF 'start `pg2osync run` first'; then
+echo "$resnapshot_refusal" >> "$LOG"
+if grep -qF 'start `pg2osync run` first' <<< "$resnapshot_refusal"; then
   ok "and the refusal says to start the pipeline first"
 else
   bad "the refusal does not say to start the pipeline first"
+fi
+if grep -q "re-reading" <<< "$resnapshot_refusal"; then
+  bad "the refused re-snapshot still announced a re-read"
+else
+  ok "and it announced no re-read before refusing"
 fi
 check "it wrote nothing" "$(os_field e2e_mysql_users 1 name)" "indexed-by-1x"
 # A rebuild reads through the same load, so it waits for the same run; it has

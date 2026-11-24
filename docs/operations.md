@@ -190,7 +190,7 @@ needs no flag at all.
 | `status` | Checkpoint position versus the source's, and what each slot retains |
 | `setup-sql` | Print the SQL a DBA needs, derived from your config |
 | `resnapshot --table T` | Read one table again into its index, without reloading the rest |
-| `reconcile` | Name index documents whose row is gone; `--delete` removes them |
+| `reconcile` | Name index documents whose row is gone; `--delete` removes them (PostgreSQL sources only) |
 | `rejects` | What the target refused, and `--replay` to submit it again |
 | `reindex --table T --alias A` | Rebuild the table's index under a fresh name and flip the alias onto it (a swap of the two names on Meilisearch, which has no aliases) |
 | `switch-alias --alias A` | Point an alias at this config's index, atomically |
@@ -278,6 +278,10 @@ Each index is paged in primary-key order and each page of keys is checked
 against the table. A document whose row is gone is named; with `--delete` it is
 removed. Only keys move between the two sides, which is what makes this far
 cheaper than a reindex.
+
+It reads PostgreSQL sources only; on a MySQL source the command refuses to run.
+There, documents whose rows are gone are removed by rebuilding the index with
+[`reindex`](configuration.md#rebuilding-an-index).
 
 The key column need not be unique within an index — a composite real key with
 one declared key column puts several documents under one key — and a key's
@@ -588,7 +592,8 @@ that wrote a wrong value.
 Three things it does not do:
 
 - **It does not delete.** A row gone from the source keeps its document; deciding
-  that is `reconcile`'s job, and keeping the two apart keeps each explainable.
+  that is `reconcile`'s job on PostgreSQL and `reindex`'s on MySQL, and keeping
+  them apart keeps each explainable.
 - **It does not resume.** An interruption means running it again, which costs the
   read and nothing else. Recording progress would leave bookkeeping the next
   pipeline start would read as an unfinished initial load.
@@ -685,6 +690,19 @@ Until that first start has written its checkpoint, `resnapshot` and `reindex`
 refuse to run on a MySQL stream, because the generation is not settled yet.
 On PostgreSQL an unfinished 1.x load carries on from its progress and the
 stream resumes from the slot.
+
+On MySQL the upgrade has one more step, taken **before the first 2.0 start**.
+The load only upserts and the stream starts at the server's position now, so a
+row deleted, truncated or moved to another index while 1.x was stopped stays in
+an index 1.x wrote, and `reconcile` does not read MySQL. Point every `[sync]`
+section at an index name 1.x never wrote to, start 2.0, and move readers onto
+the new names once the load is done. Renaming after that first start is too
+late: its checkpoint names the stream, not the indices, so a restart onto new
+names resumes from it. A start on the 1.x names logs a `WARN` with the repairs
+that still work — `reindex` per table it accepts, otherwise a new `server_id`
+plus fresh names; see
+[Upgrades and rollbacks](deployment.md#upgrades-and-rollbacks). PostgreSQL needs
+nothing: the slot replays the gap, deletes included.
 
 Rolling back to 1.x is not supported. On PostgreSQL 1.x resumes from the
 current checkpoint's LSN. On MySQL it re-runs the initial load in version

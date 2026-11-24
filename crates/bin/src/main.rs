@@ -119,7 +119,8 @@ enum Command {
         alias: String,
     },
     /// Compare each index against its source table and report documents whose
-    /// row is gone. Reports only unless --delete is given.
+    /// row is gone. Reports only unless --delete is given. PostgreSQL sources
+    /// only.
     Reconcile {
         #[command(flatten)]
         config: ConfigArgs,

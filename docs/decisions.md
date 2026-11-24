@@ -896,7 +896,15 @@ the window the way the initial load does — its rows carry no position, the
 checkpoint does not move, and restarting the pipeline against the new index
 replays everything committed since. The refusal is positive evidence rather
 than a flag: an active replication slot on PostgreSQL, and on either source a
-checkpoint that moves while it is watched. There is no `--force`.
+checkpoint that moves while it is watched — for two seconds before the load,
+and again across the whole load just before the alias moves. There is no
+`--force`. The second look exists because a running pipeline with nothing to
+stream leaves no evidence on MySQL (it does not register with the server) and
+none on PostgreSQL between reconnects: it keeps writing the index the section
+names while the alias moves away, its checkpoint advances past those changes,
+and the restart against the new index replays only from there, so they are
+lost from it. A pipeline that stays idle through the whole rebuild and wakes
+after the switch is still not detected; stopping it is the operator's step.
 
 The alias is flipped before the restart because it costs nothing to: the old
 index is exactly as stale as the new one at that moment, and both catch up
@@ -1246,6 +1254,21 @@ one-shot load used. PostgreSQL has
 nothing to carry: its version is the LSN, which never goes backwards on one
 slot. There an unfinished 1.x load resumes from its own progress and the
 stream resumes from the slot.
+
+The consequence on MySQL is a gap the upgrade cannot close by itself. The load
+only upserts and the stream starts at the server's coordinate now, so a row
+deleted, truncated or moved to another templated index while 1.x was stopped
+is in neither, and stays indexed. `reconcile` does not read MySQL, so the
+documented upgrade points `[sync]` at fresh index names before the first 2.0
+start, which works for every kind of section. After that start it is too late
+for names alone: the first checkpoint is written before the first chunk under
+an id that names the stream, not the indices, so a restart onto new names
+resumes from it. The run therefore logs a warning when it starts from a 1.x
+checkpoint naming only what still works then: `reindex` for each table that
+command accepts (asked through the command's own refusals), and otherwise a new
+`server_id` — a new stream with no checkpoint — with fresh names. Resuming the
+1.x position to replay the gap stays rejected for the reason above. PostgreSQL has no such gap: the slot replays everything since
+1.x last confirmed, deletes included.
 
 **A quarantined document keeps its position and its version apart.** The
 reject store records the position as hex under `ordering` — absent for a row

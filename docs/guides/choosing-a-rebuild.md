@@ -74,7 +74,7 @@ the gap they leave.
 | | What it is | Freshness gap | Needs |
 |---|---|---|---|
 | `resnapshot` into a new index name | a copy of the config pointing at `users_v2`, filled from the source, then `switch-alias` | the new index is static from the moment the re-snapshot finished | no second slot |
-| [`reindex`](../configuration.md#rebuilding-an-index) | one command: create `users-<unix seconds>` from the section's `mapping_file`, load it, check the count, move the alias | the length of the load — the pipeline is stopped for it | the pipeline stopped; it refuses to run beside a live stream, and there is no `--force` |
+| [`reindex`](../configuration.md#rebuilding-an-index) | one command: create `users-<unix seconds>` from the section's `mapping_file`, load it, check the count, move the alias | the length of the load — the pipeline is stopped for it | the pipeline stopped; it refuses when it sees a live stream, and there is no `--force` |
 | a second instance | a second config with its own `index` and `slot_name`, run to catch-up, then the alias moved | none | a second slot, and two lots of retained WAL until the old one is dropped |
 
 `reindex` is the usual answer. A

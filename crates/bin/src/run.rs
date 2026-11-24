@@ -2360,7 +2360,8 @@ fn carried_over_base(legacy: Option<&str>, head: u64) -> u64 {
 }
 
 /// Read the 1.x checkpoint `stream` may have left and settle the base it
-/// carries over onto the source's current coordinate; 0 when there is none.
+/// carries over onto the source's current coordinate; `None` when there is
+/// none.
 ///
 /// A read that fails is an error rather than a 0: a 0 under a 1.x generation
 /// is the silent staleness this exists to prevent.
@@ -2368,14 +2369,14 @@ async fn mysql_base_from_1x(
     sink: &dyn Sink,
     stream: &StreamId,
     admin: &mut pg2osync_source_mysql::connection::MySqlConnection,
-) -> Result<u64> {
+) -> Result<Option<u64>> {
     use pg2osync_source_mysql::catalog as mysql_catalog;
     let Some(legacy) = sink
         .read_legacy_position_text(stream)
         .await
         .context("reading the checkpoint 1.x left, for its version generation")?
     else {
-        return Ok(0);
+        return Ok(None);
     };
     let (file, pos) = mysql_catalog::master_position(admin).await?;
     let base = carried_over_base(Some(&legacy), mysql_catalog::pack_coordinate(&file, pos));
@@ -2384,7 +2385,65 @@ async fn mysql_base_from_1x(
             "a 1.x checkpoint is not resumed from, but its versions are in the target: \
              versioning documents from generation {base} so none goes backwards");
     }
-    Ok(base)
+    Ok(Some(base))
+}
+
+/// What to tell the operator when a MySQL stream starts over from a 1.x
+/// checkpoint; `None` when there was no 1.x checkpoint to start over from.
+///
+/// The load that follows only upserts and the stream starts at the server's
+/// coordinate now, so a delete, TRUNCATE or index move made while 1.x was
+/// stopped is in neither. MySQL keeps no slot that would replay that gap and
+/// `reconcile` does not read MySQL, so a rebuild is the repair, and it waits
+/// for this run's checkpoint because that is where the generation is settled.
+///
+/// Only remedies that still work once this run has started are named. Fresh
+/// index names alone no longer are one: this run writes its checkpoint before
+/// the first chunk, under an id that names the stream and not the indices, so
+/// a restart onto new names would resume from it and the load cursor and leave
+/// them missing rows. A new `server_id` is a new stream with neither.
+fn mysql_upgrade_gap_warning(found_1x: bool, cfg: &AppConfig) -> Option<String> {
+    if !found_1x {
+        return None;
+    }
+    let (mut rebuilds, mut refused) = (Vec::new(), Vec::new());
+    for (key, tbl) in &cfg.sync {
+        match crate::reindex::rebuild_command(cfg, key, tbl) {
+            Ok(command) => rebuilds.push(command),
+            Err(_) => refused.push(tbl.table.as_str()),
+        }
+    }
+    let mut warning = String::from(
+        "this stream was last checkpointed by 1.x, and that checkpoint is not resumed from: \
+         the initial load below rewrites every row the source has now, but a row deleted, \
+         truncated or moved to another index since 1.x last checkpointed is not in this load \
+         and stays in the index, unless [sync] names indices 1.x never wrote to.",
+    );
+    if !rebuilds.is_empty() {
+        warning.push_str(&format!(
+            " Once this run has written its checkpoint, stop it and rebuild with \
+             {}, following the steps each prints; readers have to query the name given as \
+             --alias, which is what moves onto the rebuilt index.",
+            rebuilds.join("; ")
+        ));
+    }
+    let rest = if refused.is_empty() {
+        "Where readers cannot move to an alias".to_string()
+    } else {
+        format!(
+            "reindex does not rebuild {} (run it to see why); for those, or where readers \
+             cannot move to an alias",
+            refused.join(", ")
+        )
+    };
+    warning.push_str(&format!(
+        " {rest}, stop the pipeline, give [source] a server_id nothing else uses and point \
+         [sync] at fresh index names, then start it: a new server_id is a new stream with no \
+         checkpoint, so every table loads into the new names, and readers move to them once \
+         the load is done. New index names alone are not enough, because this run's \
+         checkpoint would be resumed from."
+    ));
+    Some(warning)
 }
 
 /// The checkpoint a first run writes before its first chunk, in the
@@ -2543,7 +2602,11 @@ async fn attempt_mysql(
     } else {
         // Settled before the first checkpoint replaces the 1.x one, which is
         // the last place the generation 1.x reached is written down.
-        mysql_base_from_1x(sink.as_ref(), &stream_id, &mut admin).await?
+        let carried = mysql_base_from_1x(sink.as_ref(), &stream_id, &mut admin).await?;
+        if let Some(warning) = mysql_upgrade_gap_warning(carried.is_some(), cfg) {
+            tracing::warn!(target: "pg2osync::run", "{warning}");
+        }
+        carried.unwrap_or(0)
     };
     version_base.store(base, std::sync::atomic::Ordering::Relaxed);
     if gtid_resume.is_some() && !gtid_support.usable {
@@ -3366,6 +3429,118 @@ mod tests {
             carried_over_base(Some("binlog.000002:4"), coordinate(3, 4)),
             0
         );
+    }
+
+    fn mysql_cfg(target_extra: &str, sections: &str) -> AppConfig {
+        toml::from_str(&format!(
+            "[source]\nflavor = \"mysql\"\nurl = \"mysql://u@h/shop\"\nserver_id = 4242\n\
+             [target]\nurl = \"http://t\"\n{target_extra}\n{sections}"
+        ))
+        .expect("parses")
+    }
+
+    #[test]
+    fn an_upgrade_from_1x_warns_of_the_deletes_its_load_cannot_see() {
+        let cfg = mysql_cfg(
+            "",
+            "[sync.users]\ntable = \"shop.users\"\nindex = \"users\"\n\
+             [sync.orders]\ntable = \"shop.orders\"\nindex = \"orders\"\n",
+        );
+        let warning = mysql_upgrade_gap_warning(true, &cfg).expect("a 1.x checkpoint warns");
+        assert!(warning.contains("deleted"), "{warning}");
+        assert!(
+            warning.contains("Once this run has written its checkpoint"),
+            "{warning}"
+        );
+        for table in ["shop.users", "shop.orders"] {
+            assert!(
+                warning.contains(&format!("pg2osync reindex --table {table} --alias <alias>")),
+                "{warning}"
+            );
+        }
+        assert!(
+            warning.contains("query the name given as --alias"),
+            "{warning}"
+        );
+        // fresh names on their own would resume from this run's checkpoint
+        assert!(warning.contains("server_id nothing else uses"), "{warning}");
+        assert!(
+            warning.contains("New index names alone are not enough"),
+            "{warning}"
+        );
+        assert!(!warning.contains("does not rebuild"), "{warning}");
+    }
+
+    #[test]
+    fn an_upgrade_warning_names_reindex_only_where_reindex_accepts_the_table() {
+        let cfg = mysql_cfg(
+            "",
+            "[sync.users]\ntable = \"shop.users\"\nindex = \"users\"\n\
+             [sync.docs]\ntable = \"shop.docs\"\nindex = \"docs\"\n\
+             [sync.docs.fan_out]\nfield = \"tags\"\nid = \"{id}-{tag}\"\n\
+             [sync.a]\ntable = \"shop.a\"\nindex = \"both\"\nid = \"a-{id}\"\n\
+             [sync.b]\ntable = \"shop.b\"\nindex = \"both\"\nid = \"b-{id}\"\n\
+             [sync.events]\ntable = \"shop.events\"\nindex = \"events-{tenant}\"\n\
+             [sync.live]\ntable = \"shop.live\"\nindex = \"live-{tenant}\"\n\
+             alias = \"{tenant}-live\"\n",
+        );
+        let warning = mysql_upgrade_gap_warning(true, &cfg).expect("warns");
+        assert!(
+            warning.contains("pg2osync reindex --table shop.users --alias <alias>"),
+            "{warning}"
+        );
+        // a template is rebuilt under its own alias, and only that one
+        assert!(
+            warning.contains("pg2osync reindex --table shop.live --alias {tenant}-live"),
+            "{warning}"
+        );
+        for refused in ["shop.docs", "shop.a", "shop.b", "shop.events"] {
+            assert!(
+                !warning.contains(&format!("--table {refused} ")),
+                "{refused} is offered a rebuild reindex refuses: {warning}"
+            );
+        }
+        assert!(
+            warning.contains("reindex does not rebuild shop.a, shop.b, shop.docs, shop.events"),
+            "{warning}"
+        );
+        assert!(warning.contains("server_id nothing else uses"), "{warning}");
+    }
+
+    #[test]
+    fn an_upgrade_warning_on_a_target_whose_alias_is_the_index_names_the_index() {
+        let cfg = mysql_cfg(
+            "flavor = \"meilisearch\"\nstate_dir = \"/tmp/s\"",
+            "[sync.users]\ntable = \"shop.users\"\nindex = \"users\"\n",
+        );
+        let warning = mysql_upgrade_gap_warning(true, &cfg).expect("warns");
+        assert!(
+            warning.contains("pg2osync reindex --table shop.users --alias users"),
+            "{warning}"
+        );
+    }
+
+    #[test]
+    fn an_upgrade_warning_under_require_alias_offers_no_rebuild() {
+        let cfg = mysql_cfg(
+            "require_alias = true",
+            "[sync.users]\ntable = \"shop.users\"\nindex = \"users\"\n",
+        );
+        let warning = mysql_upgrade_gap_warning(true, &cfg).expect("warns");
+        assert!(!warning.contains("pg2osync reindex --table"), "{warning}");
+        assert!(
+            warning.contains("reindex does not rebuild shop.users"),
+            "{warning}"
+        );
+    }
+
+    #[test]
+    fn a_first_run_with_no_1x_checkpoint_has_no_gap_to_warn_of() {
+        let cfg = mysql_cfg(
+            "",
+            "[sync.users]\ntable = \"shop.users\"\nindex = \"users\"\n",
+        );
+        assert_eq!(mysql_upgrade_gap_warning(false, &cfg), None);
     }
 
     #[test]

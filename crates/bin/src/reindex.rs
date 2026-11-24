@@ -364,7 +364,7 @@ pub async fn run_for(
     })?;
 
     let sink = run::build_sink(cfg, target_password)?;
-    refuse_a_live_stream(cfg, source_url, sink.as_ref()).await?;
+    let seen = refuse_a_live_stream(cfg, source_url, sink.as_ref()).await?;
     // The load asks the same question later, but by then the fresh index
     // exists and a refusal would leave it behind empty, one per retry.
     if cfg.source.flavor == "mysql" {
@@ -432,6 +432,17 @@ pub async fn run_for(
         }
     }
 
+    refuse_a_woken_stream(
+        cfg,
+        sink.as_ref(),
+        seen.as_deref(),
+        &format!(
+            "{fresh} is left as the load filled it and {index} is untouched; remove the rebuilt \
+             index with a {}",
+            delete_hint(swapped, &fresh)
+        ),
+    )
+    .await?;
     sink.switch_alias(alias, &fresh).await?;
     let elapsed = started.elapsed().as_secs_f64();
     // The swap runs both ways, so on a target whose alias is an index the
@@ -508,7 +519,7 @@ async fn run_templated(
     next_config(cfg, key, &fresh_spec, workspace, &source.name)?;
 
     let sink = run::build_sink(cfg, target_password)?;
-    refuse_a_live_stream(cfg, source_url, sink.as_ref()).await?;
+    let seen = refuse_a_live_stream(cfg, source_url, sink.as_ref()).await?;
     let existing = sink.list_indices(&fresh_pattern).await?;
     if !existing.is_empty() {
         bail!(
@@ -575,6 +586,17 @@ async fn run_templated(
          switch-alias with that config, and start the pipeline again; the checkpoint did not \
          move, so it replays everything committed since the rebuild started"
     );
+    refuse_a_woken_stream(
+        cfg,
+        sink.as_ref(),
+        seen.as_deref(),
+        &format!(
+            "{fresh_pattern} is left as the load filled it and {old_pattern} is untouched; \
+             delete the rebuilt indices: {}",
+            indices.join(", ")
+        ),
+    )
+    .await?;
     let left = switch_generation(sink.as_ref(), &fresh, &pairs, &indices, &then).await?;
     let elapsed = started.elapsed().as_secs_f64();
     println!(
@@ -640,6 +662,34 @@ async fn count_all(sink: &dyn Sink, indices: &[String]) -> Result<u64> {
         })?;
     }
     Ok(total)
+}
+
+/// The `reindex` command that rebuilds `[sync.key]`, or why there is none.
+///
+/// Asked through [`refuse_unsupported`] itself, so advice that names the
+/// command can never name one the command then refuses. The alias is the one
+/// value each shape accepts: the section's own for a template, the index on a
+/// target whose alias is the index, and the operator's to choose otherwise.
+/// Under `require_alias` the section's name is the only alias an operator
+/// could pass, and asking with it gets that refusal.
+pub(crate) fn rebuild_command(
+    cfg: &AppConfig,
+    key: &str,
+    tbl: &crate::config::TableSync,
+) -> Result<String, String> {
+    let index = tbl.index_name(key);
+    let alias = if tbl.is_templated() {
+        tbl.alias.clone().unwrap_or_else(|| "<alias>".into())
+    } else if alias_is_the_index(cfg) || cfg.target.require_alias {
+        index
+    } else {
+        "<alias>".into()
+    };
+    refuse_unsupported(cfg, key, tbl, &alias, false).map_err(|e| e.to_string())?;
+    Ok(format!(
+        "pg2osync reindex --table {} --alias {alias}",
+        tbl.table
+    ))
 }
 
 /// Everything a rebuild cannot do, said before anything is created.
@@ -797,11 +847,14 @@ fn delete_hint(swapped: bool, index: &str) -> String {
 /// wrote to has no way to order a row the load read stale against the change
 /// that superseded it, so a rebuild beside a live stream silently keeps the
 /// wrong value.
+///
+/// Answers with the checkpoint position it saw, for [`refuse_a_woken_stream`]
+/// to compare against once the load is done.
 async fn refuse_a_live_stream(
     cfg: &AppConfig,
     source_url: &str,
     sink: &dyn pg2osync_core::sink::Sink,
-) -> Result<()> {
+) -> Result<Option<String>> {
     if cfg.source.flavor != "mysql" {
         let client = crate::connect_pg(cfg, source_url).await?;
         let slots = pg2osync_source::catalog::all_slots(&client).await?;
@@ -833,7 +886,46 @@ async fn refuse_a_live_stream(
             second.unwrap_or_else(|| "none".into())
         );
     }
-    Ok(())
+    Ok(second)
+}
+
+/// Refuse to switch once the checkpoint has left where [`refuse_a_live_stream`]
+/// saw it.
+///
+/// That check proves nothing about a pipeline that was running but idle: on
+/// MySQL nothing else says it is there, and it keeps writing the index the
+/// section names while the alias moves away from it. Its checkpoint advancing
+/// past those changes is what loses them, because the restart against the new
+/// index replays only from there. The rebuild cannot move the checkpoint
+/// itself, so any movement over the load is such a pipeline waking up.
+async fn refuse_a_woken_stream(
+    cfg: &AppConfig,
+    sink: &dyn pg2osync_core::sink::Sink,
+    seen: Option<&str>,
+    left: &str,
+) -> Result<()> {
+    let now = sink
+        .read_checkpoint(&cfg.stream_id())
+        .await?
+        .map(|c| c.position);
+    match moved_during_rebuild(seen, now.as_deref(), left) {
+        Some(refusal) => bail!(refusal),
+        None => Ok(()),
+    }
+}
+
+/// The refusal for a checkpoint that moved while the rebuild was loading;
+/// `None` while it is where the pre-flight check saw it.
+fn moved_during_rebuild(seen: Option<&str>, now: Option<&str>, left: &str) -> Option<String> {
+    (seen != now).then(|| {
+        format!(
+            "the checkpoint moved from {} to {} during the rebuild, so a pipeline is still \
+             streaming into the index the section names, and the changes it took there are not \
+             in the rebuild. Nothing was switched; {left}. Stop the pipeline and run this again",
+            seen.unwrap_or("none"),
+            now.unwrap_or("none")
+        )
+    })
 }
 
 /// How many rows the section would index right now.
@@ -1416,5 +1508,30 @@ mod tests {
         assert_eq!(verdict(100, 100, 98, true), Verdict::WithinDrift);
         assert_eq!(verdict(100, 100, 100, true), Verdict::Exact);
         assert_eq!(verdict(100, 103, 104, true), Verdict::Mismatch);
+    }
+
+    #[test]
+    fn a_checkpoint_still_where_the_check_saw_it_lets_the_switch_go_ahead() {
+        assert_eq!(moved_during_rebuild(Some("a"), Some("a"), "left"), None);
+        assert_eq!(moved_during_rebuild(None, None, "left"), None);
+    }
+
+    #[test]
+    fn a_checkpoint_that_moved_during_the_load_stops_the_switch() {
+        let refusal = moved_during_rebuild(
+            Some("binlog.000003:120"),
+            Some("binlog.000003:480"),
+            "users-1 is left as the load filled it",
+        )
+        .expect("an idle pipeline that woke up is refused");
+        assert!(refusal.contains("binlog.000003:120"), "{refusal}");
+        assert!(refusal.contains("binlog.000003:480"), "{refusal}");
+        assert!(refusal.contains("Nothing was switched"), "{refusal}");
+        assert!(
+            refusal.contains("users-1 is left as the load filled it"),
+            "{refusal}"
+        );
+        // a first checkpoint appearing is a pipeline starting under the load
+        assert!(moved_during_rebuild(None, Some("binlog.000001:4"), "left").is_some());
     }
 }
