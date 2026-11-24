@@ -16,6 +16,8 @@
 //! - a checkpoint that was written reads back, and one belonging to another
 //!   stream does not
 //! - a current checkpoint is never taken for one 1.x left behind
+//! - a lease that was written reads back, replaces the one before it, is
+//!   cleared, and never reaches another stream or the checkpoint beside it
 //! - the indices a pattern claims are listed, and a pattern that claims none
 //!   is an empty list
 //! - an index created for a row carries the alias the row names, even when a
@@ -38,7 +40,7 @@
 //! it leaves the fifth out rather than passing for nothing. Skipping is
 //! reported, so an opt-out is a line in the output rather than a silence.
 
-use crate::checkpoint::{Checkpoint, StreamId};
+use crate::checkpoint::{Checkpoint, Lease, StreamId};
 use crate::error::CoreError;
 use crate::position::Position;
 use crate::sink::{DocumentOp, IndexSpec, LsnOp, Sink};
@@ -157,6 +159,11 @@ impl SinkTestHarness {
         } else {
             report.skipped.push("1.x checkpoint".into());
         }
+
+        // no opt-out: a target that could not keep a lease would let a rebuild
+        // switch an alias away from a pipeline that is still running
+        self.lease_round_trip(sink).await.map_err(named("lease"))?;
+        report.passed.push("lease".into());
 
         if self.lists_indices {
             self.index_listing(sink)
@@ -419,6 +426,95 @@ impl SinkTestHarness {
             return fail(format!(
                 "a stream nothing ever wrote for has a 1.x checkpoint at {text:?}"
             ));
+        }
+        Ok(())
+    }
+
+    /// A lease is how `reindex` tells a running pipeline from a stopped one,
+    /// so it has to read back exactly, be replaced by the next refresh, be
+    /// gone once cleared, and never be one stream's answer for another — nor
+    /// replace the checkpoint it sits beside. Runs after
+    /// `checkpoint_durability`, whose checkpoint it checks is untouched.
+    async fn lease_round_trip(&self, sink: &dyn Sink) -> Result<(), CoreError> {
+        let mine = StreamId {
+            source: crate::checkpoint::SOURCE_POSTGRES.into(),
+            stream: "pg2osync_testkit".into(),
+            publication: "pg2osync_testkit_pub".into(),
+        };
+        let other = StreamId {
+            stream: "pg2osync_testkit_lease_other".into(),
+            ..mine.clone()
+        };
+        // an earlier run that failed half way may have left either behind
+        sink.clear_lease(&mine).await?;
+        sink.clear_lease(&other).await?;
+        let checkpoint = sink.read_checkpoint(&mine).await?;
+        let legacy = sink.read_legacy_position_text(&mine).await?;
+        if sink.read_lease(&mine).await?.is_some() {
+            return fail("a cleared lease still reads back");
+        }
+        let first = Lease {
+            stream: mine.clone(),
+            run: "kit-run-1".into(),
+            counter: 1,
+            interval_ms: 5_000,
+            holder: "kit".into(),
+            refreshed_at_epoch: 1_700_000_000,
+        };
+        sink.write_lease(&first).await?;
+        match sink.read_lease(&mine).await? {
+            Some(read) if read == first => {}
+            Some(read) => {
+                return fail(format!(
+                    "the lease read back as {read:?} rather than {first:?}"
+                ));
+            }
+            None => return fail("the lease that was written did not read back"),
+        }
+        if sink.read_lease(&other).await?.is_some() {
+            return fail("one stream's lease was returned for another's");
+        }
+        let second = Lease {
+            counter: 2,
+            refreshed_at_epoch: 1_700_000_005,
+            ..first.clone()
+        };
+        sink.write_lease(&second).await?;
+        match sink.read_lease(&mine).await? {
+            Some(read) if read == second => {}
+            other => {
+                return fail(format!(
+                    "a refresh read back as {other:?} rather than {second:?}"
+                ));
+            }
+        }
+        if sink.read_checkpoint(&mine).await? != checkpoint {
+            return fail("writing the lease changed the checkpoint beside it");
+        }
+        if sink.read_legacy_position_text(&mine).await? != legacy {
+            return fail("writing the lease changed what reads as a 1.x checkpoint");
+        }
+        let theirs = Lease {
+            stream: other.clone(),
+            run: "kit-run-2".into(),
+            ..first.clone()
+        };
+        sink.write_lease(&theirs).await?;
+        sink.clear_lease(&mine).await?;
+        if sink.read_lease(&mine).await?.is_some() {
+            return fail("the lease was still there after it was cleared");
+        }
+        if sink.read_lease(&other).await? != Some(theirs) {
+            return fail("clearing one stream's lease removed another's");
+        }
+        if sink.read_checkpoint(&mine).await? != checkpoint {
+            return fail("clearing the lease changed the checkpoint beside it");
+        }
+        // absent is success, as a second clean shutdown would find it
+        sink.clear_lease(&mine).await?;
+        sink.clear_lease(&other).await?;
+        if sink.read_lease(&other).await?.is_some() {
+            return fail("a cleared lease still reads back");
         }
         Ok(())
     }

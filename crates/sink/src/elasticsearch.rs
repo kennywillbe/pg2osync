@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 use base64::Engine as _;
-use pg2osync_core::checkpoint::Checkpoint;
+use pg2osync_core::checkpoint::{Checkpoint, Lease};
 use pg2osync_core::error::CoreError;
 use pg2osync_core::position::Position;
 use pg2osync_core::sink::{BulkLoadSettings, DocumentOp, Health, IndexSpec, LsnOp, Sink, SinkAck};
@@ -635,19 +635,17 @@ fn ndjson_body(batch: &[LsnOp], require_alias: bool) -> Result<String, CoreError
     Ok(ndjson)
 }
 
-#[async_trait]
-impl Sink for ElasticsearchSink {
-    fn set_retry_policy(
-        &self,
-        max_attempts: u32,
-        base_backoff_ms: u64,
-        max_elapsed_ms: Option<u64>,
-    ) {
-        self.retry
-            .set(max_attempts, base_backoff_ms, max_elapsed_ms);
-    }
-
-    async fn ensure_ready(&self, tables: &[IndexSpec]) -> Result<(), CoreError> {
+impl ElasticsearchSink {
+    /// Create the meta index with its settings unless it is known to exist.
+    ///
+    /// Asked by the lease as well as by `ensure_ready`, because a pipeline
+    /// writes its first lease before it gets that far, and a document written
+    /// into a missing index has the target create it without being hidden and
+    /// with the default shard count.
+    async fn ensure_meta_index(&self) -> Result<(), CoreError> {
+        if crate::lock(&self.known_indexes).contains(META_INDEX) {
+            return Ok(());
+        }
         let (status, _) = self
             .send(
                 reqwest::Method::PUT,
@@ -664,6 +662,25 @@ impl Sink for ElasticsearchSink {
         if !(status == 200 || status == 400) {
             return Err(CoreError::Sink(format!("ensure meta index: {status}")));
         }
+        crate::lock(&self.known_indexes).insert(META_INDEX.to_string());
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Sink for ElasticsearchSink {
+    fn set_retry_policy(
+        &self,
+        max_attempts: u32,
+        base_backoff_ms: u64,
+        max_elapsed_ms: Option<u64>,
+    ) {
+        self.retry
+            .set(max_attempts, base_backoff_ms, max_elapsed_ms);
+    }
+
+    async fn ensure_ready(&self, tables: &[IndexSpec]) -> Result<(), CoreError> {
+        self.ensure_meta_index().await?;
         for spec in tables {
             if spec.pattern {
                 // nothing exists to create or compare yet: the names come from
@@ -1212,6 +1229,59 @@ impl Sink for ElasticsearchSink {
             return Err(CoreError::Sink(format!("read checkpoint: {status}")));
         }
         Ok(crate::checkpoint_from_doc(&body["_source"]))
+    }
+
+    async fn write_lease(&self, lease: &Lease) -> Result<(), CoreError> {
+        self.ensure_meta_index().await?;
+        let doc_id = crate::lease_doc_id(&lease.stream);
+        let (status, _) = self
+            .send(
+                reqwest::Method::PUT,
+                &format!("/{META_INDEX}/_doc/{doc_id}"),
+                Some(crate::lease_doc(lease).to_string()),
+            )
+            .await?;
+        if status != 200 && status != 201 {
+            return Err(CoreError::Sink(format!("write lease: {status}")));
+        }
+        Ok(())
+    }
+
+    async fn read_lease(
+        &self,
+        stream: &pg2osync_core::checkpoint::StreamId,
+    ) -> Result<Option<Lease>, CoreError> {
+        let doc_id = crate::lease_doc_id(stream);
+        let (status, body) = self
+            .send(
+                reqwest::Method::GET,
+                &format!("/{META_INDEX}/_doc/{doc_id}"),
+                None,
+            )
+            .await?;
+        match status {
+            200 => Ok(crate::lease_from_doc(&body["_source"])),
+            404 => Ok(None),
+            other => Err(CoreError::Sink(format!("read lease: {other}"))),
+        }
+    }
+
+    async fn clear_lease(
+        &self,
+        stream: &pg2osync_core::checkpoint::StreamId,
+    ) -> Result<(), CoreError> {
+        let doc_id = crate::lease_doc_id(stream);
+        let (status, _) = self
+            .send(
+                reqwest::Method::DELETE,
+                &format!("/{META_INDEX}/_doc/{doc_id}"),
+                None,
+            )
+            .await?;
+        if status != 200 && status != 404 {
+            return Err(CoreError::Sink(format!("clear lease: {status}")));
+        }
+        Ok(())
     }
 
     async fn read_legacy_position_text(

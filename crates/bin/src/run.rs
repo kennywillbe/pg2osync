@@ -160,7 +160,7 @@ pub async fn run_pipeline(
     secrets: ResolvedSecrets,
     rt: SourceRuntime,
 ) -> Result<()> {
-    let sink = build_sink(&cfg, secrets.target_password)?;
+    let sink = build_sink(&cfg, secrets.target_password.clone())?;
     check_rejection_policy(&cfg, sink.as_ref())?;
     for note in embedded_children_with_own_section(&cfg)
         .into_iter()
@@ -170,7 +170,20 @@ pub async fn run_pipeline(
     }
     let index_specs = index_specs(&cfg)?;
 
-    match cfg.source.flavor.as_str() {
+    // Held from before setup to after the last reconnect, not per attempt: a
+    // pipeline between two attempts, or still loading, is running all the
+    // same, and a rebuild beside it would lose what it writes next. Released
+    // on an error too, because a source that halted inside a process that
+    // keeps running its other sources is a stopped pipeline.
+    let lease = match rt.mode {
+        Mode::Run => Some(crate::lease::hold(
+            build_sink(&cfg, secrets.target_password.clone())?,
+            cfg.stream_id(),
+            crate::lease::interval(),
+        )),
+        Mode::Bootstrap => None,
+    };
+    let result = match cfg.source.flavor.as_str() {
         "mysql" => run_mysql(cfg, secrets.source_url, sink, index_specs, rt).await,
         "postgres" | "postgresql" => {
             run_postgres(
@@ -183,8 +196,14 @@ pub async fn run_pipeline(
             )
             .await
         }
-        other => bail!("unsupported source.flavor {other:?}; expected \"postgres\" or \"mysql\""),
+        other => Err(anyhow::anyhow!(
+            "unsupported source.flavor {other:?}; expected \"postgres\" or \"mysql\""
+        )),
+    };
+    if let Some(lease) = lease {
+        lease.release().await;
     }
+    result
 }
 
 // ---------------------------------------------------------------- shared wiring

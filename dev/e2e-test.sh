@@ -48,6 +48,10 @@ MAPPING=$(dirname "$CONFIG")/pg2osync-e2e-mapping-$TAG.json
 # gives a caller running suites back to back a file of its own.
 LOG=${E2E_LOG:-/tmp/pg2osync-e2e.log}
 export PG2OSYNC_SOURCE_URL="postgres://postgres:postgres@localhost:$PG_PORT/sourcedb"
+# Every pipeline refreshes its lease every second rather than every five, so
+# each reindex and switch-alias watches it for seconds rather than for the
+# twelve a production check waits.
+export PG2OSYNC_LEASE_INTERVAL_MS=1000
 # Every pipeline the suite starts binds its metrics and API ports on this
 # machine rather than inside a container, so two suites at once need two
 # blocks: E2E_PORT_BASE moves every port this one uses.
@@ -2367,10 +2371,24 @@ check "the original index is loaded" "$(os_count e2e_reindex)" "3"
 # writing to, so a row changing under it would be wrong there for good
 refusal=$($BIN reindex -c "$XCONFIG" --table public.reindex_probe --alias "$XALIAS" 2>&1 || true)
 case "$refusal" in
-  *"$XSLOT"*"reader attached"*) ok "a rebuild refuses while the pipeline is running, naming the slot" ;;
-  *) bad "a rebuild ran beside a live stream: $refusal" ;;
+  *"$XSLOT"*"reader attached"*"its lease names "*) ok "a rebuild refuses while the pipeline is running, naming the slot and the lease" ;;
+  *) bad "a rebuild ran beside a live stream, or did not name the slot and the lease: $refusal" ;;
 esac
+# switch-alias has no slot to look at, so the lease is all that tells it a
+# pipeline idle for the whole check is still running
+check "status shows the running pipeline's lease" \
+  "$($BIN status -c "$XCONFIG" 2>&1 | grep -c '^lease: held by ')" "1"
+refusal=$($BIN switch-alias -c "$XCONFIG" --alias "$XALIAS" 2>&1 || true)
+echo "$refusal" >> "$LOG"
+case "$refusal" in
+  *"lease of the PostgreSQL stream on slot $XSLOT was refreshed while this was checking"*"Stop the pipeline"*)
+    ok "switch-alias refuses an idle running pipeline by its lease" ;;
+  *) bad "switch-alias moved an alias away from a running pipeline, or said something else: $refusal" ;;
+esac
+check "and moved nothing" "$(curl -s -o /dev/null -w '%{http_code}' "$OS/_alias/$XALIAS")" "404"
 stop_sync
+check "a clean stop clears the lease" \
+  "$($BIN status -c "$XCONFIG" 2>&1 | grep -c '^lease: none')" "1"
 
 # the mapping the rebuild has to pick up: v is a keyword from here on, which
 # is the change no live index would accept
@@ -2417,7 +2435,24 @@ done
 check "the restart replays what changed while the pipeline was stopped" \
   "$(os_field "$new_index" 1 v)" "changed-while-stopped"
 check "and what was inserted while it was stopped" "$(os_field "$new_index" 4 v)" "added-while-stopped"
-stop_sync
+# A pipeline that was killed never clears its lease, and the lease it leaves
+# never moves again: that is no evidence, and it must not block a rebuild
+# forever. The slot is released once the server sees the connection gone.
+sync_kill
+for _ in $(seq 1 30); do
+  [ "$(pg "SELECT count(*) FROM pg_replication_slots WHERE slot_name='$XSLOT' AND active;")" = "0" ] && break
+  sleep 1
+done
+check "the killed pipeline left its lease behind" \
+  "$($BIN status -c "${XCONFIG}.new" 2>&1 | grep -c '^lease: held by ')" "1"
+out=$($BIN reindex -c "${XCONFIG}.new" --table public.reindex_probe --alias "$XALIAS" 2>&1 || true)
+echo "$out" >> "$LOG"
+rebuilt_again=$(curl -s "$OS/_alias/$XALIAS" | jqf "sorted(d.keys())[0] if d else 'none'")
+case "$rebuilt_again" in
+  "$new_index") bad "a killed pipeline's lease blocked the rebuild: $out" ;;
+  e2e_reindex-*) ok "a killed pipeline's lease does not block a rebuild ($rebuilt_again)" ;;
+  *) bad "the rebuild after a kill did not move the alias (got '$rebuilt_again'): $out" ;;
+esac
 
 # A templated table is rebuilt as a fresh generation of its template, and the
 # alias of every tenant moves in one request. A tenant that first appears

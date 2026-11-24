@@ -116,7 +116,7 @@ Two tables are created in the target database and are pg2osync's own:
 
 | Table | What it holds |
 |---|---|
-| `pg2osync_state` | one row per stream's checkpoint, plus initial-load progress |
+| `pg2osync_state` | one row per stream's checkpoint, one per running stream's lease, plus initial-load progress |
 | `pg2osync_rejects` | documents the target refused, when quarantine is on |
 
 So a restart resumes from a position only the target can have moved, and

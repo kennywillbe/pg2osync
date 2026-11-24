@@ -52,6 +52,9 @@ STATE_DIR=$(mktemp -d /tmp/pg2osync-meili-state.XXXXXX)
 # a file of this run's own, so two suites do not read each other's log lines
 LOG=${E2E_LOG:-/tmp/pg2osync-meili-smoke.log}
 export PG2OSYNC_SOURCE_URL="postgres://postgres:postgres@localhost:$PG_PORT/sourcedb"
+# the lease is refreshed every second rather than every five, so each reindex
+# watches it for seconds rather than for the twelve a production check waits
+export PG2OSYNC_LEASE_INTERVAL_MS=1000
 # Every pipeline the suite starts binds its metrics and API ports on this
 # machine rather than inside a container, so two suites at once need two
 # blocks: E2E_PORT_BASE moves every port this one uses.

@@ -107,7 +107,7 @@ Two collections are created and are pg2osync's own:
 
 | Collection | What it holds |
 |---|---|
-| `pg2osync_state` | one point per stream's checkpoint, plus initial-load progress |
+| `pg2osync_state` | one point per stream's checkpoint, one per running stream's lease, plus initial-load progress |
 | `pg2osync_rejects` | documents the target refused, when quarantine is on |
 
 Neither holds a vector. So a restart resumes from a position only the target can

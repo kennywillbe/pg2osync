@@ -18,7 +18,7 @@
 //!   engine keeps, so the DDL has to declare it
 
 use async_trait::async_trait;
-use pg2osync_core::checkpoint::Checkpoint;
+use pg2osync_core::checkpoint::{Checkpoint, Lease};
 use pg2osync_core::error::CoreError;
 use pg2osync_core::sink::{
     DocumentOp, Health, IndexSpec, LsnOp, Rejection, Sink, SinkAck, StoredReject,
@@ -872,6 +872,38 @@ impl Sink for PostgresSink {
             .and_then(crate::checkpoint_from_doc))
     }
 
+    async fn write_lease(&self, lease: &Lease) -> Result<(), CoreError> {
+        self.put_state_doc(&lease_key(&lease.stream), &crate::lease_doc(lease))
+            .await
+    }
+
+    async fn read_lease(
+        &self,
+        stream: &pg2osync_core::checkpoint::StreamId,
+    ) -> Result<Option<Lease>, CoreError> {
+        Ok(self
+            .state_doc(&lease_key(stream))
+            .await?
+            .as_ref()
+            .and_then(crate::lease_from_doc))
+    }
+
+    async fn clear_lease(
+        &self,
+        stream: &pg2osync_core::checkpoint::StreamId,
+    ) -> Result<(), CoreError> {
+        let key = lease_key(stream);
+        self.with_client(async |client| {
+            let sql = format!("DELETE FROM {} WHERE key = $1", quote_ident(STATE_TABLE));
+            match client.execute(&sql, &[&key]).await {
+                Ok(_) => Ok(()),
+                Err(e) if e.code() == Some(&SqlState::UNDEFINED_TABLE) => Ok(()),
+                Err(e) => Err(db_err(&format!("clear lease {key}"), e)),
+            }
+        })
+        .await
+    }
+
     /// 1.x kept its checkpoint under the key the current one uses; no shared
     /// key ever existed here, because this target is newer than that layout.
     async fn read_legacy_position_text(
@@ -905,6 +937,12 @@ impl Sink for PostgresSink {
 /// overwrite each other's position.
 fn checkpoint_key(stream: &pg2osync_core::checkpoint::StreamId) -> String {
     format!("checkpoint-{}", crate::checkpoint_doc_id(stream))
+}
+
+/// Beside the checkpoint, under a key of its own so neither write replaces the
+/// other.
+fn lease_key(stream: &pg2osync_core::checkpoint::StreamId) -> String {
+    crate::lease_doc_id(stream)
 }
 
 #[cfg(test)]

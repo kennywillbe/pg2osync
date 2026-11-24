@@ -48,6 +48,10 @@ LOG=${E2E_LOG:-/tmp/pg2osync-mysql-e2e.log}
 # mapping files and probe logs.
 TAG=${CONFIG##*.}
 export PG2OSYNC_MYSQL_URL="mysql://$USER:$PASSWORD@localhost:$PORT/sourcedb"
+# Every pipeline refreshes its lease every second rather than every five, so
+# each reindex and switch-alias watches it for seconds rather than for the
+# twelve a production check waits.
+export PG2OSYNC_LEASE_INTERVAL_MS=1000
 # Every pipeline the suite starts binds its metrics and API ports on this
 # machine rather than inside a container, so two suites at once need two
 # blocks: E2E_PORT_BASE moves every port this one uses.
@@ -2356,6 +2360,113 @@ check "the stream carried on past the cascade" \
   "$(nested 2 "[o['colour'] for o in $(line_of c)['options']]")" "['teal']"
 stop_sync
 
+
+say "32. a running pipeline with nothing to stream holds off a rebuild"
+# MySQL lists no reader for a binlog stream and the checkpoint only moves when
+# something is written, so an idle pipeline left nothing for a rebuild to see:
+# it kept writing the index the alias left, and its checkpoint moved past
+# those changes. The lease it refreshes is what shows it now.
+LCONFIG=$(mktemp /tmp/pg2osync-mysql-lease.XXXXXX)
+LSID=990019
+LALIAS=e2e_mysql_lease_live
+cat > "$LCONFIG" <<TOML
+[source]
+flavor = "mysql"
+url_env = "PG2OSYNC_MYSQL_URL"
+server_id = $LSID
+
+[target]
+url = "$OS"
+flavor = "$TARGET_FLAVOR"
+
+[metrics]
+bind = "127.0.0.1:$((PORT_BASE + 30))"
+
+[sync.lease_probe]
+table = "sourcedb.lease_probe"
+index = "e2e_mysql_lease"
+TOML
+# one name at a time: a wildcard DELETE is refused by Elasticsearch by default
+drop_lease_indices() {
+  for name in $(curl -s "$OS/_cat/indices/e2e_mysql_lease*?h=index" 2> /dev/null); do
+    curl -s -XDELETE "$OS/$name" > /dev/null 2>&1 || true
+  done
+}
+lease_cleanup() {
+  sync_kill
+  my "DROP TABLE IF EXISTS lease_probe;" > /dev/null 2>&1 || true
+  drop_lease_indices
+  curl -s -XDELETE "$OS/.pg2osync_meta/_doc/mysql-$LSID" > /dev/null 2>&1 || true
+  curl -s -XDELETE "$OS/.pg2osync_meta/_doc/lease-mysql-$LSID" > /dev/null 2>&1 || true
+  rm -f "$LCONFIG" "${LCONFIG}.new"
+}
+trap 'cleanup; resume_cleanup; types_cleanup; child_cleanup; where_cleanup; events_cleanup; pipe_cleanup; append_cleanup; routing_cleanup; through_cleanup; pseudo_cleanup; rl_cleanup; agg_cleanup; element_cleanup; flatten_cleanup; add_cleanup; nested_cleanup; lease_cleanup' EXIT
+
+my "DROP TABLE IF EXISTS lease_probe; CREATE TABLE lease_probe(id bigint primary key, v varchar(40));"
+my "INSERT INTO lease_probe VALUES (1,'one'),(2,'two'),(3,'three');"
+drop_lease_indices
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/mysql-$LSID" > /dev/null
+curl -s -XDELETE "$OS/.pg2osync_meta/_doc/lease-mysql-$LSID" > /dev/null
+sync_spawn "$LCONFIG"
+await_count e2e_mysql_lease 3
+check "the pipeline loaded the table" "$(os_count e2e_mysql_lease)" "3"
+check "status shows the running pipeline's lease" \
+  "$($BIN status -c "$LCONFIG" 2>&1 | grep -c '^lease: held by ')" "1"
+ckpt_idle=$(curl -s "$OS/.pg2osync_meta/_doc/mysql-$LSID" | jqf "d['_source']['position']")
+
+refusal=$($BIN reindex -c "$LCONFIG" --table sourcedb.lease_probe --alias "$LALIAS" 2>&1 || true)
+echo "$refusal" >> "$LOG"
+case "$refusal" in
+  *"lease of the MySQL stream with server_id $LSID was refreshed while this was checking"*"Stop the pipeline"*)
+    ok "a rebuild refuses an idle running pipeline by its lease" ;;
+  *) bad "a rebuild ran beside an idle pipeline, or said something else: $refusal" ;;
+esac
+check "the checkpoint stood still, so only the lease could have said it" \
+  "$(curl -s "$OS/.pg2osync_meta/_doc/mysql-$LSID" | jqf "d['_source']['position']")" "$ckpt_idle"
+check "and it created no index to fill" \
+  "$(curl -s "$OS/_cat/indices/e2e_mysql_lease-*?h=index" | wc -l | tr -d ' ')" "0"
+refusal=$($BIN switch-alias -c "$LCONFIG" --alias "$LALIAS" 2>&1 || true)
+echo "$refusal" >> "$LOG"
+case "$refusal" in
+  *"lease of the MySQL stream with server_id $LSID was refreshed while this was checking"*"Stop the pipeline"*)
+    ok "switch-alias refuses it the same way" ;;
+  *) bad "switch-alias moved an alias away from a running pipeline, or said something else: $refusal" ;;
+esac
+check "and moved nothing" "$(curl -s -o /dev/null -w '%{http_code}' "$OS/_alias/$LALIAS")" "404"
+
+stop_sync
+check "a clean stop clears the lease" \
+  "$($BIN status -c "$LCONFIG" 2>&1 | grep -c '^lease: none')" "1"
+out=$($BIN reindex -c "$LCONFIG" --table sourcedb.lease_probe --alias "$LALIAS" 2>&1 || true)
+echo "$out" >> "$LOG"
+rebuilt=$(curl -s "$OS/_alias/$LALIAS" | jqf "sorted(d.keys())[0] if d else 'none'")
+case "$rebuilt" in
+  e2e_mysql_lease-*) ok "with the pipeline stopped the rebuild runs and moves the alias ($rebuilt)" ;;
+  *) bad "the rebuild after a clean stop did not move the alias (got '$rebuilt'): $out" ;;
+esac
+refresh
+check "the rebuilt index holds every row" "$(os_count "$rebuilt")" "3"
+
+# A killed pipeline never clears its lease, and the lease it leaves never moves
+# again: no evidence, so it must not hold a rebuild off for good.
+sed "s#^index = \"e2e_mysql_lease\"\$#index = \"$rebuilt\"#" "$LCONFIG" > "${LCONFIG}.new"
+sync_spawn "${LCONFIG}.new"
+for _ in $(seq 1 30); do
+  [ "$($BIN status -c "${LCONFIG}.new" 2>&1 | grep -c '^lease: held by ')" = "1" ] && break
+  sleep 1
+done
+sync_kill
+check "the killed pipeline left its lease behind" \
+  "$($BIN status -c "${LCONFIG}.new" 2>&1 | grep -c '^lease: held by ')" "1"
+out=$($BIN reindex -c "${LCONFIG}.new" --table sourcedb.lease_probe --alias "$LALIAS" 2>&1 || true)
+echo "$out" >> "$LOG"
+rebuilt_again=$(curl -s "$OS/_alias/$LALIAS" | jqf "sorted(d.keys())[0] if d else 'none'")
+case "$rebuilt_again" in
+  "$rebuilt") bad "a killed pipeline's lease blocked the rebuild: $out" ;;
+  e2e_mysql_lease-*) ok "a killed pipeline's lease does not block a rebuild ($rebuilt_again)" ;;
+  *) bad "the rebuild after a kill did not move the alias (got '$rebuilt_again'): $out" ;;
+esac
+lease_cleanup
 
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

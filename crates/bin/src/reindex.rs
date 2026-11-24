@@ -30,7 +30,8 @@ use std::collections::BTreeSet;
 
 use crate::config::AppConfig;
 use crate::workspace::{Source, Workspace};
-use crate::{resnapshot, run};
+use crate::{lease, resnapshot, run};
+use pg2osync_core::checkpoint::Lease;
 
 /// The index a rebuild writes into, derived from the one in the config.
 ///
@@ -257,23 +258,32 @@ pub(crate) async fn switch_generation(
 /// Say which aliases a switch left where they were, and what joins them to
 /// the generation switched to.
 pub(crate) fn report_left_behind(left: &[(String, String)]) {
+    print!("{}", left_behind_report(left));
+}
+
+fn left_behind_report(left: &[(String, String)]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
     if left.is_empty() {
-        return;
+        return out;
     }
     // the stream creates a tenant's missing index with its alias, and from
-    // then on the alias reads two generations until a switch picks one
-    println!(
+    // then on the alias reads two generations until a switch picks one; that
+    // switch refuses a running pipeline, so the hint has to say to stop it
+    let _ = writeln!(
+        out,
         "{} alias(es) stayed where they were, because this generation has no index for their \
          tenant. Once the stream creates one, the alias reads both until switch-alias runs \
-         again against this generation:",
+         again against this generation, with the pipeline stopped:",
         left.len()
     );
     for (alias, index) in left.iter().take(10) {
-        println!("  {alias} -> {index}");
+        let _ = writeln!(out, "  {alias} -> {index}");
     }
     if left.len() > 10 {
-        println!("  … and {} more", left.len() - 10);
+        let _ = writeln!(out, "  … and {} more", left.len() - 10);
     }
+    out
 }
 
 /// What the source said before the load, and what it said after.
@@ -435,7 +445,7 @@ pub async fn run_for(
     refuse_a_woken_stream(
         cfg,
         sink.as_ref(),
-        seen.as_deref(),
+        &seen,
         &format!(
             "{fresh} is left as the load filled it and {index} is untouched; remove the rebuilt \
              index with a {}",
@@ -589,7 +599,7 @@ async fn run_templated(
     refuse_a_woken_stream(
         cfg,
         sink.as_ref(),
-        seen.as_deref(),
+        &seen,
         &format!(
             "{fresh_pattern} is left as the load filled it and {old_pattern} is untouched; \
              delete the rebuilt indices: {}",
@@ -848,13 +858,15 @@ fn delete_hint(swapped: bool, index: &str) -> String {
 /// that superseded it, so a rebuild beside a live stream silently keeps the
 /// wrong value.
 ///
-/// Answers with the checkpoint position it saw, for [`refuse_a_woken_stream`]
-/// to compare against once the load is done.
+/// Answers with what it saw, for [`refuse_a_woken_stream`] to compare against
+/// once the load is done.
 async fn refuse_a_live_stream(
     cfg: &AppConfig,
     source_url: &str,
     sink: &dyn pg2osync_core::sink::Sink,
-) -> Result<Option<String>> {
+) -> Result<Seen> {
+    let stream = cfg.stream_id();
+    let first_lease = sink.read_lease(&stream).await?;
     if cfg.source.flavor != "mysql" {
         let client = crate::connect_pg(cfg, source_url).await?;
         let slots = pg2osync_source::catalog::all_slots(&client).await?;
@@ -862,21 +874,38 @@ async fn refuse_a_live_stream(
             .iter()
             .any(|s| s.name == cfg.source.slot_name && s.active)
         {
+            // the lease is named too when there is one, since the slot alone
+            // does not say which of several hosts is the one to stop
+            let holder = first_lease
+                .as_ref()
+                .filter(|l| !l.holder.is_empty())
+                .map(|l| format!(" (its lease names {})", l.holder))
+                .unwrap_or_default();
             bail!(
-                "replication slot {} has a reader attached, so the pipeline is still running. \
-                 A rebuild fills an index the stream is not writing to, so a row that changes \
-                 during it would be wrong there for good. Stop the pipeline and run this again",
+                "replication slot {} has a reader attached, so the pipeline is still \
+                 running{holder}. A rebuild fills an index the stream is not writing to, so a \
+                 row that changes during it would be wrong there for good. Stop the pipeline \
+                 and run this again",
                 cfg.source.slot_name
             );
         }
     }
     // The slot says nothing on MySQL and nothing about a pipeline that is
-    // between reconnects on PostgreSQL; a checkpoint that moves says it on
-    // both.
-    let stream = cfg.stream_id();
+    // between reconnects on PostgreSQL. The lease says it for a pipeline that
+    // is running at all, idle or not; a checkpoint that moves in the same
+    // window says it for one whose lease cannot be written.
     let position = |c: Option<pg2osync_core::checkpoint::Checkpoint>| c.map(|c| c.position);
     let first = position(sink.read_checkpoint(&stream).await?);
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    tokio::time::sleep(lease::wait_after(first_lease.as_ref())).await;
+    let second_lease = sink.read_lease(&stream).await?;
+    if let Some(refusal) = lease::refusal(
+        &stream,
+        first_lease.as_ref(),
+        second_lease.as_ref(),
+        "while this was checking",
+    ) {
+        bail!(refusal);
+    }
     let second = position(sink.read_checkpoint(&stream).await?);
     if first != second {
         bail!(
@@ -886,32 +915,78 @@ async fn refuse_a_live_stream(
             second.unwrap_or_else(|| "none".into())
         );
     }
-    Ok(second)
+    Ok(Seen {
+        checkpoint: second,
+        lease: second_lease,
+    })
 }
 
-/// Refuse to switch once the checkpoint has left where [`refuse_a_live_stream`]
-/// saw it.
+/// What [`refuse_a_live_stream`] saw last, before the load began.
+struct Seen {
+    checkpoint: Option<String>,
+    lease: Option<Lease>,
+}
+
+/// Refuse to switch once the stream shows a pipeline since
+/// [`refuse_a_live_stream`] looked, or shows one now.
 ///
-/// That check proves nothing about a pipeline that was running but idle: on
-/// MySQL nothing else says it is there, and it keeps writing the index the
-/// section names while the alias moves away from it. Its checkpoint advancing
-/// past those changes is what loses them, because the restart against the new
-/// index replays only from there. The rebuild cannot move the checkpoint
-/// itself, so any movement over the load is such a pipeline waking up.
+/// A pipeline that started during the load, or one that was idle and woke,
+/// keeps writing the index the section names while the alias moves away from
+/// it. Its checkpoint advancing past those changes is what loses them,
+/// because the restart against the new index replays only from there. The
+/// rebuild moves neither the lease nor the checkpoint itself, so any change
+/// to either since the first check is such a pipeline. The lease is then
+/// watched once more, for as long as the first check watched it, so a holder
+/// whose refreshes were held up while the first check looked is still seen
+/// before anything moves.
 async fn refuse_a_woken_stream(
     cfg: &AppConfig,
     sink: &dyn pg2osync_core::sink::Sink,
-    seen: Option<&str>,
+    seen: &Seen,
     left: &str,
 ) -> Result<()> {
-    let now = sink
-        .read_checkpoint(&cfg.stream_id())
-        .await?
-        .map(|c| c.position);
-    match moved_during_rebuild(seen, now.as_deref(), left) {
+    let stream = cfg.stream_id();
+    let now = sink.read_lease(&stream).await?;
+    if let Some(refusal) = lease::refusal(
+        &stream,
+        seen.lease.as_ref(),
+        now.as_ref(),
+        "during the rebuild",
+    ) {
+        bail!("{refusal}. Nothing was switched; {left}");
+    }
+    if let Some(refusal) = moved_during_rebuild(
+        seen.checkpoint.as_deref(),
+        checkpoint_position(sink, &stream).await?.as_deref(),
+        left,
+    ) {
+        bail!(refusal);
+    }
+    tokio::time::sleep(lease::wait_after(now.as_ref())).await;
+    let later = sink.read_lease(&stream).await?;
+    if let Some(refusal) = lease::refusal(
+        &stream,
+        now.as_ref(),
+        later.as_ref(),
+        "while this was checking before the switch",
+    ) {
+        bail!("{refusal}. Nothing was switched; {left}");
+    }
+    match moved_during_rebuild(
+        seen.checkpoint.as_deref(),
+        checkpoint_position(sink, &stream).await?.as_deref(),
+        left,
+    ) {
         Some(refusal) => bail!(refusal),
         None => Ok(()),
     }
+}
+
+async fn checkpoint_position(
+    sink: &dyn pg2osync_core::sink::Sink,
+    stream: &pg2osync_core::checkpoint::StreamId,
+) -> Result<Option<String>> {
+    Ok(sink.read_checkpoint(stream).await?.map(|c| c.position))
 }
 
 /// The refusal for a checkpoint that moved while the rebuild was loading;
@@ -993,6 +1068,28 @@ mod tests {
             "[source]\nurl = \"postgres://u@h/db\"\n[target]\nurl = \"http://t\"\n{sections}"
         ))
         .expect("parses")
+    }
+
+    #[test]
+    fn the_left_behind_hint_says_to_stop_the_pipeline_for_the_switch() {
+        assert_eq!(left_behind_report(&[]), "");
+        let left: Vec<_> = (0..12)
+            .map(|i| (format!("t{i}-live"), format!("old-t{i}")))
+            .collect();
+        let text = left_behind_report(&left);
+        assert!(
+            text.starts_with("12 alias(es) stayed where they were"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "switch-alias runs again against this generation, with the pipeline stopped"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("  t0-live -> old-t0\n"), "{text}");
+        assert!(!text.contains("t10-live"), "{text}");
+        assert!(text.ends_with("  … and 2 more\n"), "{text}");
     }
 
     #[test]
@@ -1508,6 +1605,81 @@ mod tests {
         assert_eq!(verdict(100, 100, 98, true), Verdict::WithinDrift);
         assert_eq!(verdict(100, 100, 100, true), Verdict::Exact);
         assert_eq!(verdict(100, 103, 104, true), Verdict::Mismatch);
+    }
+
+    fn held(counter: u64, cfg: &AppConfig) -> Lease {
+        Lease {
+            stream: cfg.stream_id(),
+            run: "r1".into(),
+            counter,
+            // short, so the watch before the switch takes a fraction of a second
+            interval_ms: 50,
+            holder: "pod-a pid 7".into(),
+            refreshed_at_epoch: 0,
+        }
+    }
+
+    fn holding(lease: Option<Lease>) -> crate::lease::tests::LeaseOnly {
+        let sink = crate::lease::tests::LeaseOnly::default();
+        *sink.lease.lock().unwrap() = lease;
+        sink
+    }
+
+    fn seen(lease: Option<Lease>) -> Seen {
+        Seen {
+            checkpoint: None,
+            lease,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lease_nobody_refreshed_since_the_first_check_lets_the_switch_go_ahead() {
+        // what a pipeline killed before the rebuild leaves behind
+        let cfg = config("[sync.users]\ntable = \"public.users\"\n");
+        let sink = holding(Some(held(3, &cfg)));
+        refuse_a_woken_stream(&cfg, &sink, &seen(Some(held(3, &cfg))), "left")
+            .await
+            .expect("a lease that stands still is no pipeline");
+    }
+
+    #[tokio::test]
+    async fn a_pipeline_that_started_during_the_load_stops_the_switch() {
+        let cfg = config("[sync.users]\ntable = \"public.users\"\n");
+        let sink = holding(Some(held(1, &cfg)));
+        let refusal = refuse_a_woken_stream(&cfg, &sink, &seen(None), "users-1 is left")
+            .await
+            .expect_err("a lease that appeared is a pipeline")
+            .to_string();
+        assert!(refusal.contains("during the rebuild"), "{refusal}");
+        assert!(refusal.contains("pod-a pid 7"), "{refusal}");
+        assert!(
+            refusal.contains("Nothing was switched; users-1 is left"),
+            "{refusal}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_idle_pipeline_refreshing_just_before_the_switch_stops_it() {
+        // the first check saw it idle and unchanged, the load changed nothing,
+        // and only the watch right before the switch sees it refresh
+        let cfg = config("[sync.users]\ntable = \"public.users\"\n");
+        let sink = std::sync::Arc::new(holding(Some(held(3, &cfg))));
+        let refresher = {
+            let sink = sink.clone();
+            let next = held(4, &cfg);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                *sink.lease.lock().unwrap() = Some(next);
+            })
+        };
+        let refusal =
+            refuse_a_woken_stream(&cfg, sink.as_ref(), &seen(Some(held(3, &cfg))), "left")
+                .await
+                .expect_err("a refresh before the switch is a running pipeline")
+                .to_string();
+        refresher.await.unwrap();
+        assert!(refusal.contains("before the switch"), "{refusal}");
+        assert!(refusal.contains("Nothing was switched"), "{refusal}");
     }
 
     #[test]

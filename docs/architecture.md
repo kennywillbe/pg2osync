@@ -429,7 +429,8 @@ so the load does not write versions below the ones already indexed.
 ## Extension points
 
 Adding a target means implementing `Sink` (`ensure_ready`, `get_documents`,
-`write`, `truncate_index`, `write_checkpoint`, `read_checkpoint`, `health`). No
+`write`, `truncate_index`, `write_checkpoint`, `read_checkpoint`, the three lease
+methods `write_lease`, `read_lease` and `clear_lease`, `health`). No
 engine code changes, and the engine never matches on a sink kind.
 
 Adding a source means producing `ChangeEvent`s with positions encoded as ordered

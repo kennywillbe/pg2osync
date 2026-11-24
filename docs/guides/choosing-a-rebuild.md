@@ -74,8 +74,8 @@ the gap they leave.
 | | What it is | Freshness gap | Needs |
 |---|---|---|---|
 | `resnapshot` into a new index name | a copy of the config pointing at `users_v2`, filled from the source, then `switch-alias` | the new index is static from the moment the re-snapshot finished | no second slot |
-| [`reindex`](../configuration.md#rebuilding-an-index) | one command: create `users-<unix seconds>` from the section's `mapping_file`, load it, check the count, move the alias | the length of the load — the pipeline is stopped for it | the pipeline stopped; it refuses when it sees a live stream, and there is no `--force` |
-| a second instance | a second config with its own `index` and `slot_name`, run to catch-up, then the alias moved | none | a second slot, and two lots of retained WAL until the old one is dropped |
+| [`reindex`](../configuration.md#rebuilding-an-index) | one command: create `users-<unix seconds>` from the section's `mapping_file`, load it, check the count, move the alias | the length of the load — the pipeline is stopped for it | the pipeline stopped; it refuses while one is running, idle or not, and there is no `--force` |
+| a second instance | a second config with its own `index` and `slot_name`, run to catch-up, then the alias moved | seconds — the new instance is stopped for the switch | a second slot, and two lots of retained WAL until the old one is dropped |
 
 `reindex` is the usual answer. A
 [templated](../configuration.md#per-row-indices) index is rebuilt as a fresh
@@ -101,7 +101,7 @@ rollback: one alias flip away.
 
 ## The full sequence
 
-The live cutover with no freshness gap at all has been rehearsed end to end
+The live cutover with a freshness gap of seconds has been rehearsed end to end
 against the dev stack, with a reader polling the alias throughout, and the four
 things the rehearsal turned up are written down beside it. Rather than restate
 it here: [Zero-downtime re-index](../operations.md#zero-downtime-re-index).

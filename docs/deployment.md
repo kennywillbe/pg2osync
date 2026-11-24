@@ -708,8 +708,10 @@ now, so a row deleted, truncated or moved to another index while 1.x was
 stopped stays in an index 1.x wrote, and `reconcile` does not read MySQL. So on
 MySQL, **before the first 2.0 start**, point every `[sync]` section at an index
 name 1.x never wrote to. The first start loads every table into the new names;
-once the load is done, move readers onto them (`pg2osync switch-alias`, if they
-query an alias) and delete the old indices. This works for every kind of
+once the load is done, move readers onto them and delete the old indices. If
+they query an alias, stop the pipeline for the move, run `pg2osync
+switch-alias` and start it again: the switch refuses while the stream's
+pipeline runs. This works for every kind of
 section.
 
 Renaming the indices only *after* that first start does not work: it writes its

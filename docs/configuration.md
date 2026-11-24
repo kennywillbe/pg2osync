@@ -413,7 +413,9 @@ alias = "{tenant}-events-live"
   does, and when the index is dropped while the pipeline runs: each batch
   looks its indices up again and recreates a missing one with its alias. An
   index that already exists is never changed by the
-  stream: run `switch-alias` once after adding `alias` to a running config.
+  stream: after adding `alias` to a running config, stop the pipeline, run
+  `switch-alias` once and start it again. The switch refuses while the
+  stream's pipeline runs, as [below](#rebuilding-an-index) explains.
 - **`switch-alias --alias "{tenant}-events-live"`** (the section's `alias`,
   verbatim) lists every index the template claims and points each one's
   alias at it in one atomic `_aliases` request.
@@ -444,7 +446,7 @@ alias = "{tenant}-events-live"
   first appeared in the newer generation. Both commands list each such alias
   and the index still holding it. Once the stream creates the tenant's index
   here, with the alias, the alias spans both generations until `switch-alias`
-  runs again. `--drop-old` is refused with a template.
+  runs again, with the pipeline stopped. `--drop-old` is refused with a template.
 - **An alias that collides with an index name** halts the pipeline, in
   either order: an alias named like an existing index is refused by the
   target when the index is created, and an index named like an existing
@@ -474,11 +476,21 @@ rollback — one alias flip away.
   document to compare against, so a row that changed during the rebuild would
   be wrong there for good — and the count would still add up. The command
   refuses on evidence, not a flag: an active replication slot on PostgreSQL,
-  and on either source a checkpoint that moves, watched for two seconds before
-  the load and compared again before the alias moves. A running pipeline with
-  nothing to stream shows neither on MySQL, so one that stays idle through the
-  whole rebuild is not detected; if it streams after the switch, the changes go
-  to the old index and the restart does not replay them. There is no `--force`.
+  and on either source the pipeline's lease or its checkpoint moving. `run`
+  refreshes a lease beside the checkpoint every five seconds, idle or not, so
+  the command reads it, waits twelve seconds, and reads it again — before the
+  load and once more right before the alias moves, where a lease that differs
+  from the one the first check saw is refused too. The refusal names the stream
+  and the instance (`PG2OSYNC_INSTANCE_ID`, or the host, and the process id).
+  A clean stop clears the lease; a pipeline that was killed leaves one that
+  never moves again, which costs the wait and blocks nothing. No clock is
+  compared, so hosts that disagree about the time do not matter. There is no
+  `--force`.
+- **`switch-alias` makes the same lease check** before it moves anything, for
+  the stream its config names, because a pipeline of that stream still running
+  from the config before a rebuild keeps writing the index the alias leaves.
+  The lease cannot tell that pipeline from one already writing the index the
+  alias moves to, so stop the stream's pipeline for the switch either way.
 - **The checkpoint does not move,** by construction: the rows carry position
   `0`, exactly as a re-snapshot's do. So everything committed while the
   pipeline was stopped is still in the log, and the restart replays it into the
@@ -501,9 +513,9 @@ rollback — one alias flip away.
   things differ afterwards: no config edit is needed, only the restart, and it
   is `<index>-<unix seconds>` that ends up holding the documents from before the
   rebuild — see [the Meilisearch sink](sinks/meilisearch.md#rebuilding-an-index).
-- **A live cutover with no freshness gap at all is still two instances,** as
-  [operations.md](operations.md) describes. A rebuild trades the gap for one
-  command.
+- **A live cutover with a freshness gap of seconds is still two instances,**
+  as [operations.md](operations.md) describes: the new instance is stopped only
+  for the switch. A rebuild trades the longer gap for one command.
 
 #### Keeping every write behind the alias
 
@@ -2164,7 +2176,7 @@ nothing changed) or `failed`. Nothing a reload does moves the checkpoint.
 |---|---|
 | `RUST_LOG` | Log filter, e.g. `pg2osync=debug`. Wins over `[log] filter`, and cannot be changed without a restart |
 | `PG2OSYNC_LOG_FORMAT` | `text` (default) or `json` for one JSON object per line |
-| `PG2OSYNC_INSTANCE_ID` | Recorded in the checkpoint document; identifies the writer |
+| `PG2OSYNC_INSTANCE_ID` | Recorded in the checkpoint document and the lease; identifies the writer, and names the pipeline a `reindex` or `switch-alias` refusal asks you to stop |
 | `PG2OSYNC_OTLP_ENDPOINT` | OTLP/gRPC collector for traces. Unset means none are built or sent — [Traces](operations.md#traces) |
 | `PG2OSYNC_OTLP_SAMPLE_RATIO` | Fraction of traces kept, `0.0` to `1.0` (default `1.0`) |
 | `PG2OSYNC_OTLP_SERVICE_NAME` | `service.name` on every span (default `pg2osync`) |
