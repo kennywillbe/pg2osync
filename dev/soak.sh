@@ -392,7 +392,7 @@ OS_PORT=$(published_port "$OS_CONTAINER" 9200)
 OS_URL=http://localhost:$OS_PORT
 METRICS=http://127.0.0.1:$(pick_port)
 for _ in $(seq 1 90); do
-  if docker exec "$PG" pg_isready -U postgres -d sourcedb > /dev/null 2>&1; then break; fi
+  if docker exec "$PG" pg_isready -h 127.0.0.1 -U postgres -d sourcedb > /dev/null 2>&1; then break; fi
   sleep 2
 done
 for _ in $(seq 1 90); do

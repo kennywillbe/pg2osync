@@ -506,8 +506,12 @@ pick_port_base() {
   return 1
 }
 
-pg_ready() { docker exec "$1" pg_isready -U postgres -d sourcedb; }
-pgsink_ready() { docker exec "$1" pg_isready -U postgres -d targetdb; }
+# Over TCP, not the unix socket: the image entrypoint first runs a temporary
+# server with listen_addresses='' to create POSTGRES_DB and run init scripts,
+# then stops it and starts the real one. The socket answers during the first,
+# so a seed sent then meets "the database system is shutting down".
+pg_ready() { docker exec "$1" pg_isready -h 127.0.0.1 -U postgres -d sourcedb; }
+pgsink_ready() { docker exec "$1" pg_isready -h 127.0.0.1 -U postgres -d targetdb; }
 os_green() { curl -s "$1/_cluster/health" | grep -q green; }
 # The dev stack's OpenSearch is a single node that outlives one run, so an index
 # left behind with a replica keeps the cluster yellow for good. This is the
