@@ -192,6 +192,33 @@ enum SinkCommand {
 /// without knowing whether the token is a WAL LSN or a binlog offset.
 pub type PositionRenderer = Arc<dyn Fn(u64) -> String + Send + Sync>;
 
+/// A position as a log line names it, through the source's display renderer.
+///
+/// Zero is the load's sentinel rather than a place in the stream, and a source
+/// would otherwise render it as a coordinate that never existed.
+fn logged_position(display: &PositionRenderer, lsn: Lsn) -> String {
+    if lsn.0 == 0 {
+        "no position".to_string()
+    } else {
+        display(lsn.0)
+    }
+}
+
+/// The line a refused document is logged with, matching what
+/// `pg2osync rejects` lists for it.
+fn rejection_line(
+    rejection: &pg2osync_core::sink::Rejection,
+    display: &PositionRenderer,
+) -> String {
+    format!(
+        "PERMANENT rejection {}/{} at {}: {}",
+        rejection.index,
+        rejection.doc_id,
+        logged_position(display, rejection.lsn),
+        rejection.reason
+    )
+}
+
 /// The inverse: turns a position a caller supplies back into an ordering token.
 ///
 /// Returns `None` when the text does not belong to this source's position
@@ -290,12 +317,18 @@ fn seal_batch_span(
 ///
 /// Returns a fatal error when the pipeline must halt (permanent document
 /// rejection — correctness-first failure policy).
+///
+/// `display_position` names positions in log lines and must not touch source
+/// state: unlike `render_position`, it is called for positions the target has
+/// not acknowledged yet.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     mut events: mpsc::Receiver<ChangeEvent>,
     copy: mpsc::Receiver<ChangeEvent>,
     ctx: Arc<PipelineCtx>,
     stream: StreamId,
     render_position: PositionRenderer,
+    display_position: PositionRenderer,
     durable: crate::mapping::DurableLsn,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), CoreError> {
@@ -321,6 +354,7 @@ pub async fn run(
         ctx.cfg.on_permanent_rejection,
         ctx.cfg.max_rejects,
         ctx.cfg.write_concurrency,
+        display_position.clone(),
     ));
 
     // checkpoint loop: persist acked LSN periodically; only after a successful
@@ -482,7 +516,8 @@ pub async fn run(
         tracing::trace!(target: "pg2osync::engine", "engine got event");
         match ev {
             ChangeEvent::Transaction(TransactionBoundary::Begin { lsn }) => {
-                tracing::debug!(target: "pg2osync::engine", "BEGIN at {lsn}");
+                tracing::debug!(target: "pg2osync::engine",
+                    "BEGIN at {}", logged_position(&display_position, lsn));
                 stream_txn_open = true;
             }
             ChangeEvent::Transaction(TransactionBoundary::Commit {
@@ -1104,6 +1139,7 @@ async fn sink_loop(
     policy: RejectionPolicy,
     max_rejects: u64,
     write_concurrency: usize,
+    display_position: PositionRenderer,
 ) {
     // What the target already holds, so the budget survives a restart instead of
     // being handed back every time the pipeline comes up.
@@ -1131,6 +1167,7 @@ async fn sink_loop(
         policy,
         max_rejects,
         quarantined,
+        display_position: &display_position,
     };
     // Write requests are the only command that may be open concurrently, and
     // they are still completed in submission order: a position is acknowledged
@@ -1325,6 +1362,7 @@ struct Acks<'a> {
     policy: RejectionPolicy,
     max_rejects: u64,
     quarantined: u64,
+    display_position: &'a PositionRenderer,
 }
 
 impl Acks<'_> {
@@ -1338,6 +1376,10 @@ impl Acks<'_> {
                     metrics.batches_flushed.fetch_add(1, Ordering::Relaxed);
                 }
                 if !ack.rejected.is_empty() {
+                    for rejection in &ack.rejected {
+                        tracing::error!(target: "pg2osync::sink", "{}",
+                            rejection_line(rejection, self.display_position));
+                    }
                     let first = &ack.rejected[0];
                     if policy == RejectionPolicy::Halt {
                         metrics.sink_errors_total.fetch_add(1, Ordering::Relaxed);
@@ -2132,6 +2174,45 @@ mod tests {
         assert!(cfg.checkpoint_interval_ms > 0);
         assert!(cfg.retry_max > 0);
     }
+
+    /// Stands in for a source whose positions are not PostgreSQL's `X/Y`.
+    fn binlog_display() -> PositionRenderer {
+        Arc::new(|token| format!("binlog.{:06}:{}", token >> 32, token as u32))
+    }
+
+    #[test]
+    fn a_logged_position_is_in_the_sources_own_terms() {
+        let display = binlog_display();
+        assert_eq!(
+            logged_position(&display, Lsn((4 << 32) | 900)),
+            "binlog.000004:900"
+        );
+        assert_eq!(
+            logged_position(&display, Lsn(0)),
+            "no position",
+            "a load row was never at a binlog coordinate"
+        );
+    }
+
+    #[test]
+    fn a_permanent_rejection_is_logged_at_the_sources_position() {
+        let rejection = pg2osync_core::sink::Rejection {
+            index: "orders".into(),
+            doc_id: "7".into(),
+            reason: "mapper_parsing_exception: nope".into(),
+            lsn: Lsn((4 << 32) | 900),
+            op: DocumentOp::Delete {
+                index: "orders".into(),
+                id: "7".into(),
+                routing: None,
+                version: None,
+            },
+        };
+        assert_eq!(
+            rejection_line(&rejection, &binlog_display()),
+            "PERMANENT rejection orders/7 at binlog.000004:900: mapper_parsing_exception: nope"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2494,6 +2575,27 @@ mod pipeline_tests {
         script: Vec<ChangeEvent>,
         copy_script: Vec<ChangeEvent>,
     ) -> (Arc<RecordingSink>, u64) {
+        drive_displayed(
+            metrics,
+            sink,
+            cfg,
+            script,
+            copy_script,
+            Arc::new(|token| Lsn(token).to_string()),
+        )
+        .await
+    }
+
+    /// As `drive_metrics`, with log lines naming positions through `display`
+    /// while the checkpoint keeps the PostgreSQL renderer.
+    async fn drive_displayed(
+        metrics: crate::metrics::SharedMetrics,
+        sink: Arc<RecordingSink>,
+        cfg: EngineConfig,
+        script: Vec<ChangeEvent>,
+        copy_script: Vec<ChangeEvent>,
+        display: PositionRenderer,
+    ) -> (Arc<RecordingSink>, u64) {
         let (events_tx, events_rx) = mpsc::channel(1024);
         let (copy_tx, copy_rx) = mpsc::channel(1024);
         let (ack_tx, _ack_rx) = watch::channel(None);
@@ -2536,6 +2638,7 @@ mod pipeline_tests {
             ctx,
             stream,
             render,
+            display,
             crate::mapping::DurableLsn::default(),
             shutdown_rx,
         ));
@@ -2545,6 +2648,87 @@ mod pipeline_tests {
         engine.await.expect("task joined").expect("engine ran");
         let mark = *load_done_rx.borrow();
         (sink, mark)
+    }
+
+    /// Every event's message, at every level, from the thread it is set on.
+    ///
+    /// Hand-written over `tracing`'s own trait: a log line is what an operator
+    /// matches against `pg2osync rejects`, so the tests read the line itself.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<String>>>);
+
+    impl Captured {
+        fn lines(&self) -> Vec<String> {
+            self.0.lock().expect("not poisoned").clone()
+        }
+    }
+
+    impl tracing::Subscriber for Captured {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Message<'a>(&'a mut String);
+            impl tracing::field::Visit for Message<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        *self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut line = String::new();
+            event.record(&mut Message(&mut line));
+            self.0.lock().expect("not poisoned").push(line);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn log_lines_name_positions_in_the_sources_terms_and_the_checkpoint_keeps_its_own() {
+        let captured = Captured::default();
+        // The runtime of a plain tokio test is this one thread, so the sink
+        // task's lines land here too.
+        let _guard = tracing::subscriber::set_default(captured.clone());
+        let at = (4u64 << 32) | 900;
+        let (sink, _) = drive_displayed(
+            Arc::new(crate::metrics::Metrics::default()),
+            Arc::new(refusing(&["2"])),
+            quarantining(100),
+            vec![begin(at), row(1), row(2), commit(at)],
+            vec![],
+            Arc::new(|token| format!("binlog.{:06}:{}", token >> 32, token as u32)),
+        )
+        .await;
+        let lines = captured.lines();
+        assert!(
+            lines.iter().any(|l| l == "BEGIN at binlog.000004:900"),
+            "{lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("PERMANENT rejection users/2 at binlog.000004:900: ")),
+            "{lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("4/384")),
+            "no line falls back to the PostgreSQL form: {lines:#?}"
+        );
+        assert_eq!(
+            sink.last_checkpoint().map(|c| c.position),
+            Some(Lsn(at).to_string()),
+            "the checkpoint still goes through its own renderer"
+        );
     }
 
     #[tokio::test]
@@ -3289,6 +3473,7 @@ mod pipeline_tests {
             RejectionPolicy::Halt,
             100,
             concurrency,
+            Arc::new(|token| Lsn(token).to_string()),
         ));
         Writer {
             commands,
@@ -3643,6 +3828,7 @@ mod pipeline_tests {
             copy_rx,
             ctx,
             stream,
+            render.clone(),
             render,
             crate::mapping::DurableLsn::default(),
             shutdown_rx,
@@ -3784,6 +3970,7 @@ mod pipeline_tests {
                 publication: "pub".into(),
             },
             Arc::new(|token| Lsn(token).to_string()),
+            Arc::new(|token| Lsn(token).to_string()),
             crate::mapping::DurableLsn::default(),
             shutdown_rx,
         )
@@ -3839,6 +4026,7 @@ mod pipeline_tests {
                 stream: "slot".into(),
                 publication: "pub".into(),
             },
+            Arc::new(|token| Lsn(token).to_string()),
             Arc::new(|token| Lsn(token).to_string()),
             crate::mapping::DurableLsn::default(),
             shutdown_rx,
@@ -3899,6 +4087,7 @@ mod pipeline_tests {
                 stream: "slot".into(),
                 publication: "pub".into(),
             },
+            Arc::new(|token| Lsn(token).to_string()),
             Arc::new(|token| Lsn(token).to_string()),
             crate::mapping::DurableLsn::default(),
             shutdown_rx,
@@ -4212,6 +4401,7 @@ mod pipeline_tests {
                 publication: "pub".into(),
             },
             Arc::new(|token| Lsn(token).to_string()),
+            Arc::new(|token| Lsn(token).to_string()),
             crate::mapping::DurableLsn::default(),
             shutdown_rx,
         )
@@ -4290,6 +4480,7 @@ mod pipeline_tests {
                 stream: "slot".into(),
                 publication: "pub".into(),
             },
+            Arc::new(|token| Lsn(token).to_string()),
             Arc::new(|token| Lsn(token).to_string()),
             crate::mapping::DurableLsn::default(),
             shutdown_rx,
@@ -4584,6 +4775,7 @@ mod pipeline_tests {
                 stream: "slot".into(),
                 publication: "pub".into(),
             },
+            Arc::new(|token| Lsn(token).to_string()),
             Arc::new(|token| Lsn(token).to_string()),
             crate::mapping::DurableLsn::default(),
             shutdown_rx,
@@ -4977,6 +5169,7 @@ mod pipeline_tests {
             copy_rx,
             ctx,
             stream,
+            render.clone(),
             render,
             crate::mapping::DurableLsn::default(),
             shutdown_rx,
@@ -5328,6 +5521,7 @@ mod pipeline_tests {
                 publication: "pub".into(),
             },
             Arc::new(|token| Lsn(token).to_string()),
+            Arc::new(|token| Lsn(token).to_string()),
             crate::mapping::DurableLsn::default(),
             shutdown_rx,
         )
@@ -5569,6 +5763,7 @@ mod pipeline_tests {
                 publication: "pub".into(),
             },
             Arc::new(|token| Lsn(token).to_string()),
+            Arc::new(|token| Lsn(token).to_string()),
             crate::mapping::DurableLsn::default(),
             shutdown_rx,
         )
@@ -5759,6 +5954,7 @@ mod pipeline_tests {
             copy_rx,
             ctx,
             stream,
+            render.clone(),
             render,
             crate::mapping::DurableLsn::default(),
             shutdown_rx,

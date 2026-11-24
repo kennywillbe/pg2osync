@@ -81,7 +81,10 @@ types for that to hold.
 position token. Whether that token is a WAL LSN or a packed binlog coordinate is
 the source's business, and the binary injects a closure that renders it back to
 text for the checkpoint. This is what made adding MySQL a small change rather
-than a fork.
+than a fork. Log lines get a second closure that renders only the coordinate:
+the checkpoint one may consume source state as it renders (MySQL folds GTIDs
+into the resume position up to the token), so a log of a position ahead of the
+acknowledgement must never call it.
 
 **New targets implement `Sink`.** No `match sink_kind` anywhere in the engine.
 

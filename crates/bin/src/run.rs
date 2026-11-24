@@ -1629,6 +1629,7 @@ async fn attempt_postgres(
         copy_rx,
         ctx,
         stream_id,
+        render.clone(),
         render,
         durable,
         shutdown_rx.clone(),
@@ -2203,6 +2204,14 @@ enum VersionBase {
     NewGeneration(u64),
 }
 
+/// How far above a checkpoint a new generation of versions opens.
+///
+/// The margin has to clear the highest version already written but not yet
+/// acknowledged, which one unacknowledged transaction bounds to a few file
+/// rotations. A thousand rotations of headroom is far past that, and still
+/// leaves millions of generations in a u64.
+pub(crate) const GENERATION_MARGIN: u64 = 1 << 40;
+
 /// Decide the version base from the checkpoint and the source's coordinate.
 ///
 /// The version is `base + coordinate`, and a version at the target only ever
@@ -2214,11 +2223,6 @@ fn version_base_for(base: u64, stored_token: u64, current_coordinate: u64) -> Ve
     if base.saturating_add(current_coordinate) >= stored_token {
         return VersionBase::Kept(base);
     }
-    // The margin has to clear the highest version already written but not yet
-    // acknowledged, which one unacknowledged transaction bounds to a few file
-    // rotations. A thousand rotations of headroom is far past that, and still
-    // leaves millions of generations in a u64.
-    const GENERATION_MARGIN: u64 = 1 << 40;
     VersionBase::NewGeneration(stored_token.saturating_add(GENERATION_MARGIN))
 }
 
@@ -2396,9 +2400,10 @@ async fn attempt_mysql(
             ),
         ))
     });
+    let (prefix, _) =
+        mysql_catalog::split_binlog_file(&start_file).unwrap_or_else(|| ("binlog".to_string(), 0));
+    let display = mysql_display_renderer(prefix.clone(), base);
     let render: PositionRenderer = {
-        let (prefix, _) = mysql_catalog::split_binlog_file(&start_file)
-            .unwrap_or_else(|| ("binlog".to_string(), 0));
         let tracker = tracker.clone();
         Arc::new(move |token| {
             // Asked for the position *as of this token*, never the newest one:
@@ -2445,6 +2450,7 @@ async fn attempt_mysql(
         ctx,
         stream_id,
         render,
+        display,
         durable,
         shutdown_rx.clone(),
     );
@@ -2961,20 +2967,33 @@ async fn add_table_mysql(deps: &MySqlSections, key: &str, file: &AppConfig) -> R
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_engine(
     events_rx: mpsc::Receiver<ChangeEvent>,
     copy_rx: mpsc::Receiver<ChangeEvent>,
     ctx: Arc<PipelineCtx>,
     stream_id: StreamId,
     render: PositionRenderer,
+    display: PositionRenderer,
     durable: DurableLsn,
     shutdown: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<Result<(), pg2osync_core::CoreError>> {
     tokio::spawn(async move {
         pg2osync_engine::run(
-            events_rx, copy_rx, ctx, stream_id, render, durable, shutdown,
+            events_rx, copy_rx, ctx, stream_id, render, display, durable, shutdown,
         )
         .await
+    })
+}
+
+/// How a MySQL log line names a stream position: the binlog coordinate alone.
+///
+/// The checkpoint renderer cannot serve here. It folds GTIDs into the resume
+/// position up to the token it is given, and a log names positions the target
+/// has not taken yet.
+fn mysql_display_renderer(prefix: String, base: u64) -> PositionRenderer {
+    Arc::new(move |token| {
+        pg2osync_source_mysql::catalog::position_text(&prefix, token.saturating_sub(base))
     })
 }
 
@@ -2989,6 +3008,21 @@ mod tests {
     }
 
     const MARGIN: u64 = 1 << 40;
+
+    #[test]
+    fn a_logged_mysql_position_is_the_bare_binlog_coordinate() {
+        let display = mysql_display_renderer("binlog".to_string(), 4096);
+        assert_eq!(
+            display(4096 + coordinate(4, 900)),
+            "binlog.000004:900",
+            "the generation base belongs to the version, not the coordinate"
+        );
+        assert_eq!(
+            mysql_display_renderer("mysql-bin".to_string(), 0)(coordinate(4, 900)),
+            "mysql-bin.000004:900",
+            "no ;gtid= or ;base= suffix in a log line"
+        );
+    }
 
     #[test]
     fn a_first_run_versions_from_zero_so_the_version_is_the_bare_coordinate() {
